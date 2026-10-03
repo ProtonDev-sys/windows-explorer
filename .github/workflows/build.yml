@@ -1,0 +1,34 @@
+name: Windows headless build and tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build native C++ application
+        shell: pwsh
+        run: ./scripts/build.ps1 -Configuration Release
+      - name: Run headless core, Shell operation, and application checks
+        shell: pwsh
+        run: ./scripts/test.ps1 -Configuration Release -SkipBuild
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: headless-test-reports
+          path: artifacts/
+          if-no-files-found: warn
+      - name: Upload native application
+        uses: actions/upload-artifact@v7
+        with:
+          name: WindowsExplorer-x64
+          path: build/Release/WindowsExplorer.exe

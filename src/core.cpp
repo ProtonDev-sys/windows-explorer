@@ -1,0 +1,288 @@
+#include "explorer/core.hpp"
+
+#include <shlobj.h>
+#include <algorithm>
+#include <array>
+#include <charconv>
+#include <cwctype>
+#include <fstream>
+#include <iomanip>
+#include <iterator>
+#include <limits>
+#include <locale>
+#include <sstream>
+#include <string_view>
+#include <vector>
+
+namespace explorer {
+namespace {
+constexpr std::size_t maximumSettingsBytes = 256 * 1024;
+constexpr std::size_t maximumLocationLength = 32767;
+
+std::string utf8(const std::wstring& text) {
+    if (text.empty()) return {};
+    if (text.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) return {};
+    const auto length = static_cast<int>(text.size());
+    const int required = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text.data(), length, nullptr, 0, nullptr, nullptr);
+    if (required <= 0) return {};
+    std::string result(static_cast<std::size_t>(required), '\0');
+    if (!WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text.data(), length, result.data(), required, nullptr, nullptr)) return {};
+    return result;
+}
+
+bool fromUtf8(const std::string& text, std::wstring& result) {
+    if (text.empty()) { result.clear(); return true; }
+    const int length = static_cast<int>(text.size());
+    const int required = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(), length, nullptr, 0);
+    if (required <= 0) return false;
+    result.resize(static_cast<std::size_t>(required));
+    return MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(), length, result.data(), required) != 0;
+}
+
+std::string escapeLocation(const std::string& text) {
+    std::string result;
+    for (const char ch : text) {
+        switch (ch) {
+        case '\\': result += "\\\\"; break;
+        case '\n': result += "\\n"; break;
+        case '\r': result += "\\r"; break;
+        case '\t': result += "\\t"; break;
+        default: result += ch; break;
+        }
+    }
+    return result;
+}
+
+bool unescapeLocation(const std::string& text, std::wstring& result) {
+    std::string unescaped;
+    for (std::size_t index = 0; index < text.size(); ++index) {
+        const char ch = text[index];
+        if (ch != '\\') { unescaped += ch; continue; }
+        if (++index == text.size()) return false;
+        switch (text[index]) {
+        case '\\': unescaped += '\\'; break;
+        case 'n': unescaped += '\n'; break;
+        case 'r': unescaped += '\r'; break;
+        case 't': unescaped += '\t'; break;
+        default: return false;
+        }
+    }
+    return fromUtf8(unescaped, result) && !result.empty() && result.size() <= maximumLocationLength && result.find(L'\0') == std::wstring::npos;
+}
+
+std::string_view trimAscii(std::string_view text) {
+    const auto whitespace = [](char ch) { return ch == ' ' || ch == '\t' || ch == '\r'; };
+    while (!text.empty() && whitespace(text.front())) text.remove_prefix(1);
+    while (!text.empty() && whitespace(text.back())) text.remove_suffix(1);
+    return text;
+}
+
+int integerOr(std::string_view text, int fallback, int minimum, int maximum) {
+    text = trimAscii(text);
+    int value = 0;
+    const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value);
+    return parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size() && value >= minimum && value <= maximum ? value : fallback;
+}
+
+bool booleanOr(std::string_view text, bool fallback) {
+    text = trimAscii(text);
+    if (text == "true" || text == "1") return true;
+    if (text == "false" || text == "0") return false;
+    return fallback;
+}
+
+std::wstring urlEncode(const std::wstring& text) {
+    constexpr char hex[] = "0123456789ABCDEF";
+    std::wstring result;
+    for (const unsigned char ch : utf8(text)) {
+        if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '-' || ch == '_' || ch == '.' || ch == '~') {
+            result += static_cast<wchar_t>(ch);
+        } else {
+            result += L'%';
+            result += static_cast<wchar_t>(hex[ch >> 4]);
+            result += static_cast<wchar_t>(hex[ch & 15]);
+        }
+    }
+    return result;
+}
+} // namespace
+
+std::filesystem::path preferencesPath() {
+    PWSTR localAppData = nullptr;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, KF_FLAG_DONT_VERIFY, nullptr, &localAppData))) {
+        const std::filesystem::path path(localAppData);
+        CoTaskMemFree(localAppData);
+        return path / L"WindowsExplorer" / L"settings.ini";
+    }
+    const auto environment = expandEnvironment(L"%LOCALAPPDATA%");
+    if (!environment.empty() && environment != L"%LOCALAPPDATA%") return std::filesystem::path(environment) / L"WindowsExplorer" / L"settings.ini";
+    // An empty path makes a missing user profile a normal settings failure.
+    return {};
+}
+
+Preferences loadPreferences(const std::filesystem::path& path) {
+    const Preferences defaults;
+    Preferences result = defaults;
+    std::error_code error;
+    const auto size = std::filesystem::file_size(path, error);
+    if (error || size > maximumSettingsBytes) return result;
+    std::ifstream input(path, std::ios::binary);
+    if (!input) return result;
+    // Bound the read as well as the initial size check if another process grows the file.
+    std::string contents(maximumSettingsBytes + 1, '\0');
+    input.read(contents.data(), static_cast<std::streamsize>(contents.size()));
+    contents.resize(static_cast<std::size_t>(input.gcount()));
+    if (contents.size() > maximumSettingsBytes || input.bad()) return result;
+    if (contents.starts_with("\xEF\xBB\xBF")) contents.erase(0, 3);
+    std::wstring checked;
+    if (!fromUtf8(contents, checked) || contents.find('\0') != std::string::npos) return result;
+    std::istringstream lines(contents);
+    std::string line;
+    while (std::getline(lines, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        const auto stripped = trimAscii(line);
+        if (stripped.empty() || stripped.front() == '#' || stripped.front() == ';') continue;
+        const auto equals = line.find('=');
+        if (equals == std::string::npos) continue;
+        const auto key = trimAscii(std::string_view(line).substr(0, equals));
+        const auto value = std::string_view(line).substr(equals + 1);
+        if (key == "navigationPane") result.navigationPane = booleanOr(value, defaults.navigationPane);
+        else if (key == "previewPane") result.previewPane = booleanOr(value, defaults.previewPane);
+        else if (key == "detailsPane") result.detailsPane = booleanOr(value, defaults.detailsPane);
+        else if (key == "showHidden") result.showHidden = booleanOr(value, defaults.showHidden);
+        else if (key == "showExtensions") result.showExtensions = booleanOr(value, defaults.showExtensions);
+        else if (key == "ribbonCollapsed") result.ribbonCollapsed = booleanOr(value, defaults.ribbonCollapsed);
+        else if (key == "view") result.view = static_cast<ViewMode>(integerOr(value, static_cast<int>(defaults.view), 0, 7));
+        else if (key == "windowWidth") result.windowWidth = integerOr(value, defaults.windowWidth, 640, 7680);
+        else if (key == "windowHeight") result.windowHeight = integerOr(value, defaults.windowHeight, 480, 4320);
+        else if (key == "startupLocation") {
+            std::wstring location;
+            result.startupLocation = unescapeLocation(std::string(value), location) ? location : defaults.startupLocation;
+        }
+    }
+    return result;
+}
+
+bool savePreferences(const std::filesystem::path& path, const Preferences& preferences) {
+    if (path.empty() || preferences.startupLocation.empty() || preferences.startupLocation.size() > maximumLocationLength || preferences.startupLocation.find(L'\0') != std::wstring::npos) return false;
+    const auto encodedLocation = utf8(preferences.startupLocation);
+    if (encodedLocation.empty()) return false;
+    const Preferences defaults;
+    const auto view = static_cast<int>(preferences.view);
+    std::ostringstream output;
+    output << "# WindowsExplorer settings (UTF-8).\nversion=1\n" << std::boolalpha
+        << "navigationPane=" << preferences.navigationPane << '\n'
+        << "previewPane=" << preferences.previewPane << '\n'
+        << "detailsPane=" << preferences.detailsPane << '\n'
+        << "showHidden=" << preferences.showHidden << '\n'
+        << "showExtensions=" << preferences.showExtensions << '\n'
+        << "ribbonCollapsed=" << preferences.ribbonCollapsed << '\n'
+        << "view=" << (view >= 0 && view <= 7 ? view : static_cast<int>(defaults.view)) << '\n'
+        << "windowWidth=" << (preferences.windowWidth >= 640 && preferences.windowWidth <= 7680 ? preferences.windowWidth : defaults.windowWidth) << '\n'
+        << "windowHeight=" << (preferences.windowHeight >= 480 && preferences.windowHeight <= 4320 ? preferences.windowHeight : defaults.windowHeight) << '\n'
+        << "startupLocation=" << escapeLocation(encodedLocation) << '\n';
+    const auto contents = output.str();
+    std::error_code error;
+    if (!path.parent_path().empty()) {
+        std::filesystem::create_directories(path.parent_path(), error);
+        if (error) return false;
+    }
+    std::filesystem::path temporary;
+    HANDLE file = INVALID_HANDLE_VALUE;
+    for (unsigned attempt = 0; attempt < 8; ++attempt) {
+        temporary = path;
+        temporary += L".tmp-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetCurrentThreadId()) + L"-" + std::to_wstring(GetTickCount64()) + L"-" + std::to_wstring(attempt);
+        file = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file != INVALID_HANDLE_VALUE) break;
+        if (GetLastError() != ERROR_FILE_EXISTS && GetLastError() != ERROR_ALREADY_EXISTS) return false;
+    }
+    if (file == INVALID_HANDLE_VALUE) return false;
+    DWORD written = 0;
+    const bool wrote = WriteFile(file, contents.data(), static_cast<DWORD>(contents.size()), &written, nullptr) && written == contents.size() && FlushFileBuffers(file);
+    const bool closed = CloseHandle(file) != FALSE;
+    if (!wrote || !closed || !MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileW(temporary.c_str());
+        return false;
+    }
+    return true;
+}
+
+std::wstring trim(const std::wstring& text) {
+    const auto first = std::find_if_not(text.begin(), text.end(), [](wchar_t ch) { return std::iswspace(ch) != 0; });
+    const auto last = std::find_if_not(text.rbegin(), text.rend(), [](wchar_t ch) { return std::iswspace(ch) != 0; }).base();
+    return first >= last ? std::wstring{} : std::wstring(first, last);
+}
+
+std::wstring expandEnvironment(const std::wstring& text) {
+    if (text.empty()) return {};
+    for (unsigned attempt = 0; attempt < 3; ++attempt) {
+        const DWORD required = ExpandEnvironmentStringsW(text.c_str(), nullptr, 0);
+        if (!required || required > 1024 * 1024) return text;
+        std::wstring result(static_cast<std::size_t>(required), L'\0');
+        const DWORD copied = ExpandEnvironmentStringsW(text.c_str(), result.data(), required);
+        if (!copied) return text;
+        if (copied > required) continue;
+        result.resize(static_cast<std::size_t>(copied) - 1);
+        return result;
+    }
+    return text;
+}
+
+std::wstring searchUri(const std::wstring& query, const std::wstring& scope) {
+    // Microsoft search-ms protocol: query is AQS by default; location supports local and UNC scopes.
+    // https://learn.microsoft.com/windows/win32/search/-search-3x-wds-qryidx-crumb
+    std::wstring result = L"search-ms:query=" + urlEncode(query);
+    if (!scope.empty()) result += L"&crumb=location:" + urlEncode(scope);
+    return result;
+}
+
+std::wstring formatBytes(std::uint64_t bytes) {
+    if (bytes < 1024) return std::to_wstring(bytes) + (bytes == 1 ? L" byte" : L" bytes");
+    constexpr std::array<const wchar_t*, 6> units{ L"KB", L"MB", L"GB", L"TB", L"PB", L"EB" };
+    long double value = static_cast<long double>(bytes) / 1024.0L;
+    std::size_t unit = 0;
+    while (value >= 1024.0L && unit + 1 < units.size()) { value /= 1024.0L; ++unit; }
+    std::wostringstream output;
+    output.imbue(std::locale::classic());
+    output << std::fixed << std::setprecision(2) << value << L' ' << units[unit];
+    return output.str();
+}
+
+bool validLeafName(const std::wstring& name) {
+    if (name.empty() || name.size() > 255 || name == L"." || name == L".." || name.back() == L' ' || name.back() == L'.') return false;
+    for (std::size_t index = 0; index < name.size(); ++index) {
+        const wchar_t ch = name[index];
+        if (ch < 32 || std::wstring_view(L"<>:\"/\\|?*").find(ch) != std::wstring_view::npos) return false;
+        if (ch >= 0xD800 && ch <= 0xDBFF) {
+            if (index + 1 == name.size() || name[index + 1] < 0xDC00 || name[index + 1] > 0xDFFF) return false;
+            ++index;
+        } else if (ch >= 0xDC00 && ch <= 0xDFFF) return false;
+    }
+    std::wstring base = name.substr(0, name.find(L'.'));
+    while (!base.empty() && base.back() == L' ') base.pop_back();
+    std::transform(base.begin(), base.end(), base.begin(), [](wchar_t ch) { return static_cast<wchar_t>(std::towupper(ch)); });
+    if (base == L"CON" || base == L"PRN" || base == L"AUX" || base == L"NUL" || base == L"CONIN$" || base == L"CONOUT$") return false;
+    if (base.size() == 4 && (base.starts_with(L"COM") || base.starts_with(L"LPT"))) {
+        const wchar_t digit = base.back();
+        if ((digit >= L'1' && digit <= L'9') || digit == L'\u00B9' || digit == L'\u00B2' || digit == L'\u00B3') return false;
+    }
+    return true;
+}
+
+std::wstring hresultMessage(HRESULT result) {
+    PWSTR buffer = nullptr;
+    DWORD length = FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+        nullptr, static_cast<DWORD>(result), 0, reinterpret_cast<PWSTR>(&buffer), 0, nullptr);
+    if (!length && HRESULT_FACILITY(result) == FACILITY_WIN32) {
+        length = FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+            nullptr, HRESULT_CODE(result), 0, reinterpret_cast<PWSTR>(&buffer), 0, nullptr);
+    }
+    std::wstring message;
+    if (length && buffer) message = trim(std::wstring(buffer, length));
+    if (buffer) LocalFree(buffer);
+    std::wostringstream code;
+    code << L"0x" << std::uppercase << std::hex << std::setfill(L'0') << std::setw(8) << static_cast<std::uint32_t>(result);
+    return message.empty() ? code.str() : message + L" (" + code.str() + L")";
+}
+
+} // namespace explorer

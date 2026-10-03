@@ -1,0 +1,10 @@
+/build/
+/out/
+/artifacts/
+/tmp/
+/.vs/
+*.user
+*.suo
+*.log
+*.pdb
+*.ilk

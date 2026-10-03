@@ -1,0 +1,119 @@
+#pragma once
+#include "explorer/core.hpp"
+#include "explorer/commands.hpp"
+#include <shlobj.h>
+#include <commctrl.h>
+#include <shobjidl.h>
+#include <servprov.h>
+#include <wrl/client.h>
+#include <atomic>
+#include <memory>
+#include <vector>
+#include <future>
+
+namespace explorer {
+using Microsoft::WRL::ComPtr;
+struct PidlDeleter {
+    using pointer = LPITEMIDLIST;
+    void operator()(pointer p) const noexcept { CoTaskMemFree(p); }
+};
+using Pidl = std::unique_ptr<ITEMIDLIST, PidlDeleter>;
+
+class ExplorerApp final : public IExplorerBrowserEvents, public IServiceProvider,
+                          public IExplorerPaneVisibility, public ICommDlgBrowser3, public IFolderFilter {
+public:
+    ExplorerApp(HINSTANCE instance, bool headless);
+    HRESULT create(const std::wstring& location);
+    int run(int showCommand);
+    int headlessSmoke(const std::filesystem::path& report);
+    HWND window() const noexcept { return window_; }
+    bool preprocess(MSG& message);
+    HRESULT navigate(const std::wstring& location);
+    HRESULT execute(UINT command);
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** out) override;
+    ULONG STDMETHODCALLTYPE AddRef() override;
+    ULONG STDMETHODCALLTYPE Release() override;
+    HRESULT STDMETHODCALLTYPE QueryService(REFGUID service, REFIID iid, void** out) override;
+    HRESULT STDMETHODCALLTYPE GetPaneState(REFEXPLORERPANE pane, EXPLORERPANESTATE* state) override;
+    HRESULT STDMETHODCALLTYPE OnNavigationPending(PCIDLIST_ABSOLUTE) override;
+    HRESULT STDMETHODCALLTYPE OnViewCreated(IShellView*) override;
+    HRESULT STDMETHODCALLTYPE OnNavigationComplete(PCIDLIST_ABSOLUTE) override;
+    HRESULT STDMETHODCALLTYPE OnNavigationFailed(PCIDLIST_ABSOLUTE) override;
+    HRESULT STDMETHODCALLTYPE OnDefaultCommand(IShellView*) override { return S_FALSE; }
+    HRESULT STDMETHODCALLTYPE OnStateChange(IShellView*, ULONG) override;
+    HRESULT STDMETHODCALLTYPE IncludeObject(IShellView*, PCUITEMID_CHILD) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE Notify(IShellView*, DWORD) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE GetDefaultMenuText(IShellView*, LPWSTR text, int size) override;
+    HRESULT STDMETHODCALLTYPE GetViewFlags(DWORD* flags) override;
+    HRESULT STDMETHODCALLTYPE OnColumnClicked(IShellView*, int) override { return S_FALSE; }
+    HRESULT STDMETHODCALLTYPE GetCurrentFilter(LPWSTR text, int size) override;
+    HRESULT STDMETHODCALLTYPE OnPreViewCreated(IShellView*) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE ShouldShow(IShellFolder*, PCIDLIST_ABSOLUTE, PCUITEMID_CHILD) override;
+    HRESULT STDMETHODCALLTYPE GetEnumFlags(IShellFolder*, PCIDLIST_ABSOLUTE, HWND*, DWORD*) override;
+private:
+    ~ExplorerApp();
+    static LRESULT CALLBACK windowProc(HWND, UINT, WPARAM, LPARAM);
+    static LRESULT CALLBACK editProc(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
+    LRESULT onMessage(UINT, WPARAM, LPARAM);
+    void createControls();
+    void layout();
+    void rebuildRibbon();
+    void updateCommands();
+    void updateStatus();
+    void updateBreadcrumbs();
+    void editAddress();
+    void finishAddress(bool navigateNow);
+    HRESULT createBrowser();
+    void destroyBrowser();
+    HRESULT recreateBrowser();
+    HRESULT browseHistory(int offset);
+    HRESULT setView(ViewMode mode);
+    HRESULT setSort(const PROPERTYKEY& key);
+    HRESULT setGroup(const PROPERTYKEY& key);
+    HRESULT selection(ComPtr<IShellItemArray>& out, bool folderIfEmpty = false);
+    HRESULT currentFolder(ComPtr<IShellItem>& out);
+    HRESULT chooseDestination(bool move);
+    HRESULT nativeVerb(const wchar_t* verb, bool folderIfEmpty = false);
+    HRESULT newFolder();
+    HRESULT newText();
+    HRESULT showProperties(const wchar_t* page);
+    HRESULT archive(bool extract);
+    HRESULT makeShortcut(bool fromClipboard);
+    void popup(UINT command, HWND anchor = nullptr);
+    void showError(HRESULT hr, const wchar_t* action);
+    void persist();
+    void setStatus(const std::wstring& text);
+    int px(int value) const { return MulDiv(value, static_cast<int>(dpi_), 96); }
+    std::atomic<ULONG> references_{1};
+    HINSTANCE instance_;
+    bool headless_;
+    bool closing_ = false;
+    bool browserInitialized_ = false;
+    bool addressEditing_ = false;
+    bool navigating_ = false;
+    bool searchActive_ = false;
+    bool checkboxes_ = false;
+    bool ascending_ = true;
+    HWND window_ = nullptr, tabs_ = nullptr, nav_ = nullptr, address_ = nullptr;
+    HWND breadcrumbs_ = nullptr, search_ = nullptr, status_ = nullptr, file_ = nullptr;
+    HFONT font_ = nullptr;
+    UINT dpi_ = 96;
+    Preferences preferences_;
+    ComPtr<IExplorerBrowser> browser_;
+    ComPtr<IShellView> view_;
+    ComPtr<IFolderView2> folderView_;
+    DWORD adviseCookie_ = 0;
+    std::vector<HWND> ribbonControls_;
+    std::vector<HIMAGELIST> ribbonImages_;
+    std::vector<Pidl> breadcrumbsPidls_;
+    std::vector<Pidl> history_;
+    std::vector<Pidl> searchLocations_;
+    int historyIndex_ = -1, pendingHistory_ = -1;
+    Pidl currentPidl_;
+    std::wstring currentLocation_, currentName_, lastError_;
+    ULONGLONG navigationStarted_ = 0, lastNavigationMs_ = 0;
+    unsigned navigationCount_ = 0;
+    std::future<HRESULT> archiveTask_;
+    std::wstring archiveAction_;
+};
+}
