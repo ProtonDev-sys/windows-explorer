@@ -356,8 +356,19 @@ public:
         std::vector<explorer::ContextMenuEntry> entries;
         succeeded(menu_.enumerate(entries), "read native advanced option checkbox");
         find(entries, true, 0);
+        // A generic CommandStore context menu can omit MFS_CHECKED while the
+        // actual Ribbon IExplorerCommand reports ECS_CHECKED. Use the native
+        // provider state, which is also the production Ribbon's authority.
+        menuChecked_=state_.checked;
+        explorer::NamespaceCommandState native;
+        succeeded(explorer::namespaceCommandState(option,nullptr,site.Get(),&native),
+            "read actual native Ribbon advanced-option state");
+        require(native.explorerCommand,"advanced option lacks native IExplorerCommand state");
+        state_.enabled=state_.enabled && native.enabled();
+        state_.checked=native.checked();
     }
     const OptionState& state() const { return state_; }
+    bool menuChecked() const { return menuChecked_; }
     void invoke(HWND owner) {
         require(!ReadOnlyAudit, "read-only audit cannot invoke a native command");
         require(environmentEquals(L"GITHUB_ACTIONS", L"true") && environmentEquals(L"WINDOWSEXPLORER_SEARCH_OPTIONS_TEST", L"1"),
@@ -380,7 +391,7 @@ private:
             find(entry.children, enabled && entry.enabled(), depth + 1);
         }
     }
-    const wchar_t* option_ = nullptr; OptionState state_;
+    const wchar_t* option_ = nullptr; OptionState state_; bool menuChecked_=false;
     std::unique_ptr<HKEY__, KeyCloser> key_;
     ComPtr<IContextMenu> context_; explorer::NativeContextMenu menu_;
 };
@@ -505,7 +516,8 @@ void describeOptionState(HiddenBrowser& browser,const TestOption& option,const f
     const HRESULT status=explorer::namespaceCommandState(option.command,nullptr,site.Get(),&fast);
     const auto found=results(browser.current().Get(),root);
     std::wcout << L"Advanced option diagnostic " << stage << L" menuPresent=" << menu.state().present <<
-        L" menuEnabled=" << menu.state().enabled << L" menuChecked=" << menu.state().checked <<
+        L" menuEnabled=" << menu.state().enabled << L" menuMfsChecked=" << menu.menuChecked() <<
+        L" nativeChecked=" << menu.state().checked <<
         L" fastHRESULT=0x" << std::hex << static_cast<unsigned long>(status) << L" fastState=0x" << fast.state << std::dec <<
         L" fastInitialized=" << fast.initialized << L" fastSite=" << fast.siteAttached <<
         L" results=" << found.size() << L" exactOwnedResult=" << matches(found,option.expectedSuffix) << L'\n';
@@ -551,12 +563,26 @@ void auditAndTest() {
         auto zipScope=shellItem(fixture.root/L"owned.zip");
         auto explicitZip=query(L"System.FileName:=\"zipneedle.txt\"",zipScope.Get());
         std::cout << "Explicit native ZIP scope baselineResults=" << results(explicitZip.Get(),fixture.root).size() << '\n';
+        OptionMenu save;save.initialize(browser,L"Windows.SearchSave");
+        explorer::NamespaceCommandState saveState;
+        auto searchSite=browser.view();
+        const HRESULT saveStatus=explorer::namespaceCommandState(L"Windows.SearchSave",nullptr,searchSite.Get(),&saveState);
+        std::cout << "Read-only native SearchSave menuPresent=" << save.state().present <<
+            " menuEnabled=" << save.state().enabled << " nativeStateHRESULT=0x" << std::hex <<
+            static_cast<unsigned long>(saveStatus) << " nativeState=0x" << saveState.state << std::dec <<
+            " initialized=" << saveState.initialized << " site=" << saveState.siteAttached << '\n';
+        std::vector<explorer::NamespaceSubcommandMetadata> recent;
+        const HRESULT recentStatus=explorer::namespaceCommandChildren(L"Windows.SearchMru",nullptr,searchSite.Get(),&recent);
+        std::cout << "Read-only native SearchMru EnumSubCommands HRESULT=0x" << std::hex <<
+            static_cast<unsigned long>(recentStatus) << std::dec << " childCount=" << recent.size() << '\n';
+        // Do not log the user's search history labels or targets.
     }
     for (const auto& option : options) {
         auto search = query(option.query,scope.Get()); browser.navigate(search.Get());
         OptionMenu initial; initial.initialize(browser,option.command);
         std::wcout << option.command << L" present=" << initial.state().present << L" enabled=" << initial.state().enabled <<
-            L" checked=" << initial.state().checked << L" baselineResults=" << results(search.Get(),fixture.root).size() << L'\n';
+            L" checked=" << initial.state().checked << L" menuMfsChecked=" << initial.menuChecked() <<
+            L" baselineResults=" << results(search.Get(),fixture.root).size() << L'\n';
         if constexpr (ReadOnlyAudit) continue;
         require(initial.state().present && initial.state().enabled, "native option unavailable: need actual search-view service integration");
         const bool original = initial.state().checked;
@@ -573,7 +599,10 @@ void auditAndTest() {
             OptionMenu freshState; freshState.initialize(browser,option.command);
             std::wcout << L"Existing unchecked=" << unchecked.size() << L" checked=" << checked.size() << L" freshFactory=" << freshResults.size() << L'\n';
             std::wcout << L"Fresh factory native checkbox present=" << freshState.state().present << L" enabled=" <<
-                freshState.state().enabled << L" checked=" << freshState.state().checked << L'\n';
+                freshState.state().enabled << L" checked=" << freshState.state().checked <<
+                L" menuMfsChecked=" << freshState.menuChecked() << L'\n';
+            require(freshState.state().present && freshState.state().enabled && freshState.state().checked,
+                "fresh app query lost actual native advanced-option checked state");
             browser.navigate(checkedQuery.Get());
             if (option.command != options[1].command)
                 require(unchecked.empty(), "unchecked content/archive option did not exclude owned advanced-query result");
