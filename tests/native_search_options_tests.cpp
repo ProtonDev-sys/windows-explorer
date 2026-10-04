@@ -1,5 +1,6 @@
 #include "explorer/search.hpp"
 #include "explorer/context_menu.hpp"
+#include "explorer/namespace_actions.hpp"
 
 #include <shlobj.h>
 #include <searchapi.h>
@@ -157,6 +158,25 @@ public:
         }
     }
     void verifyReadOnly() const { require(SettingsSnapshot::read()==original_, "read-only audit unexpectedly changed search settings"); }
+    void describeChanges() const {
+        const auto current=SettingsSnapshot::read();
+        for (const auto& [address,value] : current.values) {
+            const auto found=original_.values.find(address);
+            if (found!=original_.values.end() && found->second==value) continue;
+            std::wcout << L"Native option setting changed: " << address.first << L"\\" << address.second <<
+                L" type=" << value.type << L" bytes=" << value.bytes.size();
+            if (value.type==REG_DWORD && value.bytes.size()==sizeof(DWORD)) {
+                DWORD actual=0; memcpy(&actual,value.bytes.data(),sizeof(actual));
+                std::wcout << L" actualDWORD=" << actual;
+            }
+            if (found==original_.values.end()) std::wcout << L" original=absent";
+            else if (found->second.type==REG_DWORD && found->second.bytes.size()==sizeof(DWORD)) {
+                DWORD original=0; memcpy(&original,found->second.bytes.data(),sizeof(original));
+                std::wcout << L" originalDWORD=" << original;
+            } else std::wcout << L" originalType=" << found->second.type << L" originalBytes=" << found->second.bytes.size();
+            std::wcout << L'\n';
+        }
+    }
     void restore() {
         require(!ReadOnlyAudit && environmentEquals(L"GITHUB_ACTIONS",L"true") &&
             environmentEquals(L"WINDOWSEXPLORER_SEARCH_OPTIONS_TEST",L"1"), "restore registry only in opted-in disposable VM");
@@ -463,14 +483,52 @@ bool matches(const std::set<std::wstring>& items, const wchar_t* suffix) {
     const auto& path = *items.begin(); const auto length = wcslen(suffix);
     return path.size() >= length && _wcsicmp(path.c_str()+path.size()-length, suffix) == 0;
 }
-void optionState(HiddenBrowser& browser, const wchar_t* option, bool checked) {
+void optionState(HiddenBrowser& browser, const wchar_t* option, bool checked,
+                 const std::function<void()>& diagnostics = {}) {
     OptionMenu menu; menu.initialize(browser, option);
     require(menu.state().present && menu.state().enabled, "installed native advanced option missing/disabled on real search view");
     if (menu.state().checked != checked) {
         menu.invoke(browser.owner());
-        waitFor([&] { OptionMenu updated; updated.initialize(browser,option); return updated.state().enabled && updated.state().checked == checked; },
-            "native option checkbox did not reach requested state");
+        try {
+            waitFor([&] { OptionMenu updated; updated.initialize(browser,option); return updated.state().enabled && updated.state().checked == checked; },
+                "native option checkbox did not reach requested state",2000);
+        } catch (...) {
+            if (diagnostics) diagnostics();
+            throw;
+        }
     }
+}
+void describeOptionState(HiddenBrowser& browser,const TestOption& option,const fs::path& root,const wchar_t* stage) {
+    OptionMenu menu; menu.initialize(browser,option.command);
+    explorer::NamespaceCommandState fast;
+    auto site=browser.view();
+    const HRESULT status=explorer::namespaceCommandState(option.command,nullptr,site.Get(),&fast);
+    const auto found=results(browser.current().Get(),root);
+    std::wcout << L"Advanced option diagnostic " << stage << L" menuPresent=" << menu.state().present <<
+        L" menuEnabled=" << menu.state().enabled << L" menuChecked=" << menu.state().checked <<
+        L" fastHRESULT=0x" << std::hex << static_cast<unsigned long>(status) << L" fastState=0x" << fast.state << std::dec <<
+        L" fastInitialized=" << fast.initialized << L" fastSite=" << fast.siteAttached <<
+        L" results=" << found.size() << L" exactOwnedResult=" << matches(found,option.expectedSuffix) << L'\n';
+}
+void describeOptionFailure(HiddenBrowser& browser,const TestOption& option,IShellItem* scope,
+                           const fs::path& root,const SettingsGuard& settings) {
+    settings.describeChanges();
+    describeOptionState(browser,option,root,L"afterInvoke-existing");
+    auto view=browser.view();
+    const HRESULT refresh=view->Refresh();
+    std::wcout << L"Advanced option native view Refresh HRESULT=0x" << std::hex <<
+        static_cast<unsigned long>(refresh) << std::dec << L'\n';
+    pump();
+    describeOptionState(browser,option,root,L"afterRefresh-existing");
+    auto fresh=query(option.query,scope);
+    const auto found=results(fresh.Get(),root);
+    std::cout << "Advanced option fresh app factory results=" << found.size() <<
+        " exactOwnedResult=" << matches(found,option.expectedSuffix) << '\n';
+    browser.navigate(fresh.Get());
+    describeOptionState(browser,option,root,L"freshFactory-sameBrowser");
+    HiddenBrowser freshBrowser;freshBrowser.initialize();freshBrowser.navigate(fresh.Get());
+    describeOptionState(freshBrowser,option,root,L"freshFactory-newBrowser");
+    freshBrowser.close();
 }
 void auditAndTest() {
     SettingsGuard settings;
@@ -502,10 +560,11 @@ void auditAndTest() {
         if constexpr (ReadOnlyAudit) continue;
         require(initial.state().present && initial.state().enabled, "native option unavailable: need actual search-view service integration");
         const bool original = initial.state().checked;
+        const auto diagnostics=[&] { describeOptionFailure(browser,option,scope.Get(),fixture.root,settings); };
         try {
-            optionState(browser,option.command,false);
+            optionState(browser,option.command,false,diagnostics);
             const auto unchecked = results(browser.current().Get(),fixture.root);
-            optionState(browser,option.command,true);
+            optionState(browser,option.command,true,diagnostics);
             const auto checked = results(browser.current().Get(),fixture.root);
             auto fresh = query(option.query,scope.Get());
             const auto freshResults = results(fresh.Get(),fixture.root);
