@@ -37,6 +37,40 @@ void succeeded(HRESULT hr, const char* message) {
     }
 }
 
+std::string diagnosticUtf8(const std::wstring& text) {
+    const int bytes = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text.data(),
+        static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr);
+    if (!bytes) return text.empty() ? "" : "<invalid UTF-16>";
+    std::string utf8(static_cast<size_t>(bytes), '\0');
+    if (!WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text.data(),
+        static_cast<int>(text.size()), utf8.data(), bytes, nullptr, nullptr)) return "<UTF-8 conversion failed>";
+    std::string escaped;
+    for (const char character : utf8) {
+        if (character == '\r') escaped += "\\r";
+        else if (character == '\n') escaped += "\\n";
+        else if (character == '\t') escaped += "\\t";
+        else escaped += character;
+    }
+    return escaped;
+}
+
+void equalText(const std::wstring& actual, const std::wstring& expected, const char* message) {
+    if (actual == expected) return;
+    std::cerr << message << "\n  expected (UTF-8): " << diagnosticUtf8(expected)
+              << "\n  actual (UTF-8):   " << diagnosticUtf8(actual) << '\n';
+    throw std::runtime_error(message);
+}
+
+std::wstring displayName(IShellItem* item, SIGDN kind) {
+    PWSTR raw = nullptr;
+    const HRESULT hr = item->GetDisplayName(kind, &raw);
+    struct StringDeleter { void operator()(wchar_t* value) const { CoTaskMemFree(value); } };
+    const std::unique_ptr<wchar_t, StringDeleter> owned(raw);
+    succeeded(hr, "read expected native Shell display name");
+    require(owned && *owned, "expected native Shell display name is nonempty");
+    return owned.get();
+}
+
 struct TaskDeleter {
     using pointer = LPITEMIDLIST;
     void operator()(pointer value) const noexcept { CoTaskMemFree(value); }
@@ -181,6 +215,10 @@ void formatting() {
     succeeded(explorer::formatQuotedPaths({L"::{virtual parsing name}"}, result),
               "format virtual path");
     require(result == L"\"::{virtual parsing name}\"", "single path has no trailing line");
+    succeeded(explorer::formatQuotedPaths({L"C:\\TEMP~1\\FILE~1.TXT", L"C:\\directory\\.\\file.txt"}, result),
+              "format literal path aliases");
+    equalText(result, L"\"C:\\TEMP~1\\FILE~1.TXT\"\r\n\"C:\\directory\\.\\file.txt\"",
+              "pure formatter preserves provider path spelling verbatim");
     const auto unchanged = result;
     require(explorer::formatQuotedPaths({}, result) == E_INVALIDARG, "empty formatter selection rejected");
     require(result == unchanged, "empty formatter preserves output");
@@ -238,10 +276,46 @@ void shellPathResolution() {
     ComPtr<IShellItem> thisPc;
     succeeded(SHCreateItemInKnownFolder(FOLDERID_ComputerFolder, 0, nullptr, IID_PPV_ARGS(&thisPc)),
               "create virtual This PC item");
-    auto actual = selectItems({shellItem(path), thisPc});
-    succeeded(ItemActions::quotedPaths(actual.Get(), result), "resolve actual native filesystem and virtual items");
-    require(result == L'"' + path.wstring() + L"\"\r\n\"::{20D04FE0-3AEA-1069-A2D8-08002B30309D}\"",
-            "native virtual item uses absolute parsing name");
+    const auto checkNative = [&](const fs::path& input) {
+        const auto actual = selectItems({shellItem(input), thisPc});
+        ComPtr<IShellItem> nativeFile;
+        ComPtr<IShellItem> nativeVirtual;
+        succeeded(actual->GetItemAt(0, &nativeFile), "read native filesystem selection");
+        succeeded(actual->GetItemAt(1, &nativeVirtual), "read native virtual selection");
+        // Shell parsing may expand short names, remove dot segments and choose
+        // its own virtual identifier spelling. Assert the native display names
+        // instead of the path used to create the fixture or a hardcoded GUID.
+        const auto filesystemName = displayName(nativeFile.Get(), SIGDN_FILESYSPATH);
+        const auto parsingName = displayName(nativeVirtual.Get(), SIGDN_DESKTOPABSOLUTEPARSING);
+        succeeded(ItemActions::quotedPaths(actual.Get(), result), "resolve actual native filesystem and virtual items");
+        equalText(result, L'"' + filesystemName + L"\"\r\n\"" + parsingName + L'"',
+                  "native filesystem and virtual item names are quoted exactly");
+        return filesystemName;
+    };
+    checkNative(path);
+
+    const auto caseAlias = path.parent_path() / L"NATIVE \u03bb.TXT";
+    if (GetFileAttributesW(caseAlias.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        checkNative(caseAlias);
+        std::cout << "Native path aliases: differently cased fixture selection passed\n";
+    }
+
+    const DWORD needed = GetShortPathNameW(path.c_str(), nullptr, 0);
+    if (needed) {
+        std::wstring shortName(needed, L'\0');
+        const DWORD length = GetShortPathNameW(path.c_str(), shortName.data(), needed);
+        require(length && length < needed, "read owned fixture short path");
+        shortName.resize(length);
+        if (shortName != path.wstring()) {
+            checkNative(fs::path(shortName));
+            std::cout << "Native path aliases: 8.3 fixture selection passed\n";
+        } else {
+            std::cout << "Native path aliases: filesystem supplied no distinct 8.3 alias\n";
+        }
+    } else {
+        std::cout << "Native path aliases: 8.3 path unavailable (Win32 "
+                  << GetLastError() << ")\n";
+    }
 }
 
 void mixedHiddenSelection() {

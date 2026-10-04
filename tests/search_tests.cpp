@@ -13,6 +13,9 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <array>
+#include <algorithm>
+#include <compare>
 
 namespace {
 namespace fs = std::filesystem;
@@ -40,6 +43,7 @@ std::string read(const fs::path& path) {
 }
 struct Fixture {
     fs::path root;
+    bool shortAlias = false;
     Fixture() {
         GUID guid{};
         succeeded(CoCreateGuid(&guid), "create search fixture id");
@@ -47,6 +51,16 @@ struct Fixture {
         require(StringFromGUID2(guid, identifier, 40) != 0, "format search fixture id");
         root = fs::temp_directory_path() / (std::wstring(L"windows-explorer-search-test-資料&-") + identifier);
         require(fs::create_directory(root), "create exclusive search fixture");
+        wchar_t aliasMode[2]{};
+        if (GetEnvironmentVariableW(L"WINDOWSEXPLORER_SEARCH_TEST_SHORT_PATHS", aliasMode, 2) == 1 && aliasMode[0] == L'1') {
+            const auto length = GetShortPathNameW(root.c_str(), nullptr, 0);
+            require(length != 0, "get deliberate fixture short alias length");
+            std::vector<wchar_t> alias(length);
+            require(GetShortPathNameW(root.c_str(), alias.data(), length) != 0, "get deliberate fixture short alias");
+            require(_wcsicmp(root.c_str(), alias.data()) != 0, "deliberate fixture short alias unavailable");
+            root = alias.data();
+            shortAlias = true;
+        }
     }
     ~Fixture() {
         std::error_code ignored;
@@ -57,6 +71,68 @@ ComPtr<IShellItem> shellItem(const fs::path& path) {
     ComPtr<IShellItem> result;
     succeeded(SHCreateItemFromParsingName(path.c_str(), nullptr, IID_PPV_ARGS(&result)), "parse search fixture item");
     return result;
+}
+
+std::wstring nativeFilesystemPath(IShellItem* item) {
+    PWSTR raw = nullptr;
+    const auto hr = item->GetDisplayName(SIGDN_FILESYSPATH, &raw);
+    std::wstring path = raw ? raw : L"";
+    CoTaskMemFree(raw);
+    succeeded(hr, "read canonical native fixture path");
+    require(!path.empty(), "canonical native fixture path is empty");
+    return path;
+}
+std::string utf8(const std::wstring& text) {
+    const int length = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text.data(),
+                                          static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr);
+    require(length > 0 || text.empty(), "encode fixture diagnostic");
+    std::string result(static_cast<size_t>(length), '\0');
+    if (length) require(WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text.data(),
+                        static_cast<int>(text.size()), result.data(), length, nullptr, nullptr) != 0,
+                        "encode fixture diagnostic bytes");
+    return result;
+}
+struct FileIdentity {
+    ULONGLONG volume = 0;
+    std::array<BYTE, 16> identifier{};
+    auto operator<=>(const FileIdentity&) const = default;
+};
+FileIdentity fileIdentity(const std::wstring& path) {
+    const HANDLE handle = CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        const auto error = GetLastError();
+        std::cerr << "cannot open result identity: " << utf8(path) << '\n';
+        succeeded(HRESULT_FROM_WIN32(error), "open exact fixture file identity");
+    }
+    FILE_ID_INFO info{};
+    const BOOL readInfo = GetFileInformationByHandleEx(handle, FileIdInfo, &info, sizeof(info));
+    const auto hr = readInfo ? S_OK : HRESULT_FROM_WIN32(GetLastError());
+    CloseHandle(handle);
+    succeeded(hr, "read volume and 128-bit fixture file identity");
+    FileIdentity result{info.VolumeSerialNumber};
+    std::copy_n(info.FileId.Identifier, result.identifier.size(), result.identifier.begin());
+    return result;
+}
+void requireResults(const std::set<std::wstring>& actual, const std::set<std::wstring>& expected,
+                    const char* message) {
+    std::set<FileIdentity> actualIds, expectedIds;
+    for (const auto& path : actual) actualIds.insert(fileIdentity(path));
+    for (const auto& path : expected) expectedIds.insert(fileIdentity(path));
+    // Do not weaken membership to equal counts or basename matching. Native
+    // Shell names may expand an 8.3 alias or change casing for the same file.
+    const bool matches = actual.size() == expected.size() && actualIds == expectedIds &&
+                         actualIds.size() == actual.size() && expectedIds.size() == expected.size();
+    if (!matches) {
+        std::cerr << message << "\nactual (" << actual.size() << "):\n";
+        for (const auto& path : actual) std::cerr << "  " << utf8(path) << '\n';
+        std::cerr << "expected (" << expected.size() << "):\n";
+        for (const auto& path : expected) std::cerr << "  " << utf8(path) << '\n';
+        std::cerr << "distinct file identities: actual=" << actualIds.size()
+                  << ", expected=" << expectedIds.size() << '\n';
+    }
+    require(matches, message);
 }
 
 struct XmlString {
@@ -128,9 +204,11 @@ std::set<std::wstring> searchResults(IShellItem* item) {
         succeeded(created, "resolve native result identity");
         PWSTR path = nullptr;
         const auto named = result->GetDisplayName(SIGDN_FILESYSPATH, &path);
-        if (SUCCEEDED(named) && path) paths.emplace(path);
+        bool inserted = false;
+        if (SUCCEEDED(named) && path) inserted = paths.emplace(path).second;
         CoTaskMemFree(path);
         succeeded(named, "resolve fixture result path");
+        require(inserted, "native search returned an empty or duplicate fixture path");
         require(++count <= 256, "fixture search escaped its bounded scope");
     }
     return paths;
@@ -173,29 +251,39 @@ void shallowAndRecursiveResults() {
     write(scopePath / L"different.txt", "not matched");
     write(fixture.root / L"outside" / L"match & 資料.txt", "must never be returned");
     auto scope = shellItem(scopePath);
+    if (fixture.shortAlias) {
+        const auto canonicalScope = nativeFilesystemPath(scope.Get());
+        require(_wcsicmp(scopePath.c_str(), canonicalScope.c_str()) != 0,
+                "deliberate fixture alias did not reproduce native path normalization");
+        std::cout << "INFO: native search fixture alias normalization reproduced\n"
+                  << "  alias: " << utf8(scopePath.native()) << '\n'
+                  << "  native: " << utf8(canonicalScope) << '\n';
+    }
     const std::wstring query = L"System.FileName:=\"match & 資料.txt\"";
     for (bool recursive : {false, true}) {
         ComPtr<IShellItem> live;
         succeeded(explorer::createSearchFolder(query, scope.Get(), &live, recursive), "create native scoped search");
         const std::set<std::wstring> expected = recursive ?
             std::set<std::wstring>{direct.native(), nested.native()} : std::set<std::wstring>{direct.native()};
-        require(searchResults(live.Get()) == expected, "native search has wrong recursion or scope");
+        requireResults(searchResults(live.Get()), expected, "native search has wrong recursion or scope");
         const auto savedPath = fixture.root / (recursive ? L"recursive.search-ms" : L"shallow.search-ms");
         succeeded(explorer::saveSearch(query, scope.Get(), recursive, savedPath), "save Unicode native search");
         auto document = loadXml(savedPath);
         const auto include = xmlElement(document.Get(), L"/persistedQuery/query/scope/include");
-        require(xmlAttribute(include.Get(), L"path") == scopePath.native(), "XML scope lost Unicode or XML metacharacters");
+        const auto savedScope = xmlAttribute(include.Get(), L"path");
+        require(savedScope == nativeFilesystemPath(scope.Get()), "XML scope lost canonical Shell path or Unicode/metacharacters");
+        require(fileIdentity(savedScope) == fileIdentity(scopePath.native()), "saved XML scope names a different folder");
         require(xmlAttribute(include.Get(), L"nonRecursive") == (recursive ? L"false" : L"true"), "saved scope lost recursion");
         const auto saved = reopenSearch(savedPath);
-        require(searchResults(saved.Get()) == expected, "reopened native saved search changed its results");
+        requireResults(searchResults(saved.Get()), expected, "reopened native saved search changed its results");
     }
     // A saved query reruns instead of freezing a result snapshot.
     require(fs::create_directories(scopePath / L"new child"), "create new saved-search result scope");
     const auto added = scopePath / L"new child" / L"match & 資料.txt";
     write(added, "created after saving");
-    require(searchResults(reopenSearch(fixture.root / L"recursive.search-ms").Get()) ==
+    requireResults(searchResults(reopenSearch(fixture.root / L"recursive.search-ms").Get()),
         std::set<std::wstring>{direct.native(), nested.native(), added.native()}, "saved search did not rerun on new fixture content");
-    require(searchResults(reopenSearch(fixture.root / L"shallow.search-ms").Get()) ==
+    requireResults(searchResults(reopenSearch(fixture.root / L"shallow.search-ms").Get()),
         std::set<std::wstring>{direct.native()}, "saved shallow query included new descendants");
 }
 
@@ -243,7 +331,7 @@ void canonicalRefinementsAndRelativeDates() {
         ComPtr<IShellItem> saved;
         try { saved = reopenSearch(savedPath); }
         catch (...) { std::cerr << "canonical refinement fixture number " << index << '\n'; throw; }
-        require(searchResults(saved.Get()) == searchResults(live.Get()), "canonical saved refinement changed native result semantics");
+        requireResults(searchResults(saved.Get()), searchResults(live.Get()), "canonical saved refinement changed native result semantics");
         if (query.find(L"System.StructuredQueryType.DateTime#") != std::wstring::npos) {
             const auto condition = xmlElement(document.Get(), L"/persistedQuery/query/conditions/condition");
             require(xmlAttribute(condition.Get(), L"valuetype") == L"System.StructuredQueryType.DateTime", "saved relative date lost semantic type");
@@ -254,7 +342,7 @@ void canonicalRefinementsAndRelativeDates() {
     const std::wstring today = L"System.DateModified:System.StructuredQueryType.DateTime#Today";
     const auto todayPath = fixture.root / L"today.search-ms";
     succeeded(explorer::saveSearch(today, scope.Get(), false, todayPath), "save relative Today text search");
-    require(searchResults(reopenSearch(todayPath).Get()) ==
+    requireResults(searchResults(reopenSearch(todayPath).Get()),
         std::set<std::wstring>{(scopePath / L"current.txt").native()}, "native relative Today query did not exclude old fixture");
 }
 
@@ -324,11 +412,11 @@ void comparisonOperatorSemantics() {
     for (const auto& example : examples) {
         ComPtr<IShellItem> live;
         succeeded(explorer::createSearchFolder(example.query, scope.Get(), &live), "create comparison search");
-        require(searchResults(live.Get()) == example.expected, "live comparison fixture has unexpected results");
+        requireResults(searchResults(live.Get()), example.expected, "live comparison fixture has unexpected results");
         const auto path = fixture.root / (std::to_wstring(++index) + L".search-ms");
         succeeded(explorer::saveSearch(example.query, scope.Get(), true, path), "save native comparison operator");
         loadXml(path);
-        require(searchResults(reopenSearch(path).Get()) == example.expected, "saved comparison spelling changed its result semantics");
+        requireResults(searchResults(reopenSearch(path).Get()), example.expected, "saved comparison spelling changed its result semantics");
     }
 }
 
