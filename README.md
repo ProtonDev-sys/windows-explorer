@@ -2,11 +2,11 @@
 
 A native C++20 file manager for Windows 10, built with Win32 controls and the Windows Shell. It runs in its own process and hosts native folder views through `IExplorerBrowser`. No Electron, WebView, or JavaScript runtime is involved.
 
-The implementation covers navigation, file operations, Home/Share/View commands, and a contextual Search page. **It is a working application, not complete Explorer parity.** The [feature matrix](docs/feature-matrix.md) separates implemented commands, Shell-provided behavior, and remaining work.
+The implementation covers navigation, file operations, Home/Share/View commands, customizable toolbar shortcuts, and contextual Search and Library pages. **It is a working application, not complete Explorer parity.** The [feature matrix](docs/feature-matrix.md) separates implemented commands, Shell-provided behavior, and remaining work.
 
 ## Run
 
-Download the x64 executable from the repository's Releases page, extract the ZIP, and run `WindowsExplorer.exe`. Windows 10 22H2 or newer is the target; the build includes the C++ runtime. ZIP creation and extraction use Windows' bundled `tar.exe` through a hidden background process.
+Download the x64 executable from the [Releases page](https://github.com/ProtonDev-sys/windows-explorer/releases), extract the ZIP, and run `WindowsExplorer.exe`. The executable is unsigned. Windows 10 22H2 or newer is the target; the build includes the C++ runtime. ZIP creation and extraction use Windows' bundled `tar.exe` through a hidden background process.
 
 ```powershell
 ./WindowsExplorer.exe
@@ -21,17 +21,24 @@ The application starts at This PC to avoid eagerly loading recent files or cloud
 - Back, forward, up, refresh, location history, clickable breadcrumbs, editable paths, and environment-variable expansion.
 - Commands for Quick access, known folders, This PC, Libraries, Network, and Recycle Bin.
 - Eight layouts, sorting/grouping, native column toggles and autosizing, item checkboxes, hidden items, hide/unhide selection, navigation/preview/details pane controls, and a collapsible command band.
+- Customizable client-area Quick Access Toolbar: add/remove supported commands, reorder, reset, and place above or below the command band; order and placement persist in app settings.
 - Copy/cut/paste, copy paths, copy/move destination pickers, new folders/text files/shortcuts, properties, recycle deletion, and confirmed permanent deletion.
-- Native AQS search folders with current-folder or recursive scope, kind/date/size refinements, 20 recent query entries per session, native saved searches, and return to the search's original folder.
+- Registered Windows New-item menu alongside direct folder/text/shortcut commands.
+- Native AQS search folders with current-folder or recursive scope, kind/date/size refinements, 20 recent query entries per session, native saved searches, filesystem-result Open file location, and return to the search's original folder.
+- Library locations, include/remove folder, default save location, content template, and creation commands using native `.library-ms` files.
 - F6/Shift+F6 region routing and F11 fullscreen, with hidden-window style/geometry restoration checks.
 - ZIP creation/extraction on a background worker, Unicode paths, and no-overwrite staging. Extraction supports classic stored/deflate ZIPs; ZIP64, encrypted, multipart, self-extracting, linked, or unsupported-metadata archives are rejected.
-- Native sharing/security properties, printing through file associations, network-drive dialogs, Folder Options, and File History settings.
+- Native Windows Share integration for selected filesystem files, separate Sharing/Security property pages, printing through file associations, network-drive dialogs, Folder Options, and File History settings.
 
 Shell-provided capabilities depend on Windows, installed handlers, policy, and devices. The application can still encounter slow network locations or Shell extensions. There is no measured speedup claim against Explorer.exe.
 
-Important remaining work includes the other contextual ribbon pages, Quick Access Toolbar customization, full Share/New/Easy access menus, advanced search options, explicit Undo/Redo integration, dark mode, localization, and accessibility validation. New Shortcut currently chooses file targets; Paste Shortcut supports file and folder targets. The File History button opens settings rather than an individual file's version history.
+Important remaining work includes the other contextual ribbon pages, Explorer's exact title-bar toolbar/ribbon presentation, full Share/Easy access command coverage, advanced search options, explicit Undo/Redo integration, dark mode, localization, and accessibility validation. New Shortcut currently chooses file targets; Paste Shortcut supports file and folder targets. The File History button opens settings rather than an individual file's version history. Native New handlers and Share recipients depend on installed components; their visible UI and actual delivery have not been tested.
 
-Saved `.search-ms` files reopen through Windows and rerun their queries. Their query/scope metadata is not imported into the application's Search page, so refinement controls are unavailable on reopened saved searches. Saving supports filesystem folders and This PC, preserves relative dates, and never overwrites a file. Explicit filename word-prefix queries (`System.FileName:$<...`) are unsupported live; saving any explicit `$<` condition, unsupported value types, arbitrary virtual scopes, and literal-percent scope paths is also unsupported. Filename starts-with (`~<`) and wildcard (`~`) queries are supported.
+Saved `.search-ms` files reopen through Windows and rerun their queries. The host restores query, scope, recursion, and Search controls for a verified subset: one filesystem scope or recursive This PC, an all-item kind union, and supported string condition/schema types. The imported condition becomes the base query; original filter-category state is not inferred. Multiple/excluded scopes, internal/provider elements, Blurb/unknown types, and other unsupported metadata remain native-view-only. The reader bounds XML input and prohibits DTDs/external resources.
+
+Saving supports filesystem folders and This PC, preserves relative dates, and never overwrites a file. Unspecified-property terms such as `report` cannot currently be persisted faithfully and reject before file creation; live generic searches still work. Explicit filename word-prefix queries (`System.FileName:$<...`) are unsupported live; saving any explicit `$<` condition, unsupported value types, arbitrary virtual scopes, and literal-percent scope paths is also unsupported. Explicit filename starts-with (`~<`) and wildcard (`~`) queries are supported. Share accepts at most 256 existing filesystem files, including regular ZIP files even when the Shell marks them as folders; physical directories, virtual items, and reparse points are rejected.
+
+New folder/text/shortcut, registered New-item menus, and terminal commands require an actual filesystem directory. ZIP namespace folders do not qualify for these destinations; their native Paste capability is handled separately.
 
 ## Build
 
@@ -58,9 +65,9 @@ All development tests run without showing the application or operating visible U
 ./scripts/test.ps1 -Configuration Release -SkipBuild
 ```
 
-CTest runs console tests and a hidden-window Shell host. The host never calls `ShowWindow` on the application, blocks interactive operations, and observes process-owned top-level windows while pumping messages. Tests operate on owned temporary fixtures and preserve the user's clipboard, shared settings, and Shell undo history. Reports are written to `artifacts/`.
+CTest runs console tests and a hidden-window Shell host. The host never calls `ShowWindow` on the application, blocks interactive operations, uses `EBO_NOPERSISTVIEWSTATE`, and observes process-owned top-level windows while pumping messages. Tests operate on owned temporary fixtures and preserve the user's clipboard, shared settings, libraries, and Shell undo history. Reports are written to `artifacts/`.
 
-The current local verification includes 54 hidden-host checks, 3,151 keyboard/model assertions across eight groups, six item-action groups, five native search groups, settings/error cases, silent Shell operations, and ZIP/shortcut round trips. Search tests execute actual owned-fixture queries and compare live with reopened saved results. See [verification details](docs/verification.md) for the tested environment and coverage limits. A Windows CI workflow is configured; hosted CI results are pending.
+The final local Release build is warning-free. CTest passed 2/2 tests in 13.93 seconds, and an independent hidden-host run passed 72/72 checks. The integrated console suite passed 3,151 keyboard/model assertions across eight groups, six item-action groups, five native search groups, five saved-metadata groups with 35 query fixtures, five Share groups, six context-menu groups with 91 assertions, four toolbar groups, and three Library groups. Share tests resolve real file payloads without showing a picker; native New menus are enumerated without invoking handlers. [Hosted CI](https://github.com/ProtonDev-sys/windows-explorer/actions/runs/37169510842) also passed CTest 2/2 and 72/72 host checks at commit `ce231210` on Windows Server 2022. See [verification details](docs/verification.md) for platform differences and coverage limits.
 
 ## Design and research
 
