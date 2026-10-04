@@ -1,4 +1,5 @@
 #include "explorer/context_menu.hpp"
+#include "explorer/namespace_actions.hpp"
 
 #include <shlobj.h>
 #include <wrl/implements.h>
@@ -267,6 +268,21 @@ private:
     unsigned undoDepth_ = UINT_MAX, redoDepth_ = UINT_MAX;
 };
 
+void compareFastHistoryState(HiddenBrowser& browser, IShellItem* destination, const char* stage) {
+    HistoryMenu menu;
+    menu.initialize(browser.window(), destination, browser.site());
+    const std::array commands{L"Windows.undo", L"Windows.redo"};
+    const std::array enabled{menu.state().undo, menu.state().redo};
+    for (size_t index = 0; index < commands.size(); ++index) {
+        explorer::NamespaceCommandState state;
+        succeeded(explorer::namespaceCommandState(commands[index], nullptr, browser.site(), &state),
+            "read-only fast native GetState(FALSE) history query");
+        require(state.enabled() == enabled[index],
+            "fast native history capability differs from actual CommandStore menu state");
+    }
+    std::cout << "Fast native history states equal actual IContextMenu at " << stage << '\n';
+}
+
 ComPtr<IShellItem> item(const fs::path& path) {
     ComPtr<IShellItem> result;
     succeeded(SHCreateItemFromParsingName(path.c_str(), nullptr, IID_PPV_ARGS(&result)),
@@ -396,6 +412,7 @@ void runNativeHistory() {
         require(!initial.state().undo && !initial.state().redo,
             "isolated VM must initially have no unrelated native Undo or Redo history");
     }
+    compareFastHistoryState(browser, destinationItem.Get(), "initial empty history");
     require(!observer.sawVisibleWindow(), "initial native-history setup displayed UI");
     const fs::path copied = nativeCopy(browser.window(), sourceItem.Get(), destinationItem.Get());
     require(sameIdentity(identity(copied.parent_path()), identity(destination)) && copied.filename() == source.filename(),
@@ -410,6 +427,7 @@ void runNativeHistory() {
         menu.initialize(browser.window(), destinationItem.Get(), browser.site());
         return menu.state().undo && !menu.state().redo;
     }, "new owned native record did not enable Undo and clear Redo");
+    compareFastHistoryState(browser, destinationItem.Get(), "after sole owned copy");
     require(!observer.sawVisibleWindow(), "native history copy displayed UI");
     {
         HistoryMenu undo;
@@ -424,6 +442,7 @@ void runNativeHistory() {
         menu.initialize(browser.window(), destinationItem.Get(), browser.site());
         return !menu.state().undo && menu.state().redo;
     }, "native Undo did not transition its sole owned record to Redo");
+    compareFastHistoryState(browser, destinationItem.Get(), "after owned Undo");
     require(!observer.sawVisibleWindow(), "native Undo displayed UI");
     {
         HistoryMenu redo;
@@ -442,6 +461,7 @@ void runNativeHistory() {
         menu.initialize(browser.window(), destinationItem.Get(), browser.site());
         return menu.state().undo && !menu.state().redo;
     }, "native Redo did not restore Undo state and clear Redo");
+    compareFastHistoryState(browser, destinationItem.Get(), "after owned Redo");
     require(!IsWindowVisible(browser.window()), "native-history owner remained hidden through Redo");
     browser.close();
     observer.stop();
