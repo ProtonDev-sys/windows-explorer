@@ -208,6 +208,28 @@ std::wstring itemName(IShellItem* item) {
     succeeded(result, "resolve owned search result identity"); require(!name.empty(), "search result identity empty");
     return name;
 }
+std::wstring expandedExistingPath(const fs::path& path) {
+    const DWORD size=GetLongPathNameW(path.c_str(),nullptr,0);
+    require(size && size < 32768, "resolve owned long path dimensions");
+    std::vector<wchar_t> value(size);
+    const DWORD written=GetLongPathNameW(path.c_str(),value.data(),size);
+    require(written && written < size, "resolve owned long path");
+    return {value.data(),written};
+}
+std::vector<std::wstring> ownedScopeAliases(const fs::path& root) {
+    // CI TEMP may contain RUNNER~1 while the Shell returns runneradmin.
+    // Derive aliases only from the existing, exclusively owned root; never
+    // weaken the guard to a filename/suffix check or log an escaped item path.
+    auto native=shellItem(root);
+    std::vector<std::wstring> aliases{expandedExistingPath(root),root.native(),itemName(native.Get())};
+    const DWORD size=GetShortPathNameW(root.c_str(),nullptr,0);
+    if (size && size < 32768) {
+        std::vector<wchar_t> value(size);
+        const DWORD written=GetShortPathNameW(root.c_str(),value.data(),size);
+        if (written && written < size) aliases.emplace_back(value.data(),written);
+    }
+    return aliases;
+}
 std::set<std::wstring> results(IShellItem* search, const fs::path& root) {
     ComPtr<IShellFolder> folder;
     succeeded(search->BindToHandler(nullptr, BHID_SFObject, IID_PPV_ARGS(&folder)), "bind actual query provider");
@@ -215,7 +237,8 @@ std::set<std::wstring> results(IShellItem* search, const fs::path& root) {
     succeeded(folder->EnumObjects(nullptr, static_cast<SHCONTF>(SHCONTF_FOLDERS | SHCONTF_NONFOLDERS | SHCONTF_INCLUDEHIDDEN | SHCONTF_INCLUDESUPERHIDDEN),
         &enumerator), "enumerate bounded owned query");
     std::set<std::wstring> paths;
-    const auto prefix = root.native() + L"\\";
+    const auto aliases=ownedScopeAliases(root);
+    const auto canonicalPrefix=aliases.front()+L"\\";
     while (enumerator) {
         PITEMID_CHILD raw = nullptr;
         const auto next = enumerator->Next(1, &raw, nullptr);
@@ -224,9 +247,17 @@ std::set<std::wstring> results(IShellItem* search, const fs::path& root) {
         succeeded(next, "read provider result"); require(raw != nullptr, "provider result PIDL missing");
         ComPtr<IShellItem> item;
         succeeded(SHCreateItemWithParent(nullptr, folder.Get(), raw, IID_PPV_ARGS(&item)), "resolve provider item");
-        const auto path = itemName(item.Get());
-        require(path.size() > prefix.size() && _wcsnicmp(path.c_str(), prefix.c_str(), prefix.size()) == 0,
-            "query result escaped fresh owned scope");
+        auto path = itemName(item.Get());
+        bool owned=false;
+        for (const auto& alias : aliases) {
+            const auto prefix=alias+L"\\";
+            if (path.size() > prefix.size() && _wcsnicmp(path.c_str(),prefix.c_str(),prefix.size())==0) {
+                path=canonicalPrefix+path.substr(prefix.size()); owned=true; break;
+            }
+        }
+        if (!owned) std::cerr << "Owned query scope mismatch: resultCharacters=" << path.size() <<
+            " canonicalScopeCharacters=" << canonicalPrefix.size()-1 << " derivedAliases=" << aliases.size() << '\n';
+        require(owned,"query result escaped fresh owned scope");
         require(paths.insert(path).second && paths.size() <= 64, "duplicate or unbounded query result");
     }
     return paths;
@@ -448,6 +479,14 @@ void auditAndTest() {
     HiddenBrowser browser; browser.initialize();
     auto baseline = query(L"System.FileName:=\"baseline.txt\"", scope.Get()); browser.navigate(baseline.Get());
     require(matches(results(baseline.Get(),fixture.root), L"\\baseline.txt"), "ordinary query provider baseline failed");
+    const auto aliases=ownedScopeAliases(fixture.root);
+    if (_wcsicmp(aliases.front().c_str(),aliases.back().c_str())!=0) {
+        auto shortScope=shellItem(fs::path(aliases.back()));
+        auto shortBaseline=query(L"System.FileName:=\"baseline.txt\"",shortScope.Get());
+        require(matches(results(shortBaseline.Get(),fs::path(aliases.back())),L"\\baseline.txt"),
+            "owned 8.3 query scope did not canonicalize native long-path result");
+        std::cout << "Owned 8.3 scope and native long-path results verified without option invocation\n";
+    }
     if constexpr (ReadOnlyAudit) {
         auto explicitContents=query(L"System.Search.Contents:uniquefilecontentneedle",scope.Get());
         std::cout << "Explicit documented System.Search.Contents baselineResults=" << results(explicitContents.Get(),fixture.root).size() << '\n';
