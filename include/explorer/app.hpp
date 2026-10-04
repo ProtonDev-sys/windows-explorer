@@ -10,6 +10,8 @@
 #include <memory>
 #include <vector>
 #include <future>
+#include <array>
+#include <optional>
 
 namespace explorer {
 using Microsoft::WRL::ComPtr;
@@ -61,6 +63,14 @@ private:
     void updateCommands();
     void updateStatus();
     void updateBreadcrumbs();
+    void updateContextTabs();
+    HRESULT cycleFocus(bool backwards);
+    HRESULT toggleFullscreen();
+    HRESULT sizeColumns();
+    HRESULT toggleColumn(const PROPERTYKEY& key);
+    HRESULT saveSearch();
+    HRESULT startSearch(const std::wstring& query, bool recursive,
+                        std::optional<size_t> category = {}, const std::wstring& filter = L"");
     void editAddress();
     void finishAddress(bool navigateNow);
     HRESULT createBrowser();
@@ -92,8 +102,19 @@ private:
     bool addressEditing_ = false;
     bool navigating_ = false;
     bool searchActive_ = false;
+    bool pendingSearchActive_ = false;
+    bool searchBackground_ = false;
+    bool pendingSearchBackground_ = false;
     bool checkboxes_ = false;
     bool ascending_ = true;
+    bool selectionStateDirty_ = true;
+    bool selectionFilesystem_ = false;
+    bool selectionHidden_ = false;
+    bool fullscreen_ = false;
+    bool searchRecursive_ = true;
+    LONG_PTR windowStyle_ = 0;
+    WINDOWPLACEMENT windowPlacement_{sizeof(WINDOWPLACEMENT)};
+    RECT windowRect_{};
     HWND window_ = nullptr, tabs_ = nullptr, nav_ = nullptr, address_ = nullptr;
     HWND breadcrumbs_ = nullptr, search_ = nullptr, status_ = nullptr, file_ = nullptr;
     HFONT font_ = nullptr;
@@ -107,9 +128,18 @@ private:
     std::vector<HIMAGELIST> ribbonImages_;
     std::vector<Pidl> breadcrumbsPidls_;
     std::vector<Pidl> history_;
-    std::vector<Pidl> searchLocations_;
+    struct SearchLocation {
+        Pidl location; Pidl scope; std::wstring query; bool recursive;
+        std::wstring base; std::array<std::wstring, 3> filters;
+    };
+    std::vector<SearchLocation> searchLocations_;
     int historyIndex_ = -1, pendingHistory_ = -1;
     Pidl currentPidl_;
+    Pidl searchScope_;
+    std::vector<std::wstring> recentSearches_;
+    std::wstring activeQuery_;
+    std::wstring searchBase_;
+    std::array<std::wstring, 3> searchFilters_;
     std::wstring currentLocation_, currentName_, lastError_;
     ULONGLONG navigationStarted_ = 0, lastNavigationMs_ = 0;
     unsigned navigationCount_ = 0;

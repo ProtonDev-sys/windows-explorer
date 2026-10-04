@@ -3,6 +3,7 @@
 #include "explorer/search.hpp"
 #include "explorer/extra_operations.hpp"
 #include "explorer/input.hpp"
+#include "explorer/item_actions.hpp"
 #include <windowsx.h>
 #include <uxtheme.h>
 #include <propkey.h>
@@ -25,6 +26,19 @@ bool visibleWindowObserved = false;
 constexpr std::array<const wchar_t*, 8> ViewNames{
     L"Extra large icons", L"Large icons", L"Medium icons", L"Small icons",
     L"List", L"Details", L"Tiles", L"Content"};
+bool isExternalSearch(PCIDLIST_ABSOLUTE pidl) {
+    PWSTR raw = nullptr;
+    if (!pidl || FAILED(SHGetNameFromIDList(pidl, SIGDN_DESKTOPABSOLUTEPARSING, &raw))) return false;
+    const std::wstring name(raw); CoTaskMemFree(raw);
+    if (_wcsnicmp(name.c_str(), L"search-ms:", 10) == 0) return true;
+    if (name.size() < 10 || _wcsicmp(name.c_str() + name.size() - 10, L".search-ms") != 0) return false;
+    ComPtr<IShellItem2> item;
+    if (FAILED(SHCreateItemFromIDList(pidl, IID_PPV_ARGS(&item)))) return false;
+    raw = nullptr;
+    if (FAILED(item->GetString(PKEY_ItemType, &raw))) return false;
+    const bool saved = raw && _wcsicmp(raw, L".search-ms") == 0;
+    CoTaskMemFree(raw); return saved;
+}
 
 std::wstring textOf(HWND window) {
     const auto length = GetWindowTextLengthW(window);
@@ -160,7 +174,7 @@ HRESULT ExplorerApp::GetViewFlags(DWORD* flags) {
     *flags = CDB2GVF_NOSELECTVERB | CDB2GVF_ALLOWPREVIEWPANE;
     // Native searches must enumerate in the background. Regular folders use
     // our attribute filter to hide hidden files independently of Explorer.exe.
-    if (searchActive_) *flags |= CDB2GVF_NOINCLUDEITEM;
+    if (navigating_ ? pendingSearchBackground_ : searchBackground_) *flags |= CDB2GVF_NOINCLUDEITEM;
     if (preferences_.showHidden) *flags |= CDB2GVF_SHOWALLFILES;
     return S_OK;
 }
@@ -199,6 +213,10 @@ HRESULT ExplorerApp::create(const std::wstring& location) {
                              nullptr, nullptr, instance_, this);
     if (!window_) return HRESULT_FROM_WIN32(GetLastError());
     dpi_ = GetDpiForWindow(window_);
+    RECT initialBounds{}; GetWindowRect(window_, &initialBounds);
+    SetWindowPos(window_, nullptr, 0, 0, std::max(px(1030), static_cast<int>(initialBounds.right - initialBounds.left)),
+                 std::max(px(480), static_cast<int>(initialBounds.bottom - initialBounds.top)),
+                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
     NONCLIENTMETRICSW metrics{sizeof(metrics)};
     SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0, dpi_);
     font_ = CreateFontIndirectW(&metrics.lfMessageFont);
@@ -281,8 +299,10 @@ HRESULT ExplorerApp::navigate(const std::wstring& location) {
 }
 HRESULT ExplorerApp::OnNavigationPending(PCIDLIST_ABSOLUTE pidl) {
     if (pendingHistory_ >= 0 && !ILIsEqual(history_[pendingHistory_].get(), pidl)) pendingHistory_ = -1;
-    searchActive_ = std::any_of(searchLocations_.begin(), searchLocations_.end(),
-                                [&](const Pidl& item) { return ILIsEqual(item.get(), pidl); });
+    const auto search = std::find_if(searchLocations_.begin(), searchLocations_.end(),
+                                    [&](const SearchLocation& item) { return ILIsEqual(item.location.get(), pidl); });
+    pendingSearchActive_ = search != searchLocations_.end();
+    pendingSearchBackground_ = pendingSearchActive_ || isExternalSearch(pidl);
     navigating_ = true; navigationStarted_ = GetTickCount64();
     setStatus(L"Loading…"); return S_OK;
 }
@@ -295,8 +315,22 @@ HRESULT ExplorerApp::OnViewCreated(IShellView* view) {
 }
 HRESULT ExplorerApp::OnNavigationComplete(PCIDLIST_ABSOLUTE pidl) {
     navigating_ = false;
+    selectionStateDirty_ = true;
     lastNavigationMs_ = GetTickCount64() - navigationStarted_;
     ++navigationCount_;
+    const auto search = std::find_if(searchLocations_.rbegin(), searchLocations_.rend(),
+                                    [&](const SearchLocation& item) { return ILIsEqual(item.location.get(), pidl); });
+    searchActive_ = search != searchLocations_.rend();
+    pendingSearchActive_ = searchActive_;
+    searchBackground_ = searchActive_ || isExternalSearch(pidl);
+    pendingSearchBackground_ = searchBackground_;
+    if (searchActive_) {
+        searchScope_.reset(ILCloneFull(search->scope.get()));
+        activeQuery_ = search->query;
+        searchRecursive_ = search->recursive;
+        searchBase_ = search->base;
+        searchFilters_ = search->filters;
+    }
     currentPidl_.reset(ILCloneFull(pidl));
     currentLocation_ = pidlName(pidl, SIGDN_DESKTOPABSOLUTEPARSING);
     currentName_ = pidlName(pidl, SIGDN_NORMALDISPLAY);
@@ -311,18 +345,23 @@ HRESULT ExplorerApp::OnNavigationComplete(PCIDLIST_ABSOLUTE pidl) {
     SetWindowTextW(window_, (currentName_ + L" — Windows Explorer").c_str());
     SetWindowTextW(address_, currentLocation_.c_str());
     SendMessageW(search_, EM_SETCUEBANNER, FALSE, reinterpret_cast<LPARAM>((L"Search " + currentName_).c_str()));
+    SetWindowTextW(search_, searchActive_ ? activeQuery_.c_str() : L"");
     updateBreadcrumbs();
+    updateContextTabs();
     PostMessageW(window_, DeferredView, 0, 0);
     PostMessageW(window_, DeferredUpdate, 0, 0);
     return S_OK;
 }
 HRESULT ExplorerApp::OnNavigationFailed(PCIDLIST_ABSOLUTE) {
     navigating_ = false; pendingHistory_ = -1;
+    pendingSearchActive_ = searchActive_;
+    pendingSearchBackground_ = searchBackground_;
     lastError_ = L"This location could not be opened. Check its availability and your permissions.";
     setStatus(lastError_);
     return S_OK;
 }
 HRESULT ExplorerApp::OnStateChange(IShellView*, ULONG) {
+    selectionStateDirty_ = true;
     PostMessageW(window_, DeferredUpdate, 0, 0); return S_OK;
 }
 
@@ -334,7 +373,7 @@ void ExplorerApp::createControls() {
         return hwnd;
     };
     file_ = control(L"BUTTON", L"File", BS_PUSHBUTTON | WS_TABSTOP, FileMenu);
-    tabs_ = control(WC_TABCONTROLW, L"", TCS_FOCUSNEVER | TCS_FIXEDWIDTH, TabsId);
+    tabs_ = control(WC_TABCONTROLW, L"Command pages", WS_TABSTOP | TCS_FIXEDWIDTH, TabsId);
     for (auto label : {L"Home", L"Share", L"View", L"Computer"}) {
         TCITEMW tab{TCIF_TEXT}; tab.pszText = const_cast<LPWSTR>(label);
         TabCtrl_InsertItem(tabs_, TabCtrl_GetItemCount(tabs_), &tab);
@@ -363,6 +402,7 @@ void ExplorerApp::createControls() {
 }
 
 void ExplorerApp::rebuildRibbon() {
+    selectionStateDirty_ = true;
     for (auto control : ribbonControls_) DestroyWindow(control);
     ribbonControls_.clear();
     for (auto images : ribbonImages_) ImageList_Destroy(images);
@@ -383,7 +423,8 @@ void ExplorerApp::rebuildRibbon() {
         x += px(width);
     };
     auto smallButton = [&](UINT id, const wchar_t* label, int left, int row, int width = 100, bool checked = false, bool toggle = false) {
-        auto hwnd = child(L"BUTTON", label, WS_TABSTOP | (toggle ? BS_AUTOCHECKBOX : BS_PUSHBUTTON), id,
+        const bool scopeChoice = id == SearchCurrent || id == SearchSubfolders;
+        auto hwnd = child(L"BUTTON", label, WS_TABSTOP | (scopeChoice ? BS_RADIOBUTTON : toggle ? BS_AUTOCHECKBOX : BS_PUSHBUTTON), id,
                           left, top + px(row * 24), px(width), px(23));
         if (toggle) SendMessageW(hwnd, BM_SETCHECK, checked ? BST_CHECKED : BST_UNCHECKED, 0);
     };
@@ -447,9 +488,12 @@ void ExplorerApp::rebuildRibbon() {
                 smallButton(ViewFirst + i, ViewNames[i], left + px((i / 3) * 91), i % 3, 89);
             }
         });
-        group(L"Current view", 122, [&](int left) {
+        group(L"Current view", 248, [&](int left) {
             smallButton(SortMenu, L"Sort by ▾", left, 0, 112); smallButton(GroupMenu, L"Group by ▾", left, 1, 112);
-            smallButton(Refresh, L"Refresh", left, 2, 112);
+            smallButton(ColumnsMenu, L"Add columns ▾", left, 2, 112);
+            smallButton(SizeColumns, L"Size columns to fit", left + px(116), 0, 124);
+            smallButton(Refresh, L"Refresh", left + px(116), 1, 124);
+            smallButton(HideSelected, L"Hide selected items", left + px(116), 2, 124);
         });
         group(L"Show/hide", 183, [&](int left) {
             smallButton(Checkboxes, L"Item check boxes", left, 0, 173, checkboxes_, true);
@@ -457,7 +501,7 @@ void ExplorerApp::rebuildRibbon() {
             smallButton(HiddenItems, L"Hidden items", left, 2, 173, preferences_.showHidden, true);
         });
         group(L"Options", 100, [&](int left) { large(FolderOptions, L"Options", left, SIID_SETTINGS); });
-    } else {
+    } else if (selectedTab == 3) {
         group(L"Locations", 280, [&](int left) {
             large(ThisPC, L"This PC", left, SIID_DESKTOPPC); large(QuickAccess, L"Quick access", left + px(68), SIID_FOLDER);
             large(Network, L"Network", left + px(136), SIID_MYNETWORK); large(RecycleBin, L"Recycle Bin", left + px(204), SIID_RECYCLER);
@@ -471,6 +515,22 @@ void ExplorerApp::rebuildRibbon() {
             smallButton(FolderOptions, L"Folder options", left, 1, 170);
             smallButton(FileHistory, L"File History", left, 2, 170);
         });
+    } else if (selectedTab == 4 && searchActive_) {
+        group(L"Location", 168, [&](int left) {
+            smallButton(SearchCurrent, L"Current folder", left, 0, 158, !searchRecursive_, true);
+            smallButton(SearchSubfolders, L"All subfolders", left, 1, 158, searchRecursive_, true);
+        });
+        group(L"Refine", 244, [&](int left) {
+            smallButton(SearchKindMenu, L"Kind ▾", left, 0, 112);
+            smallButton(SearchDateMenu, L"Date modified ▾", left, 1, 112);
+            smallButton(SearchSizeMenu, L"Size ▾", left, 2, 112);
+            smallButton(FocusSearch, L"Edit query", left + px(116), 0, 120);
+        });
+        group(L"Options", 168, [&](int left) {
+            smallButton(RecentSearches, L"Recent searches ▾", left, 0, 158);
+            smallButton(SaveSearch, L"Save search…", left, 1, 158);
+        });
+        group(L"Close", 104, [&](int left) { large(CloseSearch, L"Close search", left, SIID_DELETE); });
     }
     updateCommands();
     layout();
@@ -498,6 +558,219 @@ void ExplorerApp::layout() {
         RECT viewRect{0, y + px(35), width, std::max(y + px(36), height - static_cast<int>(statusRect.bottom - statusRect.top))};
         browser_->SetRect(nullptr, viewRect);
     }
+}
+
+void ExplorerApp::updateContextTabs() {
+    const bool present = TabCtrl_GetItemCount(tabs_) > 4;
+    if (searchActive_ && !present) {
+        TCITEMW tab{TCIF_TEXT}; tab.pszText = const_cast<LPWSTR>(L"Search");
+        TabCtrl_InsertItem(tabs_, 4, &tab);
+        TabCtrl_SetCurSel(tabs_, 4);
+        rebuildRibbon();
+    } else if (!searchActive_ && present) {
+        const bool selected = TabCtrl_GetCurSel(tabs_) == 4;
+        TabCtrl_DeleteItem(tabs_, 4);
+        if (selected) TabCtrl_SetCurSel(tabs_, 0);
+        rebuildRibbon();
+    } else if (searchActive_ && TabCtrl_GetCurSel(tabs_) == 4) {
+        if (const auto current = GetDlgItem(window_, SearchCurrent)) SendMessageW(current, BM_SETCHECK, searchRecursive_ ? BST_UNCHECKED : BST_CHECKED, 0);
+        if (const auto recursive = GetDlgItem(window_, SearchSubfolders)) SendMessageW(recursive, BM_SETCHECK, searchRecursive_ ? BST_CHECKED : BST_UNCHECKED, 0);
+    }
+}
+
+HRESULT ExplorerApp::cycleFocus(bool backwards) {
+    HWND nativeView = nullptr;
+    if (view_) view_->GetWindow(&nativeView);
+    HWND tree = nullptr;
+    struct TreeSearch { HWND host; HWND view; HWND tree = nullptr; } treeSearch{window_, nativeView};
+    EnumChildWindows(window_, [](HWND child, LPARAM data) -> BOOL {
+        auto& search = *reinterpret_cast<TreeSearch*>(data);
+        wchar_t name[64]{}; GetClassNameW(child, name, 64);
+        if (_wcsicmp(name, WC_TREEVIEWW) != 0 || (search.view && IsChild(search.view, child))) return TRUE;
+        bool namespaceTree = false;
+        for (auto current = child; current && current != search.host; current = GetParent(current)) {
+            if (!(GetWindowLongPtrW(current, GWL_STYLE) & WS_VISIBLE)) return TRUE;
+            GetClassNameW(current, name, 64);
+            if (_wcsicmp(name, L"NamespaceTreeControl") == 0) namespaceTree = true;
+        }
+        if (namespaceTree) { search.tree = child; return FALSE; }
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&treeSearch));
+    tree = treeSearch.tree;
+    auto usable = [](HWND hwnd) { return hwnd && IsWindow(hwnd) && IsWindowEnabled(hwnd); };
+    const auto focus = GetFocus();
+    auto within = [&](HWND hwnd) { return hwnd && (focus == hwnd || IsChild(hwnd, focus)); };
+    std::optional<FocusRegion> current;
+    if (within(address_) || within(breadcrumbs_)) current = FocusRegion::Address;
+    else if (within(search_)) current = FocusRegion::Search;
+    else if (within(nativeView)) current = FocusRegion::FolderView;
+    else if (within(tree)) current = FocusRegion::Navigation;
+    else if (within(file_) || within(tabs_) || std::any_of(ribbonControls_.begin(), ribbonControls_.end(), within))
+        current = FocusRegion::CommandBand;
+    const FocusAvailability available{usable(address_), usable(search_), usable(nativeView), usable(file_),
+                                      preferences_.navigationPane && usable(tree)};
+    const auto next = cycleFocusRegion(current, backwards, available);
+    if (!next) return S_FALSE;
+    switch (*next) {
+    case FocusRegion::Address: editAddress(); break;
+    case FocusRegion::Search: SetFocus(search_); break;
+    case FocusRegion::FolderView: return view_->UIActivate(SVUIA_ACTIVATE_FOCUS);
+    case FocusRegion::CommandBand: SetFocus(file_); break;
+    case FocusRegion::Navigation: SetFocus(tree); break;
+    }
+    return S_OK;
+}
+
+HRESULT ExplorerApp::toggleFullscreen() {
+    if (!fullscreen_) {
+        windowStyle_ = GetWindowLongPtrW(window_, GWL_STYLE);
+        if (!GetWindowPlacement(window_, &windowPlacement_) || !GetWindowRect(window_, &windowRect_))
+            return HRESULT_FROM_WIN32(GetLastError());
+        MONITORINFO monitor{sizeof(monitor)};
+        if (!GetMonitorInfoW(MonitorFromWindow(window_, MONITOR_DEFAULTTONEAREST), &monitor))
+            return HRESULT_FROM_WIN32(GetLastError());
+        SetWindowLongPtrW(window_, GWL_STYLE, windowStyle_ & ~static_cast<LONG_PTR>(WS_OVERLAPPEDWINDOW | WS_MAXIMIZE | WS_MINIMIZE));
+        if (!SetWindowPos(window_, nullptr, monitor.rcMonitor.left, monitor.rcMonitor.top,
+                          monitor.rcMonitor.right - monitor.rcMonitor.left, monitor.rcMonitor.bottom - monitor.rcMonitor.top,
+                          SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED)) {
+            SetWindowLongPtrW(window_, GWL_STYLE, windowStyle_); return HRESULT_FROM_WIN32(GetLastError());
+        }
+        fullscreen_ = true;
+    } else {
+        SetWindowLongPtrW(window_, GWL_STYLE, windowStyle_);
+        // SetWindowPlacement can show a previously hidden top-level window.
+        // Headless tests restore only its geometry, without changing visibility.
+        const BOOL restored = headless_
+            ? SetWindowPos(window_, nullptr, windowRect_.left, windowRect_.top, windowRect_.right - windowRect_.left,
+                           windowRect_.bottom - windowRect_.top, SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED)
+            : SetWindowPlacement(window_, &windowPlacement_);
+        if (!restored) return HRESULT_FROM_WIN32(GetLastError());
+        fullscreen_ = false;
+        SetWindowPos(window_, nullptr, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    }
+    layout(); return S_OK;
+}
+
+HRESULT ExplorerApp::sizeColumns() {
+    if (!folderView_) return E_UNEXPECTED;
+    ComPtr<IColumnManager> columns;
+    auto hr = folderView_.As(&columns);
+    UINT count = 0;
+    if (SUCCEEDED(hr)) hr = columns->GetColumnCount(CM_ENUM_VISIBLE, &count);
+    if (FAILED(hr)) return hr;
+    if (count > 1000) return E_UNEXPECTED;
+    std::vector<PROPERTYKEY> keys(count);
+    hr = columns->GetColumns(CM_ENUM_VISIBLE, keys.data(), count);
+    if (FAILED(hr)) return hr;
+    CM_COLUMNINFO info{sizeof(info)}; info.dwMask = CM_MASK_WIDTH;
+    info.uWidth = static_cast<UINT>(CM_WIDTH_AUTOSIZE);
+    for (const auto& key : keys) {
+        hr = columns->SetColumnInfo(key, &info);
+        if (FAILED(hr)) return hr;
+    }
+    return S_OK;
+}
+
+HRESULT ExplorerApp::toggleColumn(const PROPERTYKEY& key) {
+    if (!folderView_) return E_UNEXPECTED;
+    if (IsEqualPropertyKey(key, PKEY_ItemNameDisplay)) return E_ACCESSDENIED;
+    ComPtr<IColumnManager> columns;
+    auto hr = folderView_.As(&columns);
+    UINT count = 0;
+    if (SUCCEEDED(hr)) hr = columns->GetColumnCount(CM_ENUM_VISIBLE, &count);
+    if (FAILED(hr)) return hr;
+    if (count > 1000) return E_UNEXPECTED;
+    std::vector<PROPERTYKEY> keys(count);
+    hr = columns->GetColumns(CM_ENUM_VISIBLE, keys.data(), count);
+    if (FAILED(hr)) return hr;
+    const auto found = std::find_if(keys.begin(), keys.end(), [&](const PROPERTYKEY& value) { return IsEqualPropertyKey(key, value); });
+    if (found == keys.end()) keys.push_back(key);
+    else keys.erase(found);
+    if (keys.empty()) return E_INVALIDARG;
+    std::vector<CM_COLUMNINFO> info(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        info[i].cbSize = sizeof(CM_COLUMNINFO); info[i].dwMask = CM_MASK_WIDTH | CM_MASK_STATE;
+        if (FAILED(columns->GetColumnInfo(keys[i], &info[i]))) return E_INVALIDARG;
+    }
+    hr = columns->SetColumns(keys.data(), static_cast<UINT>(keys.size()));
+    for (size_t i = 0; SUCCEEDED(hr) && i < keys.size(); ++i) {
+        info[i].dwState |= CM_STATE_VISIBLE;
+        hr = columns->SetColumnInfo(keys[i], &info[i]);
+    }
+    return hr;
+}
+
+HRESULT ExplorerApp::saveSearch() {
+    if (headless_) return E_ACCESSDENIED;
+    if (!searchActive_ || !searchScope_ || activeQuery_.empty()) return E_UNEXPECTED;
+    ComPtr<IShellItem> scope;
+    auto hr = SHCreateItemFromIDList(searchScope_.get(), IID_PPV_ARGS(&scope));
+    if (FAILED(hr)) return hr;
+    ComPtr<IFileSaveDialog> dialog;
+    hr = CoCreateInstance(CLSID_FileSaveDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog));
+    if (FAILED(hr)) return hr;
+    const COMDLG_FILTERSPEC filter{L"Saved searches", L"*.search-ms"};
+    dialog->SetOptions(FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST | FOS_NOREADONLYRETURN);
+    dialog->SetFileTypes(1, &filter);
+    dialog->SetDefaultExtension(L"search-ms");
+    dialog->SetTitle(L"Save search");
+    std::wstring name = activeQuery_.substr(0, 60);
+    for (auto& ch : name) if (ch < 32 || wcschr(L"<>:\"/\\|?*", ch)) ch = L'_';
+    name = trim(name);
+    while (!name.empty() && name.back() == L'.') name.pop_back();
+    if (!validLeafName(name + L".search-ms")) name = L"Search results";
+    dialog->SetFileName((name + L".search-ms").c_str());
+    ComPtr<IShellItem> savedSearches;
+    if (SUCCEEDED(SHGetKnownFolderItem(FOLDERID_SavedSearches, KF_FLAG_DEFAULT, nullptr, IID_PPV_ARGS(&savedSearches))))
+        dialog->SetDefaultFolder(savedSearches.Get());
+    hr = dialog->Show(window_);
+    if (FAILED(hr)) return hr;
+    ComPtr<IShellItem> output;
+    hr = dialog->GetResult(&output);
+    if (FAILED(hr)) return hr;
+    const auto path = itemName(output.Get(), SIGDN_FILESYSPATH);
+    return path.empty() ? E_INVALIDARG : explorer::saveSearch(activeQuery_, scope.Get(), searchRecursive_, std::filesystem::path(path));
+}
+
+HRESULT ExplorerApp::startSearch(const std::wstring& requested, bool recursive,
+                                std::optional<size_t> category, const std::wstring& filter) {
+    auto query = trim(requested);
+    if (query.empty() && !category) return S_FALSE;
+    auto base = query;
+    std::array<std::wstring, 3> filters;
+    if (searchActive_ && query == activeQuery_) { base = searchBase_; filters = searchFilters_; }
+    if (category) {
+        if (*category >= filters.size()) return E_INVALIDARG;
+        filters[*category] = filter;
+        query = base.empty() ? L"" : L"(" + base + L")";
+        for (const auto& refinement : filters) if (!refinement.empty()) {
+            if (!query.empty()) query += L" AND ";
+            query += refinement;
+        }
+    }
+    ComPtr<IShellItem> scope;
+    auto hr = searchActive_ && searchScope_
+        ? SHCreateItemFromIDList(searchScope_.get(), IID_PPV_ARGS(&scope)) : currentFolder(scope);
+    if (FAILED(hr)) return hr;
+    ComPtr<IShellItem> results;
+    hr = createSearchFolder(query, scope.Get(), &results, recursive);
+    if (FAILED(hr)) return hr;
+    PIDLIST_ABSOLUTE raw = nullptr;
+    hr = SHGetIDListFromObject(results.Get(), &raw);
+    if (FAILED(hr)) return hr;
+    Pidl location(raw);
+    raw = nullptr;
+    hr = SHGetIDListFromObject(scope.Get(), &raw);
+    if (FAILED(hr)) return hr;
+    searchLocations_.push_back({std::move(location), Pidl(raw), query, recursive, base, filters});
+    if (searchLocations_.size() > 100) searchLocations_.erase(searchLocations_.begin());
+    hr = browser_->BrowseToObject(results.Get(), SBSP_ABSOLUTE);
+    if (SUCCEEDED(hr)) {
+        recentSearches_.erase(std::remove(recentSearches_.begin(), recentSearches_.end(), query), recentSearches_.end());
+        recentSearches_.insert(recentSearches_.begin(), query);
+        if (recentSearches_.size() > 20) recentSearches_.pop_back();
+    }
+    return hr;
 }
 
 void ExplorerApp::updateBreadcrumbs() {
@@ -565,11 +838,29 @@ void ExplorerApp::updateCommands() {
     SHELLSTATE shellSettings{};
     SHGetSetSettings(&shellSettings, SSF_SHOWEXTENSIONS, FALSE);
     preferences_.showExtensions = shellSettings.fShowExtensions;
+    if (selectionStateDirty_ && GetDlgItem(window_, HideSelected)) {
+        SFGAOF attributes = 0;
+        const bool available = count && SUCCEEDED(selected->GetAttributes(SIATTRIBFLAGS_AND, SFGAO_FILESYSTEM | SFGAO_HIDDEN, &attributes));
+        selectionFilesystem_ = available && (attributes & SFGAO_FILESYSTEM);
+        selectionHidden_ = available && (attributes & SFGAO_HIDDEN);
+        selectionStateDirty_ = false;
+    }
     for (auto hwnd : ribbonControls_) {
         const auto id = GetDlgCtrlID(hwnd);
         bool enabled = true;
         if (id == Copy || id == Cut || id == CopyPath || id == MoveTo || id == CopyTo || id == Delete || id == Open || id == Edit || id == Print || id == Zip) enabled = count > 0;
         if (id == Rename) enabled = count == 1;
+        if (id == HideSelected) {
+            enabled = count && selectionFilesystem_;
+            SetWindowTextW(hwnd, selectionHidden_ ? L"Unhide selected items" : L"Hide selected items");
+        }
+        if (id == ColumnsMenu || id == SizeColumns) {
+            FOLDERVIEWMODE mode = FVM_AUTO; int iconSize = 0;
+            enabled = folderView_ && SUCCEEDED(folderView_->GetViewModeAndIconSize(&mode, &iconSize)) && mode == FVM_DETAILS;
+        }
+        if (id == RecentSearches) enabled = !recentSearches_.empty();
+        if (id == SearchCurrent || id == SearchSubfolders || id == SaveSearch || id == CloseSearch ||
+            id == SearchKindMenu || id == SearchDateMenu || id == SearchSizeMenu) enabled = searchActive_;
         if (id == NewFolder || id == NewText || id == NewShortcut || id == Paste || id == PasteShortcut || id == Terminal) enabled = writable;
         if (id == Extract) {
             ComPtr<IShellItem> item;
@@ -827,22 +1118,20 @@ HRESULT ExplorerApp::execute(UINT command) {
     case Up: return browser_->BrowseToIDList(nullptr, SBSP_PARENT);
     case Refresh: return view_ ? view_->Refresh() : E_UNEXPECTED;
     case Address: editAddress(); return S_OK;
+    case FocusNext: return cycleFocus(false);
+    case FocusPrevious: return cycleFocus(true);
+    case Fullscreen: return toggleFullscreen();
     case FocusSearch: SetFocus(search_); SendMessageW(search_, EM_SETSEL, 0, -1); return S_OK;
     case Search: {
-        auto query = trim(textOf(search_));
-        if (query.empty()) return S_FALSE;
-        currentFolder(folder);
-        ComPtr<IShellItem> results;
-        auto hr = createSearchFolder(query, folder.Get(), &results);
-        if (FAILED(hr)) return hr;
-        PIDLIST_ABSOLUTE raw = nullptr;
-        hr = SHGetIDListFromObject(results.Get(), &raw);
-        if (FAILED(hr)) return hr;
-        searchLocations_.emplace_back(raw);
-        if (searchLocations_.size() > 100) searchLocations_.erase(searchLocations_.begin());
-        searchActive_ = true;
-        return browser_->BrowseToObject(results.Get(), SBSP_ABSOLUTE);
+        return startSearch(textOf(search_), searchRecursive_);
     }
+    case CloseSearch:
+        if (!searchActive_ || !searchScope_) return S_FALSE;
+        SetWindowTextW(search_, L"");
+        return browser_->BrowseToIDList(searchScope_.get(), SBSP_ABSOLUTE);
+    case SearchSubfolders: case SearchCurrent:
+        return searchActive_ ? startSearch(activeQuery_, command == SearchSubfolders) : S_FALSE;
+    case SaveSearch: return saveSearch();
     case QuickAccess: return navigate(L"shell:::{679f85cb-0220-4080-b29b-5540cc05aab6}");
     case ThisPC: return navigate(L"shell:MyComputerFolder");
     case Desktop: return navigate(L"shell:Desktop");
@@ -854,7 +1143,10 @@ HRESULT ExplorerApp::execute(UINT command) {
     case Network: return navigate(L"shell:NetworkPlacesFolder");
     case RecycleBin: return navigate(L"shell:RecycleBinFolder");
     case Libraries: return navigate(L"shell:Libraries");
-    case FileMenu: case HistoryMenu: case ViewMenu: case SortMenu: case GroupMenu: popup(command); return S_OK;
+    case FileMenu: case HistoryMenu: case ViewMenu: case SortMenu: case GroupMenu:
+    case ColumnsMenu: case RecentSearches: case SearchKindMenu: case SearchDateMenu: case SearchSizeMenu:
+        popup(command); return S_OK;
+    case SizeColumns: return sizeColumns();
     case Close: PostMessageW(window_, WM_CLOSE, 0, 0); return S_OK;
     case NewWindow: {
         if (headless_) return E_ACCESSDENIED;
@@ -874,6 +1166,15 @@ HRESULT ExplorerApp::execute(UINT command) {
         return SUCCEEDED(hr) ? ShellOperations::paste(window_, folder.Get()) : hr;
     }
     case PasteShortcut: return makeShortcut(true);
+    case HideSelected: {
+        if (headless_) return E_ACCESSDENIED;
+        auto hr = selection(items); if (FAILED(hr)) return hr;
+        HRESULT rollback = S_OK;
+        hr = ItemActions::toggleHidden(items.Get(), &rollback);
+        if (FAILED(rollback)) showError(rollback, L"Restore hidden attributes");
+        if (view_) view_->Refresh();
+        return hr;
+    }
     case CopyTo: return chooseDestination(false);
     case MoveTo: return chooseDestination(true);
     case Delete: case PermanentDelete: {
@@ -977,6 +1278,12 @@ void ExplorerApp::popup(UINT command, HWND anchor) {
         AppendMenuW(menu, MF_STRING | (checked ? MF_CHECKED : 0) | (disabled ? MF_GRAYED : 0), id, text);
     };
     auto separator = [&] { AppendMenuW(menu, MF_SEPARATOR, 0, nullptr); };
+    std::vector<PROPERTYKEY> columnKeys;
+    std::vector<std::wstring> refinements;
+    auto refine = [&](const wchar_t* label, const wchar_t* query) {
+        add(8000 + static_cast<UINT>(refinements.size()), label);
+        refinements.emplace_back(query);
+    };
     if (command == FileMenu) {
         add(NewWindow, L"Open new window\tCtrl+N"); add(Terminal, L"Open command prompt here"); separator();
         add(QuickAccess, L"Quick access"); add(ThisPC, L"This PC"); add(Desktop, L"Desktop");
@@ -985,6 +1292,7 @@ void ExplorerApp::popup(UINT command, HWND anchor) {
         add(Network, L"Network"); add(RecycleBin, L"Recycle Bin"); separator();
         add(FolderOptions, L"Change folder and search options");
         add(Collapse, L"Minimize the ribbon\tCtrl+F1", preferences_.ribbonCollapsed); separator();
+        add(Fullscreen, L"Full screen\tF11", fullscreen_); separator();
         add(Close, L"Close\tAlt+F4");
     } else if (command == ViewMenu) {
         for (int i = 0; i < 8; ++i) add(ViewFirst + i, ViewNames[i], static_cast<int>(preferences_.view) == i);
@@ -999,6 +1307,42 @@ void ExplorerApp::popup(UINT command, HWND anchor) {
             auto name = pidlName(history_[i].get(), SIGDN_NORMALDISPLAY);
             add(4000 + i, name.c_str(), i == historyIndex_);
         }
+    } else if (command == ColumnsMenu) {
+        ComPtr<IColumnManager> columns;
+        UINT count = 0;
+        if (folderView_ && SUCCEEDED(folderView_.As(&columns)) && SUCCEEDED(columns->GetColumnCount(CM_ENUM_ALL, &count)) && count <= 1000) {
+            columnKeys.resize(count);
+            if (SUCCEEDED(columns->GetColumns(CM_ENUM_ALL, columnKeys.data(), count))) {
+                for (UINT i = 0; i < count; ++i) {
+                    CM_COLUMNINFO info{sizeof(info)}; info.dwMask = CM_MASK_NAME | CM_MASK_STATE;
+                    if (SUCCEEDED(columns->GetColumnInfo(columnKeys[i], &info)) && *info.wszName)
+                        add(6000 + i, info.wszName, (info.dwState & CM_STATE_VISIBLE) != 0,
+                            IsEqualPropertyKey(columnKeys[i], PKEY_ItemNameDisplay));
+                }
+            }
+        }
+        separator(); add(SizeColumns, L"Size all columns to fit");
+    } else if (command == RecentSearches) {
+        for (size_t i = 0; i < recentSearches_.size(); ++i) add(7000 + static_cast<UINT>(i), recentSearches_[i].c_str());
+    } else if (command == SearchKindMenu) {
+        refine(L"Documents", L"System.Kind:=System.Kind#Document"); refine(L"Pictures", L"System.Kind:=System.Kind#Picture");
+        refine(L"Music", L"System.Kind:=System.Kind#Music"); refine(L"Videos", L"System.Kind:=System.Kind#Video");
+        refine(L"Folders", L"System.Kind:=System.Kind#Folder"); refine(L"Programs", L"System.Kind:=System.Kind#Program");
+    } else if (command == SearchDateMenu) {
+        refine(L"Today", L"System.DateModified:System.StructuredQueryType.DateTime#Today");
+        refine(L"Yesterday", L"System.DateModified:System.StructuredQueryType.DateTime#Yesterday");
+        refine(L"This week", L"System.DateModified:System.StructuredQueryType.DateTime#ThisWeek");
+        refine(L"Last week", L"System.DateModified:System.StructuredQueryType.DateTime#LastWeek");
+        refine(L"This month", L"System.DateModified:System.StructuredQueryType.DateTime#ThisMonth");
+        refine(L"This year", L"System.DateModified:System.StructuredQueryType.DateTime#ThisYear");
+    } else if (command == SearchSizeMenu) {
+        refine(L"Empty (0 KB)", L"System.Size:System.Size#Empty");
+        refine(L"Tiny (0–16 KB)", L"System.Size:System.Size#Tiny");
+        refine(L"Small (16 KB–1 MB)", L"System.Size:System.Size#Small");
+        refine(L"Medium (1–128 MB)", L"System.Size:System.Size#Medium");
+        refine(L"Large (128 MB–1 GB)", L"System.Size:System.Size#Large");
+        refine(L"Huge (1–4 GB)", L"System.Size:System.Size#Huge");
+        refine(L"Gigantic (over 4 GB)", L"System.Size:System.Size#Gigantic");
     }
     if (!anchor) anchor = command == FileMenu ? file_ : command == HistoryMenu ? nav_ : GetDlgItem(window_, command);
     RECT rect{};
@@ -1011,6 +1355,15 @@ void ExplorerApp::popup(UINT command, HWND anchor) {
         auto hr = browser_->BrowseToIDList(history_[pendingHistory_].get(), SBSP_ABSOLUTE);
         if (FAILED(hr)) pendingHistory_ = -1;
         showError(hr, L"Open history location");
+    } else if (selected >= 6000 && selected - 6000 < columnKeys.size()) {
+        showError(toggleColumn(columnKeys[selected - 6000]), L"Change columns");
+    } else if (selected >= 7000 && selected - 7000 < recentSearches_.size()) {
+        SetWindowTextW(search_, recentSearches_[selected - 7000].c_str());
+        showError(execute(Search), L"Search");
+    } else if (selected >= 8000 && selected - 8000 < refinements.size()) {
+        const auto previous = trim(textOf(search_));
+        const size_t category = command == SearchKindMenu ? 0 : command == SearchDateMenu ? 1 : 2;
+        showError(startSearch(previous, searchRecursive_, category, refinements[selected - 8000]), L"Refine search");
     } else if (selected) showError(execute(selected), L"Command");
 }
 void ExplorerApp::showError(HRESULT hr, const wchar_t* action) {
@@ -1022,7 +1375,10 @@ void ExplorerApp::showError(HRESULT hr, const wchar_t* action) {
 void ExplorerApp::persist() {
     if (headless_) return;
     RECT rect{}; GetWindowRect(window_, &rect);
-    if (!IsIconic(window_)) {
+    if (fullscreen_) {
+        preferences_.windowWidth = windowRect_.right - windowRect_.left;
+        preferences_.windowHeight = windowRect_.bottom - windowRect_.top;
+    } else if (!IsIconic(window_)) {
         preferences_.windowWidth = rect.right - rect.left;
         preferences_.windowHeight = rect.bottom - rect.top;
     }
@@ -1100,7 +1456,7 @@ LRESULT ExplorerApp::onMessage(UINT message, WPARAM wparam, LPARAM lparam) {
     switch (message) {
     case WM_SIZE: layout(); return 0;
     case WM_GETMINMAXINFO:
-        reinterpret_cast<MINMAXINFO*>(lparam)->ptMinTrackSize = {px(980), px(480)}; return 0;
+        reinterpret_cast<MINMAXINFO*>(lparam)->ptMinTrackSize = {px(1030), px(480)}; return 0;
     case WM_DPICHANGED: {
         dpi_ = HIWORD(wparam);
         auto rect = reinterpret_cast<RECT*>(lparam);
@@ -1162,6 +1518,12 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report) {
     };
     const auto started = GetTickCount64();
     const auto fixture = std::filesystem::temp_directory_path() / (L"WindowsExplorer-smoke-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(started));
+    auto atLocation = [&](const std::filesystem::path& path) {
+        PIDLIST_ABSOLUTE raw = nullptr;
+        const auto hr = SHParseDisplayName(path.c_str(), nullptr, &raw, 0, nullptr);
+        Pidl expected(raw);
+        return SUCCEEDED(hr) && currentPidl_ && ILIsEqual(currentPidl_.get(), expected.get());
+    };
     std::error_code filesystemError;
     try {
         check("host_stays_hidden", !IsWindowVisible(window_));
@@ -1179,13 +1541,13 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report) {
         const auto navigation = navigate(fixture.wstring());
         auto ready = pumpUntil([&] {
             int count = 0;
-            return !navigating_ && folderView_ && currentLocation_ == fixture.wstring() &&
+            return !navigating_ && folderView_ && atLocation(fixture) &&
                    SUCCEEDED(folderView_->ItemCount(SVGIO_ALLVIEW, &count)) && count >= 1002;
         }, 15000);
         int count = -1;
         if (folderView_) folderView_->ItemCount(SVGIO_ALLVIEW, &count);
         check("enumerate_1000_files", SUCCEEDED(navigation) && ready && count == 1002,
-              L"Visible items: " + std::to_wstring(count), lastNavigationMs_);
+              L"Visible items: " + std::to_wstring(count) + L"; actual=" + currentLocation_ + L"; expected=" + fixture.wstring(), lastNavigationMs_);
         check("breadcrumbs_and_history", breadcrumbsPidls_.size() >= 2 && historyIndex_ >= 1);
         check("native_view_interface", folderView_ && view_);
         if (ready) {
@@ -1215,8 +1577,60 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report) {
             execute(Checkboxes);
             ComPtr<IColumnManager> columns;
             UINT columnCount = 0;
-            check("native_details_columns", SUCCEEDED(folderView_.As(&columns)) && SUCCEEDED(columns->GetColumnCount(CM_ENUM_VISIBLE, &columnCount)) && columnCount >= 1,
-                  std::to_wstring(columnCount));
+            const bool columnsAvailable = SUCCEEDED(folderView_.As(&columns)) &&
+                SUCCEEDED(columns->GetColumnCount(CM_ENUM_VISIBLE, &columnCount)) && columnCount >= 1;
+            check("native_details_columns", columnsAvailable, std::to_wstring(columnCount));
+            std::vector<PROPERTYKEY> originalColumns(columnCount);
+            if (columns && columnCount) {
+                auto columnsResult = columns->GetColumns(CM_ENUM_VISIBLE, originalColumns.data(), columnCount);
+                auto contains = [&](const PROPERTYKEY& key) {
+                    UINT total = 0;
+                    if (FAILED(columns->GetColumnCount(CM_ENUM_VISIBLE, &total))) return false;
+                    std::vector<PROPERTYKEY> visible(total);
+                    if (FAILED(columns->GetColumns(CM_ENUM_VISIBLE, visible.data(), total))) return false;
+                    return std::any_of(visible.begin(), visible.end(), [&](const PROPERTYKEY& value) { return IsEqualPropertyKey(key, value); });
+                };
+                const bool initiallyVisible = contains(PKEY_Size);
+                auto toggleResult = toggleColumn(PKEY_Size);
+                check("toggle_details_column", SUCCEEDED(columnsResult) && SUCCEEDED(toggleResult) && contains(PKEY_Size) != initiallyVisible);
+                toggleResult = toggleColumn(PKEY_Size);
+                check("restore_details_column", SUCCEEDED(toggleResult) && contains(PKEY_Size) == initiallyVisible);
+                check("name_column_stays_visible", toggleColumn(PKEY_ItemNameDisplay) == E_ACCESSDENIED && contains(PKEY_ItemNameDisplay));
+                auto sizing = sizeColumns();
+                bool widthsValid = SUCCEEDED(sizing);
+                for (const auto& key : originalColumns) {
+                    CM_COLUMNINFO info{sizeof(info)}; info.dwMask = CM_MASK_WIDTH;
+                    widthsValid = widthsValid && SUCCEEDED(columns->GetColumnInfo(key, &info)) && info.uWidth > 0 && info.uWidth < 100000;
+                }
+                check("autosize_native_details_columns", widthsValid);
+            }
+            RECT originalRect{}, fullscreenRect{}, restoredRect{};
+            GetWindowRect(window_, &originalRect);
+            const auto originalStyle = GetWindowLongPtrW(window_, GWL_STYLE);
+            auto fullscreenResult = execute(Fullscreen);
+            GetWindowRect(window_, &fullscreenRect);
+            check("fullscreen_hidden_window", SUCCEEDED(fullscreenResult) && fullscreen_ &&
+                  (GetWindowLongPtrW(window_, GWL_STYLE) & WS_OVERLAPPEDWINDOW) == 0 && !IsWindowVisible(window_) &&
+                  fullscreenRect.right > fullscreenRect.left && fullscreenRect.bottom > fullscreenRect.top);
+            fullscreenResult = execute(Fullscreen);
+            GetWindowRect(window_, &restoredRect);
+            check("fullscreen_restores_style_and_geometry", SUCCEEDED(fullscreenResult) && !fullscreen_ && !IsWindowVisible(window_) &&
+                  GetWindowLongPtrW(window_, GWL_STYLE) == originalStyle && EqualRect(&originalRect, &restoredRect));
+            TabCtrl_SetCurSel(tabs_, 2); rebuildRibbon();
+            check("view_commands_exposed", GetDlgItem(window_, ColumnsMenu) && GetDlgItem(window_, SizeColumns) && GetDlgItem(window_, HideSelected));
+            MINMAXINFO minimum{}; SendMessageW(window_, WM_GETMINMAXINFO, 0, reinterpret_cast<LPARAM>(&minimum));
+            SetWindowPos(window_, nullptr, 0, 0, minimum.ptMinTrackSize.x, minimum.ptMinTrackSize.y, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+            RECT clientBounds{}; GetClientRect(window_, &clientBounds);
+            bool controlsFit = true;
+            for (const auto control : ribbonControls_) {
+                RECT rect{}; GetWindowRect(control, &rect);
+                MapWindowPoints(nullptr, window_, reinterpret_cast<POINT*>(&rect), 2);
+                controlsFit = controlsFit && rect.left >= 0 && rect.right <= clientBounds.right && rect.top >= 0 && rect.bottom <= clientBounds.bottom;
+            }
+            check("view_ribbon_fits_minimum_window", controlsFit);
+            SetWindowPos(window_, nullptr, 0, 0, originalRect.right - originalRect.left, originalRect.bottom - originalRect.top,
+                         SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+            TabCtrl_SetCurSel(tabs_, 0); rebuildRibbon();
             execute(SelectAll);
             ComPtr<IShellItemArray> selected;
             DWORD selectedCount = 0;
@@ -1231,13 +1645,13 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report) {
             check("invert_selection", selectedCount == 1002, std::to_wstring(selectedCount));
             execute(SelectNone);
             auto hr = navigate((fixture / L"Subfolder").wstring());
-            check("navigate_subfolder", SUCCEEDED(hr) && pumpUntil([&] { return !navigating_ && currentLocation_ == (fixture / L"Subfolder").wstring(); }, 5000));
+            check("navigate_subfolder", SUCCEEDED(hr) && pumpUntil([&] { return !navigating_ && atLocation(fixture / L"Subfolder"); }, 5000));
             hr = execute(Back);
-            check("back", SUCCEEDED(hr) && pumpUntil([&] { return !navigating_ && currentLocation_ == fixture.wstring(); }, 5000));
+            check("back", SUCCEEDED(hr) && pumpUntil([&] { return !navigating_ && atLocation(fixture); }, 5000));
             hr = execute(Forward);
-            check("forward", SUCCEEDED(hr) && pumpUntil([&] { return !navigating_ && currentLocation_ == (fixture / L"Subfolder").wstring(); }, 5000));
+            check("forward", SUCCEEDED(hr) && pumpUntil([&] { return !navigating_ && atLocation(fixture / L"Subfolder"); }, 5000));
             hr = execute(Up);
-            check("up", SUCCEEDED(hr) && pumpUntil([&] { return !navigating_ && currentLocation_ == fixture.wstring(); }, 5000));
+            check("up", SUCCEEDED(hr) && pumpUntil([&] { return !navigating_ && atLocation(fixture); }, 5000));
             execute(HiddenItems);
             ready = pumpUntil([&] { int total = 0; return !navigating_ && folderView_ && SUCCEEDED(folderView_->ItemCount(SVGIO_ALLVIEW, &total)) && total == 1003; }, 10000);
             check("show_hidden_items", ready);
@@ -1251,18 +1665,63 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report) {
             check("panes_mutually_exclusive", ready && preferences_.detailsPane && !preferences_.previewPane && (pane & EPS_DEFAULT_OFF));
             check("invalid_location_returns_error", FAILED(navigate((fixture / L"does-not-exist").wstring())));
             auto previousCount = navigationCount_;
+            Pidl originalSearchScope(ILCloneFull(currentPidl_.get()));
             SetWindowTextW(search_, L"filename:file-99");
             hr = execute(Search);
             const bool searchReady = SUCCEEDED(hr) && pumpUntil([&] { return !navigating_ && navigationCount_ > previousCount; }, 10000);
             check("search_folder_navigation", searchReady, currentLocation_);
             DWORD flags = 0; GetViewFlags(&flags);
             check("background_search_filtering_flag", searchReady && (flags & CDB2GVF_NOINCLUDEITEM) != 0);
-            navigate(fixture.wstring());
-            ready = pumpUntil([&] { int total = 0; return !navigating_ && folderView_ && currentLocation_ == fixture.wstring() && SUCCEEDED(folderView_->ItemCount(SVGIO_ALLVIEW, &total)) && total == 1003; }, 5000);
+            check("search_context_commands", searchReady && TabCtrl_GetItemCount(tabs_) == 5 &&
+                  GetDlgItem(window_, CloseSearch) && GetDlgItem(window_, SaveSearch) && GetDlgItem(window_, SearchCurrent));
+            previousCount = navigationCount_;
+            hr = execute(SearchCurrent);
+            ready = SUCCEEDED(hr) && pumpUntil([&] { return !navigating_ && navigationCount_ > previousCount; }, 10000);
+            check("search_current_folder_retains_origin", ready && !searchRecursive_ && searchScope_ &&
+                  ILIsEqual(searchScope_.get(), originalSearchScope.get()) && activeQuery_ == L"filename:file-99" &&
+                  SendMessageW(GetDlgItem(window_, SearchCurrent), BM_GETCHECK, 0, 0) == BST_CHECKED &&
+                  SendMessageW(GetDlgItem(window_, SearchSubfolders), BM_GETCHECK, 0, 0) == BST_UNCHECKED);
+            previousCount = navigationCount_;
+            hr = execute(SearchSubfolders);
+            ready = SUCCEEDED(hr) && pumpUntil([&] { return !navigating_ && navigationCount_ > previousCount; }, 10000);
+            check("search_subfolders_retains_origin", ready && searchRecursive_ && searchScope_ &&
+                  ILIsEqual(searchScope_.get(), originalSearchScope.get()) && recentSearches_.size() == 1 &&
+                  SendMessageW(GetDlgItem(window_, SearchCurrent), BM_GETCHECK, 0, 0) == BST_UNCHECKED &&
+                  SendMessageW(GetDlgItem(window_, SearchSubfolders), BM_GETCHECK, 0, 0) == BST_CHECKED);
+            const auto committedQuery = activeQuery_;
+            OnNavigationPending(originalSearchScope.get());
+            OnNavigationFailed(originalSearchScope.get());
+            flags = 0; GetViewFlags(&flags);
+            check("failed_navigation_preserves_committed_search", searchActive_ && searchBackground_ && searchRecursive_ &&
+                  ILIsEqual(searchScope_.get(), originalSearchScope.get()) && activeQuery_ == committedQuery &&
+                  (flags & CDB2GVF_NOINCLUDEITEM));
+            previousCount = navigationCount_;
+            hr = startSearch(activeQuery_, true, 2, L"System.Size:System.Size#Tiny");
+            ready = SUCCEEDED(hr) && pumpUntil([&] { return !navigating_ && navigationCount_ > previousCount; }, 10000);
+            previousCount = navigationCount_;
+            hr = startSearch(activeQuery_, true, 2, L"System.Size:System.Size#Empty");
+            ready = ready && SUCCEEDED(hr) && pumpUntil([&] { return !navigating_ && navigationCount_ > previousCount; }, 10000);
+            check("search_filter_replaces_same_category", ready && searchBase_ == committedQuery &&
+                  searchFilters_[2] == L"System.Size:System.Size#Empty" && activeQuery_.find(L"#Tiny") == std::wstring::npos &&
+                  activeQuery_.find(L"#Empty") != std::wstring::npos && ILIsEqual(searchScope_.get(), originalSearchScope.get()));
+            hr = execute(CloseSearch);
+            ready = SUCCEEDED(hr) && pumpUntil([&] { return !navigating_ && atLocation(fixture); }, 5000);
+            check("close_search_restores_origin_and_context", ready && !searchActive_ && TabCtrl_GetItemCount(tabs_) == 4 && !GetDlgItem(window_, CloseSearch));
+            ready = pumpUntil([&] { int total = 0; return !navigating_ && folderView_ && atLocation(fixture) && SUCCEEDED(folderView_->ItemCount(SVGIO_ALLVIEW, &total)) && total == 1003; }, 5000);
             check("protected_files_remain_hidden", ready);
             execute(HiddenItems);
             ready = pumpUntil([&] { int total = 0; return !navigating_ && folderView_ && SUCCEEDED(folderView_->ItemCount(SVGIO_ALLVIEW, &total)) && total == 1002; }, 5000);
             check("hide_hidden_after_search", ready && !searchActive_);
+            ComPtr<IShellItem> savedScope;
+            hr = SHCreateItemFromIDList(originalSearchScope.get(), IID_PPV_ARGS(&savedScope));
+            const auto savedPath = fixture / L"Subfolder" / L"Fixture.search-ms";
+            if (SUCCEEDED(hr)) hr = explorer::saveSearch(L"System.FileName:=\"file-99.txt\"", savedScope.Get(), false, savedPath);
+            if (SUCCEEDED(hr)) hr = navigate(savedPath.wstring());
+            ready = SUCCEEDED(hr) && pumpUntil([&] { return !navigating_ && isExternalSearch(currentPidl_.get()); }, 10000);
+            flags = 0; GetViewFlags(&flags);
+            check("saved_search_reopens_in_hidden_host", ready && searchBackground_ && (flags & CDB2GVF_NOINCLUDEITEM), hresultMessage(hr));
+            navigate(fixture.wstring());
+            pumpUntil([&] { return !navigating_ && atLocation(fixture); }, 5000);
             HWND nativeView = nullptr; view_->GetWindow(&nativeView);
             RECT expandedRect{}, collapsedRect{};
             GetWindowRect(nativeView, &expandedRect);
@@ -1274,7 +1733,8 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report) {
         }
         check("no_visible_host_after_tests", !IsWindowVisible(window_));
         check("no_visible_process_windows_during_pump", !visibleWindowObserved);
-        check("headless_mode_blocks_interactive_operations", execute(Delete) == E_ACCESSDENIED && execute(FolderOptions) == E_ACCESSDENIED && execute(Extensions) == E_ACCESSDENIED);
+        check("headless_mode_blocks_interactive_operations", execute(Delete) == E_ACCESSDENIED && execute(FolderOptions) == E_ACCESSDENIED &&
+              execute(Extensions) == E_ACCESSDENIED && execute(HideSelected) == E_ACCESSDENIED && execute(SaveSearch) == E_ACCESSDENIED);
     } catch (const std::exception& error) {
         const std::string detail = error.what();
         check("unexpected_exception", false, std::wstring(detail.begin(), detail.end()));

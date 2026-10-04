@@ -8,6 +8,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <cwctype>
 
 namespace {
 namespace fs = std::filesystem;
@@ -160,20 +161,58 @@ void unsafeArchives() {
     require(read(fixture.root / L"safe-result" / L"folder" / L"safe.txt").empty(), "stored ZIP empty content changed");
 }
 
-void shortcuts() {
-    Fixture fixture;
-    const fs::path target = fixture.root / L"資料 target.txt";
-    const fs::path shortcut = fixture.root / L"資料 shortcut.lnk";
-    write(target, "shortcut target");
-    succeeded(ExtraOperations::createShortcut(target, shortcut), "create native Unicode shortcut");
+std::string utf8Path(const fs::path& path) {
+    const auto bytes = path.u8string();
+    return {reinterpret_cast<const char*>(bytes.data()), bytes.size()};
+}
+
+void requireSameObject(const fs::path& actual, const fs::path& expected, const char* message) {
+    std::error_code error;
+    const bool same = fs::equivalent(actual, expected, error);
+    if (!same || error) {
+        std::cerr << message << "\n  expected: " << utf8Path(expected)
+                  << "\n  actual:   " << utf8Path(actual)
+                  << "\n  filesystem error: " << error.value() << " (" << error.message() << ")\n";
+        throw std::runtime_error(message);
+    }
+}
+
+fs::path verifyShortcut(const fs::path& shortcut, const fs::path& target, const fs::path& workingDirectory) {
     ComPtr<IShellLinkW> link;
     succeeded(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&link)), "read native shortcut");
     ComPtr<IPersistFile> persist;
     succeeded(link.As(&persist), "query shortcut persistence");
     succeeded(persist->Load(shortcut.c_str(), STGM_READ), "load saved shortcut");
     wchar_t actual[32768]{};
-    succeeded(link->GetPath(actual, static_cast<int>(std::size(actual)), nullptr, SLGP_RAWPATH), "read shortcut target");
-    require(fs::path(actual) == target, "shortcut target differs");
+    const HRESULT pathResult = link->GetPath(actual, static_cast<int>(std::size(actual)), nullptr, SLGP_RAWPATH);
+    if (pathResult != S_OK || !actual[0]) {
+        std::cerr << "shortcut has no persisted target (HRESULT 0x" << std::hex
+                  << static_cast<unsigned long>(pathResult) << std::dec << ")\n";
+        throw std::runtime_error("shortcut has no persisted target");
+    }
+    const fs::path actualTarget(actual);
+    // Shell links may expand 8.3 names or canonicalize casing. Filesystem
+    // identity proves the link references the exact object, including Unicode
+    // names, without requiring the Shell to preserve an alias's spelling.
+    requireSameObject(actualTarget, target, "shortcut target differs");
+    wchar_t actualDirectory[32768]{};
+    succeeded(link->GetWorkingDirectory(actualDirectory, static_cast<int>(std::size(actualDirectory))), "read shortcut working directory");
+    require(actualDirectory[0] != L'\0', "shortcut has no working directory");
+    requireSameObject(fs::path(actualDirectory), workingDirectory, "shortcut working directory differs");
+    return actualTarget;
+}
+
+void shortcuts() {
+    Fixture fixture;
+    const fs::path target = fixture.root / L"資料 target.txt";
+    const fs::path shortcut = fixture.root / L"資料 shortcut.lnk";
+    write(target, "shortcut target");
+    succeeded(ExtraOperations::createShortcut(target, shortcut), "create native Unicode shortcut");
+    const fs::path actual = verifyShortcut(shortcut, target, target.parent_path());
+    const fs::path decoy = fixture.root / L"same contents but different file.txt";
+    write(decoy, "shortcut target");
+    std::error_code identityError;
+    require(!fs::equivalent(actual, decoy, identityError) && !identityError, "shortcut identity check accepted an unrelated same-content file");
     const std::string saved = read(shortcut);
     require(FAILED(ExtraOperations::createShortcut(target, shortcut)), "shortcut overwrote existing output");
     require(read(shortcut) == saved, "shortcut changed after rejected overwrite");
@@ -181,6 +220,30 @@ void shortcuts() {
     require(!fs::exists(fixture.root / L"missing.lnk"), "missing shortcut target left output");
     require(fs::create_directory(fixture.root / L"folder"), "shortcut directory fixture");
     succeeded(ExtraOperations::createShortcut(fixture.root / L"folder", fixture.root / L"folder.lnk"), "create folder shortcut");
+    verifyShortcut(fixture.root / L"folder.lnk", fixture.root / L"folder", fixture.root / L"folder");
+
+    // Reproduce the CI failure mode by passing a valid alternative Windows
+    // path spelling. The Shell is allowed to persist the long, on-disk name.
+    std::wstring caseAlias = target.native();
+    for (auto& character : caseAlias) character = static_cast<wchar_t>(std::towupper(character));
+    requireSameObject(fs::path(caseAlias), target, "case-alias fixture does not reference original target");
+    succeeded(ExtraOperations::createShortcut(fs::path(caseAlias), fixture.root / L"case alias.lnk"), "create shortcut from case alias");
+    const fs::path persistedCase = verifyShortcut(fixture.root / L"case alias.lnk", target, target.parent_path());
+    if (persistedCase != fs::path(caseAlias))
+        std::cout << "INFO: Shell normalized target casing; exact file identity verified\n";
+
+    const DWORD shortLength = GetShortPathNameW(target.c_str(), nullptr, 0);
+    if (shortLength) {
+        std::wstring shortAlias(shortLength, L'\0');
+        const DWORD written = GetShortPathNameW(target.c_str(), shortAlias.data(), shortLength);
+        require(written != 0 && written < shortLength, "read short-path target alias");
+        shortAlias.resize(written);
+        requireSameObject(fs::path(shortAlias), target, "short-path fixture does not reference original target");
+        succeeded(ExtraOperations::createShortcut(fs::path(shortAlias), fixture.root / L"short alias.lnk"), "create shortcut from short-path alias");
+        const fs::path persistedShort = verifyShortcut(fixture.root / L"short alias.lnk", target, target.parent_path());
+        if (persistedShort != fs::path(shortAlias))
+            std::cout << "INFO: Shell expanded 8.3 target spelling; exact file identity verified\n";
+    }
 }
 }
 

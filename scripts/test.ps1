@@ -48,6 +48,12 @@ $smokeProcess.WaitForExit()
 $smokeProcess.Refresh()
 $smokeExit = $smokeProcess.ExitCode
 if (Test-Path -LiteralPath $smokeLog) { Get-Content -LiteralPath $smokeLog | Write-Host }
+if (Test-Path -LiteralPath $smokeReport) {
+    $reportSummary = Get-Content -LiteralPath $smokeReport -Raw | ConvertFrom-Json
+    foreach ($check in $reportSummary.results) {
+        if ($check.passed -ne $true) { Write-Host "FAIL: $($check.name): $($check.detail)" }
+    }
+}
 if ($testExit -ne 0 -or $smokeExit -ne 0) { throw "Headless checks failed: CTest=$testExit, smoke=$smokeExit. Reports: $artifactDirectory" }
 if (-not (Test-Path -LiteralPath $smokeReport)) { throw "Smoke test did not create its report: $smokeReport" }
 $smokeSummary = Get-Content -LiteralPath $smokeReport -Raw | ConvertFrom-Json

@@ -1,4 +1,5 @@
 #include "explorer/shell_operations.hpp"
+#include "explorer/item_actions.hpp"
 #include "explorer/core.hpp"
 
 #include <shlobj.h>
@@ -360,25 +361,9 @@ bool ShellOperations::canUndo() { return false; }
 bool ShellOperations::canRedo() { return false; }
 
 HRESULT ShellOperations::copyPaths(HWND, IShellItemArray* selection) {
-    HRESULT hr = checkSelection(selection);
-    if (FAILED(hr)) return hr;
-    DWORD count = 0;
-    hr = selection->GetCount(&count);
-    if (FAILED(hr)) return hr;
     std::wstring text;
-    for (DWORD index = 0; index < count; ++index) {
-        ComPtr<IShellItem> item;
-        hr = selection->GetItemAt(index, &item);
-        if (FAILED(hr)) return hr;
-        PWSTR raw = nullptr;
-        hr = item->GetDisplayName(SIGDN_FILESYSPATH, &raw);
-        TaskString path(raw);
-        if (FAILED(hr)) return hr;
-        if (index) text += L"\r\n";
-        text += L'"';
-        text += path.get();
-        text += L'"';
-    }
+    const auto hr = ItemActions::quotedPaths(selection, text);
+    if (FAILED(hr)) return hr;
     auto data = Make<TextDataObject>(std::move(text));
     return data ? publishClipboard(data.Get()) : E_OUTOFMEMORY;
 }

@@ -13,6 +13,9 @@ enum Command : UINT {
     QuickAccess, ThisPC, Desktop, Documents, Downloads, Pictures, Music, Videos,
     Network, RecycleBin, Libraries, HistoryMenu, ViewMenu, SortMenu, GroupMenu,
     Undo, Redo, PasteShortcut, NewShortcut, Zip, Extract, FileHistory, FocusSearch,
+    FocusNext, FocusPrevious, Fullscreen, HideSelected, ColumnsMenu, SizeColumns,
+    CloseSearch, SearchSubfolders, SearchCurrent, RecentSearches, SaveSearch,
+    SearchKindMenu, SearchDateMenu, SearchSizeMenu,
     ViewFirst = 500, ViewLast = ViewFirst + 7, BreadcrumbFirst = 3000
 };
 }

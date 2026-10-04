@@ -12,6 +12,8 @@
 int runShellOperationTests();
 int runExtraOperationTests();
 int runInputTests();
+int runItemActionTests();
+int runSearchTests();
 
 namespace {
 void require(bool condition, const char* message) {
@@ -161,6 +163,8 @@ int main() {
     catch (const std::exception& error) { ++failures; std::cerr << "FAIL: Additional file operations: " << error.what() << '\n'; }
     catch (...) { ++failures; std::cerr << "FAIL: Additional file operations: unknown exception\n"; }
     failures += static_cast<unsigned>(runInputTests());
+    failures += static_cast<unsigned>(runItemActionTests());
+    failures += static_cast<unsigned>(runSearchTests());
     CoUninitialize();
     return failures == 0 ? 0 : 1;
 }

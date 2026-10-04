@@ -1,4 +1,5 @@
 #include "explorer/input.hpp"
+#include <array>
 
 namespace explorer {
 
@@ -18,6 +19,8 @@ std::optional<Command> shortcutCommand(UINT key, bool control, bool shift,
         if (key == VK_F4) return Address;
         if (key == VK_F3) return FocusSearch;
         if (key == VK_F5) return Refresh;
+        if (key == VK_F6) return FocusNext;
+        if (key == VK_F11) return Fullscreen;
         if (editing) return std::nullopt;
         if (key == VK_BACK) return Back;
         if (key == VK_F2) return Rename;
@@ -36,6 +39,7 @@ std::optional<Command> shortcutCommand(UINT key, bool control, bool shift,
         if (key == 'A') return SelectAll;
         break;
     case Shift:
+        if (key == VK_F6) return FocusPrevious;
         if (!editing && key == VK_DELETE) return PermanentDelete;
         break;
     case Control | Shift:
@@ -57,6 +61,27 @@ std::optional<Command> shortcutCommand(UINT key, bool control, bool shift,
         break;
     default:
         break;
+    }
+    return std::nullopt;
+}
+
+std::optional<FocusRegion> cycleFocusRegion(std::optional<FocusRegion> current,
+                                           bool backwards,
+                                           const FocusAvailability& available) noexcept {
+    constexpr int regionCount = 5;
+    const std::array<bool, regionCount> enabled{
+        available.address, available.search, available.folderView,
+        available.commandBand, available.navigation};
+    int index = backwards ? 0 : regionCount - 1;
+    if (current) {
+        const int candidate = static_cast<int>(*current);
+        if (candidate >= 0 && candidate < regionCount) index = candidate;
+    }
+
+    for (int attempted = 0; attempted < regionCount; ++attempted) {
+        index = (index + (backwards ? regionCount - 1 : 1)) % regionCount;
+        if (enabled[static_cast<std::size_t>(index)])
+            return static_cast<FocusRegion>(index);
     }
     return std::nullopt;
 }

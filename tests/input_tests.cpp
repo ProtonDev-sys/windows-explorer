@@ -49,6 +49,9 @@ void navigationAndWindowChords() {
         Mapping{{'W', true, false, false}, explorer::Close},
         Mapping{{VK_F1, true, false, false}, explorer::Collapse},
         Mapping{{VK_F5, false, false, false}, explorer::Refresh},
+        Mapping{{VK_F6, false, false, false}, explorer::FocusNext},
+        Mapping{{VK_F6, false, true, false}, explorer::FocusPrevious},
+        Mapping{{VK_F11, false, false, false}, explorer::Fullscreen},
         Mapping{{'P', false, false, true}, explorer::PreviewPane},
         Mapping{{'P', false, true, true}, explorer::DetailsPane}
     };
@@ -158,7 +161,7 @@ void viewLayoutChords() {
 void nativeKeysRemainNative() {
     // Enter/Tab/Escape and undo/redo remain available to native controls;
     // unsupported host Undo/Redo helpers must not intercept native shortcuts.
-    constexpr std::array<UINT, 7> keys{VK_ESCAPE, VK_TAB, VK_SPACE, 'Z', 'Y', 'Q', VK_F11};
+    constexpr std::array<UINT, 7> keys{VK_ESCAPE, VK_TAB, VK_SPACE, 'Z', 'Y', 'Q', VK_F12};
     for (const UINT key : keys) {
         for (unsigned modifiers = 0; modifiers < 8; ++modifiers) {
             const Chord chord{key, (modifiers & 1) != 0, (modifiers & 2) != 0, (modifiers & 4) != 0};
@@ -171,6 +174,126 @@ void nativeKeysRemainNative() {
     expect({0, false, false, false}, false, std::nullopt, "A missing key must not dispatch a command");
     expect({0xffffffffU, true, true, true}, true, std::nullopt, "An invalid key must not dispatch a command");
 }
+
+void focusAndFullscreenModifiers() {
+    for (unsigned modifiers = 0; modifiers < 8; ++modifiers) {
+        const Chord nextChord{VK_F6, (modifiers & 1) != 0,
+                              (modifiers & 2) != 0, (modifiers & 4) != 0};
+        const std::optional<Command> focus = modifiers == 0 ? explorer::FocusNext :
+            modifiers == 2 ? std::optional<Command>(explorer::FocusPrevious) : std::nullopt;
+        const Chord fullscreenChord{VK_F11, nextChord.control, nextChord.shift, nextChord.alt};
+        const std::optional<Command> fullscreen = modifiers == 0 ?
+            std::optional<Command>(explorer::Fullscreen) : std::nullopt;
+        for (const bool editing : {false, true}) {
+            expect(nextChord, editing, focus, "F6 must cycle focus only with its exact supported modifiers");
+            expect(fullscreenChord, editing, fullscreen, "F11 must toggle fullscreen only without modifiers");
+        }
+    }
+}
+
+void expectFocus(std::optional<explorer::FocusRegion> current, bool backwards,
+                 const explorer::FocusAvailability& available,
+                 std::optional<explorer::FocusRegion> expected, const char* description) {
+    ++assertions;
+    if (explorer::cycleFocusRegion(current, backwards, available) != expected)
+        throw std::runtime_error(description);
+}
+
+void focusCycleOrderAndAvailability() {
+    using explorer::FocusRegion;
+    const explorer::FocusAvailability all;
+    constexpr std::array forward{
+        FocusRegion::Address, FocusRegion::Search, FocusRegion::FolderView,
+        FocusRegion::CommandBand, FocusRegion::Navigation, FocusRegion::Address};
+    std::optional<FocusRegion> current = FocusRegion::Navigation;
+    for (const auto expected : forward) {
+        expectFocus(current, false, all, expected, "Forward focus cycle must retain order and wrap around");
+        current = expected;
+    }
+    constexpr std::array backward{
+        FocusRegion::Navigation, FocusRegion::CommandBand, FocusRegion::FolderView,
+        FocusRegion::Search, FocusRegion::Address, FocusRegion::Navigation};
+    current = FocusRegion::Address;
+    for (const auto expected : backward) {
+        expectFocus(current, true, all, expected, "Backward focus cycle must reverse order and wrap around");
+        current = expected;
+    }
+    expectFocus(std::nullopt, false, all, FocusRegion::Address, "Unknown focus starts at the address region forward");
+    expectFocus(std::nullopt, true, all, FocusRegion::Navigation, "Unknown focus starts at navigation backward");
+    expectFocus(static_cast<FocusRegion>(-1), false, all, FocusRegion::Address, "Invalid negative focus is treated as unknown");
+    expectFocus(static_cast<FocusRegion>(999), true, all, FocusRegion::Navigation, "Invalid focus is treated as unknown");
+
+    const explorer::FocusAvailability noBandOrNavigation{true, true, true, false, false};
+    expectFocus(FocusRegion::FolderView, false, noBandOrNavigation, FocusRegion::Address,
+                "Forward focus skips a collapsed command band and hidden navigation");
+    expectFocus(FocusRegion::Address, true, noBandOrNavigation, FocusRegion::FolderView,
+                "Backward focus skips hidden trailing regions");
+    expectFocus(FocusRegion::CommandBand, false, noBandOrNavigation, FocusRegion::Address,
+                "A now-hidden current region still advances from its original position");
+    expectFocus(FocusRegion::Navigation, true, noBandOrNavigation, FocusRegion::FolderView,
+                "A hidden current region cycles safely backward");
+
+    const explorer::FocusAvailability noAddressOrView{false, true, false, true, true};
+    expectFocus(std::nullopt, false, noAddressOrView, FocusRegion::Search,
+                "Unknown forward focus skips an unavailable address region");
+    expectFocus(FocusRegion::Search, false, noAddressOrView, FocusRegion::CommandBand,
+                "Forward focus skips a missing native folder view");
+    expectFocus(FocusRegion::CommandBand, true, noAddressOrView, FocusRegion::Search,
+                "Backward focus skips a missing native folder view");
+
+    const explorer::FocusAvailability none{false, false, false, false, false};
+    for (const auto region : forward) {
+        expectFocus(region, false, none, std::nullopt, "Empty focus set has no forward target");
+        expectFocus(region, true, none, std::nullopt, "Empty focus set has no backward target");
+    }
+    expectFocus(std::nullopt, false, none, std::nullopt, "Unknown focus with an empty set stays empty");
+    expectFocus(std::nullopt, true, none, std::nullopt, "Unknown backward focus with an empty set stays empty");
+}
+
+void focusCycleSubsetInvariants() {
+    using explorer::FocusRegion;
+    constexpr std::array regions{
+        FocusRegion::Address, FocusRegion::Search, FocusRegion::FolderView,
+        FocusRegion::CommandBand, FocusRegion::Navigation};
+    auto require = [](bool passed, const char* description) {
+        ++assertions;
+        if (!passed) throw std::runtime_error(description);
+    };
+
+    // Every availability subset must form a reversible closed cycle that
+    // visits each available region once and never targets a hidden region.
+    for (unsigned subset = 1; subset < 32; ++subset) {
+        const explorer::FocusAvailability available{
+            (subset & 1) != 0, (subset & 2) != 0, (subset & 4) != 0,
+            (subset & 8) != 0, (subset & 16) != 0};
+        unsigned expectedVisits = 0;
+        for (unsigned index = 0; index < regions.size(); ++index)
+            if ((subset & (1U << index)) != 0) ++expectedVisits;
+
+        for (unsigned start = 0; start < regions.size(); ++start) {
+            if ((subset & (1U << start)) == 0) continue;
+            for (const bool backwards : {false, true}) {
+                std::optional<FocusRegion> current = regions[start];
+                unsigned visited = 0;
+                for (unsigned step = 0; step < expectedVisits; ++step) {
+                    const auto next = explorer::cycleFocusRegion(current, backwards, available);
+                    require(next.has_value(), "A nonempty focus set must always yield a target");
+                    const unsigned index = static_cast<unsigned>(*next);
+                    require(index < regions.size(), "The focus target must be a defined region");
+                    const unsigned bit = 1U << index;
+                    require((subset & bit) != 0, "The focus target must be available");
+                    require((visited & bit) == 0, "Focus must visit each available region once per cycle");
+                    require(explorer::cycleFocusRegion(next, !backwards, available) == current,
+                            "Reversing a focus step must return to the preceding available region");
+                    visited |= bit;
+                    current = next;
+                }
+                require(visited == subset, "One focus cycle must visit the entire available set");
+                require(current == regions[start], "One complete focus cycle must return to its start");
+            }
+        }
+    }
+}
 } // namespace
 
 int runInputTests() {
@@ -180,7 +303,10 @@ int runInputTests() {
         Test{"file commands and native rename safety", fileCommandsAndRenameSafety},
         Test{"modifier conflicts, system keys, and AltGr", modifierConflictsAndSystemKeys},
         Test{"eight view-layout shortcuts", viewLayoutChords},
-        Test{"unhandled native editing and Shell keys", nativeKeysRemainNative}
+        Test{"unhandled native editing and Shell keys", nativeKeysRemainNative},
+        Test{"F6 and fullscreen modifier precedence", focusAndFullscreenModifiers},
+        Test{"focus order, wraparound, and unavailable regions", focusCycleOrderAndAvailability},
+        Test{"focus cycle invariants for all availability subsets", focusCycleSubsetInvariants}
     };
     assertions = 0;
     int failures = 0;
