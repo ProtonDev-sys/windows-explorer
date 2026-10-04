@@ -109,6 +109,9 @@ public:
     HRESULT setCommandImageSpec(UINT command, const std::wstring& specification);
     // Borrowed pointer for headless property readback and host diagnostics.
     IUIFramework* framework() const noexcept;
+    // Borrowed native object/identity for owner-STA diagnostic property reads.
+    IUIFramework* nativeFramework() const noexcept;
+    UINT nativeCommandId(UINT command) const noexcept;
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

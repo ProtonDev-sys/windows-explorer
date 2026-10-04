@@ -63,6 +63,8 @@ struct VisualCaptureOptions {
         UINT nativeState = 0;
     };
     IUIFramework* ribbonFramework = nullptr; // borrowed; optional native state evidence
+    IUIFramework* nativeRibbonFramework = nullptr; // borrowed underlying owner-STA framework
+    UINT layoutGalleryNativeCommand = 0;
     std::wstring ribbonLayout; // actual loaded layout, supplied by its native host
     HRESULT installedRibbonStatus = E_NOTIMPL;
     bool ribbonFeaturesRead = false;
@@ -133,6 +135,11 @@ struct VisualCaptureReport {
     RECT pixelInspectionBounds{};
     unsigned inspectionUniqueColors = 0;
     double inspectionInkFraction = 0;
+    HRESULT layoutGallerySelectedRead = E_NOTIMPL;
+    UINT layoutGallerySelected = 0xffffffffu;
+    UINT layoutGalleryNativeCommand = 0;
+    HRESULT layoutGalleryNativeSelectedRead = E_NOTIMPL;
+    UINT layoutGalleryNativeSelected = 0xffffffffu;
     unsigned visibleChildren = 0;
     std::vector<VisualWidget> widgets;
 };

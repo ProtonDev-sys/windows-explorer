@@ -52,7 +52,15 @@ HRESULT selectNativeTab(IUIAutomation* automation, const TabSelection& request) 
     hr=automation->CreateAndCondition(typeCondition.Get(),nameCondition.Get(),&condition);if(FAILED(hr))return hr;
     if(request.cancelled)return E_ABORT;
     ComPtr<IUIAutomationElement> element;
-    hr=root->FindFirst(TreeScope_Descendants,condition.Get(),&element);if(FAILED(hr))return hr;
+    const auto deadline=GetTickCount64()+2000;
+    do {
+        if(request.cancelled)return E_ABORT;
+        hr=root->FindFirst(TreeScope_Descendants,condition.Get(),&element);if(FAILED(hr))return hr;
+        if(element)break;
+        // SetModes publishes its accessible tab tree asynchronously. Observe
+        // the identical owned root and exact tab name/type while its STA pumps.
+        Sleep(20);
+    }while(GetTickCount64()<deadline);
     if(!element)return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
     if(request.cancelled)return E_ABORT;
     ComPtr<IUIAutomationSelectionItemPattern> selection;
@@ -60,7 +68,13 @@ HRESULT selectNativeTab(IUIAutomation* automation, const TabSelection& request) 
     BOOL selected=FALSE;hr=selection->get_CurrentIsSelected(&selected);
     if(FAILED(hr)||selected)return hr;
     if(request.cancelled)return E_ABORT;
-    return selection->Select();
+    hr=selection->Select();if(FAILED(hr))return hr;
+    do {
+        if(request.cancelled)return E_ABORT;
+        hr=selection->get_CurrentIsSelected(&selected);if(FAILED(hr)||selected)return hr;
+        Sleep(20);
+    }while(GetTickCount64()<deadline);
+    return HRESULT_FROM_WIN32(ERROR_TIMEOUT);
 }
 
 HRESULT selectTabOnMta(HWND window,const wchar_t* name) {
@@ -100,7 +114,8 @@ HRESULT selectTabOnMta(HWND window,const wchar_t* name) {
         const auto waited=MsgWaitForMultipleObjectsEx(1,&request->done,20,QS_ALLINPUT,MWMO_INPUTAVAILABLE);
         if(waited==WAIT_OBJECT_0) {complete=true;break;}
         MSG message{};
-        while(PeekMessageW(&message,nullptr,0,0,PM_REMOVE)) {
+        unsigned dispatched=0;
+        while(dispatched++<16&&GetTickCount64()<deadline&&PeekMessageW(&message,nullptr,0,0,PM_REMOVE)) {
             if(message.message==WM_QUIT) {PostQuitMessage(static_cast<int>(message.wParam));request->cancelled=true;break;}
             TranslateMessage(&message);DispatchMessageW(&message);
         }
@@ -112,7 +127,8 @@ HRESULT selectTabOnMta(HWND window,const wchar_t* name) {
         const auto cancellationDeadline=GetTickCount64()+500;
         while(GetTickCount64()<cancellationDeadline) {
             if(MsgWaitForMultipleObjectsEx(1,&request->done,10,QS_ALLINPUT,MWMO_INPUTAVAILABLE)==WAIT_OBJECT_0) {complete=true;break;}
-            MSG message{};while(PeekMessageW(&message,nullptr,0,0,PM_REMOVE)) {
+            MSG message{};unsigned dispatched=0;
+            while(dispatched++<16&&GetTickCount64()<cancellationDeadline&&PeekMessageW(&message,nullptr,0,0,PM_REMOVE)) {
                 if(message.message==WM_QUIT){PostQuitMessage(static_cast<int>(message.wParam));break;}
                 TranslateMessage(&message);DispatchMessageW(&message);
             }
@@ -633,7 +649,7 @@ struct NativeRibbon::Impl {
                 if(IsEqualPropertyKey(key,UI_PKEY_Label)||IsEqualPropertyKey(key,UI_PKEY_TooltipTitle)){
                     if(owner_.layout==RibbonLayout::InstalledWindows10) {
                         if(originalId==0x2c60)return InitPropVariantFromString(L"Run",value);
-                        if(originalId==0x2c61||originalId==0x2931)return InitPropVariantFromString(L"",value);
+                        if(originalId==0x2012||originalId==0x2c61||originalId==0x2931)return InitPropVariantFromString(L"",value);
                     }
                     if(!state.label.empty())return InitPropVariantFromString(state.label.c_str(),value);
                     const auto found=owner_.metadata.find(id);
@@ -645,9 +661,6 @@ struct NativeRibbon::Impl {
                     return found!=owner_.metadata.end()&&!found->second.description.empty()?InitPropVariantFromString(found->second.description.c_str(),value):E_NOTIMPL;
                 }
                 if(IsEqualPropertyKey(key,UI_PKEY_SmallImage)||IsEqualPropertyKey(key,UI_PKEY_LargeImage)){
-                    // Help's Ribbon chrome uses the framework's themed image;
-                    // CommandStore's menu icon belongs to Help menu entries.
-                    if(id==RibbonHelpButton)return E_NOTIMPL;
                     ComPtr<IUIImage> image;
                     const auto hr=owner_.image(id,IsEqualPropertyKey(key,UI_PKEY_LargeImage),image);
                     return SUCCEEDED(hr)?UIInitPropertyFromImage(key,image.Get(),value):hr;
@@ -740,6 +753,10 @@ struct NativeRibbon::Impl {
             }
             ++index;
         }
+        // Clear/Add resets an item gallery's native selection. Restore the
+        // actual folder-view index after this ItemsSource callback returns.
+        if(parent==RibbonLayoutGallery&&type==UI_COMMANDTYPE_COLLECTION)
+            return requestInvalidation(nativeParent,UI_INVALIDATIONS_PROPERTY,&UI_PKEY_SelectedItem);
         return S_OK;
     }
     HRESULT sameThread()const noexcept {return thread==GetCurrentThreadId()?S_OK:RPC_E_WRONG_THREAD;}
@@ -916,6 +933,8 @@ void NativeRibbon::reset()noexcept{if(!impl_)return;impl_->detachSubclass();impl
 bool NativeRibbon::valid()const noexcept{return impl_&&impl_->framework&&impl_->ribbon;}
 UINT NativeRibbon::height()const noexcept{return impl_?impl_->height:0;}
 IUIFramework* NativeRibbon::framework()const noexcept{return impl_?(impl_->publicFramework?impl_->publicFramework.Get():impl_->framework.Get()):nullptr;}
+IUIFramework* NativeRibbon::nativeFramework()const noexcept{return impl_?impl_->framework.Get():nullptr;}
+UINT NativeRibbon::nativeCommandId(UINT command)const noexcept{return impl_?impl_->nativeId(command):0;}
 RibbonLayout NativeRibbon::layout()const noexcept{return impl_?impl_->layout:RibbonLayout::Authored;}
 HRESULT NativeRibbon::installedLayoutStatus()const noexcept{return impl_?impl_->stockStatus:E_UNEXPECTED;}
 HRESULT NativeRibbon::invalidate(UINT command){if(!valid())return E_UNEXPECTED;auto hr=impl_->sameThread();if(FAILED(hr))return hr;const auto id=impl_->nativeId(command);return command&&!id?HRESULT_FROM_WIN32(ERROR_NOT_FOUND):impl_->requestInvalidation(id,UI_INVALIDATIONS_ALLPROPERTIES,nullptr);}

@@ -23,6 +23,16 @@ The corresponding development executable SHA-256 is
 These snapshots ran during development on the same machine; concurrent work
 and warm Shell caches limit causal comparisons between individual samples.
 
+The October 4, 2026 23:11 UTC run of executable
+`f01bc69d57541f86c432ff1055936b1331d801000852165524a22975f2b8a6ea`
+failed the existing 45-second command-readiness wait after native Select all
+over the 10,000-item view. The operation itself returned `S_OK`, but this run
+produced no complete accepted performance report. Historical navigation or
+selection timings cannot establish responsiveness of this newer build. The
+failure is retained under ignored
+`run-20261004-231115-8478a22bfdf3466aae4875b4167cc3f0`; subsequent diagnostics
+record the exact pending command IDs and state rather than extending the bound.
+
 The benchmark now includes real selection commands over the 10,000-file view.
 Native selection providers and coalesced updates replaced repeated per-row
 host calls. The latest run independently verified every resulting count:
@@ -82,7 +92,9 @@ The report records six real native view changes, twenty cached command
 updates and four selection transitions, plus process working-set and
 private-memory counters. Selection timings separate command execution,
 message-pump work and independent native count readback; their sum must match
-the total. Cleanup releases
+the count-visible total. A separate bounded phase waits until all asynchronous
+command states complete and records both extra wait and total readiness time.
+Reaching the correct selection count alone cannot satisfy that phase. Cleanup releases
 the native browser before deleting the owned fixture. The input desktop is
 verified again after application and COM cleanup.
 

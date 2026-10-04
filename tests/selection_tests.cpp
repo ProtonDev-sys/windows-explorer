@@ -260,6 +260,7 @@ void verifyDocumentedFallback(explorer::PrivateDesktop& desktop) {
     const auto all = identities(browser.folderView.Get(), SVGIO_ALLVIEW, folder.Get());
     require(all.size() == 24, "Documented fallback view membership differs");
     const auto change = [&](explorer::SelectionAction action, const IdentitySet& expected) {
+        std::cerr << "Fallback begin action=" << static_cast<unsigned>(action) << " expected=" << expected.size() << '\n';
         succeeded(explorer::changeShellSelection(browser.folderView.Get(), browser.view.Get(), action, nullptr, true),
                   "Execute documented actual-view selection fallback");
         waitFor([&] {

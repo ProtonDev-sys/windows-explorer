@@ -284,6 +284,10 @@ $failed = @($results | Where-Object { $_.nativeCapture -ne $true -or $_.referenc
 $compared = @($results | Where-Object { $null -ne $_.referenceComparison }).Count
 $summary = [ordered]@{ headless = $true; privateDesktop = $true; captureOnly = [bool]$CaptureOnly;
     executableSha256 = $binarySha256;
+    captureEnvironment = [ordered]@{ os = [Environment]::OSVersion.VersionString;
+        uiCulture = [Globalization.CultureInfo]::CurrentUICulture.Name;
+        culture = [Globalization.CultureInfo]::CurrentCulture.Name; requestedTheme = 'Light';
+        sourceBuildThemeAccent = 'Not stated by publishers; palette and state differences remain compared.' };
     crashDiagnostics = [bool]$CrashDiagnostics; diagnosticPdbSha256 = $diagnosticPdbSha256;
     chosenLayout = $(if ($InstalledRibbon) { 'InstalledWindows10' } else { 'Authored' });
     referenceManifestSha256 = $manifestSha256; referenceManifest = $manifestPath; comparisonToolSha256 = $comparerSha256;

@@ -480,6 +480,26 @@ HRESULT captureWindowPng(const PrivateDesktop& desktop, HWND window,
         PW_RENDERFULLCONTENT | (options.includeFrame ? 0 : PW_CLIENTONLY)) != FALSE;
     GdiFlush();
     if (!result.printWindowSucceeded) return win32Failure();
+    if(options.ribbonFramework) {
+        PROPVARIANT selected{};
+        result.layoutGallerySelectedRead=options.ribbonFramework->GetUICommandProperty(
+            RibbonLayoutGallery,UI_PKEY_SelectedItem,&selected);
+        ULONG index=0xffffffffu;
+        if(SUCCEEDED(result.layoutGallerySelectedRead))
+            result.layoutGallerySelectedRead=PropVariantToUInt32(selected,&index);
+        if(SUCCEEDED(result.layoutGallerySelectedRead))result.layoutGallerySelected=index;
+        PropVariantClear(&selected);
+    }
+    if(options.nativeRibbonFramework&&options.layoutGalleryNativeCommand) {
+        result.layoutGalleryNativeCommand=options.layoutGalleryNativeCommand;
+        PROPVARIANT selected{};ULONG index=0xffffffffu;
+        result.layoutGalleryNativeSelectedRead=options.nativeRibbonFramework->GetUICommandProperty(
+            options.layoutGalleryNativeCommand,UI_PKEY_SelectedItem,&selected);
+        if(SUCCEEDED(result.layoutGalleryNativeSelectedRead))
+            result.layoutGalleryNativeSelectedRead=PropVariantToUInt32(selected,&index);
+        if(SUCCEEDED(result.layoutGalleryNativeSelectedRead))result.layoutGalleryNativeSelected=index;
+        PropVariantClear(&selected);
+    }
     const auto navigation = GetDlgItem(window, 901);
     for (auto& button : result.navigationButtons)
         button.drawRead = navigation ? chromeToolbarDrawReadback(navigation,
@@ -553,6 +573,12 @@ HRESULT writeVisualCaptureReport(const std::filesystem::path& output,
         << ",\"inkFraction\":" << report.inspectionInkFraction << '}'
         << ",\n  \"visibleChildren\":" << report.visibleChildren << ",\n  \"clientBounds\":";
     rectJson(stream, report.clientBounds);
+    stream << ",\n  \"nativeLayoutGallery\":{\"logicalCommand\":" << RibbonLayoutGallery
+        << ",\"selectedReadHresult\":" << static_cast<long>(report.layoutGallerySelectedRead)
+        << ",\"selectedIndex\":" << report.layoutGallerySelected
+        << ",\"nativeCommand\":" << report.layoutGalleryNativeCommand
+        << ",\"nativeSelectedReadHresult\":" << static_cast<long>(report.layoutGalleryNativeSelectedRead)
+        << ",\"nativeSelectedIndex\":" << report.layoutGalleryNativeSelected << '}';
     stream << ",\n  \"installedFeatures\":{\"source\":\"read-only native edition, Media Foundation, disc-burning policy, and disk-cleanup capability\","
         << "\"readRequested\":" << (report.ribbonFeaturesRead ? "true" : "false")
         << ",\"bitLocker\":" << (report.ribbonFeatures.bitLocker ? "true" : "false")

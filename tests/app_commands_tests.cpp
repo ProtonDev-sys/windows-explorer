@@ -617,7 +617,8 @@ void nativeSearchLocationDelegatesAndTargets() {
                     PWSTR raw = nullptr;
                     succeeded(result->GetDisplayName(SIGDN_FILESYSPATH,&raw),"Read exclusively owned result identity");
                     const fs::path path(raw ? raw : L""); CoTaskMemFree(raw);
-                    for (size_t expected=0;expected<paths.size();++expected) if (path == paths[expected]) indexes[expected]=index;
+                    for (size_t expected=0;expected<paths.size();++expected)
+                        if (fs::equivalent(path, paths[expected])) indexes[expected]=index;
                 }
                 for (const auto index : indexes) require(index >= 0,"Native Search wrapper lost an owned result identity");
                 ComPtr<IShellItem> current;
@@ -1181,6 +1182,7 @@ void nativeLeafStateMenuEquivalence() {
     onPrivateDesktop([] {
         Fixture fixture;const auto before=read(fixture.text),zipBefore=read(fixture.archive);
         const auto clipboard=GetClipboardSequenceNumber();
+        const auto clipboardOwnerBefore=GetClipboardOwner();
         const auto folder=item(fixture.root),text=item(fixture.text),directory=item(fixture.directory);
         HiddenView host(folder.Get());
         struct Identities {
@@ -1254,9 +1256,22 @@ void nativeLeafStateMenuEquivalence() {
                 "Verify native root-state original tail identity");
             require(comparison==0,"Read-only native state comparison replaced or lost the original tail");
         }
-        require(read(fixture.text)==before&&read(fixture.archive)==zipBefore&&fs::is_empty(fixture.directory)&&
-                GetClipboardSequenceNumber()==clipboard&&!IsWindowVisible(host.owner),
-                "Native root-leaf equivalence changed payloads, clipboard or input-desktop UI");
+        const bool textUnchanged=read(fixture.text)==before,zipUnchanged=read(fixture.archive)==zipBefore;
+        const bool directoryEmpty=fs::is_empty(fixture.directory),ownerHidden=!IsWindowVisible(host.owner);
+        const auto clipboardAfter=GetClipboardSequenceNumber();
+        const auto clipboardOwnerAfter=GetClipboardOwner();
+        const bool clipboardUnchanged=clipboardAfter==clipboard;
+        if(!textUnchanged||!zipUnchanged||!directoryEmpty||!clipboardUnchanged||!ownerHidden) {
+            DWORD ownerProcess=0;if(clipboardOwnerAfter)GetWindowThreadProcessId(clipboardOwnerAfter,&ownerProcess);
+            std::cerr<<"Native root-leaf isolation: textUnchanged="<<textUnchanged<<" zipUnchanged="<<zipUnchanged
+                <<" directoryEmpty="<<directoryEmpty<<" ownerHidden="<<ownerHidden
+                <<" clipboardSequenceUnchanged="<<clipboardUnchanged<<" clipboardSequenceDelta="<<clipboardAfter-clipboard
+                <<" clipboardOwnerChanged="<<(clipboardOwnerAfter!=clipboardOwnerBefore)
+                <<" clipboardOwnerIsThisProcess="<<(ownerProcess==GetCurrentProcessId())<<'\n';
+        }
+        require(textUnchanged&&zipUnchanged&&directoryEmpty,"Native root-leaf equivalence changed owned payloads");
+        require(clipboardUnchanged,"Native root-leaf equivalence observed a changed window-station clipboard sequence");
+        require(ownerHidden,"Native root-leaf equivalence displayed its hidden owner");
     });
 }
 

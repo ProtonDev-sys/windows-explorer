@@ -174,6 +174,39 @@ void staleCompletionAndEnterCommit() {
     require(ready(policy, 262).generation != entered.generation, "Enter on same text was swallowed");
     fixture.unchanged();
 }
+void busyRetryPreservesOnlyCurrentIntent() {
+    Fixture fixture; LiveSearchPolicy policy;
+    const std::wstring literal=L"  System.FileName:=\"beta.bin\"  ";
+    succeeded(policy.submit(literal,10), "Issue an explicit native query before busy retry");
+    const auto first=ready(policy,10);
+    require(policy.retry(first,20)&&policy.current(first)&&policy.waiting()&&policy.deadline()==120&&
+            policy.literal()==literal&&policy.committedLiteral().empty(), "Busy retry changed current intent or prematurely committed");
+    require(!policy.retry(first,21)&&!policy.finish(first,S_OK)&&!policy.takeReady(119)&&!policy.takeReady(120,false),
+            "Busy request accepted duplicate completion/retry or bypassed navigation backpressure");
+    const auto second=ready(policy,120);
+    require(second==first, "Busy retry lost generation, literal or explicit Enter intent");
+    auto native=query(second,fixture);
+    require(nativeResults(native.Get(),fixture)==fixture.identities({L"beta.bin"})&&policy.finish(second,S_OK)&&
+            policy.committedLiteral()==literal&&!policy.retry(second,121), "Retried native query did not commit exactly once");
+    succeeded(policy.userEdited(L"System.FileExtension:=\".txt\"",200), "Issue old automatic query");
+    const auto obsolete=ready(policy,450);
+    succeeded(policy.userEdited(L"System.FileName:=\"alpha.txt\"",451), "Newer edit replaces busy work");
+    const auto newerDeadline=policy.deadline();
+    require(!policy.retry(obsolete,452)&&policy.deadline()==newerDeadline&&!policy.finish(obsolete,S_OK),
+            "Busy retry resurrected stale work or changed the newer debounce");
+    const auto newer=ready(policy,701);native=query(newer,fixture);
+    require(nativeResults(native.Get(),fixture)==fixture.identities({L"alpha.txt"})&&policy.finish(newer,S_OK)&&
+            policy.committedLiteral()==literal, "Automatic retry changed explicit history or native identities");
+    policy.escape(800);const auto origin=ready(policy,800);
+    require(policy.retry(origin,801)&&ready(policy,901)==origin, "Busy origin restoration lost its exact intent");
+    policy.cancel();require(!policy.retry(origin,902)&&!policy.waiting(), "Cancelled origin request was resurrected");
+    const auto maximum=(std::numeric_limits<std::uint64_t>::max)();
+    succeeded(policy.submit(literal,maximum-20), "Schedule busy retry near tick limit");
+    const auto bounded=ready(policy,maximum-20);
+    require(policy.retry(bounded,maximum-10)&&policy.deadline()==maximum&&!policy.takeReady(maximum-1)&&
+            ready(policy,maximum)==bounded, "Busy retry deadline overflowed or changed intent");
+    fixture.unchanged();
+}
 void clearEscapeProgrammaticAndNavigationCancellation() {
     Fixture fixture; LiveSearchPolicy policy;
     succeeded(policy.userEdited(L"System.Size:>0", 10), "Schedule cancellable native query");
@@ -246,9 +279,10 @@ int main() {
     if (FAILED(desktop.initialize())) { std::cerr << "FAIL: owned private desktop unavailable\n"; return 1; }
     if (FAILED(OleInitialize(nullptr))) { std::cerr << "FAIL: native search STA unavailable\n"; return 1; }
     const DWORD clipboard = GetClipboardSequenceNumber(); int failures = 0;
-    for (const auto& [name, test] : std::array<std::pair<const char*, void(*)()>, 4>{{
+    for (const auto& [name, test] : std::array<std::pair<const char*, void(*)()>, 5>{{
         {"debounced latest-only literal and real native final identities", &debounceAndNativeFinalResults},
         {"stale actual native completion and immediate explicit commit", &staleCompletionAndEnterCommit},
+        {"busy retry preserves only current intent and real native identities", &busyRetryPreservesOnlyCurrentIntent},
         {"clear/Escape origin, programmatic suppression and navigation cancellation", &clearEscapeProgrammaticAndNavigationCancellation},
         {"incomplete AQS, failure preservation and bounded scheduling", &incompleteFailureBoundsAndPreservation}}}) {
         try { test(); std::cout << "PASS: " << name << '\n'; }
@@ -259,6 +293,6 @@ int main() {
         visible || GetClipboardSequenceNumber() != clipboard) {
         ++failures; std::cerr << "FAIL: live search desktop/clipboard isolation\n";
     }
-    OleUninitialize(); std::cout << 4 - std::min(failures, 4) << "/4 headless live search groups passed\n";
+    OleUninitialize(); std::cout << 5 - std::min(failures, 5) << "/5 headless live search groups passed\n";
     return failures ? 1 : 0;
 }

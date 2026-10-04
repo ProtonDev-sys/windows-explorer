@@ -55,7 +55,7 @@ if(MSVC)
   target_link_options(WindowsExplorer PRIVATE /MANIFEST:NO)
   target_link_options(WindowsExplorer PRIVATE "$<$<CONFIG:Release>:/DEBUG:FULL>"
     "$<$<CONFIG:Release>:/OPT:REF>" "$<$<CONFIG:Release>:/OPT:ICF>"
-    "$<$<CONFIG:Release>:/INCREMENTAL:NO>" /PDBALTPATH:%_PDB%)
+    "$<$<CONFIG:Release>:/INCREMENTAL:NO>" "/PDBALTPATH:$<TARGET_PDB_FILE_NAME:WindowsExplorer>")
 endif()
 include(CTest)
 if(BUILD_TESTING)
@@ -64,9 +64,16 @@ if(BUILD_TESTING)
   target_sources(explorer_tests PRIVATE tests/app_commands_tests.cpp tests/search_history_tests.cpp tests/address_history_tests.cpp tests/typed_address_tests.cpp tests/worker_sta_tests.cpp)
   if(MSVC)
     target_compile_options(explorer_tests PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    target_compile_options(explorer_tests PRIVATE "$<$<CONFIG:Release>:/Zi>")
+    target_link_options(explorer_tests PRIVATE "$<$<CONFIG:Release>:/DEBUG:FULL>"
+      "$<$<CONFIG:Release>:/OPT:REF>" "$<$<CONFIG:Release>:/OPT:ICF>"
+      "$<$<CONFIG:Release>:/INCREMENTAL:NO>" "/PDBALTPATH:$<TARGET_PDB_FILE_NAME:explorer_tests>")
   endif()
   add_test(NAME core_and_shell_operations COMMAND explorer_tests)
-  set_tests_properties(core_and_shell_operations PROPERTIES TIMEOUT 90)
+  # Full installed-menu comparisons visit 10,000-item arrays repeatedly. The
+  # quiet target-machine run takes 88 seconds; this is a correctness suite,
+  # with per-worker deadlines, rather than a 90-second performance threshold.
+  set_tests_properties(core_and_shell_operations PROPERTIES TIMEOUT 120)
   add_executable(native_selection_tests tests/selection_tests.cpp)
   target_link_libraries(native_selection_tests PRIVATE explorer_core)
   add_test(NAME native_view_selection COMMAND native_selection_tests)

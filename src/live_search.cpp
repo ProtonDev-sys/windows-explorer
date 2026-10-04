@@ -82,6 +82,13 @@ std::optional<LiveSearchRequest> LiveSearchPolicy::takeReady(std::uint64_t now, 
 bool LiveSearchPolicy::current(const LiveSearchRequest& request) const {
     return request_ && *request_ == request;
 }
+bool LiveSearchPolicy::retry(const LiveSearchRequest& request, std::uint64_t now) {
+    if (!issued_ || !current(request)) return false;
+    issued_ = false;
+    pending_ = true;
+    deadline_ = after(now, 100);
+    return true;
+}
 bool LiveSearchPolicy::finish(const LiveSearchRequest& request, HRESULT result) {
     if (!issued_ || !current(request)) return false;
     if (SUCCEEDED(result) && request.explicitSubmit && request.kind == LiveSearchKind::Query)

@@ -1,10 +1,12 @@
 #include "explorer/search.hpp"
 #include "explorer/saved_search.hpp"
+#include "explorer/search_presentation_store.hpp"
 
 #include <shlobj.h>
 #include <shlguid.h>
 #include <propkey.h>
 #include <sddl.h>
+#include <aclapi.h>
 #include <winioctl.h>
 #include <msxml6.h>
 #include <wrl/client.h>
@@ -19,6 +21,7 @@
 #include <array>
 #include <algorithm>
 #include <compare>
+#include <cstring>
 
 namespace {
 namespace fs = std::filesystem;
@@ -719,19 +722,56 @@ struct OwnedHandle {
     HANDLE value = INVALID_HANDLE_VALUE;
     ~OwnedHandle() { if (value != INVALID_HANDLE_VALUE) CloseHandle(value); }
 };
-std::wstring fileDacl(const fs::path& path) {
+struct DaclState {
+    std::vector<BYTE> descriptor;
+    std::wstring sddl;
+    SECURITY_DESCRIPTOR_CONTROL control{};
+};
+DaclState fileDaclState(const fs::path& path) {
     DWORD length = 0;
     GetFileSecurityW(path.c_str(), DACL_SECURITY_INFORMATION, nullptr, 0, &length);
     require(length != 0, "read owned saved-search DACL size");
-    std::vector<BYTE> security(length);
-    require(GetFileSecurityW(path.c_str(), DACL_SECURITY_INFORMATION, security.data(), length, &length) != FALSE,
+    DaclState result; result.descriptor.resize(length);
+    require(GetFileSecurityW(path.c_str(), DACL_SECURITY_INFORMATION, result.descriptor.data(), length, &length) != FALSE,
             "read owned saved-search DACL");
+    DWORD revision = 0;
+    require(GetSecurityDescriptorControl(result.descriptor.data(), &result.control, &revision) != FALSE,
+            "read owned saved-search DACL control");
     PWSTR raw = nullptr;
-    require(ConvertSecurityDescriptorToStringSecurityDescriptorW(security.data(), SDDL_REVISION_1,
+    require(ConvertSecurityDescriptorToStringSecurityDescriptorW(result.descriptor.data(), SDDL_REVISION_1,
         DACL_SECURITY_INFORMATION, &raw, nullptr) != FALSE && raw, "format owned saved-search DACL");
-    const std::wstring result(raw);
+    result.sddl = raw;
     LocalFree(raw);
     return result;
+}
+std::wstring fileDacl(const fs::path& path) { return fileDaclState(path).sddl; }
+void describeDacl(const char* phase, const DaclState& state) {
+    PACL acl = nullptr; BOOL present = FALSE, defaulted = FALSE;
+    require(GetSecurityDescriptorDacl(const_cast<BYTE*>(state.descriptor.data()), &present, &acl, &defaulted) != FALSE,
+            "decode owned DACL diagnostic");
+    // Never print SDDL, trustees, hashes of SIDs, paths or user identities.
+    // All the reported facts concern exclusively owned fixture descriptors.
+    std::cerr << "owned saved-search DACL " << phase << " control=0x" << std::hex << state.control << std::dec
+              << " present=" << (present != FALSE) << " null=" << (acl == nullptr) << " defaulted=" << (defaulted != FALSE)
+              << " revision=" << (acl ? acl->AclRevision : 0) << " aceCount=" << (acl ? acl->AceCount : 0) << '\n';
+    for (DWORD index = 0; acl && index < acl->AceCount; ++index) {
+        void* raw = nullptr; require(GetAce(acl, index, &raw) != FALSE, "decode owned diagnostic ACE");
+        const auto* header = static_cast<const ACE_HEADER*>(raw);
+        ACCESS_MASK mask = 0;
+        if (header->AceSize >= sizeof(ACE_HEADER) + sizeof(mask))
+            std::memcpy(&mask, static_cast<const BYTE*>(raw) + sizeof(ACE_HEADER), sizeof(mask));
+        std::cerr << "  aceIndex=" << index << " type=" << static_cast<unsigned>(header->AceType)
+                  << " flags=0x" << std::hex << static_cast<unsigned>(header->AceFlags) << " mask=0x" << mask
+                  << std::dec << " bytes=" << header->AceSize << '\n';
+    }
+}
+void requireDacl(const DaclState& before, const fs::path& path, const char* message) {
+    const auto after = fileDaclState(path);
+    constexpr auto flags = SE_DACL_PRESENT | SE_DACL_DEFAULTED | SE_DACL_PROTECTED |
+        SE_DACL_AUTO_INHERIT_REQ | SE_DACL_AUTO_INHERITED;
+    const bool equal = before.sddl == after.sddl && (before.control & flags) == (after.control & flags);
+    if (!equal) { describeDacl("before", before); describeDacl("after", after); }
+    require(equal, message);
 }
 FILE_BASIC_INFO fileBasic(const fs::path& path) {
     OwnedHandle file{CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES,
@@ -761,7 +801,8 @@ void confirmedSearchReplacement() {
     const auto originalBytes = read(output);
     require(SetFileAttributesW(output.c_str(), FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_ARCHIVE) != FALSE,
             "set owned saved-query attributes");
-    const auto dacl = fileDacl(output);
+    const auto beforeDacl = fileDaclState(output);
+    const auto dacl = beforeDacl.sddl;
     const auto basic = fileBasic(output);
     const auto members = fixtureMembers(fixture.root);
     succeeded(explorer::saveSearch(L"System.FileName:=\"second.bin\"", scope.Get(), true, output,
@@ -776,7 +817,7 @@ void confirmedSearchReplacement() {
     require(replacementBytes != originalBytes, "confirmed replacement did not publish the new complete query");
     std::cout << "INFO: native confirmed save retained prior filename identity=" <<
         (fileIdentity(output.native()) == originalId) << '\n';
-    require(fileDacl(output) == dacl, "confirmed replacement changed the existing saved-query DACL");
+    requireDacl(beforeDacl, output, "confirmed replacement changed the existing saved-query DACL");
     const auto replaced = fileBasic(output);
     require(replaced.CreationTime.QuadPart == basic.CreationTime.QuadPart && replaced.FileAttributes == basic.FileAttributes,
             "confirmed replacement lost existing creation time or attributes");
@@ -876,7 +917,127 @@ void confirmedSearchReplacement() {
             "saved-query replacement changed source file identity or content");
     require(fixtureMembers(fixture.root).size() == members.size() + 1, "final confirmed saves leaked temporary files");
 }
+
+std::wstring currentFixtureTrustee() {
+    OwnedHandle token;
+    require(OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token.value) != FALSE, "read current owned fixture trustee token");
+    DWORD length = 0; GetTokenInformation(token.value, TokenUser, nullptr, 0, &length);
+    require(length != 0, "read owned fixture trustee length");
+    std::vector<BYTE> bytes(length);
+    require(GetTokenInformation(token.value, TokenUser, bytes.data(), length, &length) != FALSE, "read owned fixture trustee");
+    PWSTR raw = nullptr;
+    require(ConvertSidToStringSidW(reinterpret_cast<TOKEN_USER*>(bytes.data())->User.Sid, &raw) != FALSE && raw,
+            "encode owned fixture trustee internally");
+    const std::wstring result(raw); LocalFree(raw); return result;
+}
+void setLegacyFixtureDacl(const fs::path& path, const std::wstring& sddl) {
+    PSECURITY_DESCRIPTOR raw = nullptr;
+    require(ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(), SDDL_REVISION_1, &raw, nullptr) != FALSE,
+            "create exclusively owned legacy ACL fixture descriptor");
+    // The obsolete but documented low-level setter is used ONLY to generate
+    // legacy control/ACE fixtures. Production never uses it to set a file.
+    const auto success = SetFileSecurityW(path.c_str(), DACL_SECURITY_INFORMATION, raw);
+    LocalFree(raw); require(success != FALSE, "set exclusively owned legacy ACL fixture");
+}
+void modernizeFixtureDacl(const fs::path& path, bool protectedDacl) {
+    const auto state = fileDaclState(path); PACL acl = nullptr; BOOL present = FALSE, defaulted = FALSE;
+    require(GetSecurityDescriptorDacl(const_cast<BYTE*>(state.descriptor.data()), &present, &acl, &defaulted) != FALSE,
+            "read owned fixture ACL for modern inheritance");
+    OwnedHandle file{CreateFileW(path.c_str(), READ_CONTROL | WRITE_DAC,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr)};
+    require(file.value != INVALID_HANDLE_VALUE, "open exclusively owned inheritance fixture");
+    require(SetSecurityInfo(file.value, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION |
+        (protectedDacl ? PROTECTED_DACL_SECURITY_INFORMATION : UNPROTECTED_DACL_SECURITY_INFORMATION),
+        nullptr, nullptr, acl, nullptr) == ERROR_SUCCESS, "convert only owned ACL to actual native auto-inheritance");
+}
+void confirmedSearchSecurityProfiles() {
+    Fixture fixture;
+    const auto scopePath = fixture.root / L"scope"; require(fs::create_directory(scopePath), "create owned security query scope");
+    const auto first = scopePath / L"first.txt", second = scopePath / L"second.bin";
+    write(first, "unchanged owned permission fixture A"); write(second, "unchanged owned permission fixture B");
+    const auto firstId = fileIdentity(first.native()), secondId = fileIdentity(second.native());
+    const auto firstBasic = fileBasic(first), secondBasic = fileBasic(second);
+    auto scope = shellItem(scopePath); const auto trustee = currentFixtureTrustee();
+    const auto parent = fixture.root / L"legacy-parent"; require(fs::create_directory(parent), "create owned legacy permission parent");
+    setLegacyFixtureDacl(parent, L"D:P(A;OICI;FA;;;" + trustee + L")(A;OICI;FR;;;WD)(A;OICI;0x1200a9;;;BU)");
+    for (const auto* profile : {L"legacy-inherited", L"legacy-explicit", L"protected", L"modern-inherited", L"modern-protected", L"deny-data-write"}) {
+        const std::wstring name(profile); const auto output = parent / (name + L".search-ms");
+        succeeded(explorer::saveSearch(L"System.FileName:=\"first.txt\"", scope.Get(), true, output), "create owned exact-ACL query fixture");
+        if (name == L"legacy-explicit") setLegacyFixtureDacl(output, L"D:(A;;FA;;;" + trustee + L")(A;;FR;;;WD)");
+        if (name == L"protected" || name == L"modern-protected")
+            setLegacyFixtureDacl(output, L"D:P(A;;FA;;;" + trustee + L")(A;;FR;;;WD)");
+        if (name == L"deny-data-write")
+            setLegacyFixtureDacl(output, L"D:P(D;;0x2;;;WD)(A;;FA;;;" + trustee + L")(A;;FR;;;WD)");
+        if (name == L"modern-inherited" || name == L"modern-protected") modernizeFixtureDacl(output, name == L"modern-protected");
+        const auto beforeDacl = fileDaclState(output); const auto beforeBasic = fileBasic(output);
+        const auto beforeBytes = read(output); const auto beforeMembers = fixtureMembers(fixture.root);
+        const bool modern = name.starts_with(L"modern");
+        require(((beforeDacl.control & SE_DACL_AUTO_INHERITED) != 0) == modern,
+                "Owned legacy/modern permission fixture did not establish its intended actual native state");
+        const auto replaced = explorer::saveSearch(L"System.FileName:=\"second.bin\"", scope.Get(), true, output,
+            explorer::SearchSaveMode::UserConfirmed);
+        if (FAILED(replaced)) { describeDacl("owned profile original", beforeDacl); describeDacl("owned profile after failure", fileDaclState(output)); }
+        succeeded(replaced, "replace actual native protected/legacy/modern/deny-permission saved query");
+        require(read(output) != beforeBytes && read(output).find("second.bin") != std::string::npos,
+                "Exact-ACL replacement did not publish complete updated XML");
+        requireDacl(beforeDacl, output, "Actual confirmed query replacement changed exact ACE order/rights/flags or DACL control");
+        const auto afterBasic = fileBasic(output);
+        require(afterBasic.CreationTime.QuadPart == beforeBasic.CreationTime.QuadPart &&
+                afterBasic.FileAttributes == beforeBasic.FileAttributes && fixtureMembers(fixture.root) == beforeMembers,
+                "Exact-ACL replacement changed original metadata or left a staging entry");
+        requireReopenedResults(output, {second.native()}, "Exact-ACL replacement has incorrect actual native result identity");
+        const auto finalBytes = read(output); const auto finalId = fileIdentity(output.native());
+        OwnedHandle locked{CreateFileW(output.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr)};
+        require(locked.value != INVALID_HANDLE_VALUE, "lock only owned exact-ACL query against replacement");
+        require(explorer::saveSearch(L"System.FileName:=\"first.txt\"", scope.Get(), true, output,
+            explorer::SearchSaveMode::UserConfirmed) == HRESULT_FROM_WIN32(ERROR_SHARING_VIOLATION),
+            "Exact-ACL sharing failure was ignored");
+        require(read(output) == finalBytes && fileIdentity(output.native()) == finalId && fixtureMembers(fixture.root) == beforeMembers,
+                "Failed exact-ACL replacement changed existing content/identity or left a staging entry");
+        requireDacl(beforeDacl, output, "Failed actual exact-ACL replacement modified original permissions");
+        CloseHandle(locked.value); locked.value = INVALID_HANDLE_VALUE;
+
+        // The app-owned presentation record uses the same safe metadata
+        // publication, in an explicitly owned cache rather than LocalAppData.
+        const auto cache = parent / (name + L"-owned-cache");
+        explorer::SearchViewPresentation presentation;
+        presentation.mode = explorer::SearchViewMode::Content; presentation.iconSize = 32;
+        succeeded(explorer::saveSearchPresentationCompanion(output, cache, presentation), "create only owned presentation ACL fixture");
+        auto entries = fs::directory_iterator(cache);
+        require(entries != fs::directory_iterator{}, "owned companion fixture is missing");
+        const auto record = entries->path();
+        ++entries; require(entries == fs::directory_iterator{}, "owned companion fixture unexpectedly has multiple records");
+        if (name == L"legacy-explicit") setLegacyFixtureDacl(record, L"D:(A;;FA;;;" + trustee + L")(A;;FR;;;WD)");
+        if (name == L"protected" || name == L"modern-protected")
+            setLegacyFixtureDacl(record, L"D:P(A;;FA;;;" + trustee + L")(A;;FR;;;WD)");
+        if (name == L"deny-data-write")
+            setLegacyFixtureDacl(record, L"D:P(D;;0x2;;;WD)(A;;FA;;;" + trustee + L")(A;;FR;;;WD)");
+        if (modern) modernizeFixtureDacl(record, name == L"modern-protected");
+        const auto recordDacl = fileDaclState(record);
+        const auto queryBeforeCompanion = read(output); const auto queryIdBeforeCompanion = fileIdentity(output.native());
+        presentation.mode = explorer::SearchViewMode::List; presentation.iconSize = 16;
+        succeeded(explorer::saveSearchPresentationCompanion(output, cache, presentation), "replace owned companion retaining exact ACL");
+        requireDacl(recordDacl, record, "Actual companion replacement changed exact native ACL or inheritance control");
+        explorer::SearchViewPresentation loaded;
+        require(explorer::loadSearchPresentationCompanion(output, cache, &loaded) == S_OK && loaded.mode == presentation.mode &&
+                loaded.iconSize == presentation.iconSize && read(output) == queryBeforeCompanion &&
+                fileIdentity(output.native()) == queryIdBeforeCompanion,
+                "Exact-ACL companion replacement lost layout or changed the saved query");
+        require(std::distance(fs::directory_iterator(cache), fs::directory_iterator{}) == 1,
+                "Exact-ACL companion replacement leaked a staging record");
+    }
+    require(fileIdentity(first.native()) == firstId && fileIdentity(second.native()) == secondId &&
+            read(first) == "unchanged owned permission fixture A" && read(second) == "unchanged owned permission fixture B" &&
+            fileBasic(first).LastWriteTime.QuadPart == firstBasic.LastWriteTime.QuadPart &&
+            fileBasic(second).LastWriteTime.QuadPart == secondBasic.LastWriteTime.QuadPart,
+            "Exact-permission saved-query fixtures modified source identities/content/times");
+}
 } // namespace
+
+int runSearchSecurityTests() {
+    try { confirmedSearchSecurityProfiles(); std::cout << "PASS: actual confirmed saves preserve six legacy/protected/modern/deny DACL profiles\n"; return 0; }
+    catch (const std::exception& error) { std::cerr << "FAIL: actual native saved-search DACL profiles: " << error.what() << '\n'; return 1; }
+}
 
 int runSearchTests() {
     const std::vector<std::pair<const char*, std::function<void()>>> tests{
@@ -886,6 +1047,7 @@ int runSearchTests() {
         {"native saved numeric/string/wildcard/Boolean comparison results", comparisonOperatorSemantics},
         {"saved-search XML escaping, Unicode and This PC identity", xmlEscapingAndThisPcScope},
         {"confirmed saved-search replacement, native results, permissions and failure preservation", confirmedSearchReplacement},
+        {"confirmed saves preserve exact legacy/protected/modern/deny ACLs and native identities", confirmedSearchSecurityProfiles},
         {"saved-search invalid input, unsupported scope and no overwrite", rejectedInputsAndNoOverwrite}
     };
     int failures = 0;

@@ -18,19 +18,30 @@ and performance runs copy the executable into a unique directory and verify its
 checksum before use. Reports describe the tested snapshot; a previous passing
 run is not evidence for later source changes.
 
-The warning-free Release checkpoint linked on 2026-10-04 at 20:36:54 UTC has
-executable SHA-256
-`2d0377dbd41ffed6f7986928f88d0049e34bb02630ca23377b99b93b48ee813c`.
-Its saved-search presentation, live-search policy/native result, and owned crash
-diagnostic targets passed in 2.83 seconds. The complete core suite separately
-passed after the worker desktop-connection lifetime fix. Its subsequent full
-seventeen-target run took 303.28 seconds: eleven active targets passed, three
-failed and three shared-state targets were correctly skipped. Both application
-hosts exceeded their existing 90-second bound during native selection work;
-the core failure was the large native-menu fixture's combined isolation guard.
-The worker shutdown proof itself passed with no pending workers. The failures
-remain recorded in the JUnit and test-environment reports. Later source changes
-require their own reports and checksum; this checkpoint is not release acceptance.
+The latest functional Release checkpoint has SHA-256
+`f01bc69d57541f86c432ff1055936b1331d801000852165524a22975f2b8a6ea`.
+Its 2026-10-04 full seventeen-target run took 206.33 seconds: thirteen active
+targets passed, one failed, and three shared-state targets were correctly
+skipped. The failure was an added test attempting an unsupported native Ribbon
+group-label property read. After removing that invalid probe, the actual
+installed-Ribbon suite passed separately in 11.81 seconds. This is a full run
+plus a corrected focused recheck, not a single all-green full run.
+
+Both application suites passed: 130 authored checks in 35.88 seconds and 137
+installed checks in 29.73 seconds. The core suite passed in 96.18 seconds,
+including all six saved-search ACL profiles, native large-array menu equivalence,
+retained-handler reentrancy and actual kernel worker termination. Quiet complete
+core runs measured approximately 88–96 seconds; its aggregate bound is now 120
+seconds with per-worker deadlines unchanged. Application bounds remain 90 seconds.
+
+The preceding immutable `797d8295` full run passed thirteen active targets,
+failed the large native-menu fixture's combined isolation guard, and skipped
+three targets in 202.81 seconds. Subsequent separate and full core runs passed,
+but did not reproduce that failure. The guard now reports payload, visibility
+and clipboard-sequence conditions separately without dropping any assertion.
+The clipboard sequence belongs to the window station, shared with other
+desktops; the original failure has not been attributed to a particular condition
+or writer. Historical failures remain evidence, not silently corrected reports.
 
 ## Test boundaries
 

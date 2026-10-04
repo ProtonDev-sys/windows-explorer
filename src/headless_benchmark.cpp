@@ -89,15 +89,27 @@ int ExplorerApp::headlessBenchmark(const std::filesystem::path& report) {
         };
         observeDesktop();
         requireBenchmark(!IsWindowVisible(window_), "Benchmark host must stay hidden");
-        auto pumpUntil = [this, &observeDesktop](const std::function<bool()>& predicate, DWORD timeout) {
+        const char* waitPhase = "navigation";
+        auto pumpUntil = [this, &observeDesktop, &waitPhase](const std::function<bool()>& predicate, DWORD timeout) {
             const auto deadline = GetTickCount64() + timeout;
             while (!predicate()) {
-                requireBenchmark(GetTickCount64() < deadline, "Native benchmark timed out");
+                if (GetTickCount64() >= deadline) {
+                    std::fprintf(stderr,"Benchmark wait timed out: phase=%s batch=%u tasks=%zu namespaceDirty=%u selectionDirty=%u navigating=%u clipboardChanged=%u\n",
+                        waitPhase,selectionStateBatch_?1u:0u,commandStateTasks_.size(),namespaceDirty_?1u:0u,
+                        selectionStateDirty_?1u:0u,navigating_?1u:0u,GetClipboardSequenceNumber()!=clipboardSequence_?1u:0u);
+                    for(const auto& [id,capability]:commandCapabilities_)if(capability.status==E_PENDING)
+                        std::fprintf(stderr,"Benchmark pending command: id=%u scope=%u selectionVerbs=%zu task=%u\n",
+                            id,static_cast<unsigned>(capability.binding.scope),capability.selectionVerbs.size(),commandStateTasks_.contains(id)?1u:0u);
+                    requireBenchmark(false,"Native benchmark timed out");
+                }
                 MsgWaitForMultipleObjects(0, nullptr, FALSE, 5, QS_ALLINPUT);
                 MSG message{};
-                while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+                unsigned dispatched = 0;
+                while (dispatched < 16 && GetTickCount64() < deadline &&
+                       PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
                     requireBenchmark(message.message != WM_QUIT, "Benchmark received quit");
                     if (!preprocess(message)) { TranslateMessage(&message); DispatchMessageW(&message); }
+                    ++dispatched;
                 }
                 requireBenchmark(!IsWindowVisible(window_), "Benchmark showed its host");
                 observeDesktop();
@@ -200,6 +212,7 @@ int ExplorerApp::headlessBenchmark(const std::filesystem::path& report) {
             // Keep the count-visible boundary comparable with earlier runs.
             // Separately wait for actual asynchronous provider states; merely
             // emptying the message queue does not prove those states are ready.
+            waitPhase = action;
             pumpUntil([this] { pollCommandStates(); return !commandStatesPending(); }, 45000);
             const auto stateReady = nowMs();
             selectionChanges.push_back({action, readbackCompleted - started,

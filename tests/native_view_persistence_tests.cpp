@@ -479,6 +479,14 @@ private:
 };
 
 void run(const explorer::PrivateDesktop& desktop) {
+    // Enumerate a real hidden anchor even before the native view exists. Some
+    // desktops report no enumeration on an entirely empty window list.
+    struct HiddenAnchor {
+        HWND window = CreateWindowExW(0, L"STATIC", L"Owned isolation anchor", WS_POPUP,
+            0, 0, 1, 1, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+        ~HiddenAnchor() { if (window) DestroyWindow(window); }
+    } anchor;
+    require(anchor.window != nullptr && !IsWindowVisible(anchor.window), "Create hidden private-desktop enumeration anchor");
     VisibilityObserver visibility;
     succeeded(visibility.start(), "Observe actual new visible windows on original desktop");
     const DWORD clipboard = GetClipboardSequenceNumber();
@@ -487,13 +495,16 @@ void run(const explorer::PrivateDesktop& desktop) {
         bool unchanged = false, visible = true;
         succeeded(desktop.verifyIsolation(&unchanged), "Verify private desktop isolation");
         succeeded(desktop.visibleWindowsOnInputDesktop(visible), "Observe own input-desktop window visibility");
-        bool privateVisible = false;
+        struct WindowObservation { HWND anchor; bool anchorSeen = false; bool visible = false; } privateWindows{anchor.window};
         require(EnumDesktopWindows(GetThreadDesktop(GetCurrentThreadId()), [](HWND window, LPARAM argument) -> BOOL {
-            if (IsWindowVisible(window)) *reinterpret_cast<bool*>(argument) = true;
+            auto& observation = *reinterpret_cast<WindowObservation*>(argument);
+            if (window == observation.anchor) observation.anchorSeen = true;
+            if (IsWindowVisible(window)) observation.visible = true;
             return TRUE;
-        }, reinterpret_cast<LPARAM>(&privateVisible)) != FALSE, "Observe actual private-desktop window visibility");
+        }, reinterpret_cast<LPARAM>(&privateWindows)) != FALSE && privateWindows.anchorSeen,
+            "Observe actual private-desktop window visibility and owned anchor");
         ++observations;
-        require(unchanged && !visible && !privateVisible && !visibility.visible(), "Native persistence verification exposed UI");
+        require(unchanged && !visible && !privateWindows.visible && !visibility.visible(), "Native persistence verification exposed UI");
     };
     isolated();
     CABINETSTATE cabinet{};

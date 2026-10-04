@@ -165,6 +165,11 @@ void namesAndSizes() {
 } // namespace
 
 int main(int argc, char** argv) {
+    // Preserve actual progress before CTest terminates a stalled provider;
+    // redirected console buffering otherwise hides completed test groups.
+    std::cout.setf(std::ios::unitbuf);
+    std::wcout.setf(std::ios::unitbuf);
+    const auto suiteStarted = GetTickCount64();
     if (argc == 2 && std::string_view(argv[1]) == "--worker-only") return runStaWorkerTests();
     if (argc == 2 && std::string_view(argv[1]) == "--worker-after-autocomplete") {
         const auto initialized = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
@@ -222,5 +227,7 @@ int main(int argc, char** argv) {
                   << static_cast<unsigned long>(drained) << '\n';
     }
     CoUninitialize();
+    std::cout << "Core suite elapsed_ms=" << GetTickCount64() - suiteStarted
+              << " failures=" << failures << '\n';
     return failures == 0 ? 0 : 1;
 }

@@ -296,7 +296,10 @@ HRESULT NativeContextMenu::invoke(UINT commandId, POINT screenPoint, bool contro
     info.lpVerbW = MAKEINTRESOURCEW(commandId - firstCommand_);
     info.nShow = SW_SHOWNORMAL;
     info.ptInvoke = screenPoint;
-    return context_->InvokeCommand(reinterpret_cast<CMINVOKECOMMANDINFO*>(&info));
+    // InvokeCommand may pump the owner STA. Retain the handler across any
+    // callback that refreshes the host's menu collections.
+    const auto retained = context_;
+    return retained->InvokeCommand(reinterpret_cast<CMINVOKECOMMANDINFO*>(&info));
 }
 
 bool NativeContextMenu::handleMessage(UINT message, WPARAM wParam, LPARAM lParam,

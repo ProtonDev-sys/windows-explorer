@@ -457,7 +457,14 @@ HRESULT ExplorerApp::OnNavigationPending(PCIDLIST_ABSOLUTE pidl) {
     cancelCommandStates();extractDestinations_.reset();KillTimer(window_,3);navigationExpansion_.clear();navigationTree_.Reset();
     if (breadcrumbTask_) { breadcrumbTask_->cancel(); breadcrumbTask_.reset(); KillTimer(window_, 2); }
     navigating_ = true; navigationStarted_ = GetTickCount64();
-    setStatus(L"Loading…"); return S_OK;
+    setStatus(L"Loading…");
+    // Owned test callback at the real in-flight browser boundary. Normal
+    // windows never install it; it cannot fabricate navigation/provider state.
+    if(headless_&&expectedLive&&pendingLiveSearch_&&pendingLiveSearch_->kind==LiveSearchKind::Query&&
+       headlessLiveNavigationProbe_) {
+        auto probe=std::move(headlessLiveNavigationProbe_);headlessLiveNavigationProbe_={};probe();
+    }
+    return S_OK;
 }
 HRESULT ExplorerApp::OnViewCreated(IShellView* view) {
     if(closing_)return E_ABORT;
@@ -487,6 +494,7 @@ HRESULT ExplorerApp::OnNavigationComplete(PCIDLIST_ABSOLUTE pidl) {
     searchPresentationPending_=false;
     searchPresentationStatus_=S_OK;
     std::wstring completedExplicitQuery;
+    auto completedQueryRevision=directRevision;
     if (searchActive_) {
         searchScope_.reset(ILCloneFull(search->scope.get()));
         searchScopes_=search->scopes;
@@ -497,7 +505,10 @@ HRESULT ExplorerApp::OnNavigationComplete(PCIDLIST_ABSOLUTE pidl) {
         searchFilters_ = search->filters;
         searchPresentation_=search->presentation;
         if(search->rememberOnComplete&&!search->remembered) {
-            search->remembered=true;completedExplicitQuery=search->query;
+            // Consume an obsolete direct request too, so visiting this query
+            // later through Back does not commit a superseded interaction.
+            search->remembered=true;
+            if(directNavigation)completedExplicitQuery=search->query;
         }
     } else if (searchBackground_) {
         searchScopes_.Reset();
@@ -592,13 +603,24 @@ HRESULT ExplorerApp::OnNavigationComplete(PCIDLIST_ABSOLUTE pidl) {
     else if(directNavigation) {
         // The factory may pump a real edit after the chosen command has
         // started. Its completion must leave that newer literal and request.
-        if(searchInteractionRevision_==directRevision)setSearchText(searchActive_?activeQuery_:L"");
-        else if(pendingDirectSearchTarget_&&pendingDirectSearchRevision_==directRevision&&
-                ILIsEqual(pendingDirectSearchTarget_.get(),pidl))pendingDirectSearchTarget_.reset();
-    } else setSearchText(searchActive_?activeQuery_:L"");
+        if(searchInteractionRevision_==directRevision) {
+            setSearchText(searchActive_?activeQuery_:L"");
+            completedQueryRevision=searchInteractionRevision_;
+        } else {
+            completedExplicitQuery.clear();
+            if(pendingDirectSearchTarget_&&pendingDirectSearchRevision_==directRevision&&
+               ILIsEqual(pendingDirectSearchTarget_.get(),pidl))pendingDirectSearchTarget_.reset();
+        }
+    } else if(!pendingLiveSearch_&&!pendingDirectSearchTarget_&&!liveSearchPolicy_.waiting()) {
+        // A provider can report another completed view while an edit request
+        // is queued or its expected navigation is still pending. Ordinary
+        // navigation canceled that work in OnNavigationPending; an unrelated
+        // completion must not cancel or overwrite a newer accepted edit.
+        setSearchText(searchActive_?activeQuery_:L"");
+    }
     updateBreadcrumbs();
     updateContextTabs();
-    if(!completedExplicitQuery.empty())rememberQuery(completedExplicitQuery);
+    if(!completedExplicitQuery.empty()&&searchInteractionRevision_==completedQueryRevision)rememberQuery(completedExplicitQuery);
     rememberAddressNavigation(pidl);
     PostMessageW(window_, DeferredView, 0, 0);
     scheduleDeferredUpdate();
@@ -1414,6 +1436,11 @@ HRESULT ExplorerApp::processLiveSearch() {
         liveSearchStatus_=browser_?browser_->BrowseToIDList(liveSearchOrigin_.get(),SBSP_ABSOLUTE):E_UNEXPECTED;
     } else {
         if(!currentPidl_) {liveSearchPolicy_.finish(*request,E_UNEXPECTED);return E_UNEXPECTED;}
+        // Editing an already active results view continues its existing Back
+        // history slot, including a restored or repeated native query.
+        if(liveSearchHistoryIndex_<0&&searchBackground_&&historyIndex_>=0&&
+           historyIndex_<static_cast<int>(history_.size())&&ILIsEqual(history_[historyIndex_].get(),currentPidl_.get()))
+            liveSearchHistoryIndex_=historyIndex_;
         if(!liveSearchOrigin_) {
             if(searchActive_&&searchScope_)liveSearchOrigin_.reset(ILCloneFull(searchScope_.get()));
             else if(searchBackground_&&historyIndex_>0)liveSearchOrigin_.reset(ILCloneFull(history_[historyIndex_-1].get()));
@@ -1424,7 +1451,9 @@ HRESULT ExplorerApp::processLiveSearch() {
     }
     const auto result=liveSearchStatus_;
     if(FAILED(result)) {
-        liveSearchPolicy_.finish(*request,result);pendingLiveSearch_.reset();pendingLiveSearchTarget_.reset();scheduleLiveSearch();
+        if(result==HRESULT_FROM_WIN32(ERROR_BUSY))liveSearchPolicy_.retry(*request,GetTickCount64());
+        else liveSearchPolicy_.finish(*request,result);
+        pendingLiveSearch_.reset();pendingLiveSearchTarget_.reset();scheduleLiveSearch();
     } else if(!navigating_&&currentPidl_&&pendingLiveSearchTarget_&&
               ILIsEqual(currentPidl_.get(),pendingLiveSearchTarget_.get()))completeLiveSearchNavigation(currentPidl_.get(),S_OK);
     return result;
@@ -1498,12 +1527,14 @@ HRESULT ExplorerApp::startSearch(const std::wstring& requested, bool recursive,
         pendingDirectSearchTarget_=std::move(directTarget);
         pendingDirectSearchRevision_=directRevision;
     }
-    hr = browser_->BrowseToObject(results.Get(), SBSP_ABSOLUTE);
+    if(liveRequest&&headless_&&headlessLiveBrowseProbe_) {
+        auto probe=std::move(headlessLiveBrowseProbe_);headlessLiveBrowseProbe_={};hr=probe();
+    } else hr = browser_->BrowseToObject(results.Get(), SBSP_ABSOLUTE);
     if(FAILED(hr)&&!liveRequest&&pendingDirectSearchRevision_==directRevision)pendingDirectSearchTarget_.reset();
     if(SUCCEEDED(hr)&&!liveRequest&&!navigating_&&currentPidl_&&!searchLocations_.empty()&&
        ILIsEqual(currentPidl_.get(),searchLocations_.back().location.get())&&!searchLocations_.back().remembered) {
-        searchLocations_.back().remembered=true;rememberQuery(query);
-        if(searchInteractionRevision_==directRevision)setSearchText(query);
+        searchLocations_.back().remembered=true;
+        if(searchInteractionRevision_==directRevision) {setSearchText(query);rememberQuery(query);}
         else if(pendingDirectSearchRevision_==directRevision)pendingDirectSearchTarget_.reset();
     }
     return hr;
@@ -1984,11 +2015,7 @@ HRESULT ExplorerApp::execute(UINT command) {
     if(commandRefreshActive_) {deferCommandRefresh();return HRESULT_FROM_WIN32(ERROR_RETRY);}
     if(closing_)return E_ABORT;
     if(command==ExpandAncestors) {
-        const auto persistent=expandCurrent_;
-        expandCurrent_=true;
-        const auto hr=applyNavigationOptions();
-        expandCurrent_=persistent;
-        return hr;
+        return applyNavigationOptions(true);
     }
     if(headless_&&command==OpenFileLocation)return openFileLocation();
     if(headless_&&command==NewFolder)return newFolder();
@@ -2014,11 +2041,13 @@ HRESULT ExplorerApp::execute(UINT command) {
     case Fullscreen: return toggleFullscreen();
     case FocusSearch: SetFocus(search_); SendMessageW(search_, EM_SETSEL, 0, -1); return S_OK;
     case Search: {
+        ++searchInteractionRevision_;
         const auto submitted=liveSearchPolicy_.submit(textOf(search_),GetTickCount64());
         return FAILED(submitted)?submitted:processLiveSearch();
     }
     case CloseSearch:
         if(liveSearchOrigin_) {
+            ++searchInteractionRevision_;
             liveSearchPolicy_.escape(GetTickCount64());setSearchText(L"",false);return processLiveSearch();
         }
         if (!searchActive_ || !searchScope_) return S_FALSE;
@@ -2497,6 +2526,7 @@ LRESULT CALLBACK ExplorerApp::editProc(HWND window, UINT message, WPARAM wparam,
     if (message == WM_KEYDOWN && wparam == VK_ESCAPE) {
         if (id == Address) app->finishAddress(false);
         else {
+            ++app->searchInteractionRevision_;
             app->liveSearchPolicy_.escape(GetTickCount64());app->setSearchText(L"",false);
             app->processLiveSearch();if(app->view_)app->view_->UIActivate(SVUIA_ACTIVATE_FOCUS);
         }

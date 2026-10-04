@@ -473,8 +473,9 @@ void operationProgressAndTargets() {
     succeeded(ShellOperations::copyOrMove(nullptr, selected.Get(), target.Get(), false, true, false, copied.Get()),
               "native copy with caller progress sink");
     requireProbe(copied.Get());
-    require(copied->outputs.size() == 1 && copied->outputs[0].created.parent_path() == destination &&
-        copied->outputs[0].created.filename() != source.filename() && copied->outputs[0].created.extension() == L".txt",
+    require(copied->outputs.size() == 1 && fs::equivalent(copied->outputs[0].created.parent_path(), destination) &&
+        copied->outputs[0].created.filename() != source.filename() &&
+        _wcsicmp(copied->outputs[0].created.extension().c_str(), L".txt") == 0,
         "native post-copy sink supplies actual extension-preserving collision target");
     require(read(copied->outputs[0].created) == "copy content" && sameIdentity(copied->outputs[0].id, identity(copied->outputs[0].created)),
         "post-copy target retains actual output contents and identity");
@@ -489,20 +490,20 @@ void operationProgressAndTargets() {
     auto moved = Microsoft::WRL::Make<ProgressProbe>();
     succeeded(ShellOperations::copyOrMove(nullptr, selected.Get(), target.Get(), true, true, false, moved.Get()), "native move progress");
     requireProbe(moved.Get());
-    require(moved->outputs.size() == 1 && moved->outputs[0].created == destination / moving.filename() &&
+    require(moved->outputs.size() == 1 && fs::equivalent(moved->outputs[0].created, destination / moving.filename()) &&
         sameIdentity(movedId, moved->outputs[0].id) && !fs::exists(moving), "native move reports original filesystem identity at actual target");
 
     auto movingItem = item(destination / moving.filename());
     auto renamed = Microsoft::WRL::Make<ProgressProbe>();
     succeeded(ShellOperations::rename(nullptr, movingItem.Get(), L"renamed-\u03bb.txt", true, false, renamed.Get()), "native rename progress");
     requireProbe(renamed.Get());
-    require(renamed->outputs.size() == 1 && renamed->outputs[0].created == destination / L"renamed-\u03bb.txt" &&
+    require(renamed->outputs.size() == 1 && fs::equivalent(renamed->outputs[0].created, destination / L"renamed-\u03bb.txt") &&
         sameIdentity(movedId, renamed->outputs[0].id), "native rename reports exact Unicode target and original identity");
 
     auto folder = Microsoft::WRL::Make<ProgressProbe>();
     succeeded(ShellOperations::newFolder(nullptr, target.Get(), L"created-\u03bb", true, false, folder.Get()), "native new-folder progress");
     requireProbe(folder.Get());
-    require(folder->outputs.size() == 1 && folder->outputs[0].created == destination / L"created-\u03bb" &&
+    require(folder->outputs.size() == 1 && fs::equivalent(folder->outputs[0].created, destination / L"created-\u03bb") &&
         fs::is_directory(folder->outputs[0].created), "native new-folder sink reports actual folder identity");
 
     selected = selection(renamed->outputs[0].created);

@@ -68,11 +68,17 @@ bool pumpUntil(const std::function<bool()>& ready, DWORD timeoutMs) {
     do {
         observeWindows();
         MSG message;
-        while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+        // Native providers can continuously post state-change work. Recheck
+        // both the predicate and deadline after bounded batches rather than
+        // requiring their queue to become completely empty.
+        unsigned dispatched = 0;
+        while (dispatched < 16 && GetTickCount64() < end &&
+               PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
             if (message.message == WM_QUIT) return false;
             TranslateMessage(&message);
             DispatchMessageW(&message);
             observeWindows();
+            ++dispatched;
         }
         if (ready()) return true;
         MsgWaitForMultipleObjectsEx(0, nullptr, 15, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
@@ -675,6 +681,7 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report) {
             SUCCEEDED(ribbon_.quickAccessCommands(toolbarCommands)) && toolbarCommands == std::vector<UINT>{Properties, NewFolder} &&
             quickAccessModel_.commands() == std::vector<Command>{Properties, NewFolder});
         std::filesystem::create_directories(fixture / L"Subfolder");
+        std::filesystem::create_directories(fixture / L"Subfolder" / L"One-time expansion" / L"Deep");
         std::filesystem::create_directories(fixture / L"Unicode-\u65e5\u672c\u8a9e");
         for (int i = 0; i < 1000; ++i) {
             std::ofstream stream(fixture / (L"file-" + std::to_wstring(i) + L".txt"));
@@ -866,8 +873,29 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report) {
                     accessibleCheck(tab.first, accessibleRibbon.Get(), nullptr, tab.second, UIA_TabItemControlTypeId);
                 auto accessibleFile = accessibleFileMenu(automation.Get(), accessibleRibbon.Get());
                 accessibleCheckResult("native_accessibility_file_menu", accessibleFile.passed, accessibleFile.detail);
-                auto accessibleQat = accessibleCheck("native_accessibility_quick_access", accessibleHost.element.Get(), nullptr,
+                // Native QAT realization can finish after its collection and
+                // docking properties. Observe the same real provider until it
+                // is present; never infer accessibility from those properties.
+                auto qatResult = accessibleElement(automation.Get(), accessibleHost.element.Get(), nullptr,
                     L"Quick Access Toolbar", UIA_ToolBarControlTypeId);
+                auto readQat = [&] {
+                    auto result = accessibleElement(automation.Get(), accessibleHost.element.Get(), nullptr,
+                        L"Quick Access Toolbar", UIA_ToolBarControlTypeId);
+                    if(!result.passed&&accessibleRibbon)
+                        result=accessibleElement(automation.Get(),accessibleRibbon.Get(),nullptr,
+                            L"Quick Access Toolbar",UIA_ToolBarControlTypeId);
+                    return result;
+                };
+                const auto qatDeadline = GetTickCount64()+2000;
+                unsigned qatObservations = 1;
+                while(!qatResult.passed&&GetTickCount64()<qatDeadline) {
+                    Sleep(50);
+                    qatResult=readQat();
+                    ++qatObservations;
+                }
+                qatResult.detail+=L"; observations="+std::to_wstring(qatObservations);
+                accessibleCheckResult("native_accessibility_quick_access",qatResult.passed,qatResult.detail);
+                auto accessibleQat=qatResult.element;
                 accessibleCheck("native_accessibility_qat_properties", accessibleQat.Get(), nullptr, L"Properties", UIA_ButtonControlTypeId);
                 accessibleCheck("native_accessibility_qat_new_folder", accessibleQat.Get(), nullptr, L"New folder", UIA_ButtonControlTypeId);
                 accessibleCheck("native_accessibility_address", nullptr, address_, L"Address", UIA_EditControlTypeId);
@@ -970,10 +998,10 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report) {
                         L"Apply=" + hresultMessage(apply) + L"; native item bounds=" + hresultMessage(read) + expansionDiagnostic);
                     showAllFolders_ = originalAll; showLibraries_ = originalLibraries; expandCurrent_ = originalExpand;
                     applyNavigationOptions();
-                    // A freshly created branch distinguishes Ctrl+Shift+E's
-                    // one-time action from an already-expanded navigation path.
+                    // The branch existed before native tree enumeration. Its
+                    // initially absent leaf distinguishes this one-time action
+                    // from an already-expanded path without a stale child cache.
                     const auto oneTimeFolder = fixture / L"Subfolder" / L"One-time expansion" / L"Deep";
-                    std::filesystem::create_directories(oneTimeFolder);
                     showAllFolders_ = true;
                     expandCurrent_ = false;
                     const bool persistentPreference = preferences_.expandToCurrent;
@@ -984,17 +1012,21 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report) {
                     ComPtr<IShellItem> oneTimeItem;
                     RECT oneTimeBounds{};
                     auto oneTimeRead = oneTimeReady ? currentFolder(oneTimeItem) : E_UNEXPECTED;
+                    RECT beforeOneTimeBounds{};
+                    const auto beforeOneTimeRead = oneTimeItem ? navigationTree->GetItemRect(oneTimeItem.Get(), &beforeOneTimeBounds) : E_UNEXPECTED;
+                    const bool initiallyCollapsed = FAILED(beforeOneTimeRead) ||
+                        beforeOneTimeBounds.right <= beforeOneTimeBounds.left || beforeOneTimeBounds.bottom <= beforeOneTimeBounds.top;
                     const auto oneTimeCommand = oneTimeReady ? execute(ExpandAncestors) : E_UNEXPECTED;
                     if (SUCCEEDED(oneTimeRead) && SUCCEEDED(oneTimeCommand)) pumpUntil([&] {
                         oneTimeRead = navigationTree->GetItemRect(oneTimeItem.Get(), &oneTimeBounds);
                         return SUCCEEDED(oneTimeRead) && oneTimeBounds.right > oneTimeBounds.left &&
                             oneTimeBounds.bottom > oneTimeBounds.top;
                     }, 5000);
-                    check("native_ctrl_shift_e_one_time_expansion", oneTimeReady && SUCCEEDED(oneTimeCommand) &&
+                    check("native_ctrl_shift_e_one_time_expansion", oneTimeReady && initiallyCollapsed && SUCCEEDED(oneTimeCommand) &&
                         SUCCEEDED(oneTimeRead) && oneTimeBounds.right > oneTimeBounds.left &&
                         oneTimeBounds.bottom > oneTimeBounds.top && !expandCurrent_ &&
                         preferences_.expandToCurrent == persistentPreference,
-                        L"Command=" + hresultMessage(oneTimeCommand) + L"; actual leaf bounds=" +
+                        L"Initially collapsed=" + std::to_wstring(initiallyCollapsed) + L"; Command=" + hresultMessage(oneTimeCommand) + L"; actual leaf bounds=" +
                         hresultMessage(oneTimeRead) + L"; persistent expansion remains disabled=" +
                         std::to_wstring(!expandCurrent_ ? 1 : 0));
                     showAllFolders_ = originalAll; showLibraries_ = originalLibraries; expandCurrent_ = originalExpand;
@@ -1202,19 +1234,32 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report) {
             // complement must preserve item focus and checkbox/view flags.
             ComPtr<IShellItemArray> allSelectionItems;
             std::set<NativeFileIdentity> allSelectionIds, seedIds, complementIds, restoredIds;
+            auto seedStage = GetTickCount64();
+            std::fprintf(stderr, "headless-selection phase=seed-identities begin\n"); std::fflush(stderr);
             auto identityResult = folderView_->Items(SVGIO_ALLVIEW, IID_PPV_ARGS(&allSelectionItems));
             if (SUCCEEDED(identityResult)) identityResult = nativeArrayIdentities(allSelectionItems.Get(), allSelectionIds);
+            std::fprintf(stderr, "headless-selection phase=seed-identities elapsed_ms=%llu hresult=0x%08lX count=%zu\n",
+                static_cast<unsigned long long>(GetTickCount64()-seedStage),static_cast<unsigned long>(identityResult),allSelectionIds.size()); std::fflush(stderr);
+            seedStage = GetTickCount64();
             DWORD selectionOriginalFlags = 0;
             auto flagResult = folderView_->GetCurrentFolderFlags(&selectionOriginalFlags);
             if (SUCCEEDED(flagResult)) flagResult = folderView_->SetCurrentFolderFlags(FWF_CHECKSELECT, FWF_CHECKSELECT);
             DWORD selectionTestFlags = 0;
             if (SUCCEEDED(flagResult)) flagResult = folderView_->GetCurrentFolderFlags(&selectionTestFlags);
+            std::fprintf(stderr, "headless-selection phase=seed-flags elapsed_ms=%llu hresult=0x%08lX\n",
+                static_cast<unsigned long long>(GetTickCount64()-seedStage),static_cast<unsigned long>(flagResult)); std::fflush(stderr);
+            seedStage = GetTickCount64();
             auto seedResult = folderView_->SelectItem(3, SVSI_SELECT | SVSI_FOCUSED | SVSI_NOTAKEFOCUS);
             for (const int index : {107, 631}) {
                 if (SUCCEEDED(seedResult)) seedResult = folderView_->SelectItem(index, SVSI_SELECT | SVSI_NOTAKEFOCUS);
             }
+            std::fprintf(stderr, "headless-selection phase=seed-operation elapsed_ms=%llu hresult=0x%08lX\n",
+                static_cast<unsigned long long>(GetTickCount64()-seedStage),static_cast<unsigned long>(seedResult)); std::fflush(stderr);
+            seedStage = GetTickCount64();
             SelectionReadback seedCount;
             const bool seedCountReady = waitForSelectionCount(3, seedCount);
+            std::fprintf(stderr, "headless-selection phase=seed-readback elapsed_ms=%llu count=%d ready=%u dirty=%u\n",
+                static_cast<unsigned long long>(GetTickCount64()-seedStage),seedCount.count,seedCountReady?1u:0u,selectionStateDirty_?1u:0u); std::fflush(stderr);
             selected.Reset();
             if (SUCCEEDED(seedResult)) seedResult = selection(selected);
             if (SUCCEEDED(seedResult)) seedResult = nativeArrayIdentities(selected.Get(), seedIds);
@@ -1932,19 +1977,95 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report) {
                     std::count(recentSearches_.begin(),recentSearches_.end(),queryFor(0))==1&&
                     afterExplicit.size()==recentBeforeLive.size()+1&&history_.size()==liveHistorySize);
 
-                SetWindowTextW(search_,queryFor(1).c_str());SendMessageW(search_,WM_KEYDOWN,VK_RETURN,0);
-                const auto olderPending=pendingLiveSearch_;
                 const auto recentAtOverlap=recentSearches_;
-                SetWindowTextW(search_,queryFor(2).c_str());
-                const bool olderIsStale=olderPending&&!liveSearchPolicy_.current(*olderPending);
+                const auto olderHistorySlot=historyIndex_;
+                const auto olderLiveSlot=liveSearchHistoryIndex_;
+                const bool olderAcceptedSlot=searchBackground_&&currentPidl_&&olderHistorySlot>=0&&
+                    olderHistorySlot<static_cast<int>(history_.size())&&
+                    ILIsEqual(history_[static_cast<size_t>(olderHistorySlot)].get(),currentPidl_.get());
+                const auto olderAcceptedHistory=history_.size();
+                unsigned olderProbeCalls=0;
+                bool olderPendingObserved=false,olderIsStale=false,newerEditAccepted=false;
                 bool olderOverwroteEdit=false;
+                unsigned overlapObservationSamples=0,overlapBeforeEditSamples=0;
+                unsigned firstUnexpectedPhase=0,firstUnexpectedText=0,firstUnexpectedPolicy=0,firstUnexpectedActive=0;
+                unsigned firstUnexpectedNavigation=0,firstUnexpectedProbeCalls=0;
+                bool firstUnexpectedNavigating=false,firstUnexpectedLiveTarget=false,firstUnexpectedDirectTarget=false;
+                std::uint64_t firstUnexpectedGeneration=0;
+                // Observe only after the actual pending-navigation callback has
+                // delivered the newer EN_CHANGE. Before that callback the old
+                // literal is still the intended edit, even if it takes several
+                // bounded message batches for the native provider to call us.
+                const auto overlapLiteralCategory=[&](const std::wstring& text) -> unsigned {
+                    if(text==queryFor(2))return 0;
+                    if(text==queryFor(1))return 1;
+                    if(text==queryFor(0))return 2;
+                    return text.empty()?3u:4u;
+                };
+                const auto observeOverlapEdit=[&](unsigned phase) {
+                    if(olderProbeCalls!=1||!newerEditAccepted){++overlapBeforeEditSamples;return;}
+                    ++overlapObservationSamples;
+                    const auto category=overlapLiteralCategory(textOf(search_));
+                    if(!category)return;
+                    if(!olderOverwroteEdit){
+                        firstUnexpectedPhase=phase;firstUnexpectedText=category;
+                        firstUnexpectedPolicy=overlapLiteralCategory(liveSearchPolicy_.literal());
+                        firstUnexpectedActive=overlapLiteralCategory(activeQuery_);
+                        firstUnexpectedNavigation=navigationCount_;firstUnexpectedProbeCalls=olderProbeCalls;
+                        firstUnexpectedNavigating=navigating_;firstUnexpectedLiveTarget=static_cast<bool>(pendingLiveSearchTarget_);
+                        firstUnexpectedDirectTarget=static_cast<bool>(pendingDirectSearchTarget_);
+                        firstUnexpectedGeneration=pendingLiveSearch_?pendingLiveSearch_->generation:0;
+                    }
+                    olderOverwroteEdit=true;
+                };
+                struct ClearLiveNavigationProbe {
+                    std::function<void()>& probe;
+                    ~ClearLiveNavigationProbe(){probe={};}
+                } clearLiveNavigationProbe{headlessLiveNavigationProbe_};
+                unsigned busyBrowseCalls=0;
+                bool busyIntentPreserved=false;
+                struct ClearBusyBrowseProbe {
+                    std::function<HRESULT()>& probe;
+                    ~ClearBusyBrowseProbe(){probe={};}
+                } clearBusyBrowseProbe{headlessLiveBrowseProbe_};
+                headlessLiveBrowseProbe_=[&] {
+                    ++busyBrowseCalls;
+                    busyIntentPreserved=pendingLiveSearch_&&pendingLiveSearch_->explicitSubmit&&
+                        pendingLiveSearch_->literal==queryFor(1)&&liveSearchPolicy_.current(*pendingLiveSearch_)&&
+                        textOf(search_)==queryFor(1)&&recentSearches_==recentAtOverlap&&history_.size()==olderAcceptedHistory;
+                    return HRESULT_FROM_WIN32(ERROR_BUSY);
+                };
+                headlessLiveNavigationProbe_=[&] {
+                    ++olderProbeCalls;
+                    const auto olderPending=pendingLiveSearch_;
+                    olderPendingObserved=navigating_&&olderPending&&olderPending->explicitSubmit&&
+                        pendingPidl_&&pendingLiveSearchTarget_&&ILIsEqual(pendingPidl_.get(),pendingLiveSearchTarget_.get());
+                    newerEditAccepted=SetWindowTextW(search_,queryFor(2).c_str())!=FALSE;
+                    olderIsStale=olderPending&&!liveSearchPolicy_.current(*olderPending);
+                    observeOverlapEdit(1);
+                };
+                SetWindowTextW(search_,queryFor(1).c_str());SendMessageW(search_,WM_KEYDOWN,VK_RETURN,0);
                 const bool newerReady=pumpUntil([&] {
-                    if(textOf(search_)!=queryFor(2))olderOverwroteEdit=true;
-                    return activeQuery_==queryFor(2)&&!pendingLiveSearch_&&!liveSearchPolicy_.waiting()&&
+                    observeOverlapEdit(2);
+                    return olderProbeCalls==1&&newerEditAccepted&&activeQuery_==queryFor(2)&&!pendingLiveSearch_&&!liveSearchPolicy_.waiting()&&
                         exactLiveView(liveIdentities[2]);
                 },5000);
-                liveCheck("live_search_older_navigation_cannot_reset_newer_edit",olderIsStale&&newerReady&&!olderOverwroteEdit&&
-                    recentSearches_==recentAtOverlap&&history_.size()==liveHistorySize&&liveSearchStatus_==S_OK);
+                const bool olderMruPreserved=recentSearches_==recentAtOverlap;
+                const bool olderHistoryPreserved=olderAcceptedSlot&&history_.size()==olderAcceptedHistory&&
+                    olderAcceptedHistory==liveHistorySize&&historyIndex_==olderHistorySlot&&liveSearchHistoryIndex_==olderHistorySlot;
+                std::fprintf(stderr,"headless-live-overlap calls=%u actual_pending=%u old_stale=%u edit_accepted=%u newer_ready=%u old_overwrite=%u mru_preserved=%u history_preserved=%u accepted_slot_valid=%u old_slot=%d old_live_slot=%d final_slot=%d final_index=%d before_history=%zu final_history=%zu\n",
+                    olderProbeCalls,olderPendingObserved?1u:0u,olderIsStale?1u:0u,newerEditAccepted?1u:0u,newerReady?1u:0u,
+                    olderOverwroteEdit?1u:0u,olderMruPreserved?1u:0u,olderHistoryPreserved?1u:0u,olderAcceptedSlot?1u:0u,olderHistorySlot,olderLiveSlot,
+                    liveSearchHistoryIndex_,historyIndex_,olderAcceptedHistory,history_.size());std::fflush(stderr);
+                std::fprintf(stderr,"headless-live-overlap-observation samples=%u before_edit_samples=%u first_phase=%u first_text=%u first_policy=%u first_active=%u first_navigation=%u first_probe_calls=%u first_navigating=%u first_live_target=%u first_direct_target=%u first_generation=%llu\n",
+                    overlapObservationSamples,overlapBeforeEditSamples,firstUnexpectedPhase,firstUnexpectedText,firstUnexpectedPolicy,
+                    firstUnexpectedActive,firstUnexpectedNavigation,firstUnexpectedProbeCalls,firstUnexpectedNavigating?1u:0u,
+                    firstUnexpectedLiveTarget?1u:0u,firstUnexpectedDirectTarget?1u:0u,static_cast<unsigned long long>(firstUnexpectedGeneration));std::fflush(stderr);
+                liveCheck("live_search_older_navigation_cannot_reset_newer_edit",olderProbeCalls==1&&olderPendingObserved&&
+                    newerEditAccepted&&olderIsStale&&newerReady&&!olderOverwroteEdit&&olderMruPreserved&&olderHistoryPreserved&&
+                    liveSearchStatus_==S_OK&&!headlessLiveNavigationProbe_);
+                liveCheck("live_search_busy_navigation_retries_current_intent",busyBrowseCalls==1&&busyIntentPreserved&&
+                    !headlessLiveBrowseProbe_&&newerReady&&olderPendingObserved&&olderHistoryPreserved&&olderMruPreserved);
 
                 const auto beforeProgrammatic=navigationCount_;
                 SetWindowTextW(search_,queryFor(1).c_str());const bool pendingEdit=liveSearchPolicy_.waiting();
@@ -2008,6 +2129,44 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report) {
                 liveCheck("live_search_direct_factory_respects_same_text_new_generation",directAborted&&afterDirectReady&&
                     afterDirectOrigin&&recentSearches_==recentAtOverlap&&headlessSearchFactoryReentryProbe_==nullptr);
 
+                setSearchText(queryFor(1));
+                const auto enterIntentRevision=searchInteractionRevision_;
+                const auto enterIntentNavigation=navigationCount_;
+                const auto enterIntentHistory=history_.size();
+                const auto recentBeforeEnterIntent=recentSearches_;
+                unsigned enterProbeCalls=0;
+                headlessSearchFactoryReentryProbe_=[&] {++enterProbeCalls;SendMessageW(search_,WM_KEYDOWN,VK_RETURN,0);};
+                const auto enterDirectFactory=startSearch(queryFor(1),false);
+                const bool enterDirectAborted=enterDirectFactory==S_FALSE&&enterProbeCalls==1&&
+                    searchInteractionRevision_>enterIntentRevision+1&&navigationCount_==enterIntentNavigation&&
+                    history_.size()==enterIntentHistory&&liveSearchPolicy_.waiting()&&!pendingDirectSearchTarget_&&
+                    recentSearches_==recentBeforeEnterIntent&&textOf(search_)==queryFor(1)&&exactLiveView(allLiveIdentities);
+                const bool enterIntentReady=pumpUntil([&] {
+                    return searchActive_&&activeQuery_==queryFor(1)&&!pendingLiveSearch_&&!liveSearchPolicy_.waiting()&&
+                        exactLiveView(liveIdentities[1]);
+                },5000);
+                liveCheck("live_search_enter_intent_supersedes_direct_factory",enterDirectAborted&&enterIntentReady&&
+                    liveSearchPolicy_.committedLiteral()==queryFor(1)&&recentSearches_.size()==recentBeforeEnterIntent.size()+1&&
+                    std::count(recentSearches_.begin(),recentSearches_.end(),queryFor(1))==1);
+
+                const auto escapeIntentRevision=searchInteractionRevision_;
+                const auto escapeIntentNavigation=navigationCount_;
+                const auto escapeIntentHistory=history_.size();
+                const auto recentBeforeEscapeIntent=recentSearches_;
+                unsigned escapeProbeCalls=0;
+                headlessSearchFactoryReentryProbe_=[&] {++escapeProbeCalls;SendMessageW(search_,WM_KEYDOWN,VK_ESCAPE,0);};
+                const auto escapeDirectFactory=startSearch(queryFor(2),false);
+                const bool escapeDirectAborted=escapeDirectFactory==S_FALSE&&escapeProbeCalls==1&&
+                    searchInteractionRevision_>escapeIntentRevision+1&&navigationCount_==escapeIntentNavigation&&
+                    history_.size()==escapeIntentHistory&&liveSearchPolicy_.waiting()&&!pendingDirectSearchTarget_&&
+                    recentSearches_==recentBeforeEscapeIntent&&textOf(search_).empty()&&exactLiveView(liveIdentities[1]);
+                const bool escapeIntentReady=pumpUntil([&] {
+                    return !searchActive_&&currentPidl_&&ILIsEqual(currentPidl_.get(),liveOrigin.get())&&
+                        !pendingLiveSearch_&&!liveSearchPolicy_.waiting()&&exactLiveView(allLiveIdentities);
+                },5000);
+                liveCheck("live_search_escape_intent_supersedes_direct_factory",escapeDirectAborted&&escapeIntentReady&&
+                    textOf(search_).empty()&&recentSearches_==recentBeforeEscapeIntent&&headlessSearchFactoryReentryProbe_==nullptr);
+
                 ComPtr<IShellItem> liveScope;
                 liveNavigation=SHCreateItemFromIDList(liveOrigin.get(),IID_PPV_ARGS(&liveScope));
                 const auto liveSavedPath=fixture/L"Subfolder"/L"Live origin.search-ms";
@@ -2028,7 +2187,7 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report) {
                         !pendingLiveSearch_&&!liveSearchPolicy_.waiting()&&exactLiveView(allLiveIdentities);
                 },5000);
                 liveCheck("live_search_saved_search_edit_escape_returns_scope",importedRefinedReady&&savedOriginMatched&&escapedReady&&
-                    textOf(search_).empty()&&!liveSearchOrigin_&&recentSearches_==recentAtOverlap);
+                    textOf(search_).empty()&&!liveSearchOrigin_&&recentSearches_==recentBeforeEscapeIntent);
             }
             hr = execute(ThisPC);
             check("this_pc_namespace", SUCCEEDED(hr) && pumpUntil([&] { return !navigating_ && currentLocation_.find(L"20D04FE0") != std::wstring::npos; }, 5000), currentLocation_);

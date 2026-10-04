@@ -34,18 +34,6 @@ private:
     bool finished_ = false;
 };
 
-HRESULT selectAllCommand(IShellView* view) noexcept {
-    ComPtr<IOleCommandTarget> commands;
-    auto hr = view->QueryInterface(IID_PPV_ARGS(&commands));
-    if (FAILED(hr)) return hr;
-    OLECMD command{OLECMDID_SELECTALL, 0};
-    hr = commands->QueryStatus(nullptr, 1, &command, nullptr);
-    if (FAILED(hr)) return hr;
-    if (!(command.cmdf & OLECMDF_SUPPORTED)) return OLECMDERR_E_NOTSUPPORTED;
-    if (!(command.cmdf & OLECMDF_ENABLED)) return OLECMDERR_E_DISABLED;
-    return commands->Exec(nullptr, OLECMDID_SELECTALL, OLECMDEXECOPT_DONTPROMPTUSER, nullptr, nullptr);
-}
-
 bool unavailableCommand(HRESULT hr) noexcept {
     return hr == E_NOINTERFACE || hr == E_NOTIMPL || hr == OLECMDERR_E_NOTSUPPORTED ||
            hr == OLECMDERR_E_UNKNOWNGROUP;
@@ -99,15 +87,13 @@ HRESULT changeShellSelection(IFolderView2* folderView, IShellView* shellView,
             const auto native = nativeActions->invokeViewSelection(name, shellView, headless);
             if (!unavailableCommand(native) && native != HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED) &&
                 native != HRESULT_FROM_WIN32(ERROR_NOT_FOUND) && native != HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) &&
-                native != E_PENDING) return native;
+                native != E_PENDING && native != HRESULT_FROM_WIN32(ERROR_BUSY)) return native;
         }
         if (action == SelectionAction::None) return shellView->SelectItem(nullptr, SVSI_DESELECTOTHERS);
-        if (action == SelectionAction::All) {
-            // The standard OLE Select All command lets the Shell perform its
-            // own optimized operation, including any view-specific behavior.
-            hr = selectAllCommand(shellView);
-            if (!unavailableCommand(hr)) return hr;
-        }
+        // A registered selection provider above is the preferred native route.
+        // The generic document OLE Select All command can report success while
+        // doing nothing in a Shell view without document focus. Fall back to
+        // the documented bulk operation on this exact folder view instead.
 
         std::vector<bool> selected;
         int selectedCount = 0;
@@ -116,10 +102,6 @@ HRESULT changeShellSelection(IFolderView2* folderView, IShellView* shellView,
             if (FAILED(hr)) return hr;
             if (selectedCount < 0 || selectedCount > total) return E_UNEXPECTED;
             if (selectedCount == total) return shellView->SelectItem(nullptr, SVSI_DESELECTOTHERS);
-            if (!selectedCount) {
-                hr = selectAllCommand(shellView);
-                if (!unavailableCommand(hr)) return hr;
-            }
             selected.resize(static_cast<size_t>(total), false);
             int start = 0, found = 0;
             bool usableIndices = true;

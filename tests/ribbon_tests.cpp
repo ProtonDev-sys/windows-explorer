@@ -119,7 +119,17 @@ HRESULT galleryExpansionState(HWND window,const wchar_t* name,ExpandCollapseStat
         if(SUCCEEDED(status))status=button->GetCurrentPatternAs(UIA_ExpandCollapsePatternId,IID_PPV_ARGS(&pattern));
         if(SUCCEEDED(status)&&!pattern)return E_NOINTERFACE;
         if(SUCCEEDED(status)&&collapse)status=pattern->Collapse();
-        return SUCCEEDED(status)?pattern->get_CurrentExpandCollapseState(result.get()):status;
+        if(FAILED(status))return status;
+        const auto deadline=GetTickCount64()+2000;
+        do {
+            status=pattern->get_CurrentExpandCollapseState(result.get());
+            if(FAILED(status)||!collapse||*result==ExpandCollapseState_Collapsed)return status;
+            // Collapse can finish asynchronously. The owning STA continues
+            // pumping in ownedAutomation while this windowless MTA observes
+            // the same native pattern; invoke Collapse only once.
+            Sleep(10);
+        }while(GetTickCount64()<deadline);
+        return HRESULT_FROM_WIN32(ERROR_TIMEOUT);
     });
     if(SUCCEEDED(hr))state=*result;
     return hr;
@@ -332,8 +342,8 @@ int main(int argc,char** argv){
             succeeded(checkOwnedGalleryRow(window.handle,L"Owned disabled destination",false,false),"Actual native disabled destination row");
             succeeded(galleryExpansionState(window.handle,L"Copy to",expanded),"Native Copy-to state after actual visible rows");
             succeeded(galleryExpansionState(window.handle,L"Copy to",collapsed,true),"Native Copy-to collapse readback");pump();
-            require(before==ExpandCollapseState_Collapsed&&collapsed==ExpandCollapseState_Collapsed,"Native Copy-to popup did not collapse");
             std::cout<<"Native Copy-to ExpandCollapse states: before="<<before<<" after-visible-rows="<<expanded<<" after-collapse="<<collapsed<<'\n';
+            require(before==ExpandCollapseState_Collapsed&&collapsed==ExpandCollapseState_Collapsed,"Native Copy-to popup did not collapse");
             succeeded(expandOwnedGallery(window.handle,L"Copy to"),"Reopen native Copy-to retained destination gallery");pump();
             succeeded(checkOwnedGalleryRow(window.handle,L"Owned destination group",true,true),"Actual native destination cascade dispatch");
             require(itemExecutions==1&&lastItemCommand==explorer::RibbonCopyMenu&&lastItem==17,"Native gallery lost the retained provider path token");
@@ -347,6 +357,19 @@ int main(int argc,char** argv){
         succeeded(ribbon.selectTab(explorer::RibbonViewTab),"Select native View tab");succeeded(ribbon.flush(),"View tab flush");pump();
         Variant layout;succeeded(ribbon.framework()->GetUICommandProperty(explorer::RibbonLayoutGallery,UI_PKEY_ItemsSource,&layout.value),"Eight native layout choices");
         Microsoft::WRL::ComPtr<IUICollection> collection;succeeded(layout.value.punkVal->QueryInterface(IID_PPV_ARGS(&collection)),"Layout collection");UINT count=0;succeeded(collection->GetCount(&count),"Layout count");require(count==8,"Not all eight view modes exposed");
+        if(stock) {
+            const auto selectedLayout=[&] {
+                Variant selected;ULONG index=UI_COLLECTION_INVALIDINDEX;
+                succeeded(ribbon.nativeFramework()->GetUICommandProperty(ribbon.nativeCommandId(explorer::RibbonLayoutGallery),UI_PKEY_SelectedItem,&selected.value),"Native selected layout readback");
+                succeeded(PropVariantToUInt32(selected.value,&index),"Native selected layout type");
+                std::cout<<"Native selected layout: command="<<ribbon.nativeCommandId(explorer::RibbonLayoutGallery)<<" index="<<index<<'\n';
+                return index;
+            };
+            require(selectedLayout()==5,"Native gallery lost the actual Details selection");
+            succeeded(ribbon.invalidateItems(explorer::RibbonLayoutGallery),"Refresh native layout choices");
+            succeeded(ribbon.flush(),"Refreshed layout choices flush");pump();
+            require(selectedLayout()==5,"Replacing native layout choices cleared Details selection");
+        }
         for(UINT index=0;index<count;++index) {
             Microsoft::WRL::ComPtr<IUnknown> raw;Microsoft::WRL::ComPtr<IUISimplePropertySet> item;
             succeeded(collection->GetItem(index,&raw),"Native layout item");succeeded(raw.As(&item),"Layout item properties");

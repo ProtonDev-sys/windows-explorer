@@ -1,11 +1,10 @@
 #include "explorer/search_presentation_store.hpp"
+#include "file_security.hpp"
 #include <algorithm>
 #include <array>
 #include <cstring>
 #include <limits>
 #include <string_view>
-#include <aclapi.h>
-#include <memory>
 
 namespace explorer {
 namespace {
@@ -125,9 +124,7 @@ HRESULT write(const std::filesystem::path& directory, const std::wstring& name, 
     const bool exists = hr == S_OK;
     File retained;
     FILE_BASIC_INFO retainedBasic{};
-    PACL retainedDacl = nullptr;
-    SECURITY_DESCRIPTOR_CONTROL retainedControl{};
-    std::unique_ptr<void, decltype(&LocalFree)> retainedSecurity(nullptr, &LocalFree);
+    file_security::Descriptor retainedSecurity;
     if (exists) {
         QueryIdentity prior; SearchViewPresentation old;
         if (FAILED(hr = decode(original, prior, old)) || key(prior) != name) return FAILED(hr) ? hr : invalidData;
@@ -139,13 +136,8 @@ HRESULT write(const std::filesystem::path& directory, const std::wstring& name, 
         if (basic.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_READONLY)) return HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED);
         if (basic.FileAttributes & FILE_ATTRIBUTE_ENCRYPTED) return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
         retainedBasic = basic;
-        PSECURITY_DESCRIPTOR descriptor = nullptr;
-        const auto security = GetSecurityInfo(retained.value, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
-                                             nullptr, nullptr, &retainedDacl, nullptr, &descriptor);
-        retainedSecurity.reset(descriptor);
-        if (security) return HRESULT_FROM_WIN32(security);
-        DWORD revision = 0;
-        if (!GetSecurityDescriptorControl(descriptor, &retainedControl, &revision)) return HRESULT_FROM_WIN32(GetLastError());
+        hr = file_security::read(retained.value, retainedSecurity);
+        if (FAILED(hr)) return hr;
         LARGE_INTEGER length{};
         if (!GetFileSizeEx(retained.value, &length)) return HRESULT_FROM_WIN32(GetLastError());
         if (length.QuadPart != static_cast<LONGLONG>(original.size())) return HRESULT_FROM_WIN32(ERROR_RETRY);
@@ -157,23 +149,28 @@ HRESULT write(const std::filesystem::path& directory, const std::wstring& name, 
     if (!StringFromGUID2(id, text, 40)) return E_FAIL;
     File temporary; temporary.remove = true;
     const auto temporaryPath = directory / (std::wstring(L"view-write-") + text + L".tmp");
+    auto attributes = file_security::attributes(retainedSecurity);
     temporary.value = CreateFileW(temporaryPath.c_str(), GENERIC_WRITE | DELETE | WRITE_DAC, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                                 nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+                                 exists ? &attributes : nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (temporary.value == INVALID_HANDLE_VALUE) return HRESULT_FROM_WIN32(GetLastError());
+    if (exists && FAILED(hr = file_security::verifyCreated(temporary.value, retainedSecurity))) return hr;
     DWORD written = 0;
     if (!WriteFile(temporary.value, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr)) return HRESULT_FROM_WIN32(GetLastError());
     if (written != bytes.size()) return HRESULT_FROM_WIN32(ERROR_WRITE_FAULT);
-    if (retainedSecurity) {
-        const auto protection = retainedControl & SE_DACL_PROTECTED ? PROTECTED_DACL_SECURITY_INFORMATION : UNPROTECTED_DACL_SECURITY_INFORMATION;
-        const auto security = SetSecurityInfo(temporary.value, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION | protection,
-                                             nullptr, nullptr, retainedDacl, nullptr);
-        if (security) return HRESULT_FROM_WIN32(security);
+    if (exists) {
         FILE_BASIC_INFO kept{}; kept.CreationTime = retainedBasic.CreationTime;
         kept.FileAttributes = retainedBasic.FileAttributes & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_ARCHIVE | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED);
         if (!kept.FileAttributes) kept.FileAttributes = FILE_ATTRIBUTE_NORMAL;
         if (!SetFileInformationByHandle(temporary.value, FileBasicInfo, &kept, sizeof(kept))) return HRESULT_FROM_WIN32(GetLastError());
     }
     if (!FlushFileBuffers(temporary.value)) return HRESULT_FROM_WIN32(GetLastError());
+    if (exists) {
+        file_security::Descriptor now;
+        if (FAILED(hr = file_security::read(retained.value, now))) return hr;
+        if (!file_security::equal(retainedSecurity, now)) return HRESULT_FROM_WIN32(ERROR_RETRY);
+        if (FAILED(hr = file_security::read(temporary.value, now))) return hr;
+        if (!file_security::equal(retainedSecurity, now)) return HRESULT_FROM_WIN32(ERROR_RETRY);
+    }
     const auto& finalName = target.native();
     const auto length = finalName.size() * sizeof(wchar_t);
     std::vector<BYTE> buffer(offsetof(FILE_RENAME_INFO, FileName) + length + sizeof(wchar_t));

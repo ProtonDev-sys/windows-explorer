@@ -35,6 +35,10 @@ public:
 
     std::optional<LiveSearchRequest> takeReady(std::uint64_t now, bool navigationReady = true);
     bool current(const LiveSearchRequest& request) const;
+    // A native browser can reject an issued navigation as temporarily busy.
+    // Reschedule only the identical, unfinished intent without a new generation
+    // or committing history. New edits, cancellation and completion reject it.
+    bool retry(const LiveSearchRequest& request, std::uint64_t now);
     // Call for a factory failure or actual matching navigation completion,
     // not merely after BrowseToObject accepts a navigation. False means stale
     // or already finished; callers must not update UI/history for that result.

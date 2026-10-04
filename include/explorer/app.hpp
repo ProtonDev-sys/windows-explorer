@@ -141,7 +141,7 @@ private:
     HRESULT executeRibbonItem(UINT command, UINT item);
     void updateNamespace();
     AppCommandContext commandContext() const;
-    HRESULT applyNavigationOptions();
+    HRESULT applyNavigationOptions(bool expandOnce = false);
     void advanceNavigationExpansion();
     void cancelCommandStates();
     void startPendingCommandStates();
@@ -317,6 +317,7 @@ private:
     unsigned navigationExpansionGeneration_ = 0;
     ULONGLONG navigationExpansionDeadline_ = 0;
     HRESULT navigationExpansionStatus_ = S_OK;
+    bool navigationExpansionOneTime_ = false;
     std::optional<UINT> visualPage_;
     ShellLibrary library_;
     enum class ContextPage { None, Search, Library };
@@ -374,6 +375,8 @@ private:
     Pidl pendingDirectSearchTarget_;
     unsigned long long pendingDirectSearchRevision_ = 0;
     std::function<void()> headlessSearchFactoryReentryProbe_;
+    std::function<void()> headlessLiveNavigationProbe_;
+    std::function<HRESULT()> headlessLiveBrowseProbe_;
     Pidl liveSearchOrigin_;
     int liveSearchHistoryIndex_ = -1;
     std::optional<LiveSearchRequest> pendingLiveSearch_;

@@ -1,4 +1,5 @@
 #include "explorer/search.hpp"
+#include "file_security.hpp"
 #include <shlobj.h>
 #include <shlguid.h>
 #include <structuredquery.h>
@@ -704,16 +705,10 @@ HRESULT writeConfirmedFile(const std::filesystem::path& path, const std::string&
     if ((basic.FileAttributes & FILE_ATTRIBUTE_COMPRESSED) &&
         !DeviceIoControl(original.value, FSCTL_GET_COMPRESSION, nullptr, 0, &compression, sizeof(compression), &returned, nullptr))
         return HRESULT_FROM_WIN32(GetLastError());
-    PSECURITY_DESCRIPTOR rawSecurity = nullptr;
-    PACL dacl = nullptr;
-    auto hr = HRESULT_FROM_WIN32(GetSecurityInfo(original.value, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
-        nullptr, nullptr, &dacl, nullptr, &rawSecurity));
-    struct LocalSecurityFree { void operator()(void* memory) const noexcept { LocalFree(memory); } };
-    std::unique_ptr<void, LocalSecurityFree> security(rawSecurity);
+    file_security::Descriptor security;
+    auto hr = file_security::read(original.value, security);
     if (FAILED(hr)) return hr;
-    SECURITY_DESCRIPTOR_CONTROL control{};
-    DWORD revision = 0;
-    if (!GetSecurityDescriptorControl(rawSecurity, &control, &revision)) return HRESULT_FROM_WIN32(GetLastError());
+    auto attributes = file_security::attributes(security);
 
     const auto absolute = std::filesystem::absolute(path);
     const auto parent = absolute.parent_path();
@@ -727,20 +722,18 @@ HRESULT writeConfirmedFile(const std::filesystem::path& path, const std::string&
         if (!StringFromGUID2(id, text, 40)) return E_FAIL;
         temporaryPath = parent / (std::wstring(L".WindowsExplorer-search-save-") + text + L".tmp");
         temporary.value = CreateFileW(temporaryPath.c_str(), GENERIC_READ | GENERIC_WRITE | DELETE | WRITE_DAC,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, &attributes, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (temporary.value != INVALID_HANDLE_VALUE) break;
         const auto error = GetLastError();
         if (error != ERROR_FILE_EXISTS && error != ERROR_ALREADY_EXISTS) return HRESULT_FROM_WIN32(error);
     }
     if (temporary.value == INVALID_HANDLE_VALUE) return HRESULT_FROM_WIN32(ERROR_TOO_MANY_NAMES);
+    hr = file_security::verifyCreated(temporary.value, security);
+    if (FAILED(hr)) return hr;
     if (compression != COMPRESSION_FORMAT_NONE &&
         !DeviceIoControl(temporary.value, FSCTL_SET_COMPRESSION, &compression, sizeof(compression), nullptr, 0, &returned, nullptr))
         return HRESULT_FROM_WIN32(GetLastError());
     hr = writeContents(temporary.value, bytes);
-    if (FAILED(hr)) return hr;
-    const auto protection = control & SE_DACL_PROTECTED ? PROTECTED_DACL_SECURITY_INFORMATION : UNPROTECTED_DACL_SECURITY_INFORMATION;
-    hr = HRESULT_FROM_WIN32(SetSecurityInfo(temporary.value, SE_FILE_OBJECT,
-        DACL_SECURITY_INFORMATION | protection, nullptr, nullptr, dacl, nullptr));
     if (FAILED(hr)) return hr;
     FILE_BASIC_INFO retained{};
     retained.CreationTime = basic.CreationTime;
@@ -763,6 +756,13 @@ HRESULT writeConfirmedFile(const std::filesystem::path& path, const std::string&
         if (now.VolumeSerialNumber != identity.VolumeSerialNumber ||
             std::memcmp(now.FileId.Identifier, identity.FileId.Identifier, sizeof(now.FileId.Identifier)) != 0)
             return HRESULT_FROM_WIN32(ERROR_RETRY);
+        file_security::Descriptor currentSecurity;
+        hr = file_security::read(original.value, currentSecurity);
+        if (FAILED(hr)) return hr;
+        if (!file_security::equal(security, currentSecurity)) return HRESULT_FROM_WIN32(ERROR_RETRY);
+        hr = file_security::read(temporary.value, currentSecurity);
+        if (FAILED(hr)) return hr;
+        if (!file_security::equal(security, currentSecurity)) return HRESULT_FROM_WIN32(ERROR_RETRY);
         // Publish by the owned handle in one native same-directory rename.
         // This also preserves ordinary hidden/system targets, which the path-
         // based MoveFileEx replacement can reject. ReplaceFile without a

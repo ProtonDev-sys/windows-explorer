@@ -326,7 +326,7 @@ void nativeFixtureCapabilitiesAndHeadlessGuard() {
     explorer::NamespaceTarget target{folder,array(image.Get()),{}};
     succeeded(actions.initialize(nullptr,target), "Initialize namespace planner on owned image fixture");
     require(actions.facts().selectionCount == 1 && actions.facts().physicalFiles && actions.facts().images &&
-            actions.facts().singlePath == fixture.image.native(), "Actual bitmap facts differ from Shell selection");
+            fs::equivalent(fs::path(actions.facts().singlePath), fixture.image), "Actual bitmap facts differ from Shell selection");
     std::vector<explorer::ContextMenuEntry> entries;
     succeeded(actions.commandStoreEntries(entries), "Enumerate installed command handlers without invoking UI");
     require(!entries.empty(), "Native CommandStore menu was unexpectedly empty");
@@ -402,7 +402,7 @@ void metadataAndReadOnlyDriveEnumeration() {
     succeeded(SHGetKnownFolderItem(FOLDERID_ComputerFolder,KF_FLAG_DEFAULT,nullptr,IID_PPV_ARGS(&computer)), "Get native Computer namespace without opening a view");
     explorer::NativeNamespaceActions actions;
     succeeded(actions.initialize(nullptr,{computer,array(drive.Get()),{}}), "Initialize drive capability planner without touching a device");
-    require(actions.facts().driveRoot && actions.facts().singlePath == root.native(), "Drive target was inferred from the wrong folder");
+    require(actions.facts().driveRoot && fs::equivalent(fs::path(actions.facts().singlePath), root), "Drive target was inferred from the wrong folder");
     NamespaceInvocationPlan plan;
     const HRESULT hr = actions.planInvocation(NamespaceAction::FormatDrive,&plan);
     if (actions.facts().driveType == DRIVE_FIXED || actions.facts().driveType == DRIVE_REMOVABLE || actions.facts().driveType == DRIVE_RAMDISK) {

@@ -124,7 +124,7 @@ AppCommandContext ExplorerApp::commandContext() const {
     return context;
 }
 
-HRESULT ExplorerApp::applyNavigationOptions() {
+HRESULT ExplorerApp::applyNavigationOptions(bool expandOnce) {
     if (!browser_ || !preferences_.navigationPane) return S_FALSE;
     ComPtr<INameSpaceTreeControl2> tree;
     auto hr = IUnknown_QueryService(browser_.Get(), SID_SNavigationPane, IID_PPV_ARGS(&tree));
@@ -150,8 +150,17 @@ HRESULT ExplorerApp::applyNavigationOptions() {
             if(FAILED(hr))return hr;
         }
     }
-    KillTimer(window_,3);navigationExpansion_.clear();navigationTree_.Reset();
-    if(expandCurrent_) {
+    // View creation posts another options pass after navigation completion.
+    // Retain an explicit one-time expansion on this exact native tree and
+    // navigation generation even though the persistent toggle is disabled.
+    if(!expandCurrent_&&!expandOnce&&navigationExpansionOneTime_&&navigationTree_&&
+       !navigationExpansion_.empty()&&!navigating_&&navigationExpansionGeneration_==navigationCount_) {
+        ComPtr<IUnknown> previousIdentity,currentIdentity;
+        if(SUCCEEDED(navigationTree_.As(&previousIdentity))&&SUCCEEDED(tree.As(&currentIdentity))&&
+           previousIdentity.Get()==currentIdentity.Get())return hr;
+    }
+    KillTimer(window_,3);navigationExpansion_.clear();navigationTree_.Reset();navigationExpansionOneTime_=false;
+    if(expandCurrent_||expandOnce) {
         ComPtr<IShellItem> current;
         hr=currentFolder(current);if(FAILED(hr))return hr;
         RECT existing{};
@@ -182,6 +191,7 @@ HRESULT ExplorerApp::applyNavigationOptions() {
         navigationExpansion_.assign(chain.begin()+static_cast<std::ptrdiff_t>(first),chain.end());
         navigationTree_=tree;navigationExpansionIndex_=0;navigationExpansionRequested_.reset();navigationExpansionGeneration_=navigationCount_;
         navigationExpansionStatus_=S_OK;
+        navigationExpansionOneTime_=expandOnce;
         navigationExpansionDeadline_=GetTickCount64()+5000;
         SetTimer(window_,3,15,nullptr);advanceNavigationExpansion();
     }
@@ -191,7 +201,7 @@ HRESULT ExplorerApp::applyNavigationOptions() {
 void ExplorerApp::advanceNavigationExpansion() {
     if(!navigationTree_||navigationExpansion_.empty()||closing_||navigating_||
         navigationExpansionGeneration_!=navigationCount_||GetTickCount64()>=navigationExpansionDeadline_) {
-        KillTimer(window_,3);navigationExpansion_.clear();navigationTree_.Reset();return;
+        KillTimer(window_,3);navigationExpansion_.clear();navigationTree_.Reset();navigationExpansionOneTime_=false;return;
     }
     auto& item=navigationExpansion_[navigationExpansionIndex_];
     // A hidden native root and an off-screen child can be materialized without
@@ -200,7 +210,7 @@ void ExplorerApp::advanceNavigationExpansion() {
     if(FAILED(navigationTree_->GetItemState(item.Get(),NSTCIS_EXPANDED,&state)))return;
     if(navigationExpansionIndex_+1==navigationExpansion_.size()) {
         navigationTree_->EnsureItemVisible(item.Get());
-        KillTimer(window_,3);navigationExpansion_.clear();navigationTree_.Reset();return;
+        KillTimer(window_,3);navigationExpansion_.clear();navigationTree_.Reset();navigationExpansionOneTime_=false;return;
     }
     if(!(state&NSTCIS_EXPANDED)&&navigationExpansionRequested_!=navigationExpansionIndex_) {
         navigationTree_->EnsureItemVisible(item.Get());
@@ -1012,6 +1022,8 @@ int ExplorerApp::headlessVisual(const PrivateDesktop& desktop, const std::filesy
     VisualCaptureOptions options;
     options.trimInvisibleFrame=true; options.layoutDpi=scene.dpi;
     options.ribbonFramework=ribbon_.framework();
+    options.nativeRibbonFramework=ribbon_.nativeFramework();
+    options.layoutGalleryNativeCommand=ribbon_.nativeCommandId(RibbonLayoutGallery);
     options.ribbonLayout=ribbon_.layout()==RibbonLayout::InstalledWindows10?L"InstalledWindows10":L"Authored";
     options.installedRibbonStatus=ribbon_.installedLayoutStatus();
     options.ribbonFeaturesRead=true;

@@ -47,6 +47,7 @@ struct HandlerState {
     unsigned destroyed = 0;
     bool childPopulated = false;
     bool detachedAfterMenuDestroyed = false;
+    std::function<void()> duringInvoke;
     HMENU root = nullptr;
     HMENU child = nullptr;
 
@@ -85,6 +86,7 @@ struct HandlerState {
         invokeMask = info->fMask;
         invokeOwner = info->hwnd;
         invokePoint = info->ptInvoke;
+        if (duringInvoke) duringInvoke();
         return S_OK;
     }
 
@@ -318,6 +320,25 @@ void contextMenu2Fallback() {
             "CM2 delayed population must work headlessly");
 }
 
+void reentrantInvocationLifetime() {
+    auto state = std::make_shared<HandlerState>();
+    auto fake = Make<FakeMenu3>(state);
+    NativeContextMenu menu;
+    require(SUCCEEDED(menu.create(nullptr, fake.Get())), "Cannot create callback lifetime fixture");
+    fake.Reset();
+    bool callback = false;
+    state->duringInvoke = [&] {
+        callback = true;
+        menu.reset();
+        require(state->destroyed == 0, "Handler was destroyed inside its own native invocation callback");
+        require(!menu.menu(), "Reentrant reset retained the old native menu");
+    };
+    require(SUCCEEDED(menu.invoke(menu.firstCommand())), "Reentrant native invocation failed");
+    require(callback && state->invokes == 1 && state->destroyed == 1,
+            "Invocation did not retain and then release the exact handler across reentrant reset");
+    state->duringInvoke = {};
+}
+
 void lifetimeAndFailures() {
     auto state = std::make_shared<HandlerState>();
     auto fake = Make<FakeMenu3>(state);
@@ -518,6 +539,7 @@ int runContextMenuTests() {
         {"Native context menu CM3 owner message routing", messageRouting},
         {"Native context menu CM2 fallback", contextMenu2Fallback},
         {"Native context menu and site lifetime/failures", lifetimeAndFailures},
+        {"Native context menu callback retains the invoking handler", reentrantInvocationLifetime},
         {"Native context menu apartment safety", apartmentSafety},
         {"Native context menus headless capability enumeration", nativeMenusWithoutDisplayOrInvocation}
     };

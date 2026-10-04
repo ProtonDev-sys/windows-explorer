@@ -13,6 +13,7 @@
 #include <chrono>
 #include <atomic>
 #include <cstring>
+#include <cstdio>
 #include <limits>
 #include <new>
 #include <mutex>
@@ -26,6 +27,9 @@ constexpr wchar_t commandStorePath[] = L"SOFTWARE\\Microsoft\\Windows\\CurrentVe
 constexpr DWORD detailedTargetBudget = 100000;
 constexpr unsigned maximumMenuDepth = 16;
 constexpr unsigned maximumMenuEntries = 4096;
+// A cancelled worker can remain inside a native menu query. Synchronous
+// view-selection menus use this same slot, including during pumped callbacks.
+std::atomic<unsigned> defaultMenuWorkers{0};
 
 struct ActionDescription { std::wstring_view command; std::wstring_view label; };
 constexpr std::array<ActionDescription, static_cast<size_t>(NamespaceAction::Count)> actions{{
@@ -1127,7 +1131,6 @@ HRESULT NamespaceCommandStateTask::startImpl(std::wstring_view command,IShellIte
     // flight. Retain one default-selection-menu work slot until that worker
     // releases native references, uninitializes COM and finishes its lease.
     // Registered-only menus and registered state providers remain separate.
-    static std::atomic<unsigned> defaultMenuWorkers{0};
     const bool defaultMenu=selectionVerb&&command.empty();
     if(defaultMenu) {
         unsigned expected=0;
@@ -2320,6 +2323,25 @@ HRESULT NativeNamespaceActions::invokeViewSelection(std::wstring_view command,IS
         if (SUCCEEDED(hr)) hr = CLSIDFromString(allowed->canonical,&expected);
         if (FAILED(hr)) return hr;
         if (!IsEqualGUID(actual,expected)) return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+        unsigned vacant = 0;
+        if (!defaultMenuWorkers.compare_exchange_strong(vacant,1)) return HRESULT_FROM_WIN32(ERROR_BUSY);
+        struct Reservation {
+            ~Reservation() { --defaultMenuWorkers; }
+        } reservation;
+        struct Interaction {
+            Impl& owner;
+            explicit Interaction(Impl& value) : owner(value) { owner.active = &owner.backgroundCommands; }
+            ~Interaction() {
+                // Detachment can also pump COM; retain the interaction guard
+                // until the handler and its site have both been released.
+                owner.backgroundCommands.reset();
+                owner.backgroundEntries.clear();
+                owner.backgroundLoaded = false;
+                owner.backgroundStatus = E_PENDING;
+                owner.active = nullptr;
+            }
+        } interaction{*impl_};
+        if (headless) std::fprintf(stderr,"native-selection phase=state\n");
         NamespaceCommandState state;
         hr = queryCommandState(allowed->name,&state,NamespaceMenuScope::Background);
         if (FAILED(hr)) return hr; // Includes E_PENDING; never invoke from a guess.
@@ -2328,6 +2350,7 @@ HRESULT NativeNamespaceActions::invokeViewSelection(std::wstring_view command,IS
         // and retain the native menu for this exact current view interaction.
         impl_->clearMenus();
         NamespaceInvocationPlan plan;
+        if (headless) std::fprintf(stderr,"native-selection phase=menu\n");
         hr = planCommandStore(allowed->name,&plan,NamespaceMenuScope::Background);
         if (FAILED(hr)) return hr;
         if (!plan.enabled || plan.submenu || plan.route != NamespaceInvocationRoute::CommandStoreMenu ||
@@ -2336,7 +2359,10 @@ HRESULT NativeNamespaceActions::invokeViewSelection(std::wstring_view command,IS
             hr = PrivateDesktop::current()->verifyIsolation();
             if (FAILED(hr)) return hr;
         }
-        return impl_->backgroundCommands.invoke(plan.commandId);
+        if (headless) std::fprintf(stderr,"native-selection phase=invoke ordinal=%u\n",plan.commandId);
+        hr = impl_->backgroundCommands.invoke(plan.commandId);
+        if (headless) std::fprintf(stderr,"native-selection phase=complete hresult=0x%08lX\n",static_cast<unsigned long>(hr));
+        return hr;
     } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
       catch (...) { return E_FAIL; }
 }
