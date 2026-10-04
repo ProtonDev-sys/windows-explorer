@@ -1,6 +1,10 @@
 #pragma once
 #include "explorer/core.hpp"
 #include "explorer/commands.hpp"
+#include "explorer/context_menu.hpp"
+#include "explorer/quick_access.hpp"
+#include "explorer/share.hpp"
+#include "explorer/library.hpp"
 #include <shlobj.h>
 #include <commctrl.h>
 #include <shobjidl.h>
@@ -60,6 +64,7 @@ private:
     void createControls();
     void layout();
     void rebuildRibbon();
+    void rebuildQuickAccess();
     void updateCommands();
     void updateStatus();
     void updateBreadcrumbs();
@@ -69,6 +74,14 @@ private:
     HRESULT sizeColumns();
     HRESULT toggleColumn(const PROPERTYKEY& key);
     HRESULT saveSearch();
+    HRESULT openFileLocation();
+    HRESULT newItemMenu();
+    HRESULT shareFiles();
+    HRESULT newLibrary();
+    HRESULT includeLibraryFolder();
+    HRESULT commitLibrary();
+    void reloadLibrary();
+    void applyPendingSelection();
     HRESULT startSearch(const std::wstring& query, bool recursive,
                         std::optional<size_t> category = {}, const std::wstring& filter = L"");
     void editAddress();
@@ -110,6 +123,9 @@ private:
     bool selectionStateDirty_ = true;
     bool selectionFilesystem_ = false;
     bool selectionHidden_ = false;
+    bool selectionShareable_ = false;
+    bool filesystemFolder_ = false;
+    bool physicalDirectory_ = false;
     bool fullscreen_ = false;
     bool searchRecursive_ = true;
     LONG_PTR windowStyle_ = 0;
@@ -117,9 +133,17 @@ private:
     RECT windowRect_{};
     HWND window_ = nullptr, tabs_ = nullptr, nav_ = nullptr, address_ = nullptr;
     HWND breadcrumbs_ = nullptr, search_ = nullptr, status_ = nullptr, file_ = nullptr;
+    HWND quickAccess_ = nullptr;
+    HIMAGELIST quickAccessImages_ = nullptr;
+    NativeContextMenu* activeContextMenu_ = nullptr;
+    NativeShare nativeShare_;
+    ShellLibrary library_;
+    enum class ContextPage { None, Search, Library };
+    ContextPage contextPage_ = ContextPage::None;
     HFONT font_ = nullptr;
     UINT dpi_ = 96;
     Preferences preferences_;
+    QuickAccessToolbar quickAccessModel_;
     ComPtr<IExplorerBrowser> browser_;
     ComPtr<IShellView> view_;
     ComPtr<IFolderView2> folderView_;
@@ -136,6 +160,9 @@ private:
     int historyIndex_ = -1, pendingHistory_ = -1;
     Pidl currentPidl_;
     Pidl searchScope_;
+    Pidl selectionDestination_, selectionChild_;
+    ComPtr<IShellItem> selectionTarget_;
+    ULONGLONG selectionDeadline_ = 0, selectionRetryAt_ = 0;
     std::vector<std::wstring> recentSearches_;
     std::wstring activeQuery_;
     std::wstring searchBase_;

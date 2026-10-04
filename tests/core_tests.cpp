@@ -14,6 +14,11 @@ int runExtraOperationTests();
 int runInputTests();
 int runItemActionTests();
 int runSearchTests();
+int runContextMenuTests();
+int runQuickAccessTests();
+int runSavedSearchTests();
+int runShareTests();
+int runLibraryTests();
 
 namespace {
 void require(bool condition, const char* message) {
@@ -165,6 +170,11 @@ int main() {
     failures += static_cast<unsigned>(runInputTests());
     failures += static_cast<unsigned>(runItemActionTests());
     failures += static_cast<unsigned>(runSearchTests());
+    failures += static_cast<unsigned>(runContextMenuTests());
+    failures += static_cast<unsigned>(runQuickAccessTests());
+    failures += static_cast<unsigned>(runSavedSearchTests());
+    failures += static_cast<unsigned>(runShareTests());
+    failures += static_cast<unsigned>(runLibraryTests());
     CoUninitialize();
     return failures == 0 ? 0 : 1;
 }

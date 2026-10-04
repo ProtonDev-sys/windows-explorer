@@ -1,6 +1,7 @@
 #include "explorer/app.hpp"
 #include "explorer/shell_operations.hpp"
 #include "explorer/search.hpp"
+#include "explorer/saved_search.hpp"
 #include "explorer/extra_operations.hpp"
 #include "explorer/input.hpp"
 #include "explorer/item_actions.hpp"
@@ -21,7 +22,12 @@ namespace {
 constexpr wchar_t WindowClass[] = L"WindowsExplorer.Native.Window";
 constexpr UINT DeferredUpdate = WM_APP + 1;
 constexpr UINT DeferredView = WM_APP + 2;
+constexpr UINT ShareResult = WM_APP + 3;
 constexpr int TabsId = 900;
+std::filesystem::path quickAccessSettingsPath() {
+    const auto settings = preferencesPath();
+    return settings.empty() ? std::filesystem::path{} : settings.parent_path() / L"qat.ini";
+}
 bool visibleWindowObserved = false;
 constexpr std::array<const wchar_t*, 8> ViewNames{
     L"Extra large icons", L"Large icons", L"Medium icons", L"Small icons",
@@ -39,6 +45,15 @@ bool isExternalSearch(PCIDLIST_ABSOLUTE pidl) {
     const bool saved = raw && _wcsicmp(raw, L".search-ms") == 0;
     CoTaskMemFree(raw); return saved;
 }
+bool hasNativeItemType(PCIDLIST_ABSOLUTE pidl, const wchar_t* type) {
+    ComPtr<IShellItem2> item;
+    if (!pidl || FAILED(SHCreateItemFromIDList(pidl, IID_PPV_ARGS(&item)))) return false;
+    PWSTR raw = nullptr;
+    const auto hr = item->GetString(PKEY_ItemType, &raw);
+    const bool matches = SUCCEEDED(hr) && raw && _wcsicmp(raw, type) == 0;
+    CoTaskMemFree(raw);
+    return matches;
+}
 
 std::wstring textOf(HWND window) {
     const auto length = GetWindowTextLengthW(window);
@@ -53,6 +68,12 @@ std::wstring itemName(IShellItem* item, SIGDN format) {
     std::wstring result = value;
     CoTaskMemFree(value);
     return result;
+}
+bool isPhysicalDirectory(IShellItem* item) {
+    const auto path = itemName(item, SIGDN_FILESYSPATH);
+    if (path.empty()) return false;
+    const auto attributes = GetFileAttributesW(path.c_str());
+    return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY);
 }
 std::wstring pidlName(PCIDLIST_ABSOLUTE pidl, SIGDN format) {
     PWSTR value = nullptr;
@@ -131,12 +152,15 @@ HRESULT shellExecute(HWND owner, const wchar_t* target, const wchar_t* arguments
 }
 
 ExplorerApp::ExplorerApp(HINSTANCE instance, bool headless)
-    : instance_(instance), headless_(headless), preferences_(headless ? Preferences{} : loadPreferences(preferencesPath())) {}
+    : instance_(instance), headless_(headless), preferences_(headless ? Preferences{} : loadPreferences(preferencesPath())),
+      quickAccessModel_(headless ? QuickAccessToolbar{} : loadQuickAccessToolbar(quickAccessSettingsPath())) {}
 
 ExplorerApp::~ExplorerApp() {
+    nativeShare_.reset();
     destroyBrowser();
     if (window_ && IsWindow(window_)) DestroyWindow(window_);
     for (auto images : ribbonImages_) ImageList_Destroy(images);
+    if (quickAccessImages_) ImageList_Destroy(quickAccessImages_);
     if (font_) DeleteObject(font_);
 }
 
@@ -237,7 +261,8 @@ HRESULT ExplorerApp::createBrowser() {
     if (FAILED(hr)) { browser_.Reset(); return hr; }
     hr = browser_->Advise(static_cast<IExplorerBrowserEvents*>(this), &adviseCookie_);
     if (FAILED(hr)) { destroyBrowser(); return hr; }
-    browser_->SetOptions(static_cast<EXPLORER_BROWSER_OPTIONS>(EBO_SHOWFRAMES | EBO_NOTRAVELLOG));
+    browser_->SetOptions(static_cast<EXPLORER_BROWSER_OPTIONS>(EBO_SHOWFRAMES | EBO_NOTRAVELLOG |
+        (headless_ ? EBO_NOPERSISTVIEWSTATE : 0)));
     browser_->SetPropertyBag(L"WindowsExplorer.Native");
     FOLDERSETTINGS settings{FVM_DETAILS, FWF_AUTOARRANGE};
     RECT rect{0, px(164), px(1100), px(700)};
@@ -298,6 +323,9 @@ HRESULT ExplorerApp::navigate(const std::wstring& location) {
     return browser_->BrowseToIDList(pidl.get(), SBSP_ABSOLUTE);
 }
 HRESULT ExplorerApp::OnNavigationPending(PCIDLIST_ABSOLUTE pidl) {
+    if (selectionDestination_ && !ILIsEqual(selectionDestination_.get(), pidl)) {
+        selectionDestination_.reset(); selectionChild_.reset(); selectionTarget_.Reset();
+    }
     if (pendingHistory_ >= 0 && !ILIsEqual(history_[pendingHistory_].get(), pidl)) pendingHistory_ = -1;
     const auto search = std::find_if(searchLocations_.begin(), searchLocations_.end(),
                                     [&](const SearchLocation& item) { return ILIsEqual(item.location.get(), pidl); });
@@ -321,17 +349,53 @@ HRESULT ExplorerApp::OnNavigationComplete(PCIDLIST_ABSOLUTE pidl) {
     const auto search = std::find_if(searchLocations_.rbegin(), searchLocations_.rend(),
                                     [&](const SearchLocation& item) { return ILIsEqual(item.location.get(), pidl); });
     searchActive_ = search != searchLocations_.rend();
-    pendingSearchActive_ = searchActive_;
     searchBackground_ = searchActive_ || isExternalSearch(pidl);
-    pendingSearchBackground_ = searchBackground_;
     if (searchActive_) {
         searchScope_.reset(ILCloneFull(search->scope.get()));
         activeQuery_ = search->query;
         searchRecursive_ = search->recursive;
         searchBase_ = search->base;
         searchFilters_ = search->filters;
+    } else if (searchBackground_) {
+        const auto path = pidlName(pidl, SIGDN_FILESYSPATH);
+        SavedSearchMetadata metadata;
+        if (!path.empty() && SUCCEEDED(readSavedSearch(std::filesystem::path(path), &metadata))) {
+            PIDLIST_ABSOLUTE rawScope = nullptr;
+            const auto scopeResult = SHGetIDListFromObject(metadata.scope.Get(), &rawScope);
+            Pidl scope(rawScope);
+            if (SUCCEEDED(scopeResult) && scope) {
+                searchScope_ = std::move(scope);
+                activeQuery_ = std::move(metadata.query);
+                searchBase_ = activeQuery_;
+                searchFilters_ = {};
+                searchRecursive_ = metadata.recursive;
+                searchActive_ = true;
+            }
+        }
+    }
+    pendingSearchActive_ = searchActive_;
+    pendingSearchBackground_ = searchBackground_;
+    library_ = ShellLibrary{};
+    if (!searchBackground_ && hasNativeItemType(pidl, L".library-ms")) {
+        ComPtr<IShellItem> item;
+        if (SUCCEEDED(SHCreateItemFromIDList(pidl, IID_PPV_ARGS(&item)))) {
+            if (FAILED(ShellLibrary::load(item.Get(), !headless_, library_)))
+                ShellLibrary::load(item.Get(), false, library_);
+        }
     }
     currentPidl_.reset(ILCloneFull(pidl));
+    filesystemFolder_ = physicalDirectory_ = false;
+    ComPtr<IShellItem> currentItem;
+    if (SUCCEEDED(currentFolder(currentItem))) {
+        SFGAOF attributes = 0;
+        filesystemFolder_ = SUCCEEDED(currentItem->GetAttributes(SFGAO_FILESYSTEM | SFGAO_FOLDER, &attributes)) &&
+            (attributes & (SFGAO_FILESYSTEM | SFGAO_FOLDER)) == (SFGAO_FILESYSTEM | SFGAO_FOLDER);
+        physicalDirectory_ = filesystemFolder_ && isPhysicalDirectory(currentItem.Get());
+    }
+    if (selectionDestination_ && ILIsEqual(selectionDestination_.get(), pidl)) {
+        selectionDeadline_ = GetTickCount64() + 5000;
+        selectionRetryAt_ = 0;
+    }
     currentLocation_ = pidlName(pidl, SIGDN_DESKTOPABSOLUTEPARSING);
     currentName_ = pidlName(pidl, SIGDN_NORMALDISPLAY);
     if (pendingHistory_ >= 0 && ILIsEqual(history_[pendingHistory_].get(), pidl)) { historyIndex_ = pendingHistory_; pendingHistory_ = -1; }
@@ -354,6 +418,7 @@ HRESULT ExplorerApp::OnNavigationComplete(PCIDLIST_ABSOLUTE pidl) {
 }
 HRESULT ExplorerApp::OnNavigationFailed(PCIDLIST_ABSOLUTE) {
     navigating_ = false; pendingHistory_ = -1;
+    selectionDestination_.reset(); selectionChild_.reset(); selectionTarget_.Reset();
     pendingSearchActive_ = searchActive_;
     pendingSearchBackground_ = searchBackground_;
     lastError_ = L"This location could not be opened. Check its availability and your permissions.";
@@ -397,6 +462,11 @@ void ExplorerApp::createControls() {
     search_ = control(L"EDIT", L"", ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP, Search);
     SetWindowSubclass(search_, editProc, Search, reinterpret_cast<DWORD_PTR>(this));
     status_ = control(STATUSCLASSNAMEW, L"Ready", SBARS_SIZEGRIP, 903);
+    quickAccess_ = control(TOOLBARCLASSNAMEW, L"Quick Access Toolbar", WS_TABSTOP | TBSTYLE_FLAT | TBSTYLE_TOOLTIPS |
+        CCS_NORESIZE | CCS_NOPARENTALIGN | CCS_NODIVIDER, 904);
+    SendMessageW(quickAccess_, TB_BUTTONSTRUCTSIZE, sizeof(TBBUTTON), 0);
+    SendMessageW(quickAccess_, TB_SETEXTENDEDSTYLE, 0, TBSTYLE_EX_MIXEDBUTTONS);
+    rebuildQuickAccess();
     SetTimer(window_, 1, 700, nullptr);
     rebuildRibbon();
 }
@@ -408,7 +478,7 @@ void ExplorerApp::rebuildRibbon() {
     for (auto images : ribbonImages_) ImageList_Destroy(images);
     ribbonImages_.clear();
     if (preferences_.ribbonCollapsed) { layout(); return; }
-    int x = px(8), top = px(30), height = px(94);
+    int x = px(8), top = px(30 + (quickAccessModel_.belowRibbon() ? 0 : 28)), height = px(94);
     auto child = [&](const wchar_t* type, const wchar_t* label, DWORD style, UINT id, int left, int y, int width, int h) {
         auto handle = CreateWindowExW(0, type, label, WS_CHILD | WS_VISIBLE | style, left, y, width, h,
                                      window_, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(id)), instance_, nullptr);
@@ -457,7 +527,7 @@ void ExplorerApp::rebuildRibbon() {
         });
         group(L"New", 152, [&](int left) {
             large(NewFolder, L"New folder", left, SIID_FOLDER);
-            smallButton(NewText, L"Text file", left + px(68), 0, 76);
+            smallButton(NewItems, L"New item ▾", left + px(68), 0, 76);
             smallButton(NewShortcut, L"Shortcut…", left + px(68), 1, 76);
             smallButton(FolderOptions, L"Options", left + px(68), 2, 76);
         });
@@ -473,10 +543,13 @@ void ExplorerApp::rebuildRibbon() {
         });
     } else if (selectedTab == 1) {
         group(L"Send", 280, [&](int left) {
-            large(Sharing, L"Sharing", left, SIID_SHARE); large(Zip, L"Zip", left + px(68), SIID_ZIPFILE);
+            large(Sharing, L"Share", left, SIID_SHARE); large(Zip, L"Zip", left + px(68), SIID_ZIPFILE);
             large(Print, L"Print", left + px(136), SIID_PRINTER); large(Extract, L"Extract all", left + px(204), SIID_FOLDER);
         });
-        group(L"Give access to", 140, [&](int left) { large(Security, L"Advanced\nsecurity", left, SIID_LOCK); });
+        group(L"Give access to", 240, [&](int left) {
+            large(Security, L"Advanced\nsecurity", left, SIID_LOCK);
+            smallButton(SharingProperties, L"Sharing properties…", left + px(70), 0, 160);
+        });
     } else if (selectedTab == 2) {
         group(L"Panes", 165, [&](int left) {
             smallButton(NavigationPane, L"Navigation pane", left, 0, 155, preferences_.navigationPane, true);
@@ -515,6 +588,17 @@ void ExplorerApp::rebuildRibbon() {
             smallButton(FolderOptions, L"Folder options", left, 1, 170);
             smallButton(FileHistory, L"File History", left, 2, 170);
         });
+    } else if (selectedTab == 4 && contextPage_ == ContextPage::Library) {
+        group(L"Locations", 258, [&](int left) {
+            smallButton(LibraryLocations, L"Manage locations ▾", left, 0, 174);
+            smallButton(IncludeLibraryFolder, L"Include folder…", left, 1, 174);
+            smallButton(LibraryDefault, L"Save location ▾", left, 2, 174);
+        });
+        group(L"Manage", 272, [&](int left) {
+            smallButton(LibraryOptimize, L"Optimize library for ▾", left, 0, 190);
+            smallButton(NewLibrary, L"New library…", left, 1, 190);
+            large(Properties, L"Properties", left + px(198), SIID_INFO);
+        });
     } else if (selectedTab == 4 && searchActive_) {
         group(L"Location", 168, [&](int left) {
             smallButton(SearchCurrent, L"Current folder", left, 0, 158, !searchRecursive_, true);
@@ -529,6 +613,7 @@ void ExplorerApp::rebuildRibbon() {
         group(L"Options", 168, [&](int left) {
             smallButton(RecentSearches, L"Recent searches ▾", left, 0, 158);
             smallButton(SaveSearch, L"Save search…", left, 1, 158);
+            smallButton(OpenFileLocation, L"Open file location", left, 2, 158);
         });
         group(L"Close", 104, [&](int left) { large(CloseSearch, L"Close search", left, SIID_DELETE); });
     }
@@ -536,13 +621,47 @@ void ExplorerApp::rebuildRibbon() {
     layout();
 }
 
+void ExplorerApp::rebuildQuickAccess() {
+    if (!quickAccess_) return;
+    selectionStateDirty_ = true;
+    while (SendMessageW(quickAccess_, TB_BUTTONCOUNT, 0, 0)) SendMessageW(quickAccess_, TB_DELETEBUTTON, 0, 0);
+    SendMessageW(quickAccess_, TB_SETIMAGELIST, 0, 0);
+    if (quickAccessImages_) ImageList_Destroy(quickAccessImages_);
+    quickAccessImages_ = ImageList_Create(px(16), px(16), ILC_COLOR32 | ILC_MASK,
+        static_cast<int>(QuickAccessToolbar::MaximumCommands), 1);
+    SendMessageW(quickAccess_, TB_SETBITMAPSIZE, 0, MAKELPARAM(px(16), px(16)));
+    SendMessageW(quickAccess_, TB_SETBUTTONSIZE, 0, MAKELPARAM(px(24), px(24)));
+    SendMessageW(quickAccess_, TB_SETIMAGELIST, 0, reinterpret_cast<LPARAM>(quickAccessImages_));
+    for (const auto command : quickAccessModel_.commands()) {
+        const auto* metadata = quickAccessCommand(command);
+        if (!metadata) continue;
+        TBBUTTON button{}; button.idCommand = command; button.iBitmap = I_IMAGENONE;
+        button.fsState = TBSTATE_ENABLED; button.fsStyle = BTNS_BUTTON | BTNS_AUTOSIZE;
+        button.iString = reinterpret_cast<INT_PTR>(metadata->label.data());
+        SHSTOCKICONINFO icon{sizeof(icon)};
+        if (quickAccessImages_ && SUCCEEDED(SHGetStockIconInfo(metadata->icon, SHGSI_ICON | SHGSI_SMALLICON, &icon))) {
+            button.iBitmap = ImageList_AddIcon(quickAccessImages_, icon.hIcon);
+            DestroyIcon(icon.hIcon);
+        }
+        SendMessageW(quickAccess_, TB_ADDBUTTONS, 1, reinterpret_cast<LPARAM>(&button));
+    }
+    TBBUTTON customize{}; customize.idCommand = QuickAccessMenu; customize.iBitmap = I_IMAGENONE;
+    customize.fsState = TBSTATE_ENABLED; customize.fsStyle = BTNS_BUTTON | BTNS_AUTOSIZE | BTNS_SHOWTEXT;
+    customize.iString = reinterpret_cast<INT_PTR>(L"▾");
+    SendMessageW(quickAccess_, TB_ADDBUTTONS, 1, reinterpret_cast<LPARAM>(&customize));
+    updateCommands();
+}
+
 void ExplorerApp::layout() {
     if (!window_ || !tabs_) return;
     RECT client{}; GetClientRect(window_, &client);
     const int width = client.right, height = client.bottom;
-    MoveWindow(file_, px(4), px(1), px(57), px(26), TRUE);
-    MoveWindow(tabs_, px(66), 0, std::max(px(350), width - px(70)), px(28), TRUE);
-    const int y = preferences_.ribbonCollapsed ? px(34) : px(130);
+    const int above = quickAccessModel_.belowRibbon() ? 0 : px(28);
+    const int ribbonBottom = preferences_.ribbonCollapsed ? px(34) : px(130);
+    MoveWindow(file_, px(4), above + px(1), px(57), px(26), TRUE);
+    MoveWindow(tabs_, px(66), above, std::max(px(350), width - px(70)), px(28), TRUE);
+    MoveWindow(quickAccess_, px(4), quickAccessModel_.belowRibbon() ? ribbonBottom : 0, width - px(8), px(27), TRUE);
+    const int y = ribbonBottom + px(28);
     const int searchWidth = std::clamp(width / 4, px(160), px(300));
     const int navWidth = px(145);
     MoveWindow(nav_, px(4), y, navWidth - px(4), px(30), TRUE);
@@ -561,16 +680,16 @@ void ExplorerApp::layout() {
 }
 
 void ExplorerApp::updateContextTabs() {
-    const bool present = TabCtrl_GetItemCount(tabs_) > 4;
-    if (searchActive_ && !present) {
-        TCITEMW tab{TCIF_TEXT}; tab.pszText = const_cast<LPWSTR>(L"Search");
-        TabCtrl_InsertItem(tabs_, 4, &tab);
-        TabCtrl_SetCurSel(tabs_, 4);
-        rebuildRibbon();
-    } else if (!searchActive_ && present) {
+    const auto required = searchActive_ ? ContextPage::Search : library_.valid() ? ContextPage::Library : ContextPage::None;
+    if (required != contextPage_) {
         const bool selected = TabCtrl_GetCurSel(tabs_) == 4;
-        TabCtrl_DeleteItem(tabs_, 4);
-        if (selected) TabCtrl_SetCurSel(tabs_, 0);
+        if (contextPage_ != ContextPage::None) TabCtrl_DeleteItem(tabs_, 4);
+        contextPage_ = required;
+        if (required != ContextPage::None) {
+            TCITEMW tab{TCIF_TEXT}; tab.pszText = const_cast<LPWSTR>(required == ContextPage::Search ? L"Search" : L"Library");
+            TabCtrl_InsertItem(tabs_, 4, &tab);
+            TabCtrl_SetCurSel(tabs_, 4);
+        } else if (selected) TabCtrl_SetCurSel(tabs_, 0);
         rebuildRibbon();
     } else if (searchActive_ && TabCtrl_GetCurSel(tabs_) == 4) {
         if (const auto current = GetDlgItem(window_, SearchCurrent)) SendMessageW(current, BM_SETCHECK, searchRecursive_ ? BST_UNCHECKED : BST_CHECKED, 0);
@@ -732,6 +851,192 @@ HRESULT ExplorerApp::saveSearch() {
     return path.empty() ? E_INVALIDARG : explorer::saveSearch(activeQuery_, scope.Get(), searchRecursive_, std::filesystem::path(path));
 }
 
+HRESULT ExplorerApp::openFileLocation() {
+    if (!searchBackground_ || !browser_) return E_UNEXPECTED;
+    ComPtr<IShellItemArray> items;
+    auto hr = selection(items);
+    if (FAILED(hr)) return hr;
+    if (!items) return E_INVALIDARG;
+    DWORD count = 0;
+    hr = items->GetCount(&count);
+    if (FAILED(hr)) return hr;
+    if (count != 1) return E_INVALIDARG;
+    ComPtr<IShellItem> item, parent;
+    hr = items->GetItemAt(0, &item);
+    if (FAILED(hr)) return hr;
+    // A result selected in a native search view can have the search folder as
+    // its Shell parent. Resolve its filesystem parsing name first, so this
+    // command opens the containing directory instead of the result container.
+    const auto path = itemName(item.Get(), SIGDN_FILESYSPATH);
+    if (path.empty()) return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+    ComPtr<IShellItem> filesystemItem;
+    hr = SHCreateItemFromParsingName(path.c_str(), nullptr, IID_PPV_ARGS(&filesystemItem));
+    if (FAILED(hr)) return hr;
+    item = filesystemItem;
+    if (SUCCEEDED(hr)) hr = item->GetParent(&parent);
+    if (FAILED(hr)) return hr;
+    PIDLIST_ABSOLUTE raw = nullptr;
+    hr = SHGetIDListFromObject(item.Get(), &raw);
+    Pidl absolute(raw);
+    if (FAILED(hr)) return hr;
+    Pidl child(ILClone(ILFindLastID(absolute.get())));
+    raw = nullptr;
+    hr = SHGetIDListFromObject(parent.Get(), &raw);
+    Pidl destination(raw);
+    if (FAILED(hr)) return hr;
+    if (!child || ILIsEmpty(child.get()) || !destination) return E_UNEXPECTED;
+    // Keep the child PIDL tied to its actual parent; never pass a result
+    // container's relative child identifier into a filesystem view.
+    Pidl identifierParent(ILCloneFull(absolute.get()));
+    if (!identifierParent || !ILRemoveLastID(identifierParent.get()) ||
+        !ILIsEqual(identifierParent.get(), destination.get())) return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+    selectionDestination_ = std::move(destination);
+    selectionChild_ = std::move(child);
+    selectionTarget_ = item;
+    selectionDeadline_ = selectionRetryAt_ = 0;
+    pendingHistory_ = -1;
+    hr = browser_->BrowseToObject(parent.Get(), SBSP_ABSOLUTE);
+    if (FAILED(hr)) { selectionDestination_.reset(); selectionChild_.reset(); selectionTarget_.Reset(); }
+    return hr;
+}
+
+HRESULT ExplorerApp::newItemMenu() {
+    if (headless_) return E_ACCESSDENIED;
+    if (navigating_) return HRESULT_FROM_WIN32(ERROR_BUSY);
+    ComPtr<IShellItem> folder;
+    auto hr = currentFolder(folder);
+    if (FAILED(hr)) return hr;
+    NativeContextMenu menu;
+    hr = menu.createNewItems(window_, folder.Get(), view_.Get());
+    if (FAILED(hr)) return hr;
+    const HWND anchor = GetDlgItem(window_, NewItems);
+    RECT rect{};
+    if (anchor) GetWindowRect(anchor, &rect);
+    else { POINT point{}; GetCursorPos(&point); rect.left = point.x; rect.bottom = point.y; }
+    struct ActiveMenu {
+        NativeContextMenu*& slot;
+        NativeContextMenu* previous;
+        ActiveMenu(NativeContextMenu*& target, NativeContextMenu* value) : slot(target), previous(target) { slot = value; }
+        ~ActiveMenu() { slot = previous; }
+    } active(activeContextMenu_, &menu);
+    const POINT point{rect.left, rect.bottom};
+    const auto selected = TrackPopupMenuEx(menu.popup(), TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
+        point.x, point.y, window_, nullptr);
+    return selected ? menu.invoke(selected, point, (GetKeyState(VK_CONTROL) & 0x8000) != 0,
+        (GetKeyState(VK_SHIFT) & 0x8000) != 0) : S_FALSE;
+}
+
+HRESULT ExplorerApp::shareFiles() {
+    if (headless_) return E_ACCESSDENIED;
+    ComPtr<IShellItemArray> items;
+    auto hr = selection(items);
+    if (FAILED(hr)) return hr;
+    SharePayload payload;
+    hr = makeSharePayload(items.Get(), L"Share files", payload);
+    if (FAILED(hr)) return hr;
+    if (!nativeShare_.ready()) hr = nativeShare_.initialize(window_, ShareResult);
+    return FAILED(hr) ? hr : nativeShare_.show(payload);
+}
+
+HRESULT ExplorerApp::newLibrary() {
+    if (headless_) return E_ACCESSDENIED;
+    ComPtr<IFileSaveDialog> dialog;
+    auto hr = CoCreateInstance(CLSID_FileSaveDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog));
+    if (FAILED(hr)) return hr;
+    const COMDLG_FILTERSPEC filter{L"Windows libraries", L"*.library-ms"};
+    dialog->SetOptions(FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST | FOS_NOREADONLYRETURN);
+    dialog->SetFileTypes(1, &filter); dialog->SetDefaultExtension(L"library-ms");
+    dialog->SetTitle(L"Create a new library"); dialog->SetFileName(L"New library.library-ms");
+    ComPtr<IShellItem> defaultFolder;
+    if (SUCCEEDED(SHGetKnownFolderItem(FOLDERID_Libraries, KF_FLAG_DEFAULT, nullptr, IID_PPV_ARGS(&defaultFolder))))
+        dialog->SetDefaultFolder(defaultFolder.Get());
+    hr = dialog->Show(window_); if (FAILED(hr)) return hr;
+    ComPtr<IShellItem> output;
+    hr = dialog->GetResult(&output); if (FAILED(hr)) return hr;
+    const std::filesystem::path path(itemName(output.Get(), SIGDN_FILESYSPATH));
+    if (path.empty() || _wcsicmp(path.extension().c_str(), L".library-ms") != 0) return E_INVALIDARG;
+    ShellLibrary library;
+    hr = ShellLibrary::create(library); if (FAILED(hr)) return hr;
+    hr = library.save(path.parent_path(), path.stem().wstring(), output);
+    if (SUCCEEDED(hr)) {
+        library = ShellLibrary{};
+        SHChangeNotify(SHCNE_CREATE, SHCNF_PATHW, path.c_str(), nullptr);
+        hr = browser_->BrowseToObject(output.Get(), SBSP_ABSOLUTE);
+    }
+    return hr;
+}
+
+HRESULT ExplorerApp::includeLibraryFolder() {
+    if (headless_) return E_ACCESSDENIED;
+    if (!library_.valid() || !library_.writable()) return E_ACCESSDENIED;
+    Pidl target(ILCloneFull(currentPidl_.get()));
+    if (!target) return E_OUTOFMEMORY;
+    const auto generation = navigationCount_;
+    ComPtr<IFileOpenDialog> dialog;
+    auto hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog));
+    if (FAILED(hr)) return hr;
+    dialog->SetOptions(FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
+    dialog->SetTitle(L"Include a folder in this library");
+    ComPtr<IShellItem> defaultFolder;
+    if (SUCCEEDED(library_.defaultSaveFolder(defaultFolder))) dialog->SetDefaultFolder(defaultFolder.Get());
+    hr = dialog->Show(window_); if (FAILED(hr)) return hr;
+    if (navigating_ || generation != navigationCount_ || !currentPidl_ || !ILIsEqual(target.get(), currentPidl_.get()))
+        return HRESULT_FROM_WIN32(ERROR_CANCELLED);
+    ComPtr<IShellItem> folder;
+    hr = dialog->GetResult(&folder); if (FAILED(hr)) return hr;
+    hr = library_.addFolder(std::filesystem::path(itemName(folder.Get(), SIGDN_FILESYSPATH)));
+    return FAILED(hr) ? hr : commitLibrary();
+}
+
+HRESULT ExplorerApp::commitLibrary() {
+    if (headless_) return E_ACCESSDENIED;
+    const auto hr = library_.commit();
+    if (SUCCEEDED(hr)) {
+        SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_IDLIST, currentPidl_.get(), nullptr);
+        if (view_) view_->Refresh();
+        updateCommands();
+    } else {
+        // Discard uncommitted edits so a later action cannot accidentally save
+        // an operation that was reported as failed.
+        reloadLibrary(); updateContextTabs(); updateCommands();
+    }
+    return hr;
+}
+
+void ExplorerApp::reloadLibrary() {
+    library_ = ShellLibrary{};
+    ComPtr<IShellItem> item;
+    if (!currentPidl_ || !hasNativeItemType(currentPidl_.get(), L".library-ms") ||
+        FAILED(SHCreateItemFromIDList(currentPidl_.get(), IID_PPV_ARGS(&item)))) return;
+    if (FAILED(ShellLibrary::load(item.Get(), !headless_, library_))) ShellLibrary::load(item.Get(), false, library_);
+}
+
+void ExplorerApp::applyPendingSelection() {
+    if (!selectionDestination_ || !selectionChild_ || !selectionTarget_ || !selectionDeadline_ || navigating_ || !view_ ||
+        !currentPidl_ || !ILIsEqual(selectionDestination_.get(), currentPidl_.get())) return;
+    auto selectedExactly = [&] {
+        ComPtr<IShellItemArray> items;
+        ComPtr<IShellItem> item;
+        DWORD count = 0; int comparison = 1;
+        return SUCCEEDED(selection(items)) && items && SUCCEEDED(items->GetCount(&count)) && count == 1 &&
+            SUCCEEDED(items->GetItemAt(0, &item)) && SUCCEEDED(item->Compare(selectionTarget_.Get(), SICHINT_CANONICAL, &comparison)) &&
+            comparison == 0;
+    };
+    if (selectedExactly()) {
+        selectionDestination_.reset(); selectionChild_.reset(); selectionTarget_.Reset(); return;
+    }
+    const auto now = GetTickCount64();
+    if (now < selectionRetryAt_) return;
+    selectionRetryAt_ = now + 100;
+    auto hr = view_->SelectItem(selectionChild_.get(),
+        SVSI_SELECT | SVSI_DESELECTOTHERS | SVSI_ENSUREVISIBLE | SVSI_FOCUSED);
+    const bool confirmed = selectedExactly();
+    if (confirmed || now >= selectionDeadline_) {
+        selectionDestination_.reset(); selectionChild_.reset(); selectionTarget_.Reset();
+        if (!confirmed) showError(FAILED(hr) ? hr : HRESULT_FROM_WIN32(ERROR_TIMEOUT), L"Select file in its location");
+    }
+}
+
 HRESULT ExplorerApp::startSearch(const std::wstring& requested, bool recursive,
                                 std::optional<size_t> category, const std::wstring& filter) {
     auto query = trim(requested);
@@ -829,39 +1134,44 @@ void ExplorerApp::updateCommands() {
     ComPtr<IShellItemArray> selected;
     DWORD count = 0;
     if (SUCCEEDED(selection(selected)) && selected) selected->GetCount(&count);
-    ComPtr<IShellItem> folder;
-    bool writable = false;
-    if (SUCCEEDED(currentFolder(folder))) {
-        SFGAOF attrs = 0; folder->GetAttributes(SFGAO_FILESYSTEM | SFGAO_FOLDER, &attrs);
-        writable = (attrs & (SFGAO_FILESYSTEM | SFGAO_FOLDER)) == (SFGAO_FILESYSTEM | SFGAO_FOLDER);
-    }
     SHELLSTATE shellSettings{};
     SHGetSetSettings(&shellSettings, SSF_SHOWEXTENSIONS, FALSE);
     preferences_.showExtensions = shellSettings.fShowExtensions;
-    if (selectionStateDirty_ && GetDlgItem(window_, HideSelected)) {
-        SFGAOF attributes = 0;
-        const bool available = count && SUCCEEDED(selected->GetAttributes(SIATTRIBFLAGS_AND, SFGAO_FILESYSTEM | SFGAO_HIDDEN, &attributes));
-        selectionFilesystem_ = available && (attributes & SFGAO_FILESYSTEM);
-        selectionHidden_ = available && (attributes & SFGAO_HIDDEN);
+    if (selectionStateDirty_) {
+        if (GetDlgItem(window_, HideSelected) || quickAccessModel_.contains(HideSelected)) {
+            SFGAOF attributes = 0;
+            const bool available = count && SUCCEEDED(selected->GetAttributes(SIATTRIBFLAGS_AND, SFGAO_FILESYSTEM | SFGAO_HIDDEN, &attributes));
+            selectionFilesystem_ = available && (attributes & SFGAO_FILESYSTEM);
+            selectionHidden_ = available && (attributes & SFGAO_HIDDEN);
+        }
+        SharePayload payload;
+        selectionShareable_ = (GetDlgItem(window_, Sharing) || quickAccessModel_.contains(Sharing)) && count &&
+            count <= maximumShareFiles && SUCCEEDED(makeSharePayload(selected.Get(), L"Share files", payload));
         selectionStateDirty_ = false;
     }
-    for (auto hwnd : ribbonControls_) {
-        const auto id = GetDlgCtrlID(hwnd);
+    auto enabledFor = [&](UINT id, HWND hwnd) {
         bool enabled = true;
-        if (id == Copy || id == Cut || id == CopyPath || id == MoveTo || id == CopyTo || id == Delete || id == Open || id == Edit || id == Print || id == Zip) enabled = count > 0;
+        if (id == Copy || id == Cut || id == CopyPath || id == MoveTo || id == CopyTo || id == Delete || id == PermanentDelete || id == Open || id == Edit || id == Print || id == Zip) enabled = count > 0;
+        if (id == Sharing) enabled = selectionShareable_;
         if (id == Rename) enabled = count == 1;
         if (id == HideSelected) {
             enabled = count && selectionFilesystem_;
-            SetWindowTextW(hwnd, selectionHidden_ ? L"Unhide selected items" : L"Hide selected items");
+            if (hwnd) SetWindowTextW(hwnd, selectionHidden_ ? L"Unhide selected items" : L"Hide selected items");
         }
         if (id == ColumnsMenu || id == SizeColumns) {
             FOLDERVIEWMODE mode = FVM_AUTO; int iconSize = 0;
             enabled = folderView_ && SUCCEEDED(folderView_->GetViewModeAndIconSize(&mode, &iconSize)) && mode == FVM_DETAILS;
         }
         if (id == RecentSearches) enabled = !recentSearches_.empty();
+        if (id == LibraryLocations) enabled = library_.valid();
+        if (id == IncludeLibraryFolder || id == LibraryDefault || id == LibraryOptimize)
+            enabled = library_.valid() && library_.writable();
+        if (id == OpenFileLocation) enabled = searchBackground_ && count == 1;
         if (id == SearchCurrent || id == SearchSubfolders || id == SaveSearch || id == CloseSearch ||
             id == SearchKindMenu || id == SearchDateMenu || id == SearchSizeMenu) enabled = searchActive_;
-        if (id == NewFolder || id == NewText || id == NewShortcut || id == Paste || id == PasteShortcut || id == Terminal) enabled = writable;
+        if (id == NewFolder || id == NewText || id == NewShortcut || id == NewItems || id == PasteShortcut || id == Terminal)
+            enabled = physicalDirectory_ && !navigating_;
+        if (id == Paste) enabled = filesystemFolder_ && !navigating_;
         if (id == Extract) {
             ComPtr<IShellItem> item;
             if (count == 1 && SUCCEEDED(selected->GetItemAt(0, &item))) {
@@ -869,9 +1179,20 @@ void ExplorerApp::updateCommands() {
                 enabled = name.size() >= 4 && _wcsicmp(name.c_str() + name.size() - 4, L".zip") == 0;
             } else enabled = false;
         }
-        if (id == Extensions) SendMessageW(hwnd, BM_SETCHECK, preferences_.showExtensions ? BST_CHECKED : BST_UNCHECKED, 0);
+        if (id == Extensions && hwnd) SendMessageW(hwnd, BM_SETCHECK, preferences_.showExtensions ? BST_CHECKED : BST_UNCHECKED, 0);
         if ((id == Zip || id == Extract) && archiveTask_.valid()) enabled = false;
-        EnableWindow(hwnd, enabled);
+        return enabled;
+    };
+    for (auto hwnd : ribbonControls_) EnableWindow(hwnd, enabledFor(GetDlgCtrlID(hwnd), hwnd));
+    for (const auto id : quickAccessModel_.commands()) {
+        SendMessageW(quickAccess_, TB_ENABLEBUTTON, id, MAKELONG(enabledFor(id, nullptr), 0));
+        const bool checked = id >= ViewFirst && id <= ViewLast ? static_cast<UINT>(preferences_.view) == static_cast<UINT>(id) - ViewFirst :
+            id == SearchCurrent ? searchActive_ && !searchRecursive_ : id == SearchSubfolders ? searchActive_ && searchRecursive_ :
+            id == SortAscending ? ascending_ : id == SortDescending ? !ascending_ : id == Fullscreen ? fullscreen_ : id == HiddenItems ? preferences_.showHidden :
+            id == NavigationPane ? preferences_.navigationPane : id == PreviewPane ? preferences_.previewPane :
+            id == DetailsPane ? preferences_.detailsPane : id == Collapse ? preferences_.ribbonCollapsed :
+            id == Checkboxes ? checkboxes_ : id == Extensions ? preferences_.showExtensions : false;
+        SendMessageW(quickAccess_, TB_CHECKBUTTON, id, MAKELONG(checked, 0));
     }
 }
 void ExplorerApp::setStatus(const std::wstring& text) {
@@ -951,9 +1272,11 @@ HRESULT ExplorerApp::chooseDestination(bool move) {
 }
 HRESULT ExplorerApp::newFolder() {
     if (headless_) return E_ACCESSDENIED;
+    if (navigating_) return HRESULT_FROM_WIN32(ERROR_BUSY);
     ComPtr<IShellItem> folder;
     auto hr = currentFolder(folder);
     if (FAILED(hr)) return hr;
+    if (!isPhysicalDirectory(folder.Get())) return HRESULT_FROM_WIN32(ERROR_DIRECTORY);
     const auto base = itemName(folder.Get(), SIGDN_FILESYSPATH);
     if (base.empty()) return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
     std::wstring name = L"New folder";
@@ -977,9 +1300,11 @@ HRESULT ExplorerApp::newFolder() {
 }
 HRESULT ExplorerApp::newText() {
     if (headless_) return E_ACCESSDENIED;
+    if (navigating_) return HRESULT_FROM_WIN32(ERROR_BUSY);
     ComPtr<IShellItem> folder;
     auto hr = currentFolder(folder);
     if (FAILED(hr)) return hr;
+    if (!isPhysicalDirectory(folder.Get())) return HRESULT_FROM_WIN32(ERROR_DIRECTORY);
     auto base = itemName(folder.Get(), SIGDN_FILESYSPATH);
     if (base.empty()) return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
     std::wstring name = L"New Text Document.txt";
@@ -1066,8 +1391,10 @@ HRESULT ExplorerApp::archive(bool extract) {
 }
 HRESULT ExplorerApp::makeShortcut(bool fromClipboard) {
     if (headless_) return E_ACCESSDENIED;
+    if (navigating_) return HRESULT_FROM_WIN32(ERROR_BUSY);
     ComPtr<IShellItem> folder;
     auto hr = currentFolder(folder); if (FAILED(hr)) return hr;
+    if (!isPhysicalDirectory(folder.Get())) return HRESULT_FROM_WIN32(ERROR_DIRECTORY);
     auto destination = itemName(folder.Get(), SIGDN_FILESYSPATH);
     if (destination.empty()) return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
     std::vector<std::filesystem::path> targets;
@@ -1132,6 +1459,14 @@ HRESULT ExplorerApp::execute(UINT command) {
     case SearchSubfolders: case SearchCurrent:
         return searchActive_ ? startSearch(activeQuery_, command == SearchSubfolders) : S_FALSE;
     case SaveSearch: return saveSearch();
+    case OpenFileLocation: return openFileLocation();
+    case NewItems: return newItemMenu();
+    case NewLibrary: return newLibrary();
+    case IncludeLibraryFolder: return includeLibraryFolder();
+    case QuickAccessMenu: popup(command, quickAccess_); return S_OK;
+    case QuickAccessPlacement:
+        quickAccessModel_.setBelowRibbon(!quickAccessModel_.belowRibbon()); rebuildRibbon(); return S_OK;
+    case QuickAccessReset: quickAccessModel_.reset(); rebuildQuickAccess(); rebuildRibbon(); return S_OK;
     case QuickAccess: return navigate(L"shell:::{679f85cb-0220-4080-b29b-5540cc05aab6}");
     case ThisPC: return navigate(L"shell:MyComputerFolder");
     case Desktop: return navigate(L"shell:Desktop");
@@ -1145,6 +1480,7 @@ HRESULT ExplorerApp::execute(UINT command) {
     case Libraries: return navigate(L"shell:Libraries");
     case FileMenu: case HistoryMenu: case ViewMenu: case SortMenu: case GroupMenu:
     case ColumnsMenu: case RecentSearches: case SearchKindMenu: case SearchDateMenu: case SearchSizeMenu:
+    case LibraryLocations: case LibraryDefault: case LibraryOptimize:
         popup(command); return S_OK;
     case SizeColumns: return sizeColumns();
     case Close: PostMessageW(window_, WM_CLOSE, 0, 0); return S_OK;
@@ -1180,6 +1516,11 @@ HRESULT ExplorerApp::execute(UINT command) {
     case Delete: case PermanentDelete: {
         if (headless_) return E_ACCESSDENIED;
         const auto hr = selection(items); if (FAILED(hr)) return hr;
+        DWORD count = 0;
+        if (!items) return E_INVALIDARG;
+        const auto countResult = items->GetCount(&count);
+        if (FAILED(countResult)) return countResult;
+        if (!count) return E_INVALIDARG;
         if (command == PermanentDelete && MessageBoxW(window_, L"Permanently delete the selected items? They will not go to the Recycle Bin.", L"Delete permanently", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) return S_FALSE;
         return ShellOperations::remove(window_, items.Get(), command == PermanentDelete);
     }
@@ -1188,7 +1529,8 @@ HRESULT ExplorerApp::execute(UINT command) {
     case NewText: return newText();
     case NewShortcut: return makeShortcut(false);
     case Properties: return showProperties(nullptr);
-    case Sharing: return showProperties(L"Sharing");
+    case Sharing: return shareFiles();
+    case SharingProperties: return showProperties(L"Sharing");
     case Security: return showProperties(L"Security");
     case Open: return nativeVerb(L"open");
     case Edit: return nativeVerb(L"edit");
@@ -1261,7 +1603,9 @@ HRESULT ExplorerApp::execute(UINT command) {
           return result == NO_ERROR ? S_OK : result == static_cast<DWORD>(-1) ? S_FALSE : HRESULT_FROM_WIN32(result); }
     case Terminal: {
         if (headless_) return E_ACCESSDENIED;
+        if (navigating_) return HRESULT_FROM_WIN32(ERROR_BUSY);
         auto hr = currentFolder(folder); if (FAILED(hr)) return hr;
+        if (!isPhysicalDirectory(folder.Get())) return HRESULT_FROM_WIN32(ERROR_DIRECTORY);
         auto path = itemName(folder.Get(), SIGDN_FILESYSPATH);
         return path.empty() ? HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED) : shellExecute(window_, L"cmd.exe", nullptr, path.c_str());
     }
@@ -1280,17 +1624,68 @@ void ExplorerApp::popup(UINT command, HWND anchor) {
     auto separator = [&] { AppendMenuW(menu, MF_SEPARATOR, 0, nullptr); };
     std::vector<PROPERTYKEY> columnKeys;
     std::vector<std::wstring> refinements;
+    std::vector<LibraryFolder> libraryFolders;
+    Pidl libraryTarget(currentPidl_ ? ILCloneFull(currentPidl_.get()) : nullptr);
+    const auto libraryGeneration = navigationCount_;
     auto refine = [&](const wchar_t* label, const wchar_t* query) {
         add(8000 + static_cast<UINT>(refinements.size()), label);
         refinements.emplace_back(query);
     };
-    if (command == FileMenu) {
-        add(NewWindow, L"Open new window\tCtrl+N"); add(Terminal, L"Open command prompt here"); separator();
+    if (command == LibraryLocations || command == LibraryDefault) {
+        const auto hr = library_.folders(libraryFolders);
+        if (FAILED(hr)) { DestroyMenu(menu); showError(hr, L"Read library locations"); return; }
+        ComPtr<IShellItem> defaultFolder;
+        library_.defaultSaveFolder(defaultFolder);
+        for (size_t i = 0; i < libraryFolders.size(); ++i) {
+            int order = 1;
+            const bool current = defaultFolder && SUCCEEDED(libraryFolders[i].item->Compare(defaultFolder.Get(),
+                SICHINT_CANONICAL | SICHINT_TEST_FILESYSPATH_IF_NOT_EQUAL, &order)) && order == 0;
+            const auto label = libraryFolders[i].path.empty() ? libraryFolders[i].displayName : libraryFolders[i].path.wstring();
+            if (command == LibraryDefault) add(15000 + static_cast<UINT>(i), label.c_str(), current, !library_.writable());
+            else {
+                const auto location = CreatePopupMenu();
+                AppendMenuW(location, MF_STRING, 14000 + i, L"Open location");
+                AppendMenuW(location, MF_STRING | (current ? MF_CHECKED : 0) | (library_.writable() ? 0 : MF_GRAYED), 15000 + i, L"Set as save location");
+                AppendMenuW(location, MF_STRING | (library_.writable() ? 0 : MF_GRAYED), 16000 + i, L"Remove from library");
+                AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(location), label.c_str());
+            }
+        }
+        if (libraryFolders.empty()) add(0, L"No included locations", false, true);
+    } else if (command == LibraryOptimize) {
+        GUID type{}; library_.folderType(type);
+        const auto current = libraryKindForType(type);
+        const auto kinds = libraryKinds();
+        for (size_t i = 0; i < kinds.size(); ++i)
+            add(17000 + static_cast<UINT>(i), kinds[i].label.data(), current == kinds[i].kind, !library_.writable());
+    } else if (command == QuickAccessMenu) {
+        const auto catalog = quickAccessCommands();
+        const auto choices = CreatePopupMenu();
+        for (size_t i = 0; i < catalog.size(); ++i)
+            AppendMenuW(choices, MF_STRING | (quickAccessModel_.contains(catalog[i].command) ? MF_CHECKED : 0),
+                10000 + i, catalog[i].label.data());
+        AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(choices), L"Add or remove commands");
+        const auto& commands = quickAccessModel_.commands();
+        for (size_t i = 0; i < commands.size(); ++i) {
+            const auto* metadata = quickAccessCommand(commands[i]);
+            if (!metadata) continue;
+            const auto order = CreatePopupMenu();
+            AppendMenuW(order, MF_STRING | (i ? 0 : MF_GRAYED), 11000 + i, L"Move earlier");
+            AppendMenuW(order, MF_STRING | (i + 1 < commands.size() ? 0 : MF_GRAYED), 12000 + i, L"Move later");
+            AppendMenuW(order, MF_STRING, 13000 + i, L"Remove from toolbar");
+            AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(order), metadata->label.data());
+        }
+        separator();
+        add(QuickAccessPlacement, quickAccessModel_.belowRibbon() ? L"Show above the ribbon" : L"Show below the ribbon");
+        add(QuickAccessReset, L"Reset toolbar");
+    } else if (command == FileMenu) {
+        add(NewWindow, L"Open new window\tCtrl+N"); add(Terminal, L"Open command prompt here", false, !physicalDirectory_ || navigating_); separator();
         add(QuickAccess, L"Quick access"); add(ThisPC, L"This PC"); add(Desktop, L"Desktop");
         add(Documents, L"Documents"); add(Downloads, L"Downloads"); add(Pictures, L"Pictures");
         add(Music, L"Music"); add(Videos, L"Videos"); add(Libraries, L"Libraries");
         add(Network, L"Network"); add(RecycleBin, L"Recycle Bin"); separator();
         add(FolderOptions, L"Change folder and search options");
+        add(NewLibrary, L"New library…");
+        add(QuickAccessMenu, L"Customize Quick Access Toolbar");
         add(Collapse, L"Minimize the ribbon\tCtrl+F1", preferences_.ribbonCollapsed); separator();
         add(Fullscreen, L"Full screen\tF11", fullscreen_); separator();
         add(Close, L"Close\tAlt+F4");
@@ -1348,9 +1743,47 @@ void ExplorerApp::popup(UINT command, HWND anchor) {
     RECT rect{};
     if (anchor) GetWindowRect(anchor, &rect);
     else { POINT point{}; GetCursorPos(&point); rect.left = point.x; rect.bottom = point.y; }
-    const auto selected = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN, rect.left, rect.bottom, 0, window_, nullptr);
+    if (command == QuickAccessMenu && quickAccess_) {
+        RECT button{};
+        if (SendMessageW(quickAccess_, TB_GETRECT, QuickAccessMenu, reinterpret_cast<LPARAM>(&button))) {
+            MapWindowPoints(quickAccess_, nullptr, reinterpret_cast<POINT*>(&button), 2);
+            rect.left = button.left; rect.bottom = button.bottom;
+        }
+    }
+    const auto selected = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_LEFTALIGN | TPM_TOPALIGN, rect.left, rect.bottom, 0, window_, nullptr);
     DestroyMenu(menu);
-    if (selected >= 4000 && selected - 4000 < history_.size()) {
+    const bool libraryEdit = (selected >= 15000 && selected - 15000 < libraryFolders.size()) ||
+        (selected >= 16000 && selected - 16000 < libraryFolders.size()) ||
+        (command == LibraryOptimize && selected >= 17000 && selected - 17000 < libraryKinds().size());
+    if (libraryEdit && (navigating_ || libraryGeneration != navigationCount_ || !libraryTarget || !currentPidl_ ||
+        !ILIsEqual(libraryTarget.get(), currentPidl_.get()))) return;
+    bool toolbarChanged = false;
+    const auto catalog = quickAccessCommands();
+    const auto& commands = quickAccessModel_.commands();
+    if (selected >= 14000 && selected - 14000 < libraryFolders.size()) {
+        const auto& location = libraryFolders[selected - 14000];
+        showError(location.path.empty() ? browser_->BrowseToObject(location.item.Get(), SBSP_ABSOLUTE) : navigate(location.path.wstring()), L"Open library location");
+    } else if (selected >= 15000 && selected - 15000 < libraryFolders.size()) {
+        const auto hr = library_.setDefaultSaveFolder(libraryFolders[selected - 15000].item.Get());
+        showError(FAILED(hr) ? hr : commitLibrary(), L"Set library save location");
+    } else if (selected >= 16000 && selected - 16000 < libraryFolders.size()) {
+        const auto hr = library_.removeFolder(libraryFolders[selected - 16000].item.Get());
+        showError(FAILED(hr) ? hr : commitLibrary(), L"Remove library location");
+    } else if (command == LibraryOptimize && selected >= 17000 && selected - 17000 < libraryKinds().size()) {
+        const auto hr = library_.optimize(libraryKinds()[selected - 17000].kind);
+        showError(FAILED(hr) ? hr : commitLibrary(), L"Optimize library");
+    } else if (command == QuickAccessMenu && selected >= 10000 && selected - 10000 < catalog.size()) {
+        const auto id = catalog[selected - 10000].command;
+        toolbarChanged = quickAccessModel_.contains(id) ? quickAccessModel_.remove(id) : quickAccessModel_.add(id);
+    } else if (command == QuickAccessMenu && selected >= 11000 && selected - 11000 < commands.size()) {
+        const auto index = selected - 11000;
+        toolbarChanged = index && quickAccessModel_.move(commands[index], index - 1);
+    } else if (command == QuickAccessMenu && selected >= 12000 && selected - 12000 < commands.size()) {
+        const auto index = selected - 12000;
+        toolbarChanged = index + 1 < commands.size() && quickAccessModel_.move(commands[index], index + 1);
+    } else if (command == QuickAccessMenu && selected >= 13000 && selected - 13000 < commands.size()) {
+        toolbarChanged = quickAccessModel_.remove(commands[selected - 13000]);
+    } else if (selected >= 4000 && selected - 4000 < history_.size()) {
         pendingHistory_ = selected - 4000;
         auto hr = browser_->BrowseToIDList(history_[pendingHistory_].get(), SBSP_ABSOLUTE);
         if (FAILED(hr)) pendingHistory_ = -1;
@@ -1365,6 +1798,7 @@ void ExplorerApp::popup(UINT command, HWND anchor) {
         const size_t category = command == SearchKindMenu ? 0 : command == SearchDateMenu ? 1 : 2;
         showError(startSearch(previous, searchRecursive_, category, refinements[selected - 8000]), L"Refine search");
     } else if (selected) showError(execute(selected), L"Command");
+    if (toolbarChanged) rebuildQuickAccess();
 }
 void ExplorerApp::showError(HRESULT hr, const wchar_t* action) {
     if (SUCCEEDED(hr) || hr == HRESULT_FROM_WIN32(ERROR_CANCELLED) || hr == E_ABORT) return;
@@ -1383,6 +1817,7 @@ void ExplorerApp::persist() {
         preferences_.windowHeight = rect.bottom - rect.top;
     }
     savePreferences(preferencesPath(), preferences_);
+    saveQuickAccessToolbar(quickAccessSettingsPath(), quickAccessModel_);
 }
 bool ExplorerApp::preprocess(MSG& message) {
     if (message.message == WM_KEYDOWN || message.message == WM_SYSKEYDOWN) {
@@ -1453,6 +1888,10 @@ LRESULT CALLBACK ExplorerApp::editProc(HWND window, UINT message, WPARAM wparam,
     return DefSubclassProc(window, message, wparam, lparam);
 }
 LRESULT ExplorerApp::onMessage(UINT message, WPARAM wparam, LPARAM lparam) {
+    if (activeContextMenu_) {
+        LRESULT result = 0;
+        if (activeContextMenu_->handleMessage(message, wparam, lparam, result)) return result;
+    }
     switch (message) {
     case WM_SIZE: layout(); return 0;
     case WM_GETMINMAXINFO:
@@ -1464,8 +1903,8 @@ LRESULT ExplorerApp::onMessage(UINT message, WPARAM wparam, LPARAM lparam) {
         NONCLIENTMETRICSW metrics{sizeof(metrics)};
         SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0, dpi_);
         auto old = font_; font_ = CreateFontIndirectW(&metrics.lfMessageFont);
-        for (auto hwnd : {file_, tabs_, nav_, address_, breadcrumbs_, search_, status_}) SendMessageW(hwnd, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
-        rebuildRibbon(); updateBreadcrumbs(); layout(); if (old) DeleteObject(old);
+        for (auto hwnd : {file_, tabs_, nav_, address_, breadcrumbs_, search_, status_, quickAccess_}) SendMessageW(hwnd, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
+        rebuildQuickAccess(); rebuildRibbon(); updateBreadcrumbs(); layout(); if (old) DeleteObject(old);
         return 0;
     }
     case WM_COMMAND:
@@ -1487,23 +1926,28 @@ LRESULT ExplorerApp::onMessage(UINT message, WPARAM wparam, LPARAM lparam) {
                 if (FAILED(hr)) showError(hr, archiveAction_.c_str());
                 else if (view_) view_->Refresh();
             }
-            updateStatus(); updateCommands();
+            applyPendingSelection(); updateStatus(); updateCommands();
         }
         return 0;
     case WM_APPCOMMAND:
         if (GET_APPCOMMAND_LPARAM(lparam) == APPCOMMAND_BROWSER_BACKWARD) { execute(Back); return TRUE; }
         if (GET_APPCOMMAND_LPARAM(lparam) == APPCOMMAND_BROWSER_FORWARD) { execute(Forward); return TRUE; }
         break;
-    case DeferredUpdate: updateStatus(); updateCommands(); return 0;
+    case DeferredUpdate: applyPendingSelection(); updateStatus(); updateCommands(); return 0;
+    case ShareResult:
+        if (!closing_ && static_cast<HRESULT>(wparam) != E_PENDING && FAILED(static_cast<HRESULT>(wparam)))
+            showError(static_cast<HRESULT>(wparam), L"Prepare files for sharing");
+        return 0;
     case DeferredView:
         if (folderView_ && !navigating_) {
             if (navigationCount_ == 1) setView(preferences_.view);
             folderView_->SetCurrentFolderFlags(FWF_CHECKSELECT, checkboxes_ ? FWF_CHECKSELECT : 0);
+            applyPendingSelection();
         }
         return 0;
-    case WM_CLOSE: persist(); DestroyWindow(window_); return 0;
+    case WM_CLOSE: nativeShare_.reset(); persist(); DestroyWindow(window_); return 0;
     case WM_DESTROY:
-        closing_ = true; KillTimer(window_, 1); destroyBrowser();
+        closing_ = true; nativeShare_.reset(); KillTimer(window_, 1); destroyBrowser();
         if (!headless_) PostQuitMessage(0);
         return 0;
     }
@@ -1528,6 +1972,32 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report) {
     try {
         check("host_stays_hidden", !IsWindowVisible(window_));
         check("initial_shell_navigation", pumpUntil([&] { return currentPidl_ && folderView_ && !navigating_; }, 10000));
+        EXPLORER_BROWSER_OPTIONS browserOptions = EBO_NONE;
+        check("headless_disables_view_persistence", SUCCEEDED(browser_->GetOptions(&browserOptions)) &&
+            (browserOptions & EBO_NOPERSISTVIEWSTATE));
+        TBBUTTON toolbarButton{};
+        const bool toolbarDefaults = SendMessageW(quickAccess_, TB_BUTTONCOUNT, 0, 0) == 3 &&
+            SendMessageW(quickAccess_, TB_GETBUTTON, 0, reinterpret_cast<LPARAM>(&toolbarButton)) && toolbarButton.idCommand == Properties;
+        check("quick_access_toolbar_defaults", toolbarDefaults && !quickAccessModel_.belowRibbon());
+        quickAccessModel_.add(Refresh, 0);
+        quickAccessModel_.move(NewFolder, 0);
+        rebuildQuickAccess();
+        bool toolbarOrder = SendMessageW(quickAccess_, TB_BUTTONCOUNT, 0, 0) == 4;
+        for (size_t i = 0; i < quickAccessModel_.commands().size(); ++i) {
+            toolbarOrder = toolbarOrder && SendMessageW(quickAccess_, TB_GETBUTTON, i, reinterpret_cast<LPARAM>(&toolbarButton)) &&
+                toolbarButton.idCommand == static_cast<int>(quickAccessModel_.commands()[i]);
+        }
+        check("quick_access_toolbar_custom_order", toolbarOrder);
+        quickAccessModel_.add(PermanentDelete); rebuildQuickAccess();
+        check("quick_access_permanent_delete_requires_selection", !SendMessageW(quickAccess_, TB_ISBUTTONENABLED, PermanentDelete, 0));
+        execute(QuickAccessPlacement);
+        RECT toolbarBounds{}, tabBounds{};
+        GetWindowRect(quickAccess_, &toolbarBounds); GetWindowRect(tabs_, &tabBounds);
+        check("quick_access_toolbar_below_ribbon", quickAccessModel_.belowRibbon() && toolbarBounds.top > tabBounds.bottom);
+        execute(QuickAccessReset);
+        GetWindowRect(quickAccess_, &toolbarBounds); GetWindowRect(tabs_, &tabBounds);
+        check("quick_access_toolbar_reset_above", !quickAccessModel_.belowRibbon() && toolbarBounds.bottom <= tabBounds.top &&
+            quickAccessModel_.commands() == std::vector<Command>{Properties, NewFolder});
         std::filesystem::create_directories(fixture / L"Subfolder");
         std::filesystem::create_directories(fixture / L"Unicode-\u65e5\u672c\u8a9e");
         for (int i = 0; i < 1000; ++i) {
@@ -1551,6 +2021,16 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report) {
         check("breadcrumbs_and_history", breadcrumbsPidls_.size() >= 2 && historyIndex_ >= 1);
         check("native_view_interface", folderView_ && view_);
         if (ready) {
+            check("filesystem_commands_enabled_for_physical_directory", physicalDirectory_ && filesystemFolder_ &&
+                IsWindowEnabled(GetDlgItem(window_, NewFolder)) && IsWindowEnabled(GetDlgItem(window_, NewItems)));
+            ComPtr<IShellItem> newItemFolder;
+            NativeContextMenu newItems;
+            auto newMenuResult = currentFolder(newItemFolder);
+            if (SUCCEEDED(newMenuResult)) newMenuResult = newItems.createNewItems(window_, newItemFolder.Get(), view_.Get());
+            std::vector<ContextMenuEntry> newEntries;
+            if (SUCCEEDED(newMenuResult)) newMenuResult = newItems.enumerate(newEntries);
+            check("registered_new_item_menu_in_hidden_host", SUCCEEDED(newMenuResult) && !newEntries.empty(), hresultMessage(newMenuResult));
+            newItems.reset();
             for (int mode = 0; mode < 8; ++mode) {
                 const auto hr = setView(static_cast<ViewMode>(mode));
                 FOLDERVIEWMODE actual = FVM_AUTO; int size = 0;
@@ -1674,6 +2154,9 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report) {
             check("background_search_filtering_flag", searchReady && (flags & CDB2GVF_NOINCLUDEITEM) != 0);
             check("search_context_commands", searchReady && TabCtrl_GetItemCount(tabs_) == 5 &&
                   GetDlgItem(window_, CloseSearch) && GetDlgItem(window_, SaveSearch) && GetDlgItem(window_, SearchCurrent));
+            execute(SelectNone);
+            check("open_file_location_requires_one_result", FAILED(execute(OpenFileLocation)) &&
+                  searchActive_ && ILIsEqual(searchScope_.get(), originalSearchScope.get()));
             previousCount = navigationCount_;
             hr = execute(SearchCurrent);
             ready = SUCCEEDED(hr) && pumpUntil([&] { return !navigating_ && navigationCount_ > previousCount; }, 10000);
@@ -1720,8 +2203,107 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report) {
             ready = SUCCEEDED(hr) && pumpUntil([&] { return !navigating_ && isExternalSearch(currentPidl_.get()); }, 10000);
             flags = 0; GetViewFlags(&flags);
             check("saved_search_reopens_in_hidden_host", ready && searchBackground_ && (flags & CDB2GVF_NOINCLUDEITEM), hresultMessage(hr));
+            check("saved_search_restores_host_query_scope", ready && searchActive_ && searchScope_ &&
+                ILIsEqual(searchScope_.get(), originalSearchScope.get()) && !searchRecursive_ && !activeQuery_.empty() &&
+                textOf(search_) == activeQuery_ && TabCtrl_GetItemCount(tabs_) == 5 && GetDlgItem(window_, SaveSearch));
+            previousCount = navigationCount_;
+            hr = execute(SearchSubfolders);
+            ready = ready && SUCCEEDED(hr) && pumpUntil([&] { return !navigating_ && navigationCount_ > previousCount; }, 5000);
+            check("saved_search_context_refines_original_scope", ready && searchActive_ && searchRecursive_ && searchScope_ &&
+                ILIsEqual(searchScope_.get(), originalSearchScope.get()));
+            HRESULT searchCountResult = E_PENDING;
+            ready = ready && pumpUntil([&] {
+                int results = 0;
+                if (folderView_) searchCountResult = folderView_->ItemCount(SVGIO_ALLVIEW, &results);
+                return folderView_ && SUCCEEDED(searchCountResult) && results == 1;
+            }, 5000);
+            const bool resultEnumerated = ready;
+            if (ready) hr = folderView_->SelectItem(0, SVSI_SELECT | SVSI_DESELECTOTHERS);
+            if (ready && SUCCEEDED(hr)) hr = execute(OpenFileLocation);
+            ready = ready && SUCCEEDED(hr) && pumpUntil([&] {
+                if (navigating_ || !atLocation(fixture)) return false;
+                ComPtr<IShellItemArray> chosen;
+                DWORD selectedCount = 0;
+                ComPtr<IShellItem> chosenItem;
+                if (FAILED(selection(chosen)) || !chosen || FAILED(chosen->GetCount(&selectedCount)) ||
+                    selectedCount != 1 || FAILED(chosen->GetItemAt(0, &chosenItem))) return false;
+                std::error_code error;
+                return std::filesystem::equivalent(std::filesystem::path(itemName(chosenItem.Get(), SIGDN_FILESYSPATH)),
+                    fixture / L"file-99.txt", error) && !error;
+            }, 5000);
+            ComPtr<IShellItemArray> locationSelection;
+            ComPtr<IShellItem> locationItem;
+            DWORD locationCount = 0;
+            int locationTotal = 0;
+            if (folderView_) folderView_->ItemCount(SVGIO_ALLVIEW, &locationTotal);
+            if (SUCCEEDED(selection(locationSelection)) && locationSelection) locationSelection->GetCount(&locationCount);
+            if (locationCount == 1) locationSelection->GetItemAt(0, &locationItem);
+            check("open_file_location_selects_exact_result", ready && !searchBackground_ && !selectionChild_,
+                  hresultMessage(hr) + L"; location=" + currentLocation_ + L"; selected=" + std::to_wstring(locationCount) +
+                  L"; item=" + (locationItem ? itemName(locationItem.Get(), SIGDN_FILESYSPATH) : L"<none>") +
+                  L"; total=" + std::to_wstring(locationTotal) +
+                  L"; enumerated=" + std::to_wstring(resultEnumerated) + L"; countHr=" + hresultMessage(searchCountResult) +
+                  L"; pending=" + std::to_wstring(selectionChild_ != nullptr));
+            const auto libraryFolder = fixture / L"Unicode-\u65e5\u672c\u8a9e";
+            std::ofstream(libraryFolder / L"library-member.txt") << "owned library fixture";
+            ShellLibrary fixtureLibrary;
+            ComPtr<IShellItem> fixtureLibraryItem;
+            hr = ShellLibrary::create(fixtureLibrary);
+            if (SUCCEEDED(hr)) hr = fixtureLibrary.addFolder(libraryFolder);
+            if (SUCCEEDED(hr)) hr = fixtureLibrary.setDefaultSaveFolder(libraryFolder);
+            if (SUCCEEDED(hr)) hr = fixtureLibrary.save(fixture / L"Subfolder", L"Fixture library", fixtureLibraryItem);
+            fixtureLibrary = ShellLibrary{};
+            if (SUCCEEDED(hr)) hr = browser_->BrowseToObject(fixtureLibraryItem.Get(), SBSP_ABSOLUTE);
+            ready = SUCCEEDED(hr) && pumpUntil([&] { return !navigating_ && library_.valid() && contextPage_ == ContextPage::Library; }, 5000);
+            check("library_context_in_hidden_host", ready && TabCtrl_GetItemCount(tabs_) == 5 && GetDlgItem(window_, LibraryLocations) &&
+                GetDlgItem(window_, IncludeLibraryFolder) && GetDlgItem(window_, LibraryOptimize), hresultMessage(hr));
+            std::vector<LibraryFolder> includedFolders;
+            std::filesystem::path defaultLibraryPath;
+            std::error_code libraryIdentityError;
+            check("library_context_reads_included_default_location", ready && SUCCEEDED(library_.folders(includedFolders)) &&
+                includedFolders.size() == 1 && SUCCEEDED(library_.defaultSavePath(defaultLibraryPath)) &&
+                std::filesystem::equivalent(defaultLibraryPath, libraryFolder, libraryIdentityError) && !libraryIdentityError);
             navigate(fixture.wstring());
-            pumpUntil([&] { return !navigating_ && atLocation(fixture); }, 5000);
+            ready = pumpUntil([&] { return !navigating_ && atLocation(fixture); }, 5000);
+            check("library_context_removed_after_navigation", ready && !library_.valid() && contextPage_ == ContextPage::None &&
+                TabCtrl_GetItemCount(tabs_) == 4 && !GetDlgItem(window_, LibraryLocations));
+            TabCtrl_SetCurSel(tabs_, 1); rebuildRibbon();
+            PIDLIST_ABSOLUTE directoryRaw = nullptr;
+            hr = SHParseDisplayName((fixture / L"Subfolder").c_str(), nullptr, &directoryRaw, 0, nullptr);
+            Pidl directoryIdentifier(directoryRaw);
+            if (SUCCEEDED(hr)) hr = view_->SelectItem(ILFindLastID(directoryIdentifier.get()), SVSI_SELECT | SVSI_DESELECTOTHERS);
+            ready = SUCCEEDED(hr) && pumpUntil([&] {
+                ComPtr<IShellItemArray> chosen; DWORD chosenCount = 0;
+                return SUCCEEDED(selection(chosen)) && chosen && SUCCEEDED(chosen->GetCount(&chosenCount)) && chosenCount == 1 &&
+                    !selectionStateDirty_ && !IsWindowEnabled(GetDlgItem(window_, Sharing));
+            }, 5000);
+            check("share_disables_directory_selection", ready);
+            const auto shareZip = fixture / L"Subfolder" / L"Share fixture.zip";
+            {
+                constexpr char emptyZip[] = {'P', 'K', 5, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+                std::ofstream archive(shareZip, std::ios::binary); archive.write(emptyZip, sizeof(emptyZip));
+            }
+            hr = navigate((fixture / L"Subfolder").wstring());
+            ready = SUCCEEDED(hr) && pumpUntil([&] { return !navigating_ && atLocation(fixture / L"Subfolder"); }, 5000);
+            PIDLIST_ABSOLUTE zipRaw = nullptr;
+            if (ready) hr = SHParseDisplayName(shareZip.c_str(), nullptr, &zipRaw, 0, nullptr);
+            Pidl zipIdentifier(zipRaw);
+            if (ready && SUCCEEDED(hr)) hr = view_->SelectItem(ILFindLastID(zipIdentifier.get()), SVSI_SELECT | SVSI_DESELECTOTHERS);
+            ready = ready && SUCCEEDED(hr) && pumpUntil([&] { return !selectionStateDirty_ && IsWindowEnabled(GetDlgItem(window_, Sharing)); }, 5000);
+            check("share_accepts_zip_files_despite_shell_folder_attribute", ready);
+            TabCtrl_SetCurSel(tabs_, 0); rebuildRibbon();
+            hr = navigate(shareZip.wstring());
+            ready = SUCCEEDED(hr) && pumpUntil([&] { return !navigating_ && atLocation(shareZip); }, 5000);
+            for (const auto command : {NewText, NewShortcut, PasteShortcut, Terminal}) quickAccessModel_.add(command);
+            rebuildQuickAccess();
+            bool physicalCommandsDisabled = !IsWindowEnabled(GetDlgItem(window_, NewFolder)) &&
+                !IsWindowEnabled(GetDlgItem(window_, NewItems));
+            for (const auto command : {NewText, NewShortcut, PasteShortcut, Terminal})
+                physicalCommandsDisabled = physicalCommandsDisabled && !SendMessageW(quickAccess_, TB_ISBUTTONENABLED, command, 0);
+            check("zip_namespace_disables_physical_directory_commands", ready && !physicalDirectory_ && physicalCommandsDisabled,
+                hresultMessage(hr) + L"; location=" + currentLocation_);
+            execute(QuickAccessReset);
+            navigate(fixture.wstring()); pumpUntil([&] { return !navigating_ && atLocation(fixture); }, 5000);
             HWND nativeView = nullptr; view_->GetWindow(&nativeView);
             RECT expandedRect{}, collapsedRect{};
             GetWindowRect(nativeView, &expandedRect);
@@ -1734,7 +2316,9 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report) {
         check("no_visible_host_after_tests", !IsWindowVisible(window_));
         check("no_visible_process_windows_during_pump", !visibleWindowObserved);
         check("headless_mode_blocks_interactive_operations", execute(Delete) == E_ACCESSDENIED && execute(FolderOptions) == E_ACCESSDENIED &&
-              execute(Extensions) == E_ACCESSDENIED && execute(HideSelected) == E_ACCESSDENIED && execute(SaveSearch) == E_ACCESSDENIED);
+              execute(Extensions) == E_ACCESSDENIED && execute(HideSelected) == E_ACCESSDENIED && execute(SaveSearch) == E_ACCESSDENIED &&
+              execute(NewItems) == E_ACCESSDENIED && execute(Sharing) == E_ACCESSDENIED &&
+              execute(NewLibrary) == E_ACCESSDENIED && execute(IncludeLibraryFolder) == E_ACCESSDENIED);
     } catch (const std::exception& error) {
         const std::string detail = error.what();
         check("unexpected_exception", false, std::wstring(detail.begin(), detail.end()));

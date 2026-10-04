@@ -241,9 +241,12 @@ HRESULT conditionXml(ICondition* condition, std::wstring& xml, unsigned depth, u
         const auto* op = xmlOperator(operation);
         // Structured Query's unresolved scalar tokens are strings, including
         // canonical numeric/Boolean/relative-date expressions. Preserve them.
-        if (!op || value.value.vt != VT_LPWSTR || !value.value.pwszVal) return unsupported;
+        // Unspecified-property terms depend on parser input metadata to choose
+        // their generic property and implicit comparison. The public XML leaf
+        // form does not preserve that state faithfully; reject before writing.
+        if (!op || !rawProperty || value.value.vt != VT_LPWSTR || !value.value.pwszVal) return unsupported;
         xml += L"<condition type=\"leafCondition\" propertyType=\"wstr\"";
-        if (rawProperty && FAILED(hr = appendAttribute(xml, L"property", rawProperty))) return hr;
+        if (FAILED(hr = appendAttribute(xml, L"property", rawProperty))) return hr;
         if (rawType && FAILED(hr = appendAttribute(xml, L"valuetype", rawType))) return hr;
         if (FAILED(hr = appendAttribute(xml, L"operator", op))) return hr;
         if (FAILED(hr = appendAttribute(xml, L"value", value.value.pwszVal))) return hr;

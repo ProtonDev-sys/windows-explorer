@@ -349,7 +349,7 @@ void canonicalRefinementsAndRelativeDates() {
 void xmlEscapingAndThisPcScope() {
     Fixture fixture;
     auto scope = shellItem(fixture.root);
-    const std::wstring query = L"\"猫 & \"\"quoted\"\" < > ' \U0001F680\"";
+    const std::wstring query = L"System.Title:=\"猫 & \"\"quoted\"\" < > ' \U0001F680\"";
     const auto path = fixture.root / L"escaped.search-ms";
     succeeded(explorer::saveSearch(query, scope.Get(), true, path), "save escaped Unicode query");
     const auto bytes = read(path);
@@ -362,7 +362,7 @@ void xmlEscapingAndThisPcScope() {
     require(searchResults(saved.Get()).empty(), "unmatched literal query was broadened while saving");
 
     const auto computerPath = fixture.root / L"this-pc.search-ms";
-    succeeded(explorer::saveSearch(L"unique-no-results-7EB8D806", nullptr, true, computerPath), "save This PC query");
+    succeeded(explorer::saveSearch(L"System.FileName:=\"unique-no-results-7EB8D806\"", nullptr, true, computerPath), "save This PC query");
     const auto computerDocument = loadXml(computerPath);
     const auto include = xmlElement(computerDocument.Get(), L"/persistedQuery/query/scope/include");
     wchar_t identifier[40]{};
@@ -425,23 +425,23 @@ void rejectedInputsAndNoOverwrite() {
     auto scope = shellItem(fixture.root);
     const auto path = fixture.root / L"existing.search-ms";
     write(path, "existing file must survive");
-    const auto hr = explorer::saveSearch(L"report", scope.Get(), true, path);
+    const auto hr = explorer::saveSearch(L"System.FileName:=\"report\"", scope.Get(), true, path);
     require(hr == HRESULT_FROM_WIN32(ERROR_FILE_EXISTS) || hr == HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS), "saving replaced an existing file");
     require(read(path) == "existing file must survive", "no-overwrite search changed file bytes");
     const auto rejected = fixture.root / L"rejected.search-ms";
     require(explorer::saveSearch(L" \t\r\n", scope.Get(), true, rejected) == E_INVALIDARG, "empty query accepted");
     require(explorer::saveSearch(std::wstring(1, static_cast<wchar_t>(0xD800)), scope.Get(), true, rejected) == E_INVALIDARG, "invalid UTF-16 query accepted");
     require(explorer::saveSearch(std::wstring(L"a\0b", 3), scope.Get(), true, rejected) == E_INVALIDARG, "embedded NUL query accepted");
-    require(explorer::saveSearch(L"report", scope.Get(), true, fixture.root / L"wrong.txt") == E_INVALIDARG, "non-search-ms output accepted");
-    require(explorer::saveSearch(L"report", scope.Get(), true, {}) == E_INVALIDARG, "empty output path accepted");
+    require(explorer::saveSearch(L"System.FileName:=\"report\"", scope.Get(), true, fixture.root / L"wrong.txt") == E_INVALIDARG, "non-search-ms output accepted");
+    require(explorer::saveSearch(L"System.FileName:=\"report\"", scope.Get(), true, {}) == E_INVALIDARG, "empty output path accepted");
     require(explorer::saveSearch(L"System.FileName:$<\"match\"", scope.Get(), true, rejected) == unsupported, "unverified prefix-word serializer operator guessed");
     require(!fs::exists(rejected), "rejected query left a saved-search file");
     write(fixture.root / L"ordinary-file.txt", "not a folder");
     auto file = shellItem(fixture.root / L"ordinary-file.txt");
-    require(explorer::saveSearch(L"report", file.Get(), true, rejected) == HRESULT_FROM_WIN32(ERROR_DIRECTORY), "file used as search scope");
+    require(explorer::saveSearch(L"System.FileName:=\"report\"", file.Get(), true, rejected) == HRESULT_FROM_WIN32(ERROR_DIRECTORY), "file used as search scope");
     ComPtr<IShellItem> result;
     require(explorer::createSearchFolder(L"report", nullptr, &result, false) == unsupported && !result, "shallow virtual scope was silently recursive");
-    require(explorer::saveSearch(L"report", nullptr, false, rejected) == unsupported, "saved shallow virtual scope was silently recursive");
+    require(explorer::saveSearch(L"System.FileName:=\"report\"", nullptr, false, rejected) == unsupported, "saved shallow virtual scope was silently recursive");
     require(explorer::createSearchFolder(L"report", scope.Get(), nullptr) == E_POINTER, "null search output accepted");
     require(explorer::createSearchFolder(L"", scope.Get(), &result) == E_INVALIDARG && !result, "invalid live search retained result");
     // Exercise only parsing and the guard; never enumerate the rejected native
@@ -465,7 +465,7 @@ void rejectedInputsAndNoOverwrite() {
     const auto percentPath = fixture.root / L"literal %USERPROFILE% scope";
     require(fs::create_directory(percentPath), "create literal percent scope");
     auto percentScope = shellItem(percentPath);
-    require(explorer::saveSearch(L"report", percentScope.Get(), true, rejected) == unsupported, "literal percent scope would be environment-expanded when reopened");
+    require(explorer::saveSearch(L"System.FileName:=\"report\"", percentScope.Get(), true, rejected) == unsupported, "literal percent scope would be environment-expanded when reopened");
     require(!fs::exists(rejected), "unsupported scope left a partial saved search");
 }
 } // namespace

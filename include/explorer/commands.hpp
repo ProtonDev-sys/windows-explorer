@@ -15,7 +15,10 @@ enum Command : UINT {
     Undo, Redo, PasteShortcut, NewShortcut, Zip, Extract, FileHistory, FocusSearch,
     FocusNext, FocusPrevious, Fullscreen, HideSelected, ColumnsMenu, SizeColumns,
     CloseSearch, SearchSubfolders, SearchCurrent, RecentSearches, SaveSearch,
-    SearchKindMenu, SearchDateMenu, SearchSizeMenu,
+    SearchKindMenu, SearchDateMenu, SearchSizeMenu, OpenFileLocation, NewItems,
+    QuickAccessMenu, QuickAccessPlacement, QuickAccessReset,
+    SharingProperties,
+    NewLibrary, IncludeLibraryFolder, LibraryLocations, LibraryDefault, LibraryOptimize,
     ViewFirst = 500, ViewLast = ViewFirst + 7, BreadcrumbFirst = 3000
 };
 }
