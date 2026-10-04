@@ -4,6 +4,7 @@
 #include <shlobj.h>
 #include <searchapi.h>
 #include <shlwapi.h>
+#include <propkey.h>
 #include <wrl/implements.h>
 #include <array>
 #include <atomic>
@@ -383,10 +384,28 @@ struct Fixture {
         succeeded(children->Next(1,&child,nullptr), "read actual ZIP member");
         std::unique_ptr<ITEMIDLIST,PidlCloser> zipChild(child);
         require(child!=nullptr, "actual ZIP member PIDL missing");
-        STRRET label{}; wchar_t decodedName[64]{};
-        succeeded(zipFolder->GetDisplayNameOf(child,SHGDN_NORMAL,&label), "read ZIP member name");
-        succeeded(StrRetToBufW(&label,child,decodedName,64), "decode ZIP member name");
-        require(wcscmp(decodedName,L"zipneedle.txt")==0, "native ZIP fixture member differs");
+        STRRET display{}, parsing{}; wchar_t displayName[64]{}, parsingName[256]{};
+        succeeded(zipFolder->GetDisplayNameOf(child,SHGDN_NORMAL,&display), "read ZIP member display name");
+        const UINT displayType=display.uType;
+        succeeded(StrRetToBufW(&display,child,displayName,64), "decode ZIP member display name");
+        succeeded(zipFolder->GetDisplayNameOf(child,static_cast<SHGDNF>(SHGDN_INFOLDER | SHGDN_FORPARSING),&parsing),
+            "read ZIP member canonical parsing name");
+        const UINT parsingType=parsing.uType;
+        succeeded(StrRetToBufW(&parsing,child,parsingName,256), "decode ZIP member parsing name");
+        ComPtr<IShellItem2> zipMember;
+        succeeded(SHCreateItemWithParent(nullptr,zipFolder.Get(),child,IID_PPV_ARGS(&zipMember)), "resolve ZIP member canonical metadata");
+        PWSTR fileName=nullptr, itemType=nullptr;
+        const HRESULT nameStatus=zipMember->GetString(PKEY_FileName,&fileName);
+        const HRESULT typeStatus=zipMember->GetString(PKEY_ItemType,&itemType);
+        const std::wstring canonicalName=fileName ? fileName : parsingName;
+        std::wcout << L"Native ZIP member display='" << displayName << L"' STRRET=" << displayType <<
+            L" parsing='" << parsingName << L"' STRRET=" << parsingType << L" filename='" << canonicalName <<
+            L"' itemType='" << (itemType ? itemType : L"") << L"' nameHRESULT=0x" << std::hex <<
+            static_cast<unsigned long>(nameStatus) << L" typeHRESULT=0x" << static_cast<unsigned long>(typeStatus) << std::dec << L'\n';
+        CoTaskMemFree(fileName); CoTaskMemFree(itemType);
+        // PKEY_FileName/parsing identity includes the extension even when the
+        // runner hides known extensions in normal display labels.
+        require(canonicalName==L"zipneedle.txt", "native ZIP fixture canonical filename differs");
         child=nullptr;
         const auto last=children->Next(1,&child,nullptr); CoTaskMemFree(child);
         require(last==S_FALSE, "owned ZIP must contain exactly one native member");
@@ -432,6 +451,9 @@ void auditAndTest() {
     if constexpr (ReadOnlyAudit) {
         auto explicitContents=query(L"System.Search.Contents:uniquefilecontentneedle",scope.Get());
         std::cout << "Explicit documented System.Search.Contents baselineResults=" << results(explicitContents.Get(),fixture.root).size() << '\n';
+        auto zipScope=shellItem(fixture.root/L"owned.zip");
+        auto explicitZip=query(L"System.FileName:=\"zipneedle.txt\"",zipScope.Get());
+        std::cout << "Explicit native ZIP scope baselineResults=" << results(explicitZip.Get(),fixture.root).size() << '\n';
     }
     for (const auto& option : options) {
         auto search = query(option.query,scope.Get()); browser.navigate(search.Get());
