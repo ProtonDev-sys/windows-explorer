@@ -123,6 +123,14 @@ ActionResult openAndPress(HDESK desktop, DWORD uiThread, bool initialPin, unsign
         result.opened = true;
 
         auto row = findOwned(automation.Get(), uiThread, L"Owned Recent One");
+        const auto rowDeadline = GetTickCount64()+2000;
+        while(!row&&GetTickCount64()<rowDeadline) {
+            // Opening the menu returns before its asynchronous RecentItems
+            // source publishes accessible rows. Observe the exact owned row;
+            // do not invoke the menu or its default action a second time.
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            row = findOwned(automation.Get(),uiThread,L"Owned Recent One");
+        }
         require(row != nullptr, "Owned native RecentItems row is missing");
         ComPtr<IUIAutomationLegacyIAccessiblePattern> legacy;
         succeeded(row->GetCurrentPatternAs(UIA_LegacyIAccessiblePatternId, IID_PPV_ARGS(&legacy)),

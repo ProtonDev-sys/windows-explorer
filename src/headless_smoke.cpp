@@ -715,8 +715,13 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report) {
                 unsigned probeCalls = 0;
                 HRESULT nestedStateRead = E_PENDING;
                 const auto deferredBefore = headlessDeferredCommandUpdates();
-                const auto realSelection = folderView_->SelectItem(3,
-                    SVSI_SELECT | SVSI_DESELECTOTHERS | SVSI_NOTAKEFOCUS);
+                PITEMID_CHILD selectedChild = nullptr;
+                auto realSelection = folderView_->Item(3,&selectedChild);
+                if(SUCCEEDED(realSelection)&&selectedChild)
+                    realSelection = view_->SelectItem(selectedChild,
+                        SVSI_SELECT | SVSI_DESELECTOTHERS | SVSI_NOTAKEFOCUS);
+                else if(SUCCEEDED(realSelection))realSelection=E_UNEXPECTED;
+                CoTaskMemFree(selectedChild);
                 headlessCommandReentryProbe_ = [&] {
                     ++probeCalls;
                     updateCommands(); updateNamespace(); pollCommandStates(); cancelCommandStates();
@@ -784,7 +789,7 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report) {
                     std::to_wstring(settled ? 1 : 0) + L"/" + std::to_wstring(restoredSelection ? 1 : 0));
             }
             {
-                PrivatePresentation presentation(window_);
+                PrivatePresentation presentation(window_,true);
                 check("accessibility_phase_on_private_desktop", presentation.ready);
                 const auto originalSearchWidth = preferences_.searchWidth;
                 auto clientBoundsOf = [&](HWND control) {

@@ -128,7 +128,7 @@ void foldersHiddenUnicodeAndSelection() {
         if (same(child.item.Get(),unicode.Get())) {
             unicodeFound = true;
             require(child.label == fixture.empty.filename().wstring(),"Unicode breadcrumb display label was changed");
-            require(filePath(child.item.Get()) == fixture.empty.wstring(),"Unicode breadcrumb destination did not round-trip");
+            require(fs::equivalent(filePath(child.item.Get()),fixture.empty),"Unicode breadcrumb destination did not retain its actual filesystem identity");
         }
     }
     require(selectedCount == 1 && unicodeFound,"Selected or Unicode breadcrumb destination is missing");

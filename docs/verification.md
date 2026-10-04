@@ -43,6 +43,26 @@ The clipboard sequence belongs to the window station, shared with other
 desktops; the original failure has not been attributed to a particular condition
 or writer. Historical failures remain evidence, not silently corrected reports.
 
+The later `e40e8c2c` complete local run took 209.86 seconds: twelve active
+targets passed, two failed, and three were skipped. Both application hosts
+passed all 130/137 checks. The core diagnostic retained unchanged payloads,
+an empty owned directory and a hidden owner; the window-station clipboard
+sequence increased by 13, with the same foreign owner and no owner in this
+process. That evidence does not distinguish external publication from delayed
+format rendering triggered by native menu inspection. Its assertion remains.
+The installed RecentItems fixture also failed on an immediately absent row
+after opening its menu. A bounded wait for that exact owned row, without
+repeating its action, subsequently passed both layouts in 10.35 seconds.
+
+At public checkpoint `1d91605`, [the Windows Server 2022 CI run](https://github.com/ProtonDev-sys/windows-explorer/actions/runs/37243073658)
+built successfully and passed ten of fourteen targets. Breadcrumb path spelling,
+the documented selection fallback, app selection/QAT accessibility, and hidden
+folder-view persistence failed. Actual Undo/Redo and native search options passed.
+The next changes retain exact filesystem identity rather than path spelling,
+read actual whole-view member arrays, repair an acknowledged-but-unapplied bulk
+selection using the original preflighted PIDLs, and activate only the private
+owned frame for accessibility. They need their own disposable-runner evidence.
+
 ## Test boundaries
 
 | CTest target | What it verifies |

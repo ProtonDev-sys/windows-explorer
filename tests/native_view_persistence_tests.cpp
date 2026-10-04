@@ -364,9 +364,14 @@ public:
         require(nativeWindow && IsChild(window_, nativeWindow) && process == GetCurrentProcessId() &&
                 thread == GetCurrentThreadId() && !IsWindowVisible(window_) && !IsWindowVisible(nativeWindow),
                 "Native view must remain an owned invisible private-desktop child");
-        for (unsigned index = 0; index < memberCount; ++index) {
+        ComPtr<IShellItemArray> members;
+        succeeded(folderView_->Items(SVGIO_ALLVIEW,IID_PPV_ARGS(&members)),"Read actual native owned view membership");
+        DWORD actualMembers=0;
+        succeeded(members->GetCount(&actualMembers),"Read native owned membership count");
+        require(actualMembers==memberCount,"Native persistence membership differs from its owned fixture");
+        for (unsigned index = 0; index < actualMembers; ++index) {
             ComPtr<IShellItem> item, parent;
-            succeeded(folderView_->GetItem(static_cast<int>(index), IID_PPV_ARGS(&item)), "Read native owned view member");
+            succeeded(members->GetItemAt(index,&item), "Read native owned view member");
             succeeded(item->GetParent(&parent), "Read native member parent before inspecting file identity");
             int comparison = 1;
             succeeded(parent->Compare(folder, SICHINT_CANONICAL, &comparison), "Compare native owned folder identity");
