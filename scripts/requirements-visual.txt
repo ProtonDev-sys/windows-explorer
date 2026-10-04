@@ -1,0 +1,4 @@
+# Versions used for reproducible original-PDF screenshot extraction and metrics.
+Pillow==12.2.0
+numpy==2.4.4
+PyMuPDF==1.28.0

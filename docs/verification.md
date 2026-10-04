@@ -1,55 +1,127 @@
 # Headless verification
 
-Verified on 2026-10-04 on Windows 10 Home 22H2 (build 19045), using Visual Studio 2022 Build Tools (MSVC 19.44), Windows SDK 10.0.26100.0, and a Release x64 build with a static C++ runtime.
+The target machine is Windows 10 Home 22H2, build 19045. Builds use Visual Studio
+2022 Build Tools, MSVC 19.44, Windows SDK 10.0.26100.0, C++20 and the static x64
+runtime. Verification runs without displaying anything on the input desktop.
 
 ```powershell
 ./scripts/build.ps1 -Configuration Release
 ./scripts/test.ps1 -Configuration Release -SkipBuild
+python -m pip install -r scripts/requirements-visual.txt
+./scripts/visual-check.ps1 -Configuration Release
+./scripts/benchmark.ps1 -Configuration Release
 ```
 
-The final local Release build completed without compiler warnings. CTest passed **2/2** tests: console **8.21 seconds**, hidden host **5.69 seconds**, **13.93 seconds** total. An independent hidden-host run passed **72/72 checks**. The integrated console suite passed keyboard/model **3,151 assertions/eight groups**, item actions **six groups**, native search **five groups**, saved metadata **five groups/35 query fixtures**, Share **five groups**, context menus **six groups/91 assertions**, toolbar **four groups**, and Library **three groups**.
+The scripts preserve build output, CTest JUnit, the exact application smoke
+report, executable checksum and environment in ignored `artifacts/`. Screenshot
+and performance runs copy the executable into a unique directory and verify its
+checksum before use. Reports describe the tested snapshot; a previous passing
+run is not evidence for later source changes.
 
-[Hosted CI](https://github.com/ProtonDev-sys/windows-explorer/actions/runs/37169510842) passed for commit `ce231210f02757df636145bcd32e7e0a3df7d0ee` on `windows-2022` (Windows Server 2022): CTest **2/2**, console **3.98 seconds**, hidden host **4.67 seconds**, **8.69 seconds** total. Its separate smoke artifact reports `headless=true`, `passed=true`, **72 checks**, **0 failed**, and **3,562 ms** elapsed. Hosted Server results complement the local Windows 10 run; they do not establish identical provider availability or UI behavior across those systems.
+The warning-free Release checkpoint linked on 2026-10-04 at 20:36:54 UTC has
+executable SHA-256
+`2d0377dbd41ffed6f7986928f88d0049e34bb02630ca23377b99b93b48ee813c`.
+Its saved-search presentation, live-search policy/native result, and owned crash
+diagnostic targets passed in 2.83 seconds. The complete core suite separately
+passed after the worker desktop-connection lifetime fix. Its subsequent full
+seventeen-target run took 303.28 seconds: eleven active targets passed, three
+failed and three shared-state targets were correctly skipped. Both application
+hosts exceeded their existing 90-second bound during native selection work;
+the core failure was the large native-menu fixture's combined isolation guard.
+The worker shutdown proof itself passed with no pending workers. The failures
+remain recorded in the JUnit and test-environment reports. Later source changes
+require their own reports and checksum; this checkpoint is not release acceptance.
 
-## Tested behavior
+## Test boundaries
 
-| Area | Evidence |
+| CTest target | What it verifies |
 | --- | --- |
-| Host and visibility | Real Win32/Shell initialization; application stays hidden; process-owned visible-window observation during message pumping |
-| Folder fixture | 1,000 text files, nested/Unicode folders, a hidden file, and a protected hidden/system file; exact view counts and cleanup |
-| Presentation | Read back all eight native modes and icon sizes; sorting direction/key, grouping/removal, checkbox flags; toggle/restore a native column, retain Name, and autosize columns; collapsed ribbon reclaims space |
-| Quick Access Toolbar | Four model/persistence groups: supported catalog/bounds, add/remove/reorder/reset, Unicode/atomic settings, corrupt/unknown/duplicate input; five hidden-control checks verify default buttons, order, above/below placement, reset and permanent-delete selection guard; exact title-bar layout remains unverified |
-| Window geometry | F11 changes hidden window style/geometry and restores both while staying hidden; View commands fit the 1,030-pixel minimum width at the tested 96 DPI |
-| Navigation | Breadcrumb/history construction, subfolder, back, forward, up, invalid location, This PC namespace; failed navigation preserves committed search state |
-| Hidden state | Show/hide normal hidden items while protected hidden/system items remain excluded; reset after search |
-| Panes | Preview/Details policy and mutual exclusion; native preview content rendering is not asserted |
-| Search host | Native navigation/background flag; contextual commands; current-folder/all-subfolders retain origin; category replacement; Close returns to origin; saved search reopens, restores host query/scope, and refines its original scope |
-| Search results and persistence | Actual `IShellFolder` fixture enumeration: shallow/deep membership and exclusion of outside files; saved queries rerun after new files; live/saved parity for 19 canonical kind/date/size tokens and numeric/string/wildcard/Boolean comparisons; Today excludes an old file; native PIDL identity, XML escaping/Unicode, no overwrite, and rejected inputs/scopes |
-| Saved metadata | Five groups/35 actual live/saved/restored query fixtures, with known exact identities/cardinality for the first 11; Unicode/ampersand filenames, numeric/string/wildcard/Boolean operations, all 19 filters, scope/recursion, preserved raw Today token, This PC identity without enumeration; unsupported shapes/types/ProgID text and malformed/oversize/deep/node-bound/DTD inputs reject with output preserved |
-| Generic persistence | Four unspecified-property query shapes return `ERROR_NOT_SUPPORTED` before creating a file; live default/literal queries remain allowed; existing collision/scope/XML tests use supported explicit properties |
-| Open file location | Hidden search-result fixture resolves the real filesystem parent and selects exactly the owned child; one-result guard checked; virtual results are unsupported |
-| Search compatibility guard | Parser-only tests reject explicit filename `$<` inside nested conditions before native execution; literals, default terms and other properties remain allowed; no crash reproduction is part of the passing suite |
-| Saved-search classification | Native `PKEY_ItemType` is `.search-ms` for saved searches and differs for an ordinary directory with that suffix |
-| Result identity and aliases | Exact volume/128-bit file identities plus strict cardinality and duplicate rejection compare native results with fixtures; deliberate 8.3 temp aliases reproduce Shell expansion to long paths without weakening outside-scope checks |
-| Settings and helpers | Unicode round trips, atomic replacement, invalid/corrupt/bounded values, reserved Windows names, environment expansion, search-URI encoding, byte formatting, HRESULT fallback |
-| Shell operations | Silent copy/collision, move, Unicode rename/new-folder, reserved-name rejection, permanent deletion restricted to fixtures; existing/source files preserved |
-| ZIPs | Compression and Unicode round trips, nested/empty folders, read-only archive, missing/invalid inputs, collisions/no overwrite, self-inclusion rejection, unsafe/link/unsupported structures, staging cleanup |
-| Shortcuts | Native file/folder `.lnk` targets with Unicode and no overwrite |
-| Registered New / context menus | Six groups/91 assertions: real background/item/New menu enumeration on hidden fixtures; physical ZIP destination rejection, old-menu cleanup and unchanged archive bytes; command IDs, CM2/CM3 message routing, invocation arguments, apartment ownership and lifetime tested with fake handlers; no native handler execution or visible popup |
-| Physical folder commands | Hidden checks enable New folder/text/shortcut, registered New menus and terminal commands for actual filesystem directories and disable them in ZIP namespace folders; execution revalidates the directory; Paste remains a separate native Shell capability |
-| Windows Share | Five groups: bounded Unicode filesystem-file planning, regular ZIP acceptance despite the Shell folder attribute, invalid/missing/physical-directory/virtual/reparse rejection, hidden HWND desktop interop, STA ownership/event cleanup, actual asynchronous StorageItems, missing-file HRESULTs and source-shutdown lifetime; hidden host verifies directory rejection/ZIP eligibility; picker and recipients never shown |
-| Libraries | Three integrated native groups passed: Unicode Save/load/Commit, included/default identities, all five content templates, invalid/dot-path duplicate/no-overwrite behavior, read-only policies and output/HRESULT preservation; hidden host verifies Library context creation, included/default location readback, and context removal after navigation; files saved only under owned temp paths |
-| Item actions | Quoted Unicode paths and canonical virtual-item fallback; reversible selected-item Hidden attributes; no folder recursion; preflight rejection; preservation of compressed/sparse attributes; real junction rejection without target mutation |
-| Keyboard/focus model | Exact modifier routing, native editing exclusions, Alt+F4, AltGr and Ctrl+Alt+Delete preservation, view shortcuts, pane/new-folder precedence, F6/Shift+F6/F11 routing, order/wraparound and every focus-region availability subset |
+| `core_and_shell_operations` | Owned file operations and recovery; native search and saved-query membership; preferences, input mapping, archives, shortcuts, context menus, Libraries, native command state/resources, asynchronous lifetime, breadcrumbs and search history |
+| `hidden_shell_host` | The real application, native ItemsView, navigation, eight layouts, columns, selection, search/import/refine/history, ZIP and Library contexts, native tree options, splitter, Ribbon/QAT and read-only UI Automation |
+| `native_view_selection` | Complete actual selection identities and complements, focus and checkbox flags on an owned 10,000-item native view |
+| `installed_ribbon_features` | Read-only edition, media, recording and policy-dependent native capabilities |
+| `hidden_native_ribbon` | The compiled native Ribbon, pages, contextual state, collections and images, native customization, persistence, minimized/docking state, accessibility and bounded tab selection |
+| `private_desktop_visual_capture` | Actual native window/control painting, PrintWindow/WIC output, geometry, text changes, invalid inputs, exclusive output creation and desktop isolation |
+| `native_recent_items` | Native Ribbon recent-item collection and metadata contracts without invoking personal destinations |
+| `installed_native_ribbon`, `installed_recent_items`, `installed_shell_host` | Additional actual installed-resource tests configured on the target Windows 10 build |
+| `headless_crash_diagnostics` | Exact opt-in dump target validation and original exception context in an owned hidden child |
+| `saved_search_presentation` | Actual public query presentation and all eight app-owned companion layouts; atomic, stale-file and failure preservation |
+| `live_search_policy_and_native_results` | Latest-only scheduling, explicit commit, stale/cancelled result handling and real owned native result identities |
+| `native_shell_history` | Actual normal Shell Undo/Redo and registered-command state; restricted to an opted-in disposable GitHub runner |
+| `native_search_options` | Actual native Contents/System/Compressed transitions, fresh-query result membership and exact settings restoration; restricted to an opted-in disposable GitHub runner |
+| `native_view_persistence` | Real native folder property-bag restoration and no-persist control; restricted to an opted-in disposable GitHub runner |
+| `native_theme` | Theme policy, actual native dark pixels on recognized Windows builds, Light restoration, ownership guards and unchanged system configuration |
 
-## Coverage limits
+The three shared-state mutation targets check both `GITHUB_ACTIONS=true` and their
+explicit test opt-in before COM, windows or fixtures. They report **skipped**
+locally. Setting those variables on a personal machine is not an authorized test
+method. All other fixtures use exclusively owned temporary paths and preserve
+existing files, clipboard data, user Libraries, Recycle Bin contents and system
+preferences.
 
-All tests are headless. No visible app inspection or screenshot comparison was performed. Focus-model checks do not establish actual focus actuation or accessibility. Hidden F11 checks do not establish maximized-window placement restoration, and the 96-DPI geometry check does not validate mixed-DPI layouts or visual clipping. Toolbar checks do not establish caption/title-bar parity. Native menus are enumerated, while installed handler invocation and visible presentation are untested; real Share payloads do not establish picker display or recipient delivery. Drag gestures, associated apps, preview handlers, global clipboard round trips, Recycle Bin restore, live network/cloud/devices, elevation, screen readers, high contrast, dark mode, and localization require additional fixtures or inspection. Library aggregation/provider behavior and interactive pickers are unverified. Local search fixtures do not establish content-index completeness or remote/provider coverage. Matrix acceptance criteria are requirements, not completed tests.
+The application and native-control tests attach their UI threads to a new private
+Windows desktop before COM or HWND creation. The desktop has no switch access.
+Native controls may be visible there so that Windows can paint them; the desktop
+is never made interactive. Isolation is checked during message pumping and after
+teardown. Read-only UI Automation runs on a windowless worker in that same
+private desktop while the owner thread dispatches messages. No desktop-root UI
+automation or input injection is used.
 
-Reopened supported saved searches restore a faithful query, scope, recursion, and Search contextual page after successful native navigation. The imported condition becomes the base query; previous filter-category state is not inferred. The entire external `.search-ms` format is not supported: multiple/excluded scopes, non-item kind unions, internal/provider shapes, Blurb/unknown types, and other virtual scopes remain native-view-only. Explicit filename word-prefix (`$<`) searches reject live before execution; persistence also rejects general explicit word-prefix conditions, unspecified-property terms, and unsupported values/scopes. Starts-with (`~<`) and wildcard (`~`) result fixtures pass.
+## Native behavior evidence
 
-The tests do not replace the user's clipboard, change shared settings or user libraries, show Share recipients, or execute installed New handlers. Silent operations omit Shell undo records. Headless browsers set documented `EBO_NOPERSISTVIEWSTATE`; its native host flag readback passed. Libraries save only to explicit owned temporary directories. ZIP publication/extraction never overwrites an existing destination. [Browser options](https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/ne-shobjidl_core-explorer_browser_options), [Native Library Save](https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nf-shobjidl_core-ishelllibrary-save)
+Result tests compare strict cardinality and exact volume/128-bit file identities,
+including duplicate rejection and outside-scope exclusion. Search-wrapped PIDLs
+can differ from ordinary filesystem PIDLs, so actual file identity is the
+membership authority. Tests distinguish shallow/deep scopes, equal basenames
+in different locations, recursive exclusions, Library unions, relative dates,
+generic word matching and saved-query discovery of new files. See the
+[saved-search verification](saved-search-verification.md) for the supported
+condition and provider combinations.
 
-The native search fixture suite can also exercise deliberately shortened fixture paths by setting `WINDOWSEXPLORER_SEARCH_TEST_SHORT_PATHS=1` for its process. This requires available 8.3 aliases and asserts that the Shell expands their spelling. Normal and deliberate-alias local runs both passed all five search groups; XML scope checks use the native canonical scope and verify its folder identity.
+Normal Shell commands retain their actual target array, provider and view site.
+Fast native state is compared with installed context menus; full cascades are
+enumerated when needed. Headless guards reject associated-app launches,
+recipients, wizards, device operations, clipboard publication and native drops.
+Mock handlers test routing, effects, failure and lifetime without treating a mock
+invocation as proof that every installed extension works.
 
-Local reports are generated in ignored `artifacts/`: `build.log`, `headless-tests.log`, `core-tests.xml`, and `headless-smoke.json`. The passing hosted workflow linked above uploads reports and the executable. Timings are environment-specific and do not establish that the application is faster than Explorer.exe.
+The [disposable hosted verification at `928dfcd`](https://github.com/ProtonDev-sys/windows-explorer/actions/runs/37194199690)
+passed its four isolated targets. Real native Undo/Redo passed in 2.79 seconds;
+Contents/System/Compressed passed in 2.25 seconds. OFF/ON states came from the
+actual `IExplorerCommand::GetState(FALSE)`, rather than guessed host flags. The
+content-only file and ZIP member changed membership as required, and freshly
+created searches matched the active native option state and exact owned results.
+The fixture restored each original native state and registry value/type/absence.
+This Windows Server 2022 run complements local Windows 10 evidence; it does not
+establish identical rendering or arbitrary provider behavior on both systems.
+The detailed method is in [native advanced search verification](search-options-verification.md).
+
+## UI and performance evidence
+
+The [visual workflow](headless-visual.md) pins online Windows 10 source URLs,
+hashes, source crops, native dimensions, masks and strict comparison thresholds.
+It captures the real application using PrintWindow and WIC. Every image also
+passes independent checks for desktop isolation, actual widget inventory, native
+DPI and a painted command band. An intact caption cannot conceal a blank Ribbon.
+Source images, differences and private namespace captures are research
+intermediates excluded from the repository and release.
+
+Passing a native capture does not mean its pixels match the source. Per-scene
+comparison reports retain pixel and geometry failures, publisher scaling,
+unrecorded OS state and differing installed-resource revisions. Neither a shared
+Windows control nor an unmatched screenshot establishes whole-application parity.
+The [theme report](theme-compatibility.md) distinguishes documented APIs,
+version-gated native compatibility paths, measured dark surfaces and unmeasured
+states.
+
+The [navigation benchmark](performance.md) measures actual native callbacks and
+verified item counts over owned 10-, 1,000- and 10,000-file folders. It records
+individual samples, cached command updates, view changes and process memory.
+The measured application improvements do not establish superiority to stock
+Explorer.exe or performance on another machine.
+
+The [feature matrix](feature-matrix.md) distinguishes source bindings, native
+delegation and established tests. Hardware, accounts, network/cloud providers,
+interactive recipients, elevation, arbitrary preview/extension handlers,
+screen-reader operation, mixed monitors and localization need appropriate
+controlled fixtures before their behavior can be claimed as verified.

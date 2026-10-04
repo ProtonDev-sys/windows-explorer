@@ -36,12 +36,13 @@ void expect(const Chord& chord, bool editing, std::optional<Command> expected,
 void navigationAndWindowChords() {
     struct Mapping { Chord chord; Command command; };
     constexpr std::array mappings{
-        Mapping{{VK_F4, false, false, false}, explorer::Address},
+        Mapping{{VK_F4, false, false, false}, explorer::AddressList},
         Mapping{{'L', true, false, false}, explorer::Address},
         Mapping{{'D', false, false, true}, explorer::Address},
         Mapping{{VK_F3, false, false, false}, explorer::FocusSearch},
         Mapping{{'E', true, false, false}, explorer::FocusSearch},
         Mapping{{'F', true, false, false}, explorer::FocusSearch},
+        Mapping{{'E', true, true, false}, explorer::ExpandAncestors},
         Mapping{{VK_LEFT, false, false, true}, explorer::Back},
         Mapping{{VK_RIGHT, false, false, true}, explorer::Forward},
         Mapping{{VK_UP, false, false, true}, explorer::Up},
@@ -49,6 +50,7 @@ void navigationAndWindowChords() {
         Mapping{{'W', true, false, false}, explorer::Close},
         Mapping{{VK_F1, true, false, false}, explorer::Collapse},
         Mapping{{VK_F5, false, false, false}, explorer::Refresh},
+        Mapping{{'R', true, false, false}, explorer::Refresh},
         Mapping{{VK_F6, false, false, false}, explorer::FocusNext},
         Mapping{{VK_F6, false, true, false}, explorer::FocusPrevious},
         Mapping{{VK_F11, false, false, false}, explorer::Fullscreen},
@@ -71,6 +73,8 @@ void fileCommandsAndRenameSafety() {
         Mapping{{'X', true, false, false}, explorer::Cut},
         Mapping{{'V', true, false, false}, explorer::Paste},
         Mapping{{'A', true, false, false}, explorer::SelectAll},
+        Mapping{{'D', true, false, false}, explorer::Delete},
+        Mapping{{VK_ADD, true, false, false}, explorer::SizeColumns},
         Mapping{{VK_DELETE, false, false, false}, explorer::Delete},
         Mapping{{VK_DELETE, false, true, false}, explorer::PermanentDelete},
         Mapping{{VK_RETURN, false, false, true}, explorer::Properties}

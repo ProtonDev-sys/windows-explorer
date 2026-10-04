@@ -19,6 +19,7 @@ enum Command : UINT {
     QuickAccessMenu, QuickAccessPlacement, QuickAccessReset,
     SharingProperties,
     NewLibrary, IncludeLibraryFolder, LibraryLocations, LibraryDefault, LibraryOptimize,
+    ExpandAncestors, AddressList,
     ViewFirst = 500, ViewLast = ViewFirst + 7, BreadcrumbFirst = 3000
 };
 }

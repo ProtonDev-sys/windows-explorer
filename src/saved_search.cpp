@@ -175,19 +175,88 @@ HRESULT emptyElement(IXMLDOMNode* node) {
     return FAILED(hr) ? hr : children.empty() ? S_OK : unsupported;
 }
 
-HRESULT scopeMetadata(IXMLDOMNode* node, SavedSearchMetadata& result) {
-    Attributes scopeAttributes;
-    auto hr = attributes(node, {}, scopeAttributes);
+HRESULT viewMetadata(IXMLDOMNode* node, SearchViewPresentation& result) {
+    SearchViewPresentation candidate;
+    Attributes values;
+    auto hr = attributes(node, {L"viewMode", L"iconSize"}, values);
     if (FAILED(hr)) return hr;
+    if (const auto mode = values.find(L"viewMode"); mode != values.end()) {
+        auto text = mode->second;
+        std::transform(text.begin(), text.end(), text.begin(), [](wchar_t c) { return static_cast<wchar_t>(towlower(c)); });
+        if (text == L"details") candidate.mode = SearchViewMode::Details;
+        else if (text == L"icons") candidate.mode = SearchViewMode::Icons;
+        else if (text == L"tiles") candidate.mode = SearchViewMode::Tiles;
+        else return unsupported;
+    }
+    if (const auto size = values.find(L"iconSize"); size != values.end()) {
+        if (size->second.empty() || size->second.size() > 3) return unsupported;
+        int number = 0;
+        for (const auto c : size->second) {
+            if (c < L'0' || c > L'9') return unsupported;
+            number = number * 10 + c - L'0';
+        }
+        if (number < 16 || number > 256) return unsupported;
+        candidate.iconSize = number;
+    }
+    const auto orderedProperty = [&](IXMLDOMNode* item, SearchViewOrder& order) -> HRESULT {
+        Attributes itemValues;
+        auto status = attributes(item, {L"viewField", L"direction"}, itemValues);
+        if (FAILED(status)) return status;
+        if (itemValues.size() != 2 || FAILED(status = emptyElement(item))) return itemValues.size() == 2 ? status : unsupported;
+        order.property = itemValues[L"viewField"];
+        const auto& direction = itemValues[L"direction"];
+        if (direction == L"ascending") order.direction = SORT_ASCENDING;
+        else if (direction == L"descending") order.direction = SORT_DESCENDING;
+        else return unsupported;
+        return S_OK;
+    };
     Elements children;
     if (FAILED(hr = elements(node, children))) return hr;
-    if (children.size() != 1) return unsupported;
+    for (const auto& child : children) {
+        std::wstring name;
+        if (FAILED(hr = nodeName(child.Get(), name))) return hr;
+        if (name == L"groupBy" && !candidate.groupBy) {
+            candidate.groupBy.emplace();
+            if (FAILED(hr = orderedProperty(child.Get(), *candidate.groupBy))) return hr;
+            continue;
+        }
+        const bool columns = name == L"visibleColumns";
+        if ((!columns && name != L"sortList") || (columns ? candidate.visibleColumns.has_value() : candidate.sort.has_value())) return unsupported;
+        Attributes containerValues;
+        if (FAILED(hr = attributes(child.Get(), {}, containerValues))) return hr;
+        Elements entries;
+        if (FAILED(hr = elements(child.Get(), entries))) return hr;
+        if (entries.size() > (columns ? 128u : 4u)) return unsupported;
+        if (columns) candidate.visibleColumns.emplace(); else candidate.sort.emplace();
+        for (const auto& entry : entries) {
+            if (FAILED(hr = nodeName(entry.Get(), name))) return hr;
+            if (name != (columns ? L"column" : L"sort")) return unsupported;
+            if (columns) {
+                Attributes columnValues;
+                if (FAILED(hr = attributes(entry.Get(), {L"viewField"}, columnValues))) return hr;
+                if (columnValues.size() != 1 || FAILED(hr = emptyElement(entry.Get()))) return columnValues.size() == 1 ? hr : unsupported;
+                candidate.visibleColumns->push_back(columnValues[L"viewField"]);
+            } else {
+                SearchViewOrder order;
+                if (FAILED(hr = orderedProperty(entry.Get(), order))) return hr;
+                candidate.sort->push_back(std::move(order));
+            }
+        }
+    }
+    if (FAILED(hr = validateSearchViewPresentation(candidate))) return hr == E_INVALIDARG ? unsupported : hr;
+    result = std::move(candidate);
+    return S_OK;
+}
+
+HRESULT scopeItemMetadata(IXMLDOMNode* node, SavedSearchMetadata& result) {
     std::wstring name;
-    if (FAILED(hr = nodeName(children[0].Get(), name))) return hr;
-    if (name != L"include") return unsupported;
+    auto hr = nodeName(node, name);
+    if (FAILED(hr)) return hr;
+    if (name != L"include" && name != L"exclude") return unsupported;
+    const bool excluded = name == L"exclude";
     Attributes values;
-    if (FAILED(hr = attributes(children[0].Get(), {L"path", L"knownFolder", L"nonRecursive"}, values))) return hr;
-    if (FAILED(hr = emptyElement(children[0].Get()))) return hr;
+    if (FAILED(hr = attributes(node, {L"path", L"knownFolder", L"nonRecursive"}, values))) return hr;
+    if (FAILED(hr = emptyElement(node))) return hr;
     const auto path = values.find(L"path"), known = values.find(L"knownFolder");
     if ((path == values.end()) == (known == values.end())) return unsupported;
     const auto recursion = values.find(L"nonRecursive");
@@ -195,6 +264,10 @@ HRESULT scopeMetadata(IXMLDOMNode* node, SavedSearchMetadata& result) {
         if (recursion->second == L"true") result.recursive = false;
         else if (recursion->second != L"false") return unsupported;
     }
+    // Legal external XML remains openable through the native Shell viewer.
+    // The documented shallow-exclude flag has provider-dependent behavior,
+    // so it cannot yet be restated as an equivalent editable scope rule.
+    if (excluded && !result.recursive) return unsupported;
     if (path != values.end()) {
         // Environment expansion is part of the documented saved-scope format.
         if (path->second.empty() || path->second.find(L'\0') != std::wstring::npos) return invalidData;
@@ -210,17 +283,82 @@ HRESULT scopeMetadata(IXMLDOMNode* node, SavedSearchMetadata& result) {
         hr = result.scope->GetDisplayName(SIGDN_FILESYSPATH, &raw); canonical.reset(raw);
         if (FAILED(hr) || !raw || !*raw) return unsupported;
     } else {
-        // Match the one supported documented GUID directly. CLSIDFromString
-        // also accepts ProgIDs and can register unknown ones; no registry lookup
-        // or conversion of arbitrary XML text is necessary for this subset.
-        wchar_t computerIdentifier[40]{};
-        if (!StringFromGUID2(FOLDERID_ComputerFolder, computerIdentifier, 40)) return E_UNEXPECTED;
-        if (_wcsicmp(known->second.c_str(), computerIdentifier) != 0 || !result.recursive) return unsupported;
-        if (FAILED(hr = SHGetKnownFolderItem(FOLDERID_ComputerFolder, KF_FLAG_DEFAULT, nullptr, IID_PPV_ARGS(&result.scope)))) return hr;
+        // Only accept canonical GUID syntax. Never pass a ProgID to a native
+        // converter that could register it while reading an external file.
+        const auto& text = known->second;
+        if (text.size() != 38 || text.front() != L'{' || text.back() != L'}') return unsupported;
+        for (size_t i = 1; i < 37; ++i) {
+            const bool separator = i == 9 || i == 14 || i == 19 || i == 24;
+            if (separator ? text[i] != L'-' : !iswxdigit(text[i])) return unsupported;
+        }
+        GUID identifier{};
+        if (FAILED(hr = IIDFromString(text.c_str(), &identifier))) return hr;
+        if (FAILED(hr = SHGetKnownFolderItem(identifier, KF_FLAG_DEFAULT, nullptr, IID_PPV_ARGS(&result.scope)))) return hr;
+        if (!result.recursive || excluded) {
+            PWSTR raw = nullptr;
+            hr = result.scope->GetDisplayName(SIGDN_FILESYSPATH, &raw);
+            TaskString nativePath(raw);
+            if (FAILED(hr) || !raw || !*raw) return unsupported;
+        }
     }
     SFGAOF flags = 0;
     if (FAILED(hr = result.scope->GetAttributes(SFGAO_FOLDER, &flags))) return hr;
-    return flags & SFGAO_FOLDER ? S_OK : HRESULT_FROM_WIN32(ERROR_DIRECTORY);
+    if (!(flags & SFGAO_FOLDER)) return HRESULT_FROM_WIN32(ERROR_DIRECTORY);
+    result.scopeRules.push_back({result.scope, result.recursive, excluded});
+    return S_OK;
+}
+
+HRESULT scopeMetadata(IXMLDOMNode* node, SavedSearchMetadata& result) {
+    Attributes values;
+    auto hr = attributes(node, {}, values);
+    if (FAILED(hr)) return hr;
+    Elements children;
+    if (FAILED(hr = elements(node, children))) return hr;
+    if (children.empty() || children.size() > 256) return unsupported;
+    struct PidlFree {
+        using pointer = PIDLIST_ABSOLUTE;
+        void operator()(pointer value) const noexcept { CoTaskMemFree(value); }
+    };
+    std::vector<std::unique_ptr<ITEMIDLIST, PidlFree>> owned;
+    std::vector<PCIDLIST_ABSOLUTE> pidls;
+    for (const auto& child : children) {
+        SavedSearchMetadata location;
+        if (FAILED(hr = scopeItemMetadata(child.Get(), location))) return hr;
+        const auto& rule = location.scopeRules.front();
+        result.scopeRules.push_back(rule);
+        if (rule.excluded) continue;
+        if (!result.scope) { result.scope = location.scope; result.recursive = location.recursive; }
+        PIDLIST_ABSOLUTE raw = nullptr;
+        hr = SHGetIDListFromObject(location.scope.Get(), &raw);
+        std::unique_ptr<ITEMIDLIST, PidlFree> pidl(raw);
+        if (FAILED(hr)) return hr;
+        if (!raw) return E_UNEXPECTED;
+        pidls.push_back(raw); owned.push_back(std::move(pidl));
+    }
+    if (!result.scope || pidls.empty()) return unsupported;
+    const bool shallow = std::any_of(result.scopeRules.begin(), result.scopeRules.end(), [](const SearchScopeRule& rule) {
+        return !rule.excluded && !rule.recursive;
+    });
+    for (const auto& rule : result.scopeRules) {
+        if (!rule.excluded && shallow) {
+            PWSTR raw = nullptr;
+            hr = rule.folder->GetDisplayName(SIGDN_FILESYSPATH, &raw); TaskString path(raw);
+            if (FAILED(hr) || !raw || !*raw) return unsupported;
+        }
+        if (rule.excluded) for (const auto& included : result.scopeRules) {
+            if (included.excluded) continue;
+            int order = 0;
+            if (SUCCEEDED(rule.folder->Compare(included.folder.Get(), SICHINT_CANONICAL, &order)) && order == 0)
+                return unsupported;
+            if (!included.recursive) {
+                ComPtr<IShellItem> parent;
+                if (SUCCEEDED(rule.folder->GetParent(&parent)) &&
+                    SUCCEEDED(parent->Compare(included.folder.Get(), SICHINT_CANONICAL, &order)) && order == 0)
+                    return unsupported;
+            }
+        }
+    }
+    return SHCreateShellItemArrayFromIDLists(static_cast<UINT>(pidls.size()), pidls.data(), &result.scopes);
 }
 
 bool operation(std::wstring_view name, CONDITION_OPERATION& result) {
@@ -231,7 +369,7 @@ bool operation(std::wstring_view name, CONDITION_OPERATION& result) {
         Mapping{L"gte", COP_GREATERTHANOREQUAL}, Mapping{L"starts with", COP_VALUE_STARTSWITH},
         Mapping{L"ends with", COP_VALUE_ENDSWITH}, Mapping{L"contains", COP_VALUE_CONTAINS},
         Mapping{L"does not contain", COP_VALUE_NOTCONTAINS}, Mapping{L"matches", COP_DOSWILDCARDS},
-        Mapping{L"wordmatch", COP_WORD_EQUAL}};
+        Mapping{L"word eq", COP_WORD_EQUAL}, Mapping{L"wordmatch", COP_WORD_STARTSWITH}};
     for (const auto& mapping : mappings) if (name == mapping.name) { result = mapping.operation; return true; }
     return false;
 }
@@ -508,7 +646,11 @@ HRESULT relativeTokens(ICondition* item, std::vector<std::wstring>& result, unsi
         if (FAILED(hr)) return hr;
         if (value.value.vt != VT_LPWSTR || !value.value.pwszVal) return unsupported;
         std::wstring text = rawProperty ? rawProperty : L"";
-        text += L"\n" + std::to_wstring(op) + L"\n" + value.value.pwszVal;
+        // Native parsing can push NOT through a compound range and invert
+        // its comparisons. Preserve each unresolved date token here; the full
+        // resolved-tree fingerprint below verifies the resulting operations
+        // and Boolean meaning, rather than rejecting an equivalent negation.
+        text += L"\n"; text += value.value.pwszVal;
         result.push_back(std::move(text));
         return S_OK;
     }
@@ -531,6 +673,84 @@ HRESULT relativeTokens(ICondition* item, std::vector<std::wstring>& result, unsi
     }
 }
 
+HRESULT canonicalUtcSecond(IQueryParser* parser, const wchar_t* property, CONDITION_OPERATION operation,
+                           const PROPVARIANT& value, std::wstring& result) {
+    // Restatement of a constructed UTC leaf can omit its time-zone suffix.
+    // Derive a candidate only through public date resolution, then require the
+    // parser to reproduce the exact original unresolved token. This never
+    // decodes the token or changes a relative date into an absolute timestamp.
+    const wchar_t* symbol = nullptr;
+    switch (operation) {
+    case COP_IMPLICIT: symbol = L""; break;
+    case COP_EQUAL: symbol = L"="; break;
+    case COP_NOTEQUAL: symbol = L"<>"; break;
+    case COP_LESSTHAN: symbol = L"<"; break;
+    case COP_GREATERTHAN: symbol = L">"; break;
+    case COP_LESSTHANOREQUAL: symbol = L"<="; break;
+    case COP_GREATERTHANOREQUAL: symbol = L">="; break;
+    default: return S_FALSE;
+    }
+    ComPtr<IConditionFactory> factory;
+    auto hr = CoCreateInstance(__uuidof(ConditionFactory), nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory));
+    if (FAILED(hr)) return hr;
+    ComPtr<ICondition> equality, resolved;
+    if (FAILED(hr = factory->MakeLeaf(property, COP_EQUAL, L"System.StructuredQueryType.DateTime", &value,
+                                    nullptr, nullptr, nullptr, FALSE, &equality))) return hr;
+    SYSTEMTIME now{}; GetLocalTime(&now);
+    if (FAILED(hr = factory->Resolve(equality.Get(), SQRO_DONT_SPLIT_WORDS, &now, &resolved))) return hr;
+    CONDITION_TYPE type{};
+    if (!resolved || FAILED(hr = resolved->GetConditionType(&type))) return FAILED(hr) ? hr : E_UNEXPECTED;
+    if (type != CT_AND_CONDITION) return S_FALSE;
+    ComPtr<IEnumUnknown> children;
+    if (FAILED(hr = resolved->GetSubConditions(IID_PPV_ARGS(&children)))) return hr;
+    ULONGLONG first = 0, last = 0;
+    bool haveFirst = false, haveLast = false;
+    for (unsigned index = 0; index != 3; ++index) {
+        ComPtr<IUnknown> unknown;
+        hr = children->Next(1, &unknown, nullptr);
+        if (hr == S_FALSE) { if (index != 2) return S_FALSE; break; }
+        if (FAILED(hr)) return hr;
+        if (index == 2) return S_FALSE;
+        ComPtr<ICondition> child;
+        if (FAILED(hr = unknown.As(&child))) return hr;
+        PWSTR rawProperty = nullptr; CONDITION_OPERATION comparison{}; PropertyVariant boundary;
+        hr = child->GetComparisonInfo(&rawProperty, &comparison, &boundary.value); TaskString name(rawProperty);
+        if (FAILED(hr)) return hr;
+        if (!rawProperty || _wcsicmp(rawProperty, property) != 0 || boundary.value.vt != VT_FILETIME) return S_FALSE;
+        const auto ticks = (static_cast<ULONGLONG>(boundary.value.filetime.dwHighDateTime) << 32) |
+                          boundary.value.filetime.dwLowDateTime;
+        if (comparison == COP_GREATERTHANOREQUAL && !haveFirst) { first = ticks; haveFirst = true; }
+        else if (comparison == COP_LESSTHAN && !haveLast) { last = ticks; haveLast = true; }
+        else return S_FALSE;
+    }
+    constexpr ULONGLONG second = 10000000;
+    if (!haveFirst || !haveLast || last < first || last - first != second || first % second) return S_FALSE;
+    const FILETIME instant{static_cast<DWORD>(first), static_cast<DWORD>(first >> 32)};
+    SYSTEMTIME utc{};
+    if (!FileTimeToSystemTime(&instant, &utc) || utc.wYear > 9999) return S_FALSE;
+    wchar_t iso[40]{};
+    swprintf_s(iso, L"%04u-%02u-%02uT%02u:%02u:%02uZ", utc.wYear, utc.wMonth, utc.wDay,
+               utc.wHour, utc.wMinute, utc.wSecond);
+    std::wstring candidate = property;
+    candidate += L':'; candidate += symbol; candidate += iso;
+    ComPtr<IQuerySolution> solution;
+    if (FAILED(hr = parser->Parse(candidate.c_str(), nullptr, &solution))) return hr;
+    ComPtr<ICondition> reparsed;
+    if (FAILED(hr = solution->GetQuery(&reparsed, nullptr))) return hr;
+    if (FAILED(hr = reparsed->GetConditionType(&type))) return hr;
+    if (type != CT_LEAF_CONDITION) return S_FALSE;
+    PWSTR rawProperty = nullptr, rawType = nullptr; CONDITION_OPERATION checkedOperation{}; PropertyVariant checked;
+    hr = reparsed->GetComparisonInfo(&rawProperty, &checkedOperation, &checked.value); TaskString name(rawProperty);
+    if (FAILED(hr)) return hr;
+    hr = reparsed->GetValueType(&rawType); TaskString semantic(rawType);
+    if (FAILED(hr)) return hr;
+    if (!rawProperty || _wcsicmp(rawProperty, property) != 0 || checkedOperation != operation ||
+        !rawType || wcscmp(rawType, L"System.StructuredQueryType.DateTime") != 0 || checked.value.vt != value.vt ||
+        PropVariantCompareEx(value, checked.value, PVCU_DEFAULT, PVCF_DEFAULT) != 0) return S_FALSE;
+    result += candidate;
+    return S_OK;
+}
+
 // Restate each leaf through the native schema, then spell out Boolean grouping.
 // Whole-tree restatement can factor one property around a group in a form that
 // does not reparse faithfully for filename generators; the equivalence check
@@ -548,6 +768,11 @@ HRESULT queryString(IQueryParser* parser, ICondition* item, std::wstring& result
         if (FAILED(hr)) return hr;
         hr = item->GetValueType(&rawType); TaskString semantic(rawType);
         if (FAILED(hr)) return hr;
+        if (rawProperty && rawType && wcscmp(rawType, L"System.StructuredQueryType.DateTime") == 0 &&
+            value.value.vt == VT_LPWSTR && value.value.pwszVal) {
+            hr = canonicalUtcSecond(parser, rawProperty, op, value.value, result);
+            if (hr != S_FALSE) return hr;
+        }
         if (canonicalLiterals && rawProperty && value.value.vt == VT_LPWSTR && value.value.pwszVal &&
             (!rawType || wcscmp(rawType, L"System.StructuredQueryType.String") == 0 ||
                          wcscmp(rawType, L"System.StructuredQueryType.Blurb") == 0)) {
@@ -681,13 +906,28 @@ HRESULT queryMetadata(IXMLDOMNode* node, SavedSearchMetadata& result) {
     if (FAILED(hr = attributes(kinds.Get(), {}, values))) return hr;
     Elements kindChildren;
     if (FAILED(hr = elements(kinds.Get(), kindChildren))) return hr;
-    if (kindChildren.size() != 1) return unsupported;
-    std::wstring name;
-    if (FAILED(hr = nodeName(kindChildren[0].Get(), name))) return hr;
-    values.clear();
-    if (name != L"kind" || FAILED(hr = attributes(kindChildren[0].Get(), {L"name"}, values))) return name == L"kind" ? hr : unsupported;
-    if (values.size() != 1 || values[L"name"] != L"item") return unsupported;
-    if (FAILED(hr = emptyElement(kindChildren[0].Get()))) return hr;
+    if (kindChildren.empty() || kindChildren.size() > 64) return unsupported;
+    constexpr std::array<std::wstring_view, 23> supportedKinds{
+        L"calendar", L"communication", L"contact", L"document", L"email", L"feed", L"folder", L"game",
+        L"instantmessage", L"journal", L"link", L"movie", L"music", L"note", L"picture", L"program",
+        L"recordedtv", L"searchfolder", L"task", L"video", L"webhistory", L"item", L"other"};
+    std::vector<std::wstring> kindNames;
+    for (const auto& child : kindChildren) {
+        std::wstring name;
+        if (FAILED(hr = nodeName(child.Get(), name))) return hr;
+        values.clear();
+        if (name != L"kind" || FAILED(hr = attributes(child.Get(), {L"name"}, values))) return name == L"kind" ? hr : unsupported;
+        if (values.size() != 1 || FAILED(hr = emptyElement(child.Get()))) return values.size() == 1 ? hr : unsupported;
+        auto kind = values[L"name"];
+        std::transform(kind.begin(), kind.end(), kind.begin(), [](wchar_t c) { return static_cast<wchar_t>(towlower(c)); });
+        if (std::find(supportedKinds.begin(), supportedKinds.end(), kind) == supportedKinds.end()) return unsupported;
+        kindNames.push_back(std::move(kind));
+    }
+    // Native all-item is a singleton loader sentinel. Repeating it produces
+    // an empty union rather than an all-item query; retain that external shape
+    // in the native viewer instead of simplifying it to a different search.
+    if (kindNames.size() > 1 && std::all_of(kindNames.begin(), kindNames.end(), [](const std::wstring& kind) { return kind == L"item"; }))
+        return unsupported;
     values.clear();
     if (FAILED(hr = attributes(conditions.Get(), {}, values))) return hr;
     Elements roots;
@@ -699,6 +939,32 @@ HRESULT queryMetadata(IXMLDOMNode* node, SavedSearchMetadata& result) {
     if (FAILED(hr = condition(roots[0].Get(), factory.Get(), &tree))) return hr;
     ComPtr<IQueryParser> queryParser;
     if (FAILED(hr = parser(&queryParser))) return hr;
+    if (std::any_of(kindNames.begin(), kindNames.end(), [](const std::wstring& kind) { return kind != L"item"; })) {
+        // Keep System.Kind typed while constructing the union. A quoted
+        // textual System.Kind value can be parsed as a generic search term;
+        // RestateToString below supplies the native canonical entity syntax
+        // and verifies the parser round-trip against these actual values.
+        std::vector<ComPtr<ICondition>> owned;
+        std::vector<ICondition*> branches;
+        for (const auto& kind : kindNames) {
+            if (kind == L"item") continue;
+            PropertyVariant value;
+            if (FAILED(hr = InitPropVariantFromString(kind.c_str(), &value.value))) return hr;
+            ComPtr<ICondition> leaf;
+            if (FAILED(hr = factory->MakeLeaf(L"System.Kind", COP_EQUAL, nullptr, &value.value,
+                nullptr, nullptr, nullptr, FALSE, &leaf))) return hr;
+            branches.push_back(leaf.Get()); owned.push_back(std::move(leaf));
+        }
+        ComPtr<ICondition> restriction;
+        if (branches.size() == 1) restriction = owned.front();
+        else if (FAILED(hr = factory->CreateCompoundFromArray(CT_OR_CONDITION, branches.data(),
+            static_cast<ULONG>(branches.size()), CONDITION_CREATION_DEFAULT, IID_PPV_ARGS(&restriction)))) return hr;
+        ICondition* conjunction[]{tree.Get(), restriction.Get()};
+        ComPtr<ICondition> combined;
+        if (FAILED(hr = factory->CreateCompoundFromArray(CT_AND_CONDITION, conjunction, 2,
+            CONDITION_CREATION_DEFAULT, IID_PPV_ARGS(&combined)))) return hr;
+        tree = std::move(combined);
+    }
     SYSTEMTIME now{}; GetLocalTime(&now);
     hr = restatedQuery(queryParser.Get(), tree.Get(), tree.Get(), now, result.query);
     if (hr != unsupported) return hr;
@@ -732,17 +998,21 @@ HRESULT readSavedSearch(const std::filesystem::path& path, SavedSearchMetadata* 
         if (values.size() != 1 || values[L"version"] != L"1.0") return unsupported;
         Elements children;
         if (FAILED(hr = elements(root.Get(), children))) return hr;
-        ComPtr<IXMLDOMNode> query;
-        bool view = false, properties = false;
+        ComPtr<IXMLDOMNode> query, view;
+        bool properties = false;
         for (const auto& child : children) {
             if (FAILED(hr = nodeName(child.Get(), name))) return hr;
             if (name == L"query" && !query) query = child;
-            else if (name == L"viewInfo" && !view) view = true;
+            else if (name == L"viewInfo" && !view) view = child;
             else if (name == L"properties" && !properties) properties = true;
             else return unsupported;
         }
         if (!query) return unsupported;
         SavedSearchMetadata candidate;
+        if (view) {
+            candidate.presentation.emplace();
+            if (FAILED(hr = viewMetadata(view.Get(), *candidate.presentation))) return hr;
+        }
         if (FAILED(hr = queryMetadata(query.Get(), candidate))) return hr;
         *result = std::move(candidate);
         return S_OK;

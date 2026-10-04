@@ -16,7 +16,7 @@ std::optional<Command> shortcutCommand(UINT key, bool control, bool shift,
     // and Alt+F4, and keep text editing shortcuts out of file-command routing.
     switch (modifiers) {
     case 0:
-        if (key == VK_F4) return Address;
+        if (key == VK_F4) return AddressList;
         if (key == VK_F3) return FocusSearch;
         if (key == VK_F5) return Refresh;
         if (key == VK_F6) return FocusNext;
@@ -28,6 +28,7 @@ std::optional<Command> shortcutCommand(UINT key, bool control, bool shift,
         break;
     case Control:
         if (key == 'L') return Address;
+        if (key == 'R') return Refresh;
         if (key == 'E' || key == 'F') return FocusSearch;
         if (key == 'N') return NewWindow;
         if (key == 'W') return Close;
@@ -37,12 +38,15 @@ std::optional<Command> shortcutCommand(UINT key, bool control, bool shift,
         if (key == 'X') return Cut;
         if (key == 'V') return Paste;
         if (key == 'A') return SelectAll;
+        if (key == 'D') return Delete;
+        if (key == VK_ADD) return SizeColumns;
         break;
     case Shift:
         if (key == VK_F6) return FocusPrevious;
         if (!editing && key == VK_DELETE) return PermanentDelete;
         break;
     case Control | Shift:
+        if (key == 'E') return ExpandAncestors;
         if (editing) return std::nullopt;
         if (key == 'N') return NewFolder;
         if (key >= '1' && key <= '8')

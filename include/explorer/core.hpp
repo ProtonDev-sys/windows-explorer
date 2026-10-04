@@ -19,16 +19,23 @@ struct Preferences {
     bool navigationPane = true;
     bool previewPane = false;
     bool detailsPane = false;
+    bool expandToCurrent = false;
+    bool showAllFolders = false;
+    bool showLibraries = false;
     bool showHidden = false;
     bool showExtensions = true;
     bool ribbonCollapsed = false;
     ViewMode view = ViewMode::Details;
     int windowWidth = 1200;
     int windowHeight = 800;
-    std::wstring startupLocation = L"shell:MyComputerFolder";
+    int searchWidth = 146;
+    bool useWindowsStartup = true;
+    std::wstring startupLocation = L"shell:::{679f85cb-0220-4080-b29b-5540cc05aab6}";
 };
 
 std::filesystem::path preferencesPath();
+// Read-only Windows 10 Folder Options "Open File Explorer to" preference.
+std::wstring windowsDefaultStartupLocation();
 Preferences loadPreferences(const std::filesystem::path& path);
 bool savePreferences(const std::filesystem::path& path, const Preferences& preferences);
 std::wstring trim(const std::wstring& text);

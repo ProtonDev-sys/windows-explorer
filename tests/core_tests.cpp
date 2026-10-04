@@ -1,4 +1,5 @@
 #include "explorer/core.hpp"
+#include "explorer/worker_sta.hpp"
 
 #include <objbase.h>
 #include <fstream>
@@ -6,6 +7,7 @@
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -19,6 +21,14 @@ int runQuickAccessTests();
 int runSavedSearchTests();
 int runShareTests();
 int runLibraryTests();
+int runNamespaceActionTests();
+int runStatusTests();
+int runBreadcrumbTests();
+int runAppCommandTests();
+int runSearchHistoryTests();
+int runAddressHistoryTests();
+int runTypedAddressTests();
+int runStaWorkerTests();
 
 namespace {
 void require(bool condition, const char* message) {
@@ -55,7 +65,9 @@ void defaultsAndMissingSettings() {
     require(missing.navigationPane && !missing.previewPane && !missing.detailsPane, "Default panes changed");
     require(!missing.showHidden && missing.showExtensions && !missing.ribbonCollapsed, "Default visibility changed");
     require(missing.view == explorer::ViewMode::Details && missing.windowWidth == 1200 && missing.windowHeight == 800, "Default view or window size changed");
-    require(missing.startupLocation == L"shell:MyComputerFolder", "Default startup location changed");
+    require(missing.searchWidth == 146, "Windows 10 default search width changed");
+    require(missing.useWindowsStartup && missing.startupLocation == explorer::Preferences{}.startupLocation,
+            "New startup must inherit Windows Folder Options with stock Quick access fallback");
     const auto profile = explorer::preferencesPath();
     require(!profile.empty() && profile.is_absolute() && profile.filename() == L"settings.ini", "Settings path must use a user profile location");
 }
@@ -67,17 +79,23 @@ void unicodeSettingsRoundTrip() {
     original.navigationPane = false;
     original.previewPane = true;
     original.detailsPane = true;
+    original.expandToCurrent = original.showAllFolders = original.showLibraries = true;
+    original.useWindowsStartup = false;
     original.showHidden = true;
     original.showExtensions = false;
     original.ribbonCollapsed = true;
     original.view = explorer::ViewMode::Content;
     original.windowWidth = 2200;
     original.windowHeight = 1400;
+    original.searchWidth = 281;
     original.startupLocation = L"\\\\server\\share\\\u65E5\u672C\u8A9E \U0001F4C1\\a=b%20&c\nline\tname";
     require(explorer::savePreferences(path, original), "Cannot save Unicode settings");
     const auto loaded = explorer::loadPreferences(path);
     require(loaded.startupLocation == original.startupLocation, "Unicode or escaped path did not round-trip");
     require(!loaded.navigationPane && loaded.previewPane && loaded.detailsPane && loaded.showHidden && !loaded.showExtensions && loaded.ribbonCollapsed, "Boolean settings did not round-trip");
+    require(loaded.expandToCurrent && loaded.showAllFolders && loaded.showLibraries, "Native navigation preferences did not round-trip");
+    require(!loaded.useWindowsStartup, "Explicit startup policy did not round-trip");
+    require(loaded.searchWidth == 281, "Resizable search width did not round-trip");
     require(loaded.view == original.view && loaded.windowWidth == original.windowWidth && loaded.windowHeight == original.windowHeight, "View settings did not round-trip");
     original.startupLocation = L"shell:Downloads";
     require(explorer::savePreferences(path, original), "Atomic replacement failed");
@@ -96,11 +114,16 @@ void invalidSettingsFallback() {
     auto loaded = explorer::loadPreferences(path);
     require(loaded.showHidden && !loaded.navigationPane && loaded.previewPane, "Valid settings were not retained beside invalid values");
     require(loaded.showExtensions && loaded.view == explorer::ViewMode::Details, "Invalid boolean or view did not fall back");
-    require(loaded.windowWidth == 1200 && loaded.windowHeight == 800 && loaded.startupLocation == L"shell:MyComputerFolder", "Invalid bounds or escape did not fall back");
+    require(loaded.windowWidth == 1200 && loaded.windowHeight == 800 && loaded.startupLocation == explorer::Preferences{}.startupLocation && loaded.useWindowsStartup, "Invalid bounds or escape did not fall back");
     write(path, "windowWidth=640\nwindowHeight=4320\nview=0\nstartupLocation=  leading and trailing  \n");
     loaded = explorer::loadPreferences(path);
     require(loaded.windowWidth == 640 && loaded.windowHeight == 4320 && loaded.view == explorer::ViewMode::ExtraLargeIcons, "Valid boundary values were rejected");
     require(loaded.startupLocation == L"  leading and trailing  ", "Settings path whitespace was corrupted");
+    require(!loaded.useWindowsStartup, "Legacy explicit startup location must stay authoritative");
+    write(path, "startupLocation=shell:MyComputerFolder\nuseWindowsStartup=true\n");
+    loaded = explorer::loadPreferences(path);
+    require(loaded.useWindowsStartup && loaded.startupLocation == L"shell:MyComputerFolder",
+            "Windows startup policy must coexist with retained compatibility location");
     write(path, std::string("showHidden=true\nstartupLocation=") + static_cast<char>(0xFF));
     require(!explorer::loadPreferences(path).showHidden, "Malformed UTF-8 file must fall back safely");
     write(path, std::string(256 * 1024 + 1, 'x'));
@@ -141,7 +164,16 @@ void namesAndSizes() {
 }
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 2 && std::string_view(argv[1]) == "--worker-only") return runStaWorkerTests();
+    if (argc == 2 && std::string_view(argv[1]) == "--worker-after-autocomplete") {
+        const auto initialized = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        if (FAILED(initialized)) return 1;
+        const auto failures = runSearchHistoryTests() + runStaWorkerTests();
+        CoUninitialize();
+        return failures ? 1 : 0;
+    }
+    if (argc != 1) return 2;
     const HRESULT initialized = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     if (FAILED(initialized)) {
         std::cerr << "FAIL: Cannot initialize COM for headless shell tests\n";
@@ -175,6 +207,20 @@ int main() {
     failures += static_cast<unsigned>(runSavedSearchTests());
     failures += static_cast<unsigned>(runShareTests());
     failures += static_cast<unsigned>(runLibraryTests());
+    failures += static_cast<unsigned>(runNamespaceActionTests());
+    failures += static_cast<unsigned>(runStatusTests());
+    failures += static_cast<unsigned>(runBreadcrumbTests());
+    failures += static_cast<unsigned>(runAppCommandTests());
+    failures += static_cast<unsigned>(runSearchHistoryTests());
+    failures += static_cast<unsigned>(runAddressHistoryTests());
+    failures += static_cast<unsigned>(runTypedAddressTests());
+    failures += static_cast<unsigned>(runStaWorkerTests());
+    const auto drained = explorer::drainStaWorkers(5000);
+    if (FAILED(drained)) {
+        ++failures;
+        std::cerr << "FAIL: final creator STA worker drain HRESULT="
+                  << static_cast<unsigned long>(drained) << '\n';
+    }
     CoUninitialize();
     return failures == 0 ? 0 : 1;
 }

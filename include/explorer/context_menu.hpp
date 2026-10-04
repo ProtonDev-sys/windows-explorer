@@ -44,6 +44,12 @@ public:
     // Also supports IContextMenu obtained from a native view's SVGIO_BACKGROUND.
     HRESULT create(HWND owner, IContextMenu* context, IUnknown* site = nullptr,
                    UINT flags = CMF_NORMAL);
+    // Read-only native leaf-state query. Omits synchronous cascade population;
+    // enumerate(..., false) reads only metadata already supplied by the handler.
+    // Invoke and menu-message/delayed population are rejected for this instance.
+    // Normal popup and invocation paths must continue to use create().
+    HRESULT createLeafState(IContextMenu* context, IUnknown* site = nullptr,
+                            UINT flags = CMF_NORMAL);
     void reset() noexcept;
 
     HMENU menu() const noexcept { return menu_; }
@@ -67,6 +73,8 @@ public:
     bool handleMessage(UINT message, WPARAM wParam, LPARAM lParam, LRESULT& result);
 
 private:
+    HRESULT createImpl(HWND owner, IContextMenu* context, IUnknown* site, UINT flags,
+                       bool leafStateOnly);
     HRESULT enumerateMenu(HMENU menu, UINT position, unsigned depth, unsigned& budget,
                           std::vector<ContextMenuEntry>& entries, bool populate);
     std::wstring canonicalVerb(UINT id) const;
@@ -81,6 +89,7 @@ private:
     HMENU popup_ = nullptr;
     UINT commandCount_ = 0;
     bool siteAttached_ = false;
+    bool leafStateOnly_ = false;
     Microsoft::WRL::ComPtr<IContextMenu> context_;
     Microsoft::WRL::ComPtr<IContextMenu2> context2_;
     Microsoft::WRL::ComPtr<IContextMenu3> context3_;

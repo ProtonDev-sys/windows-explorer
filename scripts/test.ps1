@@ -10,16 +10,20 @@ $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 if ([string]::IsNullOrWhiteSpace($BuildDirectory)) { $BuildDirectory = Join-Path $projectRoot 'build' }
 $BuildDirectory = [IO.Path]::GetFullPath($BuildDirectory)
-if (-not $SkipBuild) { & (Join-Path $PSScriptRoot 'build.ps1') -Configuration $Configuration -BuildDirectory $BuildDirectory }
 $artifactDirectory = Join-Path $projectRoot 'artifacts'
 New-Item -ItemType Directory -Path $artifactDirectory -Force | Out-Null
 $testLog = Join-Path $artifactDirectory 'headless-tests.log'
-$smokeLog = Join-Path $artifactDirectory 'headless-smoke.log'
 $junit = Join-Path $artifactDirectory 'core-tests.xml'
 $smokeReport = Join-Path $artifactDirectory 'headless-smoke.json'
+$nativeSmokeReport = Join-Path $BuildDirectory 'headless-smoke.json'
+$installedSmokeReport = Join-Path $artifactDirectory 'headless-smoke-installed.json'
+$nativeInstalledSmokeReport = Join-Path $BuildDirectory 'headless-smoke-installed.json'
+$environmentReport = Join-Path $artifactDirectory 'test-environment.json'
 Set-Content -LiteralPath $testLog -Value '' -Encoding utf8
-Set-Content -LiteralPath $smokeLog -Value '' -Encoding utf8
-if (Test-Path -LiteralPath $smokeReport) { Remove-Item -LiteralPath $smokeReport -Force }
+foreach ($previousReport in @($junit, $environmentReport, $smokeReport, $nativeSmokeReport, $installedSmokeReport, $nativeInstalledSmokeReport)) {
+    if (Test-Path -LiteralPath $previousReport) { Remove-Item -LiteralPath $previousReport -Force }
+}
+if (-not $SkipBuild) { & (Join-Path $PSScriptRoot 'build.ps1') -Configuration $Configuration -BuildDirectory $BuildDirectory }
 
 $ctestCommand = Get-Command ctest -ErrorAction SilentlyContinue
 if ($ctestCommand) { $ctestPath = $ctestCommand.Source }
@@ -34,28 +38,86 @@ else {
     }
 }
 if (-not (Test-Path -LiteralPath $ctestPath)) { throw 'CTest executable was not found.' }
+$configuredTestsText = & $ctestPath --test-dir $BuildDirectory -C $Configuration --show-only=json-v1
+if ($LASTEXITCODE -ne 0) { throw 'Could not inventory configured headless tests.' }
+$configuredTests = ($configuredTestsText -join "`n") | ConvertFrom-Json
+$installedHostConfigured = @($configuredTests.tests | Where-Object { $_.name -eq 'installed_shell_host' }).Count -eq 1
 & $ctestPath --test-dir $BuildDirectory -C $Configuration --output-on-failure --no-tests=error --output-junit $junit 2>&1 | Tee-Object -FilePath $testLog -Append
 $testExit = $LASTEXITCODE
 $executable = Join-Path (Join-Path $BuildDirectory $Configuration) 'WindowsExplorer.exe'
 if (-not (Test-Path -LiteralPath $executable)) { throw "Application executable was not found: $executable" }
-# Waiting for the process avoids the asynchronous GUI-subsystem launch behavior of PowerShell.
-$smokeProcess = Start-Process -FilePath $executable -ArgumentList @('--headless-smoke', '--report', ('"' + $smokeReport + '"')) -WindowStyle Hidden -PassThru -RedirectStandardOutput $smokeLog -RedirectStandardError (Join-Path $artifactDirectory 'headless-smoke-errors.log')
-if (-not $smokeProcess.WaitForExit(60000)) {
-    Stop-Process -Id $smokeProcess.Id -Force -ErrorAction SilentlyContinue
-    throw "The headless smoke process timed out after 60 seconds. Reports: $artifactDirectory"
+# CTest already ran the complete private-desktop host suite. Preserve that
+# exact report rather than running every native Shell/UIA check a second time.
+$hostReports = @(@{ source = $nativeSmokeReport; destination = $smokeReport; layout = 'Authored' })
+if ($installedHostConfigured) {
+    $hostReports += @{ source = $nativeInstalledSmokeReport; destination = $installedSmokeReport; layout = 'InstalledWindows10' }
 }
-$smokeProcess.WaitForExit()
-$smokeProcess.Refresh()
-$smokeExit = $smokeProcess.ExitCode
-if (Test-Path -LiteralPath $smokeLog) { Get-Content -LiteralPath $smokeLog | Write-Host }
-if (Test-Path -LiteralPath $smokeReport) {
-    $reportSummary = Get-Content -LiteralPath $smokeReport -Raw | ConvertFrom-Json
-    foreach ($check in $reportSummary.results) {
-        if ($check.passed -ne $true) { Write-Host "FAIL: $($check.name): $($check.detail)" }
+foreach ($hostReport in $hostReports) {
+    if (Test-Path -LiteralPath $hostReport.source) {
+        Copy-Item -LiteralPath $hostReport.source -Destination $hostReport.destination
     }
 }
-if ($testExit -ne 0 -or $smokeExit -ne 0) { throw "Headless checks failed: CTest=$testExit, smoke=$smokeExit. Reports: $artifactDirectory" }
-if (-not (Test-Path -LiteralPath $smokeReport)) { throw "Smoke test did not create its report: $smokeReport" }
-$smokeSummary = Get-Content -LiteralPath $smokeReport -Raw | ConvertFrom-Json
-if ($smokeSummary.headless -ne $true -or $smokeSummary.passed -ne $true) { throw "Smoke report did not confirm successful headless checks: $smokeReport" }
+$testResults = if (Test-Path -LiteralPath $junit) { [xml](Get-Content -LiteralPath $junit -Raw) } else { $null }
+function Get-NativeTestStatus([string]$Name) {
+    if ($null -eq $testResults) { return 'not-run' }
+    $cases = @($testResults.testsuite.testcase | Where-Object { $_.name -eq $Name })
+    if ($cases.Count -ne 1) { return 'not-run' }
+    $case = $cases[0]
+    if ($null -ne $case.SelectSingleNode('skipped') -or $case.status -eq 'notrun') { return 'skipped' }
+    if ($null -ne $case.SelectSingleNode('failure') -or $case.status -ne 'run') { return 'failed' }
+    return 'passed'
+}
+function Test-ConfiguredOptIn([string]$Name, [string]$Variable) {
+    $tests = @($configuredTests.tests | Where-Object { $_.name -eq $Name })
+    if ($tests.Count -ne 1) { return $false }
+    $property = @($tests[0].properties | Where-Object { $_.name -eq 'ENVIRONMENT' })
+    return $property.Count -eq 1 -and @($property[0].value) -ccontains ($Variable + '=1')
+}
+$historyStatus = Get-NativeTestStatus 'native_shell_history'
+$searchOptionsStatus = Get-NativeTestStatus 'native_search_options'
+$viewPersistenceStatus = Get-NativeTestStatus 'native_view_persistence'
+$disposableRunner = $env:GITHUB_ACTIONS -ceq 'true'
+$historyOptIn = Test-ConfiguredOptIn 'native_shell_history' 'WINDOWSEXPLORER_NATIVE_HISTORY_TEST'
+$searchOptIn = Test-ConfiguredOptIn 'native_search_options' 'WINDOWSEXPLORER_SEARCH_OPTIONS_TEST'
+$viewPersistenceOptIn = Test-ConfiguredOptIn 'native_view_persistence' 'WINDOWSEXPLORER_VIEW_PERSISTENCE_TEST'
+@{
+    executableSha256 = (Get-FileHash -LiteralPath $executable -Algorithm SHA256).Hash.ToLowerInvariant()
+    completedUtc = [DateTime]::UtcNow.ToString('o')
+    os = [Environment]::OSVersion.VersionString
+    disposableHostedRunner = $disposableRunner
+    nativeHistoryOptInConfigured = $historyOptIn
+    nativeSearchOptionsOptInConfigured = $searchOptIn
+    nativeViewPersistenceOptInConfigured = $viewPersistenceOptIn
+    nativeHistoryMutationEnabled = $disposableRunner -and $historyOptIn -and $historyStatus -ne 'skipped' -and $historyStatus -ne 'not-run'
+    nativeSearchOptionsMutationEnabled = $disposableRunner -and $searchOptIn -and $searchOptionsStatus -ne 'skipped' -and $searchOptionsStatus -ne 'not-run'
+    nativeViewPersistenceMutationEnabled = $disposableRunner -and $viewPersistenceOptIn -and $viewPersistenceStatus -ne 'skipped' -and $viewPersistenceStatus -ne 'not-run'
+    nativeHistoryTestStatus = $historyStatus
+    nativeSearchOptionsTestStatus = $searchOptionsStatus
+    nativeViewPersistenceTestStatus = $viewPersistenceStatus
+    installedHostConfigured = $installedHostConfigured
+} | ConvertTo-Json | Set-Content -LiteralPath $environmentReport -Encoding utf8
+foreach ($hostReport in $hostReports) {
+    if (Test-Path -LiteralPath $hostReport.destination) {
+        $reportSummary = Get-Content -LiteralPath $hostReport.destination -Raw | ConvertFrom-Json
+        foreach ($check in $reportSummary.results) {
+            if ($check.passed -ne $true) { Write-Host "FAIL [$($hostReport.layout)]: $($check.name): $($check.detail)" }
+        }
+    }
+}
+if ($testExit -ne 0) { throw "Headless checks failed: CTest=$testExit. Reports: $artifactDirectory" }
+foreach ($hostReport in $hostReports) {
+    if (-not (Test-Path -LiteralPath $hostReport.destination)) {
+        throw "Smoke test did not create its report: $($hostReport.destination)"
+    }
+    $smokeSummary = Get-Content -LiteralPath $hostReport.destination -Raw | ConvertFrom-Json
+    if ($smokeSummary.headless -ne $true -or $smokeSummary.privateDesktop -ne $true -or
+        $smokeSummary.inputDesktopUnchanged -ne $true -or $smokeSummary.visibleInputDesktopWindows -ne $false -or
+        $smokeSummary.passed -ne $true -or $smokeSummary.failed -ne 0 -or
+        $smokeSummary.checks -ne $smokeSummary.results.Count -or $smokeSummary.checks -le 0 -or
+        @($smokeSummary.results | Where-Object { $_.passed -ne $true }).Count -ne 0 -or
+        $smokeSummary.ribbonLayout -ne $hostReport.layout -or
+        ($hostReport.layout -eq 'InstalledWindows10' -and $smokeSummary.installedRibbonStatus -ne 0)) {
+        throw "Smoke report did not confirm its native layout and isolation: $($hostReport.destination)"
+    }
+}
 Write-Host "All headless checks passed. Reports: $artifactDirectory"

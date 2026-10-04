@@ -1,8 +1,11 @@
 #include "explorer/search.hpp"
+#include "explorer/saved_search.hpp"
 
 #include <shlobj.h>
 #include <shlguid.h>
 #include <propkey.h>
+#include <sddl.h>
+#include <winioctl.h>
 #include <msxml6.h>
 #include <wrl/client.h>
 #include <filesystem>
@@ -239,6 +242,35 @@ ComPtr<IShellItem> reopenSearch(const fs::path& path) {
     require(comparison == 0, "saved search identity changed during PIDL round trip");
     return item;
 }
+void requireReopenedResults(const fs::path& path, const std::set<std::wstring>& expected,
+                            const char* message) {
+    std::set<FileIdentity> expectedIds;
+    for (const auto& value : expected) expectedIds.insert(fileIdentity(value));
+    const auto started = GetTickCount64();
+    unsigned retries = 0;
+    for (;;) {
+        const auto actual = searchResults(reopenSearch(path).Get());
+        std::set<FileIdentity> actualIds;
+        for (const auto& value : actual) actualIds.insert(fileIdentity(value));
+        if (actual.size() == expected.size() && actualIds == expectedIds && actual.size() == actualIds.size()) {
+            if (retries) std::cout << "INFO: native replaced-query notification settled after " << retries
+                                  << " retries / " << GetTickCount64() - started << "ms\n";
+            return;
+        }
+        if (GetTickCount64() - started >= 5000) {
+            requireResults(actual, expected, message);
+            return;
+        }
+        // Native query/cache notifications run on the owning STA. The real
+        // app keeps pumping; this windowless fixture must do the same.
+        MSG event{};
+        while (PeekMessageW(&event, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&event); DispatchMessageW(&event);
+        }
+        MsgWaitForMultipleObjectsEx(0, nullptr, 50, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+        ++retries;
+    }
+}
 
 void shallowAndRecursiveResults() {
     Fixture fixture;
@@ -312,7 +344,9 @@ void canonicalRefinementsAndRelativeDates() {
         L"System.DateModified:System.StructuredQueryType.DateTime#ThisWeek",
         L"System.DateModified:System.StructuredQueryType.DateTime#LastWeek",
         L"System.DateModified:System.StructuredQueryType.DateTime#ThisMonth",
+        L"System.DateModified:System.StructuredQueryType.DateTime#LastMonth",
         L"System.DateModified:System.StructuredQueryType.DateTime#ThisYear",
+        L"System.DateModified:System.StructuredQueryType.DateTime#LastYear",
         L"System.Size:System.Size#Empty", L"System.Size:System.Size#Tiny",
         L"System.Size:System.Size#Small", L"System.Size:System.Size#Medium",
         L"System.Size:System.Size#Large", L"System.Size:System.Size#Huge",
@@ -344,6 +378,218 @@ void canonicalRefinementsAndRelativeDates() {
     succeeded(explorer::saveSearch(today, scope.Get(), false, todayPath), "save relative Today text search");
     requireResults(searchResults(reopenSearch(todayPath).Get()),
         std::set<std::wstring>{(scopePath / L"current.txt").native()}, "native relative Today query did not exclude old fixture");
+    const auto relativeRangePath = fixture.root / L"relative-range.search-ms";
+    succeeded(explorer::saveSearch(L"System.DateModified:System.StructuredQueryType.DateTime#Today..System.StructuredQueryType.DateTime#Tomorrow",
+        scope.Get(), true, relativeRangePath), "save unresolved relative date range");
+    explorer::SavedSearchMetadata relativeRange;
+    succeeded(explorer::readSavedSearch(relativeRangePath, &relativeRange), "restore unresolved relative date range");
+    const auto expectedToday = std::set<std::wstring>{(scopePath / L"current.txt").native()};
+    requireResults(searchResults(reopenSearch(relativeRangePath).Get()), expectedToday,
+                   "saved relative range included an old fixture or omitted current identity");
+    ComPtr<IShellItem> liveRelativeRange;
+    succeeded(explorer::createSearchFolder(relativeRange.query, relativeRange.scope.Get(), &liveRelativeRange),
+              "rebuild unresolved relative range");
+    requireResults(searchResults(liveRelativeRange.Get()), expectedToday, "restored relative range changed native identities");
+    const auto relativeRangeAgain = fixture.root / L"relative-range-again.search-ms";
+    succeeded(explorer::saveSearch(relativeRange.query, relativeRange.scope.Get(), true, relativeRangeAgain),
+              "resave unresolved relative range");
+    for (const auto& path : {relativeRangePath, relativeRangeAgain}) {
+        auto document = loadXml(path);
+        const auto first = xmlElement(document.Get(), L"/persistedQuery/query/conditions/condition/condition[1]");
+        const auto last = xmlElement(document.Get(), L"/persistedQuery/query/conditions/condition/condition[2]");
+        for (const auto& bound : {first, last}) {
+            const auto token = xmlAttribute(bound.Get(), L"value");
+            require(xmlAttribute(bound.Get(), L"valuetype") == L"System.StructuredQueryType.DateTime" &&
+                    !token.empty() && token.front() == L'R', "relative date range was frozen while saving or re-saving");
+        }
+    }
+}
+
+ULONGLONG localTimestamp(WORD year, WORD month, WORD day, WORD hour = 0) {
+    SYSTEMTIME local{};
+    local.wYear = year; local.wMonth = month; local.wDay = day; local.wHour = hour;
+    SYSTEMTIME utc{};
+    require(TzSpecificLocalTimeToSystemTimeEx(nullptr, &local, &utc) != FALSE,
+            "convert owned civil date using current native time-zone rules");
+    FILETIME value{};
+    require(SystemTimeToFileTime(&utc, &value) != FALSE, "encode owned native UTC file timestamp");
+    return (static_cast<ULONGLONG>(value.dwHighDateTime) << 32) | value.dwLowDateTime;
+}
+void setOwnedTimestamp(const fs::path& path, ULONGLONG ticks) {
+    const auto file = CreateFileW(path.c_str(), FILE_WRITE_ATTRIBUTES | FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL, nullptr);
+    require(file != INVALID_HANDLE_VALUE, "open owned date-boundary fixture");
+    const FILETIME requested{static_cast<DWORD>(ticks), static_cast<DWORD>(ticks >> 32)};
+    FILETIME actual{};
+    const bool changed = SetFileTime(file, nullptr, nullptr, &requested) != FALSE &&
+                         GetFileTime(file, nullptr, nullptr, &actual) != FALSE;
+    CloseHandle(file);
+    require(changed && actual.dwHighDateTime == requested.dwHighDateTime &&
+            actual.dwLowDateTime == requested.dwLowDateTime, "owned filesystem lost exact 100ns date boundary");
+}
+ULONGLONG ownedWriteTimestamp(const fs::path& path) {
+    const auto file = CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL, nullptr);
+    require(file != INVALID_HANDLE_VALUE, "read owned date fixture timestamp");
+    FILETIME actual{};
+    const bool readTime = GetFileTime(file, nullptr, nullptr, &actual) != FALSE;
+    CloseHandle(file);
+    require(readTime, "read exact native date fixture timestamp");
+    return (static_cast<ULONGLONG>(actual.dwHighDateTime) << 32) | actual.dwLowDateTime;
+}
+std::wstring utcTimestampText(ULONGLONG ticks) {
+    const FILETIME value{static_cast<DWORD>(ticks), static_cast<DWORD>(ticks >> 32)};
+    SYSTEMTIME utc{};
+    require(FileTimeToSystemTime(&value, &utc) != FALSE, "decode owned UTC query boundary");
+    wchar_t text[40]{};
+    swprintf_s(text, L"%04u-%02u-%02uT%02u:%02u:%02uZ", utc.wYear, utc.wMonth, utc.wDay,
+               utc.wHour, utc.wMinute, utc.wSecond);
+    return text;
+}
+void absoluteDateDayAndRangeResults() {
+    Fixture fixture;
+    const auto scopePath = fixture.root / L"owned timestamp scope";
+    require(fs::create_directory(scopePath), "create exclusively owned date scope");
+    const auto leapStart = localTimestamp(2024, 2, 29);
+    const auto marchStart = localTimestamp(2024, 3, 1);
+    const auto rangeEnd = localTimestamp(2024, 3, 3);
+    const auto yearStart = localTimestamp(2024, 12, 31);
+    const auto januaryStart = localTimestamp(2025, 1, 1);
+    const auto januaryEnd = localTimestamp(2025, 1, 2);
+    const auto springStart = localTimestamp(2024, 3, 31);
+    const auto springEnd = localTimestamp(2024, 4, 1);
+    const auto autumnStart = localTimestamp(2024, 10, 27);
+    const auto autumnEnd = localTimestamp(2024, 10, 28);
+    struct Item { const wchar_t* name; ULONGLONG ticks; const char* contents; };
+    const std::array<Item, 17> items{{
+        {L"before-leap.bin", leapStart - 1, "p"},
+        {L"leap-start.bin", leapStart, "a"},
+        {L"leap-midday.bin", localTimestamp(2024, 2, 29, 12), "bb"},
+        {L"leap-last-100ns.bin", marchStart - 1, "ccc"},
+        {L"march-start.bin", marchStart, "dddd"},
+        {L"range-last-100ns.bin", rangeEnd - 1, "eeeee"},
+        {L"after-range.bin", rangeEnd, "ffffff"},
+        {L"year-start.bin", yearStart, "ggggggg"},
+        {L"year-last-100ns.bin", januaryStart - 1, "hhhhhhhh"},
+        {L"january-start.bin", januaryStart, "iiiiiiiii"},
+        {L"january-last-100ns.bin", januaryEnd - 1, "jjjjjjjjjj"},
+        {L"spring-start.bin", springStart, "spring"},
+        {L"spring-last-100ns.bin", springEnd - 1, "spring end"},
+        {L"after-spring.bin", springEnd, "after spring"},
+        {L"autumn-start.bin", autumnStart, "autumn"},
+        {L"autumn-last-100ns.bin", autumnEnd - 1, "autumn end"},
+        {L"after-autumn.bin", autumnEnd, "after autumn"}}};
+    std::vector<FileIdentity> originalIds;
+    for (const auto& item : items) {
+        const auto path = scopePath / item.name;
+        write(path, item.contents);
+        setOwnedTimestamp(path, item.ticks);
+        originalIds.push_back(fileIdentity(path.native()));
+    }
+    auto scope = shellItem(scopePath);
+    const auto scopeId = fileIdentity(scopePath.native());
+    const auto known = [&](std::initializer_list<unsigned> indices) {
+        std::set<std::wstring> paths;
+        for (const auto index : indices) paths.insert((scopePath / items[index].name).native());
+        return paths;
+    };
+    struct Example { std::wstring query; std::set<std::wstring> expected; };
+    const std::vector<Example> examples{
+        {L"System.DateModified:2024-02-29", known({1, 2, 3})},
+        {L"System.DateModified:=2024-02-29", known({1, 2, 3})},
+        {L"System.DateModified:2024-02-29..2024-03-02", known({1, 2, 3, 4, 5})},
+        {L"System.DateModified:=2024-02-29..2024-03-02", known({1, 2, 3, 4, 5})},
+        {L"NOT System.DateModified:2024-02-29..2024-03-02", known({0, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16})},
+        {L"System.DateModified:(>=2024-02-29T00:00:00 AND <2024-03-03T00:00:00)", known({1, 2, 3, 4, 5})},
+        {L"(System.DateModified:(>=2024-02-29T00:00:00 AND <2024-03-03T00:00:00)) AND System.Size:>1", known({2, 3, 4, 5})},
+        {L"System.DateModified:(>=" + utcTimestampText(leapStart) + L" AND <" + utcTimestampText(marchStart) + L")", known({1, 2, 3})},
+        {L"System.DateModified:2024-12-31..2025-01-01", known({7, 8, 9, 10})},
+        {L"System.DateModified:<2024-02-29", known({0})},
+        {L"System.DateModified:<=2024-02-29", known({0, 1, 2, 3})},
+        {L"System.DateModified:>2024-02-29", known({4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16})},
+        {L"NOT System.DateModified:2024-02-29", known({0, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16})},
+        {L"System.DateModified:=2024-03-31", known({11, 12})},
+        {L"System.DateModified:2024-03-31..2024-03-31", known({11, 12})},
+        {L"System.DateModified:2024-10-27", known({14, 15})},
+        {L"System.DateModified:(>=" + utcTimestampText(springStart) + L" AND <" + utcTimestampText(springEnd) + L")", known({11, 12})}};
+    const auto verify = [&](IShellItem* search, const std::set<std::wstring>& expected) {
+        const auto actual = searchResults(search);
+        for (const auto& path : actual)
+            require(fileIdentity(fs::path(path).parent_path().native()) == scopeId,
+                    "date search escaped its exclusively owned native scope");
+        requireResults(actual, expected, "native date query changed exact owned membership or day boundary");
+    };
+    unsigned index = 0;
+    for (const auto& example : examples) {
+        try {
+            const auto originalText = example.query;
+            ComPtr<IShellItem> live;
+            succeeded(explorer::createSearchFolder(example.query, scope.Get(), &live), "create native typed day/range query");
+            verify(live.Get(), example.expected);
+            const auto saved = fixture.root / (L"day-range-" + std::to_wstring(++index) + L".search-ms");
+            succeeded(explorer::saveSearch(example.query, scope.Get(), true, saved), "save native typed date query");
+            verify(reopenSearch(saved).Get(), example.expected);
+            explorer::SavedSearchMetadata metadata;
+            succeeded(explorer::readSavedSearch(saved, &metadata), "restore native typed date metadata");
+            require(metadata.recursive && !metadata.query.empty() && metadata.scopeRules.size() == 1 &&
+                    metadata.scopeRules.front().recursive && !metadata.scopeRules.front().excluded,
+                    "date metadata changed original scope or recursion");
+            ComPtr<IShellItem> restored;
+            succeeded(explorer::createSearchFolderForScopeRules(metadata.query, metadata.scopeRules, &restored),
+                      "rebuild native query from restored typed date metadata");
+            verify(restored.Get(), example.expected);
+            const auto again = fixture.root / (L"day-range-again-" + std::to_wstring(index) + L".search-ms");
+            succeeded(explorer::saveSearchForScopeRules(metadata.query, metadata.scopeRules, again), "resave restored typed date metadata");
+            verify(reopenSearch(again).Get(), example.expected);
+            require(example.query == originalText, "native date parsing modified supplied query text");
+        } catch (...) {
+            std::cerr << "date query case " << index << ": " << utf8(example.query) << '\n';
+            throw;
+        }
+    }
+    const auto validSaved = fixture.root / L"day-range-1.search-ms";
+    const auto originalSavedBytes = read(validSaved);
+    const auto originalSavedId = fileIdentity(validSaved.native());
+    explorer::SavedSearchMetadata preserved;
+    succeeded(explorer::readSavedSearch(validSaved, &preserved), "read metadata sentinel before invalid date input");
+    const auto originalQuery = preserved.query;
+    const auto* originalScope = preserved.scope.Get();
+    const auto* originalScopes = preserved.scopes.Get();
+    const auto originalRules = preserved.scopeRules;
+    unsigned invalidIndex = 0;
+    for (const std::wstring invalidDate : {L"System.DateModified:2024-02-30", L"System.DateModified:2023-02-29"}) {
+        const auto unchangedInput = invalidDate;
+        // Windows' tolerant parser treats an invalid date as a Value/generic
+        // condition. Do not invent date normalization or execute that fallback.
+        const auto invalidSaved = fixture.root / (L"invalid-date-" + std::to_wstring(++invalidIndex) + L".search-ms");
+        const auto saved = explorer::saveSearch(invalidDate, scope.Get(), true, invalidSaved);
+        if (SUCCEEDED(saved)) {
+            require(FAILED(explorer::readSavedSearch(invalidSaved, &preserved)),
+                    "invalid-date metadata was silently changed into a valid date");
+        } else require(!fs::exists(invalidSaved), "rejected invalid date left a partial saved search");
+        require(preserved.query == originalQuery && preserved.scope.Get() == originalScope &&
+                preserved.scopes.Get() == originalScopes && preserved.recursive &&
+                preserved.scopeRules.size() == originalRules.size() &&
+                preserved.scopeRules.front().folder.Get() == originalRules.front().folder.Get() &&
+                preserved.scopeRules.front().recursive == originalRules.front().recursive &&
+                preserved.scopeRules.front().excluded == originalRules.front().excluded,
+                "failed invalid-date metadata import changed original caller fields");
+        require(FAILED(explorer::saveSearch(invalidDate, scope.Get(), true, validSaved)) &&
+                read(validSaved) == originalSavedBytes && fileIdentity(validSaved.native()) == originalSavedId,
+                "invalid-date save overwrote an existing valid query");
+        require(invalidDate == unchangedInput, "invalid-date parsing changed supplied query text");
+    }
+    for (size_t member = 0; member < items.size(); ++member) {
+        const auto path = scopePath / items[member].name;
+        require(fileIdentity(path.native()) == originalIds[member] && read(path) == items[member].contents &&
+                ownedWriteTimestamp(path) == items[member].ticks,
+                "date queries modified owned file identity/content or exact timestamp");
+    }
+    std::cout << "INFO: date-range fixture cases=" << examples.size() << " identities=" << items.size()
+              << " nativeSpringDayHours=" << (springEnd - springStart) / 36000000000ULL
+              << " nativeAutumnDayHours=" << (autumnEnd - autumnStart) / 36000000000ULL << '\n';
 }
 
 void xmlEscapingAndThisPcScope() {
@@ -468,14 +714,178 @@ void rejectedInputsAndNoOverwrite() {
     require(explorer::saveSearch(L"System.FileName:=\"report\"", percentScope.Get(), true, rejected) == unsupported, "literal percent scope would be environment-expanded when reopened");
     require(!fs::exists(rejected), "unsupported scope left a partial saved search");
 }
+
+struct OwnedHandle {
+    HANDLE value = INVALID_HANDLE_VALUE;
+    ~OwnedHandle() { if (value != INVALID_HANDLE_VALUE) CloseHandle(value); }
+};
+std::wstring fileDacl(const fs::path& path) {
+    DWORD length = 0;
+    GetFileSecurityW(path.c_str(), DACL_SECURITY_INFORMATION, nullptr, 0, &length);
+    require(length != 0, "read owned saved-search DACL size");
+    std::vector<BYTE> security(length);
+    require(GetFileSecurityW(path.c_str(), DACL_SECURITY_INFORMATION, security.data(), length, &length) != FALSE,
+            "read owned saved-search DACL");
+    PWSTR raw = nullptr;
+    require(ConvertSecurityDescriptorToStringSecurityDescriptorW(security.data(), SDDL_REVISION_1,
+        DACL_SECURITY_INFORMATION, &raw, nullptr) != FALSE && raw, "format owned saved-search DACL");
+    const std::wstring result(raw);
+    LocalFree(raw);
+    return result;
+}
+FILE_BASIC_INFO fileBasic(const fs::path& path) {
+    OwnedHandle file{CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr)};
+    FILE_BASIC_INFO result{};
+    require(file.value != INVALID_HANDLE_VALUE &&
+        GetFileInformationByHandleEx(file.value, FileBasicInfo, &result, sizeof(result)), "read owned saved-search basic metadata");
+    return result;
+}
+std::set<std::wstring> fixtureMembers(const fs::path& root) {
+    std::set<std::wstring> paths;
+    for (const auto& entry : fs::recursive_directory_iterator(root)) paths.insert(entry.path().lexically_relative(root).native());
+    return paths;
+}
+void confirmedSearchReplacement() {
+    Fixture fixture;
+    const auto scopePath = fixture.root / L"scope";
+    require(fs::create_directory(scopePath), "create owned replacement search scope");
+    const auto first = scopePath / L"first.txt", second = scopePath / L"second.bin";
+    write(first, "original source must survive"); write(second, "second source must survive");
+    const auto firstId = fileIdentity(first.native()), secondId = fileIdentity(second.native());
+    auto scope = shellItem(scopePath);
+    const auto output = fixture.root / L"Saved-資料.search-ms";
+    succeeded(explorer::saveSearch(L"System.FileName:=\"first.txt\"", scope.Get(), true, output), "create original saved query");
+    const auto originalId = fileIdentity(output.native());
+    const auto originalBytes = read(output);
+    require(SetFileAttributesW(output.c_str(), FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_ARCHIVE) != FALSE,
+            "set owned saved-query attributes");
+    const auto dacl = fileDacl(output);
+    const auto basic = fileBasic(output);
+    const auto members = fixtureMembers(fixture.root);
+    succeeded(explorer::saveSearch(L"System.FileName:=\"second.bin\"", scope.Get(), true, output,
+        explorer::SearchSaveMode::UserConfirmed), "replace user-confirmed saved query with complete native XML");
+    const auto replacementBytes = read(output);
+    if (replacementBytes == originalBytes) {
+        std::cerr << "confirmed replacement bytes=" << replacementBytes.size()
+                  << " firstToken=" << (replacementBytes.find("first.txt") != std::string::npos)
+                  << " secondToken=" << (replacementBytes.find("second.bin") != std::string::npos)
+                  << " sameIdentity=" << (fileIdentity(output.native()) == originalId) << '\n';
+    }
+    require(replacementBytes != originalBytes, "confirmed replacement did not publish the new complete query");
+    std::cout << "INFO: native confirmed save retained prior filename identity=" <<
+        (fileIdentity(output.native()) == originalId) << '\n';
+    require(fileDacl(output) == dacl, "confirmed replacement changed the existing saved-query DACL");
+    const auto replaced = fileBasic(output);
+    require(replaced.CreationTime.QuadPart == basic.CreationTime.QuadPart && replaced.FileAttributes == basic.FileAttributes,
+            "confirmed replacement lost existing creation time or attributes");
+    require(fixtureMembers(fixture.root) == members, "confirmed replacement leaked a temporary/backup file");
+    loadXml(output);
+    requireReopenedResults(output, {second.native()}, "replaced native saved query has stale membership");
+    explorer::SavedSearchMetadata imported;
+    succeeded(explorer::readSavedSearch(output, &imported), "read replaced saved-query metadata");
+    require(imported.query.find(L"second.bin") != std::wstring::npos, "replaced query retained stale metadata");
+    const auto preservedBytes = read(output);
+    const auto preservedId = fileIdentity(output.native());
+    const auto preservedBasic = fileBasic(output);
+    const auto preserved = [&] {
+        require(read(output) == preservedBytes && fileIdentity(output.native()) == preservedId,
+                "failed replacement changed original bytes or identity");
+        const auto now = fileBasic(output);
+        require(now.CreationTime.QuadPart == preservedBasic.CreationTime.QuadPart &&
+                now.LastWriteTime.QuadPart == preservedBasic.LastWriteTime.QuadPart &&
+                now.ChangeTime.QuadPart == preservedBasic.ChangeTime.QuadPart &&
+                now.FileAttributes == preservedBasic.FileAttributes && fileDacl(output) == dacl,
+                "failed replacement changed original metadata or permissions");
+        require(fixtureMembers(fixture.root) == members, "failed replacement left temporary artifacts");
+    };
+    require(FAILED(explorer::saveSearch(L"System.FileName:=\"first.txt\"", scope.Get(), true, output)),
+            "default saved-search API overwrote the existing file");
+    preserved();
+    require(explorer::saveSearch(L"", scope.Get(), true, output, explorer::SearchSaveMode::UserConfirmed) == E_INVALIDARG,
+            "confirmed mode accepted invalid query");
+    preserved();
+    require(explorer::saveSearch(L"System.Size:>0", scope.Get(), true, output,
+        static_cast<explorer::SearchSaveMode>(99)) == E_INVALIDARG, "unknown saved-search publication mode accepted");
+    preserved();
+    {
+        OwnedHandle locked{CreateFileW(output.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL, nullptr)};
+        require(locked.value != INVALID_HANDLE_VALUE, "lock owned query against replacement");
+        const auto hr = explorer::saveSearch(L"System.FileName:=\"first.txt\"", scope.Get(), true, output,
+            explorer::SearchSaveMode::UserConfirmed);
+        if (hr != HRESULT_FROM_WIN32(ERROR_SHARING_VIOLATION))
+            std::cerr << "locked confirmed replacement HRESULT=0x" << std::hex << static_cast<unsigned long>(hr) << std::dec << '\n';
+        require(hr == HRESULT_FROM_WIN32(ERROR_SHARING_VIOLATION), "locked replacement did not preserve native sharing failure");
+        preserved();
+    }
+    require(SetFileAttributesW(output.c_str(), basic.FileAttributes | FILE_ATTRIBUTE_READONLY) != FALSE,
+            "make owned saved query read-only");
+    const auto readOnlyId = fileIdentity(output.native());
+    const auto readOnlyBasic = fileBasic(output);
+    require(explorer::saveSearch(L"System.FileName:=\"first.txt\"", scope.Get(), true, output,
+        explorer::SearchSaveMode::UserConfirmed) == HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED),
+        "confirmed replacement overrode the existing read-only attribute");
+    const auto afterReadOnly = fileBasic(output);
+    require(read(output) == preservedBytes && fileIdentity(output.native()) == readOnlyId &&
+            afterReadOnly.ChangeTime.QuadPart == readOnlyBasic.ChangeTime.QuadPart &&
+            afterReadOnly.FileAttributes == readOnlyBasic.FileAttributes && fixtureMembers(fixture.root) == members,
+            "failed read-only replacement changed the original or created artifacts");
+    require(SetFileAttributesW(output.c_str(), basic.FileAttributes) != FALSE, "restore only owned query attributes");
+
+    // Exercise the same publication through union/rule entry points, including
+    // an absent path after a successful Save dialog selected a fresh name.
+    ComPtr<IShellItemArray> scopes;
+    succeeded(SHCreateShellItemArrayFromShellItem(scope.Get(), IID_PPV_ARGS(&scopes)), "create owned union scope");
+    succeeded(explorer::saveSearchForScopes(L"System.FileName:=\"first.txt\"", scopes.Get(), true, output,
+        explorer::SearchSaveMode::UserConfirmed), "replace confirmed union-scope query");
+    require(read(output).find("first.txt") != std::string::npos && read(output).find("second.bin") == std::string::npos,
+            "union replacement did not publish the requested XML");
+    requireReopenedResults(output, {first.native()}, "union replacement kept stale query membership");
+    const std::vector<explorer::SearchScopeRule> rules{{scope, false, false}};
+    succeeded(explorer::saveSearchForScopeRules(L"System.FileName:=\"second.bin\"", rules, output,
+        explorer::SearchSaveMode::UserConfirmed), "replace confirmed explicit scope-rule query");
+    requireReopenedResults(output, {second.native()}, "rule replacement changed native scope semantics");
+    const auto fresh = fixture.root / L"new-confirmed.search-ms";
+    succeeded(explorer::saveSearchForScopeRules(L"System.Size:>0", rules, fresh,
+        explorer::SearchSaveMode::UserConfirmed), "confirmed dialog fresh path creates a new query");
+    requireResults(searchResults(reopenSearch(fresh).Get()), {first.native(), second.native()}, "fresh confirmed save lost native results");
+
+    // Saved XML is small; native filesystem compression can be retained without
+    // reading the old file's content or manipulating any user certificate.
+    {
+        OwnedHandle file{CreateFileW(output.c_str(), GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr)};
+        USHORT compression = COMPRESSION_FORMAT_DEFAULT;
+        DWORD returned = 0;
+        require(file.value != INVALID_HANDLE_VALUE && DeviceIoControl(file.value, FSCTL_SET_COMPRESSION,
+            &compression, sizeof(compression), nullptr, 0, &returned, nullptr), "compress only owned saved-query fixture");
+    }
+    const auto compressed = fileBasic(output);
+    require((compressed.FileAttributes & FILE_ATTRIBUTE_COMPRESSED) != 0, "owned query compression was not applied");
+    succeeded(explorer::saveSearch(L"System.FileName:=\"first.txt\"", scope.Get(), true, output,
+        explorer::SearchSaveMode::UserConfirmed), "replace compressed confirmed query preserving native compression");
+    require(read(output).find("first.txt") != std::string::npos && read(output).find("second.bin") == std::string::npos,
+            "compressed replacement did not publish the requested XML");
+    require((fileBasic(output).FileAttributes & FILE_ATTRIBUTE_COMPRESSED) != 0 && fileDacl(output) == dacl,
+            "confirmed save lost native compression or permissions");
+    requireReopenedResults(output, {first.native()}, "compressed replacement has incorrect native results");
+    require(fileIdentity(first.native()) == firstId && fileIdentity(second.native()) == secondId &&
+            read(first) == "original source must survive" && read(second) == "second source must survive",
+            "saved-query replacement changed source file identity or content");
+    require(fixtureMembers(fixture.root).size() == members.size() + 1, "final confirmed saves leaked temporary files");
+}
 } // namespace
 
 int runSearchTests() {
     const std::vector<std::pair<const char*, std::function<void()>>> tests{
         {"native live/saved recursive and shallow fixture results", shallowAndRecursiveResults},
         {"canonical kind/date/size refinements and relative dates", canonicalRefinementsAndRelativeDates},
+        {"typed day/range inclusive boundaries and live/saved/restored native identities", absoluteDateDayAndRangeResults},
         {"native saved numeric/string/wildcard/Boolean comparison results", comparisonOperatorSemantics},
         {"saved-search XML escaping, Unicode and This PC identity", xmlEscapingAndThisPcScope},
+        {"confirmed saved-search replacement, native results, permissions and failure preservation", confirmedSearchReplacement},
         {"saved-search invalid input, unsupported scope and no overwrite", rejectedInputsAndNoOverwrite}
     };
     int failures = 0;

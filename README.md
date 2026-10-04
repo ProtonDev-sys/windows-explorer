@@ -1,44 +1,39 @@
 # windows-explorer
 
-A native C++20 file manager for Windows 10, built with Win32 controls and the Windows Shell. It runs in its own process and hosts native folder views through `IExplorerBrowser`. No Electron, WebView, or JavaScript runtime is involved.
+A native C++20 file manager targeting Windows 10 22H2. It runs in its own process, hosts actual Windows folder views through `IExplorerBrowser`, and uses the native Windows Ribbon Framework. The executable has no web runtime or Python dependency.
 
-The implementation covers navigation, file operations, Home/Share/View commands, customizable toolbar shortcuts, and contextual Search and Library pages. **It is a working application, not complete Explorer parity.** The [feature matrix](docs/feature-matrix.md) separates implemented commands, Shell-provided behavior, and remaining work.
+Normal launches use the installed Windows 10 ribbon layout on build 19045 after checking its resource signature. An incompatible system uses the authored native fallback. Windows resources are loaded from the operating system at runtime and are not included in this repository.
+
+The [feature matrix](docs/feature-matrix.md) records each Windows 10 feature, its implementation, and its verification requirements. [Headless visual comparisons](docs/headless-visual.md) compare real private-desktop captures with pinned online Windows 10 references. Source wiring, passing behavioral tests, and matching pixels are separate evidence.
 
 ## Run
 
-Download the x64 executable from the [Releases page](https://github.com/ProtonDev-sys/windows-explorer/releases), extract the ZIP, and run `WindowsExplorer.exe`. The executable is unsigned. Windows 10 22H2 or newer is the target; the build includes the C++ runtime. ZIP creation and extraction use Windows' bundled `tar.exe` through a hidden background process.
+Build the current source using the instructions below, or download a published build from [Releases](https://github.com/ProtonDev-sys/windows-explorer/releases).
 
 ```powershell
 ./WindowsExplorer.exe
 ./WindowsExplorer.exe --path 'C:\Users'
 ```
 
-The application starts at This PC to avoid eagerly loading recent files or cloud providers. It does not replace the desktop, taskbar, or the Windows shortcut association. Settings are stored in `%LOCALAPPDATA%\WindowsExplorer\settings.ini`. The file-name-extension toggle uses Windows' shared Shell setting, matching Explorer's system-wide behavior.
+The executable is unsigned and includes the C++ runtime. It starts at Windows' configured Quick access or This PC location unless an explicit application startup location or command-line path is supplied. It runs alongside the Windows desktop shell. Application preferences and recent searches are stored under `%LOCALAPPDATA%\WindowsExplorer`; normal extension/hidden-item commands use Windows' shared settings.
 
 ## Features
 
-- Native file views with thumbnails, context menus, drag-and-drop, in-place rename, and association-based opening.
-- Back, forward, up, refresh, location history, clickable breadcrumbs, editable paths, and environment-variable expansion.
-- Commands for Quick access, known folders, This PC, Libraries, Network, and Recycle Bin.
-- Eight layouts, sorting/grouping, native column toggles and autosizing, item checkboxes, hidden items, hide/unhide selection, navigation/preview/details pane controls, and a collapsible command band.
-- Customizable client-area Quick Access Toolbar: add/remove supported commands, reorder, reset, and place above or below the command band; order and placement persist in app settings.
-- Copy/cut/paste, copy paths, copy/move destination pickers, new folders/text files/shortcuts, properties, recycle deletion, and confirmed permanent deletion.
-- Registered Windows New-item menu alongside direct folder/text/shortcut commands.
-- Native AQS search folders with current-folder or recursive scope, kind/date/size refinements, 20 recent query entries per session, native saved searches, filesystem-result Open file location, and return to the search's original folder.
-- Library locations, include/remove folder, default save location, content template, and creation commands using native `.library-ms` files.
-- F6/Shift+F6 region routing and F11 fullscreen, with hidden-window style/geometry restoration checks.
-- ZIP creation/extraction on a background worker, Unicode paths, and no-overwrite staging. Extraction supports classic stored/deflate ZIPs; ZIP64, encrypted, multipart, self-extracting, linked, or unsupported-metadata archives are rejected.
-- Native Windows Share integration for selected filesystem files, separate Sharing/Security property pages, printing through file associations, network-drive dialogs, Folder Options, and File History settings.
+- Native folder views, thumbnails, preview/details panes, overlays, association-based opening, inline rename, context menus, and drag-and-drop.
+- Home, Share, View, Computer, and Network ribbon pages; Picture, Drive, Disc Image, Compressed, Search, Library, Recycle Bin, Application, Shortcut, Music, and Video contextual pages.
+- Actual caption Quick Access Toolbar, customization, native keytips, ribbon collapse, and framework settings persistence.
+- PIDL navigation history, ancestor breadcrumbs, asynchronous sibling menus, destination drop targets, editable Shell paths, and native address completion.
+- Quick access, known folders, This PC, Libraries, Network, and Recycle Bin; configurable navigation tree expansion and roots.
+- Eight native layouts, per-folder view persistence, native sorting/grouping and complete property-column menus, checkboxes, visibility settings, and the native status footer.
+- Native copy/cut/paste, paste shortcut, copy/move destination menus, new-item handlers, properties, recycling, permanent deletion, native cancellation/progress/conflict handling, and Shell undo/redo.
+- Actual installed Share, email, fax, ZIP, security/sharing, offline-files, network, media, drive, picture, application, and selected-file history commands with provider-owned availability.
+- Native compressed-folder browsing, archive creation, Extract All, and extraction destinations. Normal archive commands use Windows' installed handlers.
+- Localized AQS search, current-folder/subfolder scopes, kind/date/size/property refinements, native advanced search options, recent searches and suggestions, saved queries, and Open file location.
+- Saved generic terms, phrases, numeric comparisons, relative and absolute date ranges, and multiple include locations, including actual Library locations; native saved results are checked against live results and exact file identities.
+- Native inline Library creation, included locations, private/public default save locations, content templates, and native management commands.
+- Keyboard navigation, region routing, fullscreen, process-local appearance, and native accessibility providers.
 
-Shell-provided capabilities depend on Windows, installed handlers, policy, and devices. The application can still encounter slow network locations or Shell extensions. There is no measured speedup claim against Explorer.exe.
-
-Important remaining work includes the other contextual ribbon pages, Explorer's exact title-bar toolbar/ribbon presentation, full Share/Easy access command coverage, advanced search options, explicit Undo/Redo integration, dark mode, localization, and accessibility validation. New Shortcut currently chooses file targets; Paste Shortcut supports file and folder targets. The File History button opens settings rather than an individual file's version history. Native New handlers and Share recipients depend on installed components; their visible UI and actual delivery have not been tested.
-
-Saved `.search-ms` files reopen through Windows and rerun their queries. The host restores query, scope, recursion, and Search controls for a verified subset: one filesystem scope or recursive This PC, an all-item kind union, and supported string condition/schema types. The imported condition becomes the base query; original filter-category state is not inferred. Multiple/excluded scopes, internal/provider elements, Blurb/unknown types, and other unsupported metadata remain native-view-only. The reader bounds XML input and prohibits DTDs/external resources.
-
-Saving supports filesystem folders and This PC, preserves relative dates, and never overwrites a file. Unspecified-property terms such as `report` cannot currently be persisted faithfully and reject before file creation; live generic searches still work. Explicit filename word-prefix queries (`System.FileName:$<...`) are unsupported live; saving any explicit `$<` condition, unsupported value types, arbitrary virtual scopes, and literal-percent scope paths is also unsupported. Explicit filename starts-with (`~<`) and wildcard (`~`) queries are supported. Share accepts at most 256 existing filesystem files, including regular ZIP files even when the Shell marks them as folders; physical directories, virtual items, and reparse points are rejected.
-
-New folder/text/shortcut, registered New-item menus, and terminal commands require an actual filesystem directory. ZIP namespace folders do not qualify for these destinations; their native Paste capability is handled separately.
+Installed providers, Windows policy, device support, and edition determine command availability. The application respects their actual states. Provider integration and arbitrary hardware/cloud behavior are tracked separately in the feature matrix.
 
 ## Build
 
@@ -48,32 +43,46 @@ Install Visual Studio 2022 Build Tools with **Desktop development with C++**, a 
 ./scripts/build.ps1 -Configuration Release
 ```
 
-The executable is written to `build/Release/WindowsExplorer.exe`. To configure directly:
+The executable is written to `build/Release/WindowsExplorer.exe`. A direct build uses:
 
 ```powershell
 cmake -S . -B build -G 'Visual Studio 17 2022' -A x64 -DBUILD_TESTING=ON
 cmake --build build --config Release --parallel
 ```
 
-## Headless testing
+The SDK's `UICC` compiles the ribbon markup during the build. Generated resources have one shared build owner. The application requires no elevation to start.
 
-All development tests run without showing the application or operating visible UI.
+## Headless verification
+
+All development verification stays off the user's visible desktop.
 
 ```powershell
 ./scripts/test.ps1 -Configuration Release
 # After a build:
 ./scripts/test.ps1 -Configuration Release -SkipBuild
+
+# Native screenshots and navigation benchmark:
+./scripts/visual-check.ps1 -Configuration Release -CaptureOnly
+./scripts/benchmark.ps1 -Configuration Release
 ```
 
-CTest runs console tests and a hidden-window Shell host. The host never calls `ShowWindow` on the application, blocks interactive operations, uses `EBO_NOPERSISTVIEWSTATE`, and observes process-owned top-level windows while pumping messages. Tests operate on owned temporary fixtures and preserve the user's clipboard, shared settings, libraries, and Shell undo history. Reports are written to `artifacts/`.
+CTest covers console fixtures, the hidden Shell host, actual native ribbon/accessibility controls, private-desktop capture, appearance, and guarded native history/search-option/folder-view persistence fixtures. Private desktops are created before COM/window initialization and cannot be switched onto the user's desktop. Capture validation checks actual PNG content, native control geometry, and expanded ribbon painting. Source comparisons preserve declared masks and strict thresholds.
 
-The final local Release build is warning-free. CTest passed 2/2 tests in 13.93 seconds, and an independent hidden-host run passed 72/72 checks. The integrated console suite passed 3,151 keyboard/model assertions across eight groups, six item-action groups, five native search groups, five saved-metadata groups with 35 query fixtures, five Share groups, six context-menu groups with 91 assertions, four toolbar groups, and three Library groups. Share tests resolve real file payloads without showing a picker; native New menus are enumerated without invoking handlers. [Hosted CI](https://github.com/ProtonDev-sys/windows-explorer/actions/runs/37169510842) also passed CTest 2/2 and 72/72 host checks at commit `ce231210` on Windows Server 2022. See [verification details](docs/verification.md) for platform differences and coverage limits.
+Local tests preserve the user's clipboard, Shell history, shared settings, and libraries. Tests that must exercise real shared search options or global undo/redo require both explicit opt-in and disposable GitHub Actions execution; local skips are reported as skips. [Native search/history CI](https://github.com/ProtonDev-sys/windows-explorer/actions/runs/37194199690) verifies those real operations. Current complete-run evidence is recorded in [verification](docs/verification.md).
 
-## Design and research
+The [performance report](docs/performance.md) measures navigation distributions, native callbacks, cached command latency, and memory for owned folders containing 10, 1,000, and 10,000 files. These app measurements do not establish a controlled speed comparison with `Explorer.exe`.
 
-- [Windows 10 research and UI specification](docs/windows-10-research.md)
-- [Feature matrix and parity backlog](docs/feature-matrix.md)
-- [Architecture and performance choices](docs/architecture.md)
-- [Verification record](docs/verification.md)
+## Research and design
+
+- [Windows 10 research and UI requirements](docs/windows-10-research.md)
+- [Feature matrix](docs/feature-matrix.md)
+- [Architecture](docs/architecture.md)
+- [Verification](docs/verification.md)
+- [Headless visual comparisons](docs/headless-visual.md)
+- [Native ribbon resources](docs/windows10-ribbon-icons.md)
+- [Installed Windows 10 ribbon adapter](docs/installed-ribbon.md)
+- [Saved-query verification](docs/saved-search-verification.md)
+- [Native folder-view persistence](docs/view-persistence-verification.md)
+- [Theme compatibility](docs/theme-compatibility.md)
 
 Licensed under MIT. This independent project is not affiliated with Microsoft.

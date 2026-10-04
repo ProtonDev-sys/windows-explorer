@@ -8,3 +8,5 @@
 *.log
 *.pdb
 *.ilk
+__pycache__/
+*.pyc

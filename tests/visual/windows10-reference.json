@@ -1,0 +1,1684 @@
+{
+  "schema": 1,
+  "target": "Windows 10 desktop File Explorer (Ribbon UI)",
+  "policy": "Reference media are downloaded into ignored artifacts/reference only. Do not commit or redistribute publisher screenshots or PDFs.",
+  "sources": [
+    {
+      "id": "microsoft-tools",
+      "kind": "pdf",
+      "url": "https://download.microsoft.com/download/7/3/8/7381E0E8-CE72-4366-9849-13B2BAFBBA3C/Microsoft_Press_ebook_Windows_10_Tools_8.5x11.pdf",
+      "file": "microsoft-windows-10-tools.pdf",
+      "sha256": "3ac6bd666d02efba3bfdbe1e67b7052ea22c38f1f18cd78b0acae797e7f590b4",
+      "publisher": "Microsoft Press",
+      "edition": "2015; historical Ribbon geometry, not evidence that HomeGroup exists in 22H2",
+      "images": [
+        {
+          "id": "home-expanded",
+          "page": 25,
+          "xref": 79,
+          "file": "win10-tools-25-79.png",
+          "size": [
+            735,
+            503
+          ],
+          "sha256": "94d931b390e30f756d0af3d67d681a067926b0907d1466ff3db0aa3cf68b6a2f"
+        },
+        {
+          "id": "view-preview",
+          "page": 25,
+          "xref": 80,
+          "file": "win10-tools-25-80.png",
+          "size": [
+            854,
+            649
+          ],
+          "sha256": "e4d945b88c0e79a67ae4bcf58b0d2f645ea76117ec780ef99861d039ac339e07"
+        },
+        {
+          "id": "view-details",
+          "page": 26,
+          "xref": 83,
+          "file": "win10-tools-26-83.png",
+          "size": [
+            854,
+            649
+          ],
+          "sha256": "9249820602a8964196f10d191bcd408d6c993f1885833eea0524421132deb9f3"
+        },
+        {
+          "id": "library-manage",
+          "page": 29,
+          "xref": 93,
+          "file": "win10-tools-29-93.png",
+          "size": [
+            820,
+            771
+          ],
+          "sha256": "414c4b5770fb9c43a3a08777051d0a2446d8a097e66e263850f42fd5a54f3779"
+        },
+        {
+          "id": "search-tools",
+          "page": 33,
+          "xref": 107,
+          "file": "win10-tools-33-107.png",
+          "size": [
+            710,
+            394
+          ],
+          "sha256": "cbd7bb9e721259b5df9e755ab14090086f29861b2457e9786f7c43be70084a68"
+        }
+      ]
+    },
+    {
+      "id": "microsoft-introducing",
+      "kind": "pdf",
+      "url": "https://download.microsoft.com/DOWNLOAD/F/4/2/F42AE0AD-A9CB-4EE7-A209-D9A399604A72/MICROSOFT_PRESS_EBOOK_INTRODUCING_WINDOWS_10_PDF.PDF",
+      "file": "microsoft-introducing-windows-10.pdf",
+      "sha256": "01e0cab7ab99e6fe519a4a9fe62c15bf4ae664c78e9b7d190f618c4c9d1c6931",
+      "publisher": "Microsoft Press",
+      "edition": "Introducing Windows 10 for IT Professionals; original Picture Tools screenshot",
+      "images": [
+        {
+          "id": "picture-manage",
+          "page": 44,
+          "xref": 2789,
+          "file": "win10-intro-44-2789.png",
+          "size": [
+            829,
+            592
+          ],
+          "sha256": "8b186d4daf128a35db9706e5b2c11d4e9883a3ab2821a04ac4490b71c36495cd"
+        }
+      ]
+    },
+    {
+      "id": "support-quick-access",
+      "kind": "image",
+      "url": "https://support.microsoft.com/en-gb/windows/media/find-your-files-pin-520-png.png",
+      "pageUrl": "https://support.microsoft.com/en-gb/windows/experience/fileexplorer/file-explorer-in-windows?nochrome=true",
+      "file": "win10-quick-access.png",
+      "sha256": "1bb42cf4e511baee7d1e8b8ddd155e99d75d8a33a18acf6188c047f1902f3b2a",
+      "size": [
+        520,
+        341
+      ],
+      "publisher": "Microsoft Support",
+      "edition": "Windows 10 section, collapsed Ribbon; publication image is scaled, not a verified DPI baseline"
+    },
+    {
+      "id": "support-context",
+      "kind": "image",
+      "url": "https://support.microsoft.com/en-gb/windows/media/36ac27e6-1b14-42e0-889e-651dd3823ed7.jpg",
+      "pageUrl": "https://support.microsoft.com/en-gb/windows/experience/fileexplorer/file-explorer-in-windows?nochrome=true",
+      "file": "win10-context.jpg",
+      "sha256": "43711f7f2878c02eda334bd99353a828dac83643621cb28828f7541d0809424c",
+      "publisher": "Microsoft Support",
+      "edition": "Windows 10 section; compressed context-menu image"
+    },
+    {
+      "id": "tech2024-home",
+      "kind": "image",
+      "url": "https://techpilipinas.com/wp-content/uploads/2024/05/file-explorer-ribbon-home.jpg",
+      "pageUrl": "https://techpilipinas.com/get-help-file-explorer-windows/",
+      "file": "tech2024-home.jpg",
+      "sha256": "9417c550842282d0d6bab95c2081ab14b6fbdf42d4d6b6f8cc3c8327fa9cdaec",
+      "size": [
+        915,
+        565
+      ],
+      "publisher": "Tech Pilipinas",
+      "edition": "2024 stock Windows 10 Ribbon screenshot with red article annotations; source OS DPI unrecorded, app frame [30,26,886,539]."
+    },
+    {
+      "id": "tech2024-share",
+      "kind": "image",
+      "url": "https://techpilipinas.com/wp-content/uploads/2024/05/file-explorer-ribbon-share.jpg",
+      "pageUrl": "https://techpilipinas.com/get-help-file-explorer-windows/",
+      "file": "tech2024-share.jpg",
+      "sha256": "f3079110da405bd3557168e6314396830f4ccf8ad13f6c878ea2f014848f71cf",
+      "size": [
+        915,
+        565
+      ],
+      "publisher": "Tech Pilipinas",
+      "edition": "2024 stock Windows 10 Ribbon screenshot with red article annotations; source OS DPI unrecorded, app frame [30,26,886,539]."
+    },
+    {
+      "id": "tech2024-view",
+      "kind": "image",
+      "url": "https://techpilipinas.com/wp-content/uploads/2024/05/file-explorer-ribbon-view.jpg",
+      "pageUrl": "https://techpilipinas.com/get-help-file-explorer-windows/",
+      "file": "tech2024-view.jpg",
+      "sha256": "92a870b841adc1117183f85485c0571792e42049552fe44d55f2aa830499305f",
+      "size": [
+        915,
+        565
+      ],
+      "publisher": "Tech Pilipinas",
+      "edition": "2024 stock Windows 10 Ribbon screenshot with red article annotations; source OS DPI unrecorded, app frame [30,26,886,539]."
+    },
+    {
+      "id": "techradar-dark",
+      "kind": "image",
+      "url": "https://cdn.mos.cms.futurecdn.net/C8ATUR84F4Tcs3K5XQ5YjC.jpg",
+      "file": "dark-techradar.jpg",
+      "sha256": "7dfa4802a445ca38119ba343840670600d7c4dc661c2e9ae4fc027ed5ea28df5",
+      "size": [
+        1024,
+        576
+      ],
+      "publisher": "TechRadar / Future",
+      "edition": "Windows 10 dark File Explorer; publisher-resized image. Palette reference only; no exact DPI or geometry claim."
+    },
+    {
+      "id": "support-extensions-checked",
+      "kind": "image",
+      "url": "https://support.microsoft.com/en-us/windows/media/file-name-extensions-png.png",
+      "pageUrl": "https://support.microsoft.com/en-us/windows/experience/storage-filemanagement/common-file-name-extensions-in-windows",
+      "file": "win10-file-extensions-checked.png",
+      "sha256": "f74fd6543744e13a287f48821430a86d199da12b18f161cc2091f2d3dc995d5f",
+      "size": [
+        520,
+        293
+      ],
+      "publisher": "Microsoft Support",
+      "edition": "Windows 10 article section. Cropped Show/hide screenshot has extensions checked. Publisher does not record OS DPI; only interior check glyph is compared."
+    },
+    {
+      "id": "pcassist-computer",
+      "kind": "image",
+      "url": "https://www.pcassistonline.co.uk/HelpandAdvice/images/fileexplorer_ribbon_computer_win10.png",
+      "pageUrl": "https://www.pcassistonline.co.uk/HelpandAdvice/file_explorer_win10.html",
+      "file": "pcassist-computer.png",
+      "sha256": "020d7dda0dd34317e6e95acdf4bfe77aab8c5173b8505f9c60801df8022fc3ea",
+      "size": [
+        805,
+        131
+      ],
+      "publisher": "PC Assist @ Home",
+      "edition": "Stock Windows10 Ribbon; source OS build and DPI unrecorded; EnglishUK wording in Drive; publisher drop shadow excluded."
+    },
+    {
+      "id": "pcassist-drivetools",
+      "kind": "image",
+      "url": "https://www.pcassistonline.co.uk/HelpandAdvice/images/fileexplorer_ribbon_drivetools_win10.png",
+      "pageUrl": "https://www.pcassistonline.co.uk/HelpandAdvice/file_explorer_win10.html",
+      "file": "pcassist-drivetools.png",
+      "sha256": "d6f981954fd622c0451900d59015776cb60ba4511c4c66d1c4b24e9f2e97d391",
+      "size": [
+        807,
+        163
+      ],
+      "publisher": "PC Assist @ Home",
+      "edition": "Stock Windows10 Ribbon; source OS build and DPI unrecorded; EnglishUK wording in Drive; publisher drop shadow excluded."
+    },
+    {
+      "id": "pcassist-applicationtools",
+      "kind": "image",
+      "url": "https://www.pcassistonline.co.uk/HelpandAdvice/images/fileexplorer_ribbon_applicationtools_win10.png",
+      "pageUrl": "https://www.pcassistonline.co.uk/HelpandAdvice/file_explorer_win10.html",
+      "file": "pcassist-applicationtools.png",
+      "sha256": "e2f909d21f4819a8a1633516f5a1142b649bee32870b65c8f6d4e4bc2716d7b1",
+      "size": [
+        807,
+        163
+      ],
+      "publisher": "PC Assist @ Home",
+      "edition": "Stock Windows10 Ribbon; source OS build and DPI unrecorded; EnglishUK wording in Drive; publisher drop shadow excluded."
+    },
+    {
+      "id": "pcassist-compressedfoldertools",
+      "kind": "image",
+      "url": "https://www.pcassistonline.co.uk/HelpandAdvice/images/fileexplorer_ribbon_compressedfoldertools_win10.png",
+      "pageUrl": "https://www.pcassistonline.co.uk/HelpandAdvice/file_explorer_win10.html",
+      "file": "pcassist-compressedfoldertools.png",
+      "sha256": "cd165bd82324578e7e4ce8d795d31b9647e525206bb6b69d6714ed0385274067",
+      "size": [
+        807,
+        163
+      ],
+      "publisher": "PC Assist @ Home",
+      "edition": "Stock Windows10 Ribbon; source OS build and DPI unrecorded; EnglishUK wording in Drive; publisher drop shadow excluded."
+    },
+    {
+      "id": "pcassist-musictools",
+      "kind": "image",
+      "url": "https://www.pcassistonline.co.uk/HelpandAdvice/images/fileexplorer_ribbon_musictools_win10.png",
+      "pageUrl": "https://www.pcassistonline.co.uk/HelpandAdvice/file_explorer_win10.html",
+      "file": "pcassist-musictools.png",
+      "sha256": "5f60cac4356dd527cff27267e33e7ddf5fcbc6af665471b8174214d289508c40",
+      "size": [
+        807,
+        163
+      ],
+      "publisher": "PC Assist @ Home",
+      "edition": "Stock Windows10 Ribbon; source OS build and DPI unrecorded; EnglishUK wording in Drive; publisher drop shadow excluded."
+    },
+    {
+      "id": "pcassist-videotools",
+      "kind": "image",
+      "url": "https://www.pcassistonline.co.uk/HelpandAdvice/images/fileexplorer_ribbon_videotools_win10.png",
+      "pageUrl": "https://www.pcassistonline.co.uk/HelpandAdvice/file_explorer_win10.html",
+      "file": "pcassist-videotools.png",
+      "sha256": "8a8f6f48dad79c7cb43be57a8e7a607fe27e32fdb276dc6e2e61fe7ee5b706ef",
+      "size": [
+        807,
+        163
+      ],
+      "publisher": "PC Assist @ Home",
+      "edition": "Stock Windows10 Ribbon; source OS build and DPI unrecorded; EnglishUK wording in Drive; publisher drop shadow excluded."
+    },
+    {
+      "id": "pcassist-recyclebintools",
+      "kind": "image",
+      "url": "https://www.pcassistonline.co.uk/HelpandAdvice/images/fileexplorer_ribbon_recyclebintools_win10.png",
+      "pageUrl": "https://www.pcassistonline.co.uk/HelpandAdvice/file_explorer_win10.html",
+      "file": "pcassist-recyclebintools.png",
+      "sha256": "57c83335e1cfce6e90b4411f3dd61fb14d1f93a8c7e6313ccbccc4f7f7ca3b92",
+      "size": [
+        807,
+        163
+      ],
+      "publisher": "PC Assist @ Home",
+      "edition": "Stock Windows10 Ribbon; source OS build and DPI unrecorded; EnglishUK wording in Drive; publisher drop shadow excluded."
+    },
+    {
+      "id": "techcult-disc-image",
+      "kind": "image",
+      "url": "https://techcult.com/wp-content/uploads/2020/03/select-the-ISO-file.-From-File-Explorer-menu-click-on-the-Disc-Image-Tools-tab-and-click-on-Mount-1.png",
+      "pageUrl": "https://techcult.com/how-to-mount-or-unmount-iso-images-in-windows-10/",
+      "file": "disc-image-techcult.png",
+      "sha256": "78f39d8b2f17cf1245133e66c6f7b439ec2fc2a0948ae1008384c9a5757721de",
+      "size": [
+        885,
+        570
+      ],
+      "publisher": "TechCult",
+      "edition": "Windows10 native DiscImageTools reference with red annotations/hover tooltip. SourceDPI notrecorded; glyph40px and larger font suggest125percent scaling, an inference rather than nativeDPI evidence.",
+      "semanticEvidence": {
+        "upperContextCaption": "Manage",
+        "lowerTabCaption": "Disc Image Tools",
+        "groupCaption": "Manage",
+        "commands": [
+          "Mount",
+          "Burn"
+        ]
+      },
+      "pixelComparisonEligibility": "No strict96DPI scene: different apparent native scale and no sourceDPI record. Never resize to manufacture matching pixels."
+    },
+    {
+      "id": "techrepublic-network-2015",
+      "kind": "image",
+      "url": "https://assets.techrepublic.com/uploads/2015/09/fig-d-9-14.png",
+      "pageUrl": "https://www.techrepublic.com/article/get-to-know-file-explorers-contextual-tabs-in-windows-10/",
+      "file": "network-techrepublic-2015.avif",
+      "sha256": "d8ab7fac73ce6a6d498b06262142e4015f9ab26d3dac199aaeef16366c0b9341",
+      "publisher": "TechRepublic",
+      "published": "2015-09-18",
+      "size": [
+        916,
+        574
+      ],
+      "encodedFormat": "AVIF despite PNG URL; Pillow decodes original bytes without resizing",
+      "edition": "Historical Windows10 Network Ribbon; exact OS build/DPI/locale not recorded. HomeGroup body/sidebar excluded from 22H2 claims."
+    },
+    {
+      "id": "audioprecision-shortcut-2021",
+      "kind": "image",
+      "url": "https://www.audioprecision.com/fileadmin-ap/Blog/Controlling_APx500_Software_with_Python_-_Figure-6.png",
+      "pageUrl": "https://www.audioprecision.com/blog/controlling-apx500-software-using-python",
+      "file": "shortcut-audioprecision-2021.png",
+      "sha256": "36f8099b3044c1d1c6911e61b9d9702441f2875ec46fcc87afbf78bf29cbba29",
+      "publisher": "Audio Precision",
+      "published": "2021-01-29",
+      "size": [
+        552,
+        245
+      ],
+      "edition": "Actual executable .lnk exposes Shortcut Tools and Application Tools simultaneously. Native DPI/build/locale not recorded; caption and band are smaller than actual 96DPI rendering.",
+      "semanticCrop": [
+        1,
+        40,
+        45,
+        106
+      ],
+      "annotationExclusions": [
+        [
+          46,
+          60,
+          93,
+          77
+        ],
+        [
+          9,
+          171,
+          430,
+          190
+        ]
+      ]
+    },
+    {
+      "id": "fileinfo-extensions-checked",
+      "kind": "image",
+      "url": "https://fileinfo.com/img/help/windows_10_file_name_extensions_checkbox.png",
+      "sourcePage": "https://fileinfo.com/help/windows_10_show_file_extensions",
+      "file": "fileinfo-extensions-on.png",
+      "sha256": "a0144e753aaafd1a302856f2ae0b4126477c45f161e0bdfe7b8417f458557b2f",
+      "size": [
+        708,
+        338
+      ],
+      "publisher": "FileInfo / Sharpened Productions",
+      "published": "2017-03-29",
+      "edition": "Windows 10 publisher screenshot; edition, build and OS DPI unspecified. The original PNG has a 13 \u00d7 13 native checked checkbox. No resampling is permitted.",
+      "annotations": "A red ellipse surrounds the label and checkbox; the measured complete 13 \u00d7 13 checkbox contains no annotation pixels."
+    }
+  ],
+  "scenes": [
+    {
+      "name": "Home",
+      "reference": "home-expanded",
+      "width": 735,
+      "height": 503,
+      "layoutDpi": 96,
+      "dpiEvidence": "Image is an original embedded screenshot; its OS DPI is not recorded by the publisher.",
+      "state": "Home expanded; Desktop namespace; one folder selected; above-ribbon QAT",
+      "regions": [
+        {
+          "name": "ribbon-tabs",
+          "kind": "text-and-geometry",
+          "reference": [
+            1,
+            31,
+            734,
+            55
+          ],
+          "actual": [
+            0,
+            0,
+            733,
+            24
+          ],
+          "actualOrigin": "ribbon",
+          "masks": [
+            [
+              228,
+              0,
+              733,
+              24
+            ]
+          ],
+          "reason": "File/Home/Share/View tabs are shared; context tabs depend on the fixture."
+        },
+        {
+          "name": "home-ribbon",
+          "kind": "icons-text-and-geometry",
+          "reference": [
+            1,
+            55,
+            734,
+            147
+          ],
+          "actual": [
+            0,
+            24,
+            733,
+            116
+          ],
+          "actualOrigin": "ribbon",
+          "masks": [],
+          "reason": "All Home groups and command presentation; different selection states remain visible differences."
+        },
+        {
+          "name": "modern-navigation-controls",
+          "kind": "icons-and-geometry",
+          "referenceId": "tech2024-home",
+          "reference": [
+            34,
+            178,
+            137,
+            208
+          ],
+          "actual": [
+            0,
+            0,
+            103,
+            30
+          ],
+          "actualOrigin": "widget",
+          "masks": [],
+          "reason": "Modern Windows10 native Back/Forward/History/Up glyphs and 30-pixel toolbar height; crop avoids red article annotation and dynamic contents. Enabled history state remains a real difference, never overridden for a match.",
+          "actualWidget": {
+            "id": 901,
+            "class": "ToolbarWindow32",
+            "expectedHeight": 30
+          },
+          "captureVariant": "modernQuickAccess",
+          "nativeFixtureReason": "Read-only native Quick Access supplies the modern source navigation eligibility independently of the historical command-band fixture."
+        },
+        {
+          "name": "modern-address-border",
+          "kind": "icons-and-geometry",
+          "referenceId": "tech2024-home",
+          "reference": [
+            137,
+            178,
+            141,
+            208
+          ],
+          "actual": [
+            0,
+            0,
+            4,
+            30
+          ],
+          "actualOrigin": "widget",
+          "masks": [],
+          "reason": "Modern Windows10 address left border and actual 30-pixel control height; path text varies.",
+          "actualWidget": {
+            "id": 902,
+            "class": "ToolbarWindow32",
+            "expectedHeight": 30
+          },
+          "captureVariant": "modernQuickAccess",
+          "nativeFixtureReason": "Read-only native Quick Access supplies the modern source navigation eligibility independently of the historical command-band fixture."
+        },
+        {
+          "name": "modern-search-left-glyph",
+          "kind": "icons-and-geometry",
+          "referenceId": "tech2024-home",
+          "reference": [
+            727,
+            178,
+            762,
+            208
+          ],
+          "actual": [
+            0,
+            0,
+            35,
+            30
+          ],
+          "actualOrigin": "widget",
+          "masks": [],
+          "reason": "Modern Windows10 left magnifier and native 30-pixel search edit border; excludes dynamic placeholder text and drag-resizable field width.",
+          "actualWidget": {
+            "id": 105,
+            "class": "Edit",
+            "expectedHeight": 30
+          },
+          "captureVariant": "modernQuickAccess",
+          "nativeFixtureReason": "Read-only native Quick Access supplies the modern source navigation eligibility independently of the historical command-band fixture."
+        },
+        {
+          "name": "caption-quick-access",
+          "kind": "icons-text-and-geometry",
+          "reference": [
+            1,
+            1,
+            734,
+            31
+          ],
+          "actual": [
+            1,
+            1,
+            734,
+            31
+          ],
+          "actualOrigin": "window",
+          "masks": [
+            [
+              0,
+              0,
+              29,
+              30
+            ],
+            [
+              100,
+              0,
+              590,
+              30
+            ]
+          ],
+          "reason": "Namespace window icon and dynamic title are excluded; preserve native QAT icons/separators/customization and caption control geometry."
+        },
+        {
+          "name": "status-view-shortcuts",
+          "kind": "icons-and-geometry",
+          "reference": [
+            1,
+            480,
+            734,
+            502
+          ],
+          "actual": [
+            1,
+            480,
+            734,
+            502
+          ],
+          "actualOrigin": "window",
+          "masks": [
+            [
+              0,
+              0,
+              180,
+              22
+            ]
+          ],
+          "reason": "Count and selected-item text depend on contents. Preserve status height and native right-side view shortcut glyphs."
+        }
+      ]
+    },
+    {
+      "name": "View",
+      "reference": "view-details",
+      "width": 854,
+      "height": 649,
+      "layoutDpi": 96,
+      "dpiEvidence": "Image is an original embedded screenshot; its OS DPI is not recorded by the publisher.",
+      "state": "View expanded; Details pane on; one JPEG selected; Picture Tools context",
+      "regions": [
+        {
+          "name": "ribbon-tabs",
+          "kind": "text-and-geometry",
+          "reference": [
+            1,
+            31,
+            853,
+            55
+          ],
+          "actual": [
+            0,
+            0,
+            852,
+            24
+          ],
+          "actualOrigin": "ribbon",
+          "masks": [
+            [
+              224,
+              0,
+              852,
+              24
+            ]
+          ],
+          "reason": "Picture Tools/Manage tabs depend on selected content."
+        },
+        {
+          "name": "view-ribbon",
+          "kind": "icons-text-and-geometry",
+          "reference": [
+            1,
+            55,
+            853,
+            147
+          ],
+          "actual": [
+            0,
+            24,
+            852,
+            116
+          ],
+          "actualOrigin": "ribbon",
+          "masks": [
+            [
+              512,
+              32,
+              521,
+              41
+            ]
+          ],
+          "reason": "Panes/Layout/Current view/Show-hide/Options geometry and text. Extensions checkbox interior is measured separately against a pinned state-matched source, selected only by independent actual OS/native Ribbon readbacks; its outline and label stay measured here."
+        },
+        {
+          "name": "modern-navigation-controls",
+          "kind": "icons-and-geometry",
+          "referenceId": "tech2024-view",
+          "reference": [
+            34,
+            178,
+            137,
+            208
+          ],
+          "actual": [
+            0,
+            0,
+            103,
+            30
+          ],
+          "actualOrigin": "widget",
+          "masks": [],
+          "reason": "Modern Windows10 native Back/Forward/History/Up glyphs and 30-pixel toolbar height; crop avoids red article annotation and dynamic contents. Enabled history state remains a real difference, never overridden for a match.",
+          "actualWidget": {
+            "id": 901,
+            "class": "ToolbarWindow32",
+            "expectedHeight": 30
+          },
+          "captureVariant": "modernQuickAccess",
+          "nativeFixtureReason": "Read-only native Quick Access supplies the modern source navigation eligibility independently of the historical command-band fixture."
+        },
+        {
+          "name": "modern-address-border",
+          "kind": "icons-and-geometry",
+          "referenceId": "tech2024-view",
+          "reference": [
+            137,
+            178,
+            141,
+            208
+          ],
+          "actual": [
+            0,
+            0,
+            4,
+            30
+          ],
+          "actualOrigin": "widget",
+          "masks": [],
+          "reason": "Modern Windows10 address left border and actual 30-pixel control height; path text varies.",
+          "actualWidget": {
+            "id": 902,
+            "class": "ToolbarWindow32",
+            "expectedHeight": 30
+          },
+          "captureVariant": "modernQuickAccess",
+          "nativeFixtureReason": "Read-only native Quick Access supplies the modern source navigation eligibility independently of the historical command-band fixture."
+        },
+        {
+          "name": "modern-search-left-glyph",
+          "kind": "icons-and-geometry",
+          "referenceId": "tech2024-view",
+          "reference": [
+            727,
+            178,
+            762,
+            208
+          ],
+          "actual": [
+            0,
+            0,
+            35,
+            30
+          ],
+          "actualOrigin": "widget",
+          "masks": [],
+          "reason": "Modern Windows10 left magnifier and native 30-pixel search edit border; excludes dynamic placeholder text and drag-resizable field width.",
+          "actualWidget": {
+            "id": 105,
+            "class": "Edit",
+            "expectedHeight": 30
+          },
+          "captureVariant": "modernQuickAccess",
+          "nativeFixtureReason": "Read-only native Quick Access supplies the modern source navigation eligibility independently of the historical command-band fixture."
+        },
+        {
+          "name": "extensions-checkbox-on",
+          "kind": "icons-and-state",
+          "referenceId": "fileinfo-extensions-checked",
+          "reference": [
+            417,
+            99,
+            430,
+            112
+          ],
+          "actual": [
+            510,
+            54,
+            523,
+            67
+          ],
+          "actualOrigin": "ribbon",
+          "masks": [],
+          "condition": {
+            "globalSetting": "fileNameExtensions",
+            "equals": true
+          },
+          "reason": "Complete 13 \u00d7 13 native checked checkbox, including its border and entire checkmark, from the publisher original Windows 10 PNG. No resizing or annotation pixels inside this control. This source applies only when independent actual OS HideFileExt and native Ribbon BooleanValue both prove extensions ON. Publisher build and DPI are unknown; the comparison covers this explicit control crop."
+        },
+        {
+          "name": "extensions-checkbox-off",
+          "kind": "icons-and-state",
+          "reference": [
+            513,
+            87,
+            522,
+            96
+          ],
+          "actual": [
+            512,
+            56,
+            521,
+            65
+          ],
+          "actualOrigin": "ribbon",
+          "masks": [],
+          "condition": {
+            "globalSetting": "fileNameExtensions",
+            "equals": false
+          },
+          "reason": "Original Microsoft screenshot empty checkbox interior; selected only when actual OS HideFileExt and native Ribbon BooleanValue both prove extensions OFF."
+        }
+      ]
+    },
+    {
+      "name": "Library",
+      "reference": "library-manage",
+      "width": 820,
+      "height": 771,
+      "layoutDpi": 96,
+      "dpiEvidence": "Original embedded screenshot; publication does not record OS DPI.",
+      "state": "Library Tools Manage; QAT below; Library Locations dialog overlays content only",
+      "regions": [
+        {
+          "name": "library-ribbon",
+          "kind": "icons-text-and-geometry",
+          "reference": [
+            1,
+            55,
+            819,
+            147
+          ],
+          "actual": [
+            0,
+            24,
+            818,
+            116
+          ],
+          "actualOrigin": "ribbon",
+          "masks": [],
+          "reason": "Compare the complete Manage group; the open body dialog is outside this crop."
+        }
+      ]
+    },
+    {
+      "name": "Search",
+      "reference": "search-tools",
+      "width": 710,
+      "height": 394,
+      "layoutDpi": 96,
+      "dpiEvidence": "Original embedded screenshot; publication does not record OS DPI and source image includes compression artifacts.",
+      "state": "Search Tools Search; relative Today filter; Date modified menu open",
+      "regions": [
+        {
+          "name": "search-ribbon",
+          "kind": "icons-text-and-geometry",
+          "reference": [
+            1,
+            55,
+            709,
+            147
+          ],
+          "actual": [
+            0,
+            24,
+            708,
+            116
+          ],
+          "actualOrigin": "ribbon",
+          "masks": [
+            [
+              172,
+              71,
+              275,
+              92
+            ]
+          ],
+          "reason": "Date menu overlays the bottom 21 pixels of the band; exclude that popup overlap and retain all remaining commands."
+        }
+      ]
+    },
+    {
+      "name": "Picture",
+      "reference": "picture-manage",
+      "width": 829,
+      "height": 592,
+      "layoutDpi": 96,
+      "dpiEvidence": "Original embedded screenshot; publication does not record OS DPI and the screenshot has a two-pixel outer frame offset.",
+      "state": "Picture Tools Manage; one JPEG selected; QAT below; Details pane on",
+      "regions": [
+        {
+          "name": "picture-ribbon",
+          "kind": "icons-text-and-geometry",
+          "reference": [
+            3,
+            57,
+            827,
+            149
+          ],
+          "actual": [
+            0,
+            24,
+            824,
+            116
+          ],
+          "actualOrigin": "ribbon",
+          "masks": [],
+          "reason": "Rotate/View groups including original icons and labels; source outer frame offset is removed explicitly."
+        }
+      ]
+    },
+    {
+      "name": "Share",
+      "reference": "tech2024-share",
+      "width": 856,
+      "height": 513,
+      "layoutDpi": 96,
+      "dpiEvidence": "Stock Windows 10 screenshot published in 2024. OS DPI is unrecorded; image includes desktop margins and red article annotations.",
+      "state": "Share expanded; one file selected in Quick access; native Send/Share with groups; above-ribbon QAT.",
+      "regions": [
+        {
+          "name": "share-ribbon",
+          "kind": "icons-text-and-geometry",
+          "reference": [
+            34,
+            83,
+            881,
+            169
+          ],
+          "actual": [
+            3,
+            26,
+            850,
+            112
+          ],
+          "actualOrigin": "ribbon",
+          "masks": [],
+          "reason": "Measured clean interior of the complete native band; excludes only the article red border, retaining all commands, captions and group dividers."
+        }
+      ]
+    },
+    {
+      "name": "ModernHome",
+      "reference": "tech2024-home",
+      "width": 856,
+      "height": 513,
+      "layoutDpi": 96,
+      "dpiEvidence": "Publisher unrecorded OS DPI/build; image window crop has native-like pixel geometry and captures are checked at actual96DPI. Measurements apply to these explicit crops only.",
+      "state": "Modern2024 Windows10 Quick access; expanded Home; dynamic route data and separately measured command band are excluded from full-window chrome region.",
+      "regions": [
+        {
+          "name": "modern-window-chrome",
+          "kind": "caption-navigation-status-and-frame",
+          "reference": [
+            30,
+            26,
+            886,
+            539
+          ],
+          "actual": [
+            0,
+            0,
+            856,
+            513
+          ],
+          "actualOrigin": "window",
+          "masks": [
+            [
+              0,
+              52,
+              856,
+              149
+            ],
+            [
+              1,
+              189,
+              855,
+              490
+            ],
+            [
+              107,
+              153,
+              632,
+              181
+            ],
+            [
+              736,
+              153,
+              842,
+              181
+            ],
+            [
+              107,
+              1,
+              690,
+              30
+            ],
+            [
+              1,
+              490,
+              265,
+              512
+            ],
+            [
+              1,
+              1,
+              29,
+              30
+            ],
+            [
+              54,
+              28,
+              118,
+              32
+            ],
+            [
+              54,
+              32,
+              58,
+              52
+            ],
+            [
+              114,
+              32,
+              118,
+              52
+            ]
+          ],
+          "maskReasons": [
+            "Article red annotation and command band; page bands are independently measured against source-specific unannotated crops.",
+            "Route-dependent navigation and file contents; owned filesystem differs from source Quick access.",
+            "Dynamic namespace/path interior ends before the source dropdown. The dropdown, Refresh, address border and row geometry remain measured.",
+            "Dynamic search placeholder; left magnifier and search border remain measured.",
+            "Dynamic folder/window caption; QAT and caption buttons remain measured.",
+            "Dynamic item/selection counts; native status height and right-side shortcuts remain measured.",
+            "Namespace window icon varies with the actual route.",
+            "Publisher selected-tab red top annotation only.",
+            "Publisher selected-tab red left annotation only.",
+            "Publisher selected-tab red right annotation only."
+          ],
+          "reason": "Complete visible frame at identical dimensions with explicit route-dependent masks. Retains caption/QAT, static navigation/address/search glyphs and borders, status shortcuts, outer frame and row geometry. This scope does not prove the masked command band or folder body."
+        },
+        {
+          "name": "modern-address-dropdown",
+          "kind": "icons-and-geometry",
+          "reference": [
+            662,
+            178,
+            680,
+            208
+          ],
+          "actual": [
+            632,
+            152,
+            650,
+            182
+          ],
+          "actualOrigin": "window",
+          "masks": [],
+          "reason": "Source right-side address dropdown is a static glyph. The dynamic path mask ends before this crop. Identical actual frame dimensions and native96DPI are required; missing or displaced glyphs fail."
+        },
+        {
+          "name": "modern-refresh-control",
+          "kind": "icons-and-geometry",
+          "reference": [
+            691,
+            178,
+            715,
+            208
+          ],
+          "actual": [
+            0,
+            0,
+            24,
+            30
+          ],
+          "actualOrigin": "widget",
+          "actualWidget": {
+            "id": 905,
+            "class": "ToolbarWindow32",
+            "expectedHeight": 30
+          },
+          "masks": [],
+          "reason": "Actual native address-actions toolbar identified by HWND ID/class and30px height, measured against the source Refresh control at identical pixels. Glyph, border and enabled-state differences remain compared."
+        }
+      ]
+    },
+    {
+      "name": "ModernShare",
+      "reference": "tech2024-share",
+      "width": 856,
+      "height": 513,
+      "layoutDpi": 96,
+      "dpiEvidence": "Publisher unrecorded OS DPI/build; image window crop has native-like pixel geometry and captures are checked at actual96DPI. Measurements apply to these explicit crops only.",
+      "state": "Modern2024 Windows10 Quick access; expanded Share; dynamic route data and separately measured command band are excluded from full-window chrome region.",
+      "regions": [
+        {
+          "name": "modern-window-chrome",
+          "kind": "caption-navigation-status-and-frame",
+          "reference": [
+            30,
+            26,
+            886,
+            539
+          ],
+          "actual": [
+            0,
+            0,
+            856,
+            513
+          ],
+          "actualOrigin": "window",
+          "masks": [
+            [
+              0,
+              52,
+              856,
+              149
+            ],
+            [
+              1,
+              189,
+              855,
+              490
+            ],
+            [
+              107,
+              153,
+              632,
+              181
+            ],
+            [
+              736,
+              153,
+              842,
+              181
+            ],
+            [
+              107,
+              1,
+              690,
+              30
+            ],
+            [
+              1,
+              490,
+              265,
+              512
+            ],
+            [
+              1,
+              1,
+              29,
+              30
+            ],
+            [
+              113,
+              28,
+              176,
+              32
+            ],
+            [
+              113,
+              32,
+              117,
+              52
+            ],
+            [
+              172,
+              32,
+              176,
+              52
+            ]
+          ],
+          "maskReasons": [
+            "Article red annotation and command band; page bands are independently measured against source-specific unannotated crops.",
+            "Route-dependent navigation and file contents; owned filesystem differs from source Quick access.",
+            "Dynamic namespace/path interior ends before the source dropdown. The dropdown, Refresh, address border and row geometry remain measured.",
+            "Dynamic search placeholder; left magnifier and search border remain measured.",
+            "Dynamic folder/window caption; QAT and caption buttons remain measured.",
+            "Dynamic item/selection counts; native status height and right-side shortcuts remain measured.",
+            "Namespace window icon varies with the actual route.",
+            "Publisher selected-tab red top annotation only.",
+            "Publisher selected-tab red left annotation only.",
+            "Publisher selected-tab red right annotation only."
+          ],
+          "reason": "Complete visible frame at identical dimensions with explicit route-dependent masks. Retains caption/QAT, static navigation/address/search glyphs and borders, status shortcuts, outer frame and row geometry. This scope does not prove the masked command band or folder body."
+        },
+        {
+          "name": "modern-address-dropdown",
+          "kind": "icons-and-geometry",
+          "reference": [
+            662,
+            178,
+            680,
+            208
+          ],
+          "actual": [
+            632,
+            152,
+            650,
+            182
+          ],
+          "actualOrigin": "window",
+          "masks": [],
+          "reason": "Source right-side address dropdown is a static glyph. The dynamic path mask ends before this crop. Identical actual frame dimensions and native96DPI are required; missing or displaced glyphs fail."
+        },
+        {
+          "name": "modern-refresh-control",
+          "kind": "icons-and-geometry",
+          "reference": [
+            691,
+            178,
+            715,
+            208
+          ],
+          "actual": [
+            0,
+            0,
+            24,
+            30
+          ],
+          "actualOrigin": "widget",
+          "actualWidget": {
+            "id": 905,
+            "class": "ToolbarWindow32",
+            "expectedHeight": 30
+          },
+          "masks": [],
+          "reason": "Actual native address-actions toolbar identified by HWND ID/class and30px height, measured against the source Refresh control at identical pixels. Glyph, border and enabled-state differences remain compared."
+        }
+      ]
+    },
+    {
+      "name": "ModernView",
+      "reference": "tech2024-view",
+      "width": 856,
+      "height": 513,
+      "layoutDpi": 96,
+      "dpiEvidence": "Publisher unrecorded OS DPI/build; image window crop has native-like pixel geometry and captures are checked at actual96DPI. Measurements apply to these explicit crops only.",
+      "state": "Modern2024 Windows10 Quick access; expanded View; dynamic route data and separately measured command band are excluded from full-window chrome region.",
+      "regions": [
+        {
+          "name": "modern-window-chrome",
+          "kind": "caption-navigation-status-and-frame",
+          "reference": [
+            30,
+            26,
+            886,
+            539
+          ],
+          "actual": [
+            0,
+            0,
+            856,
+            513
+          ],
+          "actualOrigin": "window",
+          "masks": [
+            [
+              0,
+              52,
+              856,
+              149
+            ],
+            [
+              1,
+              189,
+              855,
+              490
+            ],
+            [
+              107,
+              153,
+              632,
+              181
+            ],
+            [
+              736,
+              153,
+              842,
+              181
+            ],
+            [
+              107,
+              1,
+              690,
+              30
+            ],
+            [
+              1,
+              490,
+              265,
+              512
+            ],
+            [
+              1,
+              1,
+              29,
+              30
+            ],
+            [
+              171,
+              28,
+              230,
+              32
+            ],
+            [
+              171,
+              32,
+              175,
+              52
+            ],
+            [
+              226,
+              32,
+              230,
+              52
+            ]
+          ],
+          "maskReasons": [
+            "Article red annotation and command band; page bands are independently measured against source-specific unannotated crops.",
+            "Route-dependent navigation and file contents; owned filesystem differs from source Quick access.",
+            "Dynamic namespace/path interior ends before the source dropdown. The dropdown, Refresh, address border and row geometry remain measured.",
+            "Dynamic search placeholder; left magnifier and search border remain measured.",
+            "Dynamic folder/window caption; QAT and caption buttons remain measured.",
+            "Dynamic item/selection counts; native status height and right-side shortcuts remain measured.",
+            "Namespace window icon varies with the actual route.",
+            "Publisher selected-tab red top annotation only.",
+            "Publisher selected-tab red left annotation only.",
+            "Publisher selected-tab red right annotation only."
+          ],
+          "reason": "Complete visible frame at identical dimensions with explicit route-dependent masks. Retains caption/QAT, static navigation/address/search glyphs and borders, status shortcuts, outer frame and row geometry. This scope does not prove the masked command band or folder body."
+        },
+        {
+          "name": "modern-address-dropdown",
+          "kind": "icons-and-geometry",
+          "reference": [
+            662,
+            178,
+            680,
+            208
+          ],
+          "actual": [
+            632,
+            152,
+            650,
+            182
+          ],
+          "actualOrigin": "window",
+          "masks": [],
+          "reason": "Source right-side address dropdown is a static glyph. The dynamic path mask ends before this crop. Identical actual frame dimensions and native96DPI are required; missing or displaced glyphs fail."
+        },
+        {
+          "name": "modern-refresh-control",
+          "kind": "icons-and-geometry",
+          "reference": [
+            691,
+            178,
+            715,
+            208
+          ],
+          "actual": [
+            0,
+            0,
+            24,
+            30
+          ],
+          "actualOrigin": "widget",
+          "actualWidget": {
+            "id": 905,
+            "class": "ToolbarWindow32",
+            "expectedHeight": 30
+          },
+          "masks": [],
+          "reason": "Actual native address-actions toolbar identified by HWND ID/class and30px height, measured against the source Refresh control at identical pixels. Glyph, border and enabled-state differences remain compared."
+        }
+      ]
+    },
+    {
+      "name": "Computer",
+      "reference": "pcassist-computer",
+      "width": 791,
+      "height": 503,
+      "layoutDpi": 96,
+      "dpiEvidence": "Publisher cropped the real Windows10 band, did not record build/DPI. Captures use actual96DPI and identical crop pixels; drop shadow excluded, source caption/body not inferred.",
+      "state": "Expanded Computer native band; real installed-provider states remain differences.",
+      "regions": [
+        {
+          "name": "computer-ribbon",
+          "kind": "icons-text-and-geometry",
+          "reference": [
+            0,
+            24,
+            789,
+            116
+          ],
+          "actual": [
+            0,
+            24,
+            789,
+            116
+          ],
+          "actualOrigin": "ribbon",
+          "masks": [],
+          "reason": "Complete unannotated native command band. Publisher drop shadow is outside crop. Unknown build, locale and enabled-state differences are recorded, never overridden for matching."
+        }
+      ]
+    },
+    {
+      "name": "Drive",
+      "reference": "pcassist-drivetools",
+      "width": 792,
+      "height": 503,
+      "layoutDpi": 96,
+      "dpiEvidence": "Publisher cropped the real Windows10 band, did not record build/DPI. Captures use actual96DPI and identical crop pixels; drop shadow excluded, source caption/body not inferred.",
+      "state": "Expanded Drive native band; real installed-provider states remain differences.",
+      "regions": [
+        {
+          "name": "drive-ribbon",
+          "kind": "icons-text-and-geometry",
+          "reference": [
+            1,
+            55,
+            791,
+            147
+          ],
+          "actual": [
+            0,
+            24,
+            790,
+            116
+          ],
+          "actualOrigin": "ribbon",
+          "masks": [],
+          "reason": "Complete unannotated native command band. Publisher drop shadow is outside crop. Unknown build, locale and enabled-state differences are recorded, never overridden for matching."
+        }
+      ]
+    },
+    {
+      "name": "Application",
+      "reference": "pcassist-applicationtools",
+      "width": 792,
+      "height": 503,
+      "layoutDpi": 96,
+      "dpiEvidence": "Publisher cropped the real Windows10 band, did not record build/DPI. Captures use actual96DPI and identical crop pixels; drop shadow excluded, source caption/body not inferred.",
+      "state": "Expanded Application native band; real installed-provider states remain differences.",
+      "regions": [
+        {
+          "name": "application-ribbon",
+          "kind": "icons-text-and-geometry",
+          "reference": [
+            1,
+            55,
+            791,
+            147
+          ],
+          "actual": [
+            0,
+            24,
+            790,
+            116
+          ],
+          "actualOrigin": "ribbon",
+          "masks": [],
+          "reason": "Complete unannotated native command band. Publisher drop shadow is outside crop. Unknown build, locale and enabled-state differences are recorded, never overridden for matching."
+        }
+      ]
+    },
+    {
+      "name": "Compressed",
+      "reference": "pcassist-compressedfoldertools",
+      "width": 792,
+      "height": 503,
+      "layoutDpi": 96,
+      "dpiEvidence": "Publisher cropped the real Windows10 band, did not record build/DPI. Captures use actual96DPI and identical crop pixels; drop shadow excluded, source caption/body not inferred.",
+      "state": "Expanded Compressed native band in an owned ZIP namespace with its actual text member selected. Native MRU destinations differ from the publisher's profile; unrecorded enabled-state differences remain compared.",
+      "regions": [
+        {
+          "name": "compressed-ribbon",
+          "kind": "icons-text-and-geometry",
+          "reference": [
+            1,
+            55,
+            791,
+            147
+          ],
+          "actual": [
+            0,
+            24,
+            790,
+            116
+          ],
+          "actualOrigin": "ribbon",
+          "masks": [
+            [
+              30,
+              8,
+              93,
+              26
+            ],
+            [
+              115,
+              8,
+              178,
+              26
+            ],
+            [
+              202,
+              8,
+              264,
+              26
+            ],
+            [
+              30,
+              28,
+              93,
+              46
+            ],
+            [
+              115,
+              28,
+              178,
+              46
+            ],
+            [
+              202,
+              28,
+              264,
+              46
+            ],
+            [
+              30,
+              48,
+              93,
+              64
+            ],
+            [
+              115,
+              48,
+              178,
+              64
+            ],
+            [
+              202,
+              48,
+              264,
+              64
+            ]
+          ],
+          "maskReasons": [
+            "Native current-profile MRU destination name, row1 column1; glyph, cell geometry and enabled-state pixels remain measured.",
+            "Native current-profile MRU destination name, row1 column2; glyph, cell geometry and enabled-state pixels remain measured.",
+            "Native current-profile MRU destination name, row1 column3; glyph, cell geometry and enabled-state pixels remain measured.",
+            "Native current-profile MRU destination name, row2 column1; glyph, cell geometry and enabled-state pixels remain measured.",
+            "Native current-profile MRU destination name, row2 column2; glyph, cell geometry and enabled-state pixels remain measured.",
+            "Native current-profile MRU destination name, row2 column3; glyph, cell geometry and enabled-state pixels remain measured.",
+            "Native current-profile MRU destination name, row3 column1; glyph, cell geometry and enabled-state pixels remain measured.",
+            "Native current-profile MRU destination name, row3 column2; glyph, cell geometry and enabled-state pixels remain measured.",
+            "Native current-profile MRU destination name, row3 column3; glyph, cell geometry and enabled-state pixels remain measured."
+          ],
+          "reason": "Actual native three-column gallery geometry, icons, scroll rail, group captions and Extract all remain compared at strict thresholds. Only destination-name text varies with native current-profile MRU data and is explicitly masked. Unknown build, locale and enabled-state differences are recorded, never overridden for matching. Publisher drop shadow is outside crop."
+        }
+      ]
+    },
+    {
+      "name": "Music",
+      "reference": "pcassist-musictools",
+      "width": 792,
+      "height": 503,
+      "layoutDpi": 96,
+      "dpiEvidence": "Publisher cropped the real Windows10 band, did not record build/DPI. Captures use actual96DPI and identical crop pixels; drop shadow excluded, source caption/body not inferred.",
+      "state": "Expanded Music native band; real installed-provider states remain differences.",
+      "regions": [
+        {
+          "name": "music-ribbon",
+          "kind": "icons-text-and-geometry",
+          "reference": [
+            1,
+            55,
+            791,
+            147
+          ],
+          "actual": [
+            0,
+            24,
+            790,
+            116
+          ],
+          "actualOrigin": "ribbon",
+          "masks": [],
+          "reason": "Complete unannotated native command band. Publisher drop shadow is outside crop. Unknown build, locale and enabled-state differences are recorded, never overridden for matching."
+        }
+      ]
+    },
+    {
+      "name": "Video",
+      "reference": "pcassist-videotools",
+      "width": 792,
+      "height": 503,
+      "layoutDpi": 96,
+      "dpiEvidence": "Publisher cropped the real Windows10 band, did not record build/DPI. Captures use actual96DPI and identical crop pixels; drop shadow excluded, source caption/body not inferred.",
+      "state": "Expanded Video native band; real installed-provider states remain differences.",
+      "regions": [
+        {
+          "name": "video-ribbon",
+          "kind": "icons-text-and-geometry",
+          "reference": [
+            1,
+            55,
+            791,
+            147
+          ],
+          "actual": [
+            0,
+            24,
+            790,
+            116
+          ],
+          "actualOrigin": "ribbon",
+          "masks": [],
+          "reason": "Complete unannotated native command band. Publisher drop shadow is outside crop. Unknown build, locale and enabled-state differences are recorded, never overridden for matching."
+        }
+      ]
+    },
+    {
+      "name": "Recycle",
+      "reference": "pcassist-recyclebintools",
+      "width": 792,
+      "height": 503,
+      "layoutDpi": 96,
+      "dpiEvidence": "Publisher cropped the real Windows10 band, did not record build/DPI. Captures use actual96DPI and identical crop pixels; drop shadow excluded, source caption/body not inferred.",
+      "state": "Expanded Recycle native band; real installed-provider states remain differences.",
+      "regions": [
+        {
+          "name": "recycle-ribbon",
+          "kind": "icons-text-and-geometry",
+          "reference": [
+            1,
+            55,
+            791,
+            147
+          ],
+          "actual": [
+            0,
+            24,
+            790,
+            116
+          ],
+          "actualOrigin": "ribbon",
+          "masks": [],
+          "reason": "Complete unannotated native command band. Publisher drop shadow is outside crop. Unknown build, locale and enabled-state differences are recorded, never overridden for matching."
+        }
+      ]
+    },
+    {
+      "name": "Network",
+      "reference": "techrepublic-network-2015",
+      "width": 916,
+      "height": 574,
+      "layoutDpi": 96,
+      "dpiEvidence": "Source native-size screenshot did not record OS build/DPI. Literal unscaled 92px command band and 24px tab band are compared to actual 96DPI rendering. Whole body/sidebar/history are outside measurement.",
+      "state": "Native Network namespace, no selected network computer; actual provider eligibility is preserved. Search Active Directory availability and installed system handlers are independent native differences.",
+      "regions": [
+        {
+          "name": "network-tabs",
+          "kind": "icons-text-and-geometry",
+          "reference": [
+            0,
+            31,
+            170,
+            55
+          ],
+          "actual": [
+            0,
+            0,
+            170,
+            24
+          ],
+          "actualOrigin": "ribbon",
+          "masks": [],
+          "reason": "File, Network and View tabs from the historical native screenshot; body HomeGroup removal is irrelevant to this crop."
+        },
+        {
+          "name": "network-ribbon",
+          "kind": "icons-text-and-geometry",
+          "reference": [
+            0,
+            55,
+            914,
+            147
+          ],
+          "actual": [
+            0,
+            24,
+            914,
+            116
+          ],
+          "actualOrigin": "ribbon",
+          "masks": [],
+          "reason": "Full native Location and Network commands. Source has no Search Active Directory control; unavailable provider state is recorded and never manufactured."
+        }
+      ]
+    }
+  ],
+  "thresholds": {
+    "meanAbsoluteRgbError": 4.0,
+    "pixelAgreement": 0.98,
+    "edgeF1": 0.9,
+    "perChannelTolerance": 16,
+    "edgeTolerancePixels": 1
+  },
+  "excludedDynamicContent": [
+    "user names",
+    "folder/file names",
+    "file timestamps",
+    "storage capacities",
+    "cloud account state",
+    "third-party handlers",
+    "recent/frequent item history"
+  ],
+  "limits": "Metrics apply only to declared crops and masks. They do not establish whole-app feature parity, keyboard behavior, accessibility, an undocumented DPI, or native dark/high-contrast behavior. Missing regions, different dimensions and mismatching enabled states fail rather than being silently resized or discarded.",
+  "unavailableComparisons": [
+    {
+      "scene": "DiskImage",
+      "reference": "techcult-disc-image",
+      "reason": "An online native screenshot supplies semantic captions, but its apparent native scale differs from actual 96 DPI captures and the publisher did not record DPI. Strict same-DPI pixels need a matching source or an environment supporting that actual native DPI."
+    },
+    {
+      "scene": "Shortcut",
+      "reference": "audioprecision-shortcut-2021",
+      "reason": "The authentic 552x245 screenshot proves one Open location control and simultaneous Shortcut/Application contextual tabs. Its 66px command band and smaller caption/tab glyphs do not establish actual 96DPI pixels; native DPI/build and original resize history are unspecified. The red arrow and selected-row outline are publisher annotations. Capture the actual owned executable .lnk but require a matching native-size source before strict pixel parity."
+    }
+  ]
+}

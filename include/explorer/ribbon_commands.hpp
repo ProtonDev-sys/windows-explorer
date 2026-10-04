@@ -1,0 +1,52 @@
+#pragma once
+#include <windows.h>
+
+namespace explorer {
+// Separate from Command so existing persisted command identifiers stay stable.
+enum RibbonCommand : UINT {
+    RibbonHomeTab = 1000, RibbonShareTab, RibbonViewTab, RibbonComputerTab,
+    RibbonPictureTab, RibbonDriveTab, RibbonCompressedTab, RibbonSearchTab,
+    RibbonLibraryTab, RibbonRecycleTab, RibbonApplicationTab, RibbonMusicTab,
+    RibbonVideoTab, RibbonDiscImageTab, RibbonNetworkTab, RibbonShortcutTab,
+    RibbonPictureContext = 1100, RibbonDriveContext, RibbonCompressedContext,
+    RibbonSearchContext, RibbonLibraryContext, RibbonRecycleContext,
+    RibbonApplicationContext, RibbonMusicContext, RibbonVideoContext, RibbonDiscImageContext, RibbonShortcutContext,
+    RibbonQuickAccess = 1200, RibbonFrequentPlaces, RibbonLayoutGallery,
+    RibbonNavigationMenu, RibbonArrangeMenu, RibbonEasyAccessMenu,
+    RibbonOptionsMenu, RibbonOpenMenu, RibbonNewMenu, RibbonDeleteMenu,
+    RibbonSearchAdvancedMenu, RibbonDateMenu, RibbonSizeMenu, RibbonKindMenu,
+    RibbonLibraryOptimizeMenu, RibbonMapMenu, RibbonHelpMenu,
+    RibbonHistoryMenu, RibbonPowerShellMenu, RibbonShareGallery, RibbonExtractToGallery,
+    RibbonMoveMenu = 1240, RibbonCopyMenu, RibbonSearchAgainMenu, RibbonPropertiesMenu,
+    RibbonNewWindowMenu = 1250, RibbonHelpButton,
+    RibbonEmail = 6000, RibbonBurnDisc, RibbonFax, RibbonSpecificPeople,
+    RibbonStopSharing, RibbonAlwaysAvailableOffline, RibbonIncludeInLibrary,
+    RibbonAddToFavorites, RibbonMapAsDrive, RibbonRotateLeft, RibbonRotateRight,
+    RibbonSlideShow, RibbonSetBackground, RibbonOptimizeDrive, RibbonDiskCleanup,
+    RibbonFormatDrive, RibbonEjectDrive, RibbonOpenSettings, RibbonSystemProperties,
+    RibbonUninstallProgram, RibbonManageComputer, RibbonAddNetworkLocation,
+    RibbonAccessMedia, RibbonConnectRemote, RibbonRestoreAll, RibbonRestoreSelected,
+    RibbonEmptyRecycleBin, RibbonRecycleProperties, RibbonRunAsAdministrator,
+    RibbonTroubleshootCompatibility, RibbonPinToStart, RibbonPlay, RibbonPlayAll,
+    RibbonAddToPlaylist, RibbonNewProcess, RibbonPowerShellAdmin, RibbonHelp,
+    RibbonAbout, RibbonResetLibrary, RibbonRemoveLibraryFolder,
+    RibbonSearchOtherProperties, RibbonSearchContents, RibbonSearchSystemFiles,
+    RibbonSearchZipFiles, RibbonChangeIndexedLocations,
+    RibbonExpandToCurrent, RibbonShowAllFolders, RibbonShowLibraries,
+    RibbonNewLibraryMenu, RibbonCustomSearchFirst = 6200,
+    RibbonCopyToDesktop = 6100, RibbonCopyToDocuments, RibbonCopyToDownloads,
+    RibbonMoveToDesktop = 6110, RibbonMoveToDocuments, RibbonMoveToDownloads,
+    RibbonLibraryChangeIcon = 6160, RibbonLibraryShowInNavigation,
+    RibbonBitLocker = 6180, RibbonMountDiscImage, RibbonBurnDiscImage, RibbonCastToDevice,
+    RibbonWorkOffline, RibbonSyncOffline, RibbonSearchThisPC, RibbonFolderOptions, RibbonOpenWith, RibbonPinToTaskbar,
+    RibbonAutoPlay, RibbonFinishBurning, RibbonEraseDisc,
+    RibbonClearSearchHistory,
+    RibbonAddNetworkDevice, RibbonDeviceWebpage, RibbonConnectRemotePrinter,
+    RibbonSearchActiveDirectory, RibbonNetworkSharingCenter, RibbonShortcutOpenLocation,
+    RibbonLibraryPublicSaveLocation = 6300, RibbonRemoveProperties,
+    RibbonDeleteConfirmation, RibbonRunAsAnotherUser,
+    RibbonCloudBackup, RibbonBackup,
+    RibbonRemoveMediaServer, RibbonOpenSearchViewSite, RibbonGroupSortAscending, RibbonGroupSortDescending,
+    RibbonCustomSearchLast = RibbonCustomSearchFirst + 99
+};
+}

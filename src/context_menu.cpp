@@ -60,6 +60,7 @@ void NativeContextMenu::reset() noexcept {
     menu_ = popup_ = nullptr;
     if (siteAttached_ && objectWithSite_) objectWithSite_->SetSite(nullptr);
     siteAttached_ = false;
+    leafStateOnly_ = false;
     objectWithSite_.Reset();
     context3_.Reset();
     context2_.Reset();
@@ -71,6 +72,15 @@ void NativeContextMenu::reset() noexcept {
 
 HRESULT NativeContextMenu::create(HWND owner, IContextMenu* context, IUnknown* site,
                                   UINT flags) {
+    return createImpl(owner, context, site, flags, false);
+}
+
+HRESULT NativeContextMenu::createLeafState(IContextMenu* context, IUnknown* site, UINT flags) {
+    return createImpl(nullptr, context, site, flags, true);
+}
+
+HRESULT NativeContextMenu::createImpl(HWND owner, IContextMenu* context, IUnknown* site,
+                                     UINT flags, bool leafStateOnly) {
     // Retain inputs first: a caller may rebuild using this object's current menu.
     ComPtr<IContextMenu> retained = context;
     ComPtr<IUnknown> retainedSite = site;
@@ -78,6 +88,7 @@ HRESULT NativeContextMenu::create(HWND owner, IContextMenu* context, IUnknown* s
     if (!retained) return E_INVALIDARG;
     owner_ = owner;
     thread_ = GetCurrentThreadId();
+    leafStateOnly_ = leafStateOnly;
     context_ = retained;
     context_.As(&context2_);
     context_.As(&context3_);
@@ -90,9 +101,11 @@ HRESULT NativeContextMenu::create(HWND owner, IContextMenu* context, IUnknown* s
     menu_ = CreatePopupMenu();
     if (!menu_) { const HRESULT hr = menuError(); reset(); return hr; }
     popup_ = menu_;
-    // Native Shell submenus can otherwise contain only a loading placeholder.
+    // Real popups need populated cascades. A read-only leaf-state worker never
+    // opens those cascades, so avoid requesting their synchronous enumeration.
+    const UINT nativeFlags = leafStateOnly ? flags & ~CMF_SYNCCASCADEMENU : flags | CMF_SYNCCASCADEMENU;
     const HRESULT hr = context_->QueryContextMenu(menu_, 0, firstCommand_, lastCommand_,
-                                                 flags | CMF_SYNCCASCADEMENU);
+                                                 nativeFlags);
     if (FAILED(hr)) { reset(); return hr; }
     commandCount_ = HRESULT_CODE(hr);
     if (commandCount_ > lastCommand_ - firstCommand_ + 1) {
@@ -254,6 +267,7 @@ HRESULT NativeContextMenu::enumerate(std::vector<ContextMenuEntry>& entries, boo
     entries.clear();
     if (!context_ || !menu_) return E_UNEXPECTED;
     if (thread_ != GetCurrentThreadId()) return RPC_E_WRONG_THREAD;
+    if (leafStateOnly_ && populate) return E_ACCESSDENIED;
     try {
         std::vector<ContextMenuEntry> snapshot;
         unsigned budget = maximumEntries;
@@ -271,6 +285,7 @@ HRESULT NativeContextMenu::invoke(UINT commandId, POINT screenPoint, bool contro
                                  bool shift) {
     if (!context_ || !menu_) return E_UNEXPECTED;
     if (thread_ != GetCurrentThreadId()) return RPC_E_WRONG_THREAD;
+    if (leafStateOnly_) return E_ACCESSDENIED;
     if (!selectableCommand(commandId)) return E_INVALIDARG;
     CMINVOKECOMMANDINFOEX info{sizeof(info)};
     info.fMask = CMIC_MASK_UNICODE | CMIC_MASK_PTINVOKE;
@@ -286,7 +301,7 @@ HRESULT NativeContextMenu::invoke(UINT commandId, POINT screenPoint, bool contro
 
 bool NativeContextMenu::handleMessage(UINT message, WPARAM wParam, LPARAM lParam,
                                      LRESULT& result) {
-    if (!context_ || !menu_ || thread_ != GetCurrentThreadId()) return false;
+    if (!context_ || !menu_ || thread_ != GetCurrentThreadId() || leafStateOnly_) return false;
     switch (message) {
     case WM_INITMENUPOPUP:
         if (HIWORD(lParam) || !ownsMenu(reinterpret_cast<HMENU>(wParam))) return false;

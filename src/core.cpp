@@ -120,6 +120,14 @@ std::filesystem::path preferencesPath() {
     return {};
 }
 
+std::wstring windowsDefaultStartupLocation() {
+    DWORD launchTo = 2, size = sizeof(launchTo);
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
+                    L"LaunchTo", RRF_RT_REG_DWORD, nullptr, &launchTo, &size) == ERROR_SUCCESS && launchTo == 1)
+        return L"shell:MyComputerFolder";
+    return Preferences{}.startupLocation;
+}
+
 Preferences loadPreferences(const std::filesystem::path& path) {
     const Preferences defaults;
     Preferences result = defaults;
@@ -138,6 +146,7 @@ Preferences loadPreferences(const std::filesystem::path& path) {
     if (!fromUtf8(contents, checked) || contents.find('\0') != std::string::npos) return result;
     std::istringstream lines(contents);
     std::string line;
+    bool startupLocationSpecified = false, startupPolicySpecified = false;
     while (std::getline(lines, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
         const auto stripped = trimAscii(line);
@@ -149,6 +158,14 @@ Preferences loadPreferences(const std::filesystem::path& path) {
         if (key == "navigationPane") result.navigationPane = booleanOr(value, defaults.navigationPane);
         else if (key == "previewPane") result.previewPane = booleanOr(value, defaults.previewPane);
         else if (key == "detailsPane") result.detailsPane = booleanOr(value, defaults.detailsPane);
+        else if (key == "expandToCurrent") result.expandToCurrent = booleanOr(value, defaults.expandToCurrent);
+        else if (key == "showAllFolders") result.showAllFolders = booleanOr(value, defaults.showAllFolders);
+        else if (key == "showLibraries") result.showLibraries = booleanOr(value, defaults.showLibraries);
+        else if (key == "useWindowsStartup") {
+            result.useWindowsStartup = booleanOr(value, defaults.useWindowsStartup);
+            startupPolicySpecified = true;
+        }
+        else if (key == "searchWidth") result.searchWidth = integerOr(value, defaults.searchWidth, 90, 4096);
         else if (key == "showHidden") result.showHidden = booleanOr(value, defaults.showHidden);
         else if (key == "showExtensions") result.showExtensions = booleanOr(value, defaults.showExtensions);
         else if (key == "ribbonCollapsed") result.ribbonCollapsed = booleanOr(value, defaults.ribbonCollapsed);
@@ -157,9 +174,13 @@ Preferences loadPreferences(const std::filesystem::path& path) {
         else if (key == "windowHeight") result.windowHeight = integerOr(value, defaults.windowHeight, 480, 4320);
         else if (key == "startupLocation") {
             std::wstring location;
-            result.startupLocation = unescapeLocation(std::string(value), location) ? location : defaults.startupLocation;
+            if (unescapeLocation(std::string(value), location)) {
+                result.startupLocation = std::move(location);
+                startupLocationSpecified = true;
+            } else result.startupLocation = defaults.startupLocation;
         }
     }
+    if (!startupPolicySpecified && startupLocationSpecified) result.useWindowsStartup = false;
     return result;
 }
 
@@ -174,6 +195,11 @@ bool savePreferences(const std::filesystem::path& path, const Preferences& prefe
         << "navigationPane=" << preferences.navigationPane << '\n'
         << "previewPane=" << preferences.previewPane << '\n'
         << "detailsPane=" << preferences.detailsPane << '\n'
+        << "expandToCurrent=" << preferences.expandToCurrent << '\n'
+        << "showAllFolders=" << preferences.showAllFolders << '\n'
+        << "showLibraries=" << preferences.showLibraries << '\n'
+        << "useWindowsStartup=" << preferences.useWindowsStartup << '\n'
+        << "searchWidth=" << preferences.searchWidth << '\n'
         << "showHidden=" << preferences.showHidden << '\n'
         << "showExtensions=" << preferences.showExtensions << '\n'
         << "ribbonCollapsed=" << preferences.ribbonCollapsed << '\n'

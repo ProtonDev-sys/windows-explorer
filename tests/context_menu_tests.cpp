@@ -216,6 +216,45 @@ void snapshotAndCommandSafety() {
             "Zero ordinal is valid when the selected ID equals idCmdFirst");
 }
 
+void readOnlyLeafStateContract() {
+    auto state = std::make_shared<HandlerState>();
+    auto fake = Make<FakeMenu3>(state);
+    auto site = Make<FakeMenu2>(std::make_shared<HandlerState>());
+    NativeContextMenu menu;
+    const UINT requested = CMF_ITEMMENU | CMF_EXTENDEDVERBS | CMF_SYNCCASCADEMENU;
+    require(SUCCEEDED(menu.createLeafState(fake.Get(), site.Get(), requested)), "Read-only native leaf menu creation failed");
+    require(state->queryFlags == (requested & ~CMF_SYNCCASCADEMENU),
+            "Leaf-state creation changed normal flags or requested synchronous cascades");
+    require(state->attached == 1 && menu.commandCount() == state->range,
+            "Leaf-state query lost exact site attachment or native command bounds");
+    std::vector<ContextMenuEntry> entries;
+    require(SUCCEEDED(menu.enumerate(entries, false)) && entries.size() == 5 &&
+            entries[1].canonicalVerb == L"fixture" && !entries[2].enabled(),
+            "Read-only query changed actual canonical leaf/disabled states");
+    require(!state->childPopulated && state->message2Calls == 0 && state->message3Calls == 0,
+            "Leaf-state enumeration initialized a delayed native cascade");
+    require(menu.enumerate(entries, true) == E_ACCESSDENIED && entries.empty(),
+            "Read-only leaf menu accepted delayed population");
+    LRESULT result = 71;
+    require(!menu.handleMessage(WM_INITMENUPOPUP, reinterpret_cast<WPARAM>(state->child), 0, result) && result == 71,
+            "Read-only menu forwarded a native cascade message or changed rejected output");
+    require(menu.invoke(menu.firstCommand()) == E_ACCESSDENIED && state->invokes == 0,
+            "Read-only state query invoked an enabled native command");
+    menu.reset();
+    require(state->detached == 1 && state->detachedAfterMenuDestroyed,
+            "Leaf-state reset released native data/site in the wrong order");
+    require(SUCCEEDED(menu.create(nullptr, fake.Get(), site.Get(), CMF_EXTENDEDVERBS)) &&
+            (state->queryFlags & CMF_SYNCCASCADEMENU),
+            "Read-only creation changed later normal popup cascade flags");
+    require(SUCCEEDED(menu.enumerate(entries, true)) && state->childPopulated,
+            "Reset did not restore normal native delayed submenu behavior");
+    menu.reset();
+    state->queryResult = E_ACCESSDENIED;
+    require(menu.createLeafState(fake.Get(), site.Get()) == E_ACCESSDENIED && !menu.menu() &&
+            state->attached == state->detached, "Failed leaf-state query leaked menu/site or changed failure");
+    require(menu.createLeafState(nullptr) == E_INVALIDARG, "Leaf-state query accepted a null handler");
+}
+
 void messageRouting() {
     auto state = std::make_shared<HandlerState>();
     auto fake = Make<FakeMenu3>(state);
@@ -475,6 +514,7 @@ int runContextMenuTests() {
     int failures = 0;
     const std::pair<const char*, std::function<void()>> cases[] = {
         {"Native context menu snapshot and command validation", snapshotAndCommandSafety},
+        {"Read-only native leaf state flags, lifetime and activation guards", readOnlyLeafStateContract},
         {"Native context menu CM3 owner message routing", messageRouting},
         {"Native context menu CM2 fallback", contextMenu2Fallback},
         {"Native context menu and site lifetime/failures", lifetimeAndFailures},
