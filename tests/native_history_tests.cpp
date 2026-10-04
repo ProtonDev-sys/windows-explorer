@@ -214,7 +214,7 @@ public:
             "attach actual native Shell view site to CommandStore handlers");
         std::vector<explorer::ContextMenuEntry> entries;
         succeeded(menu_.enumerate(entries), "read native Undo/Redo state without displaying menus");
-        find(entries, true);
+        find(entries, true, 0);
         require(state_.undoId && state_.redoId, "both registered Windows.undo/redo commands must exist");
     }
     const HistoryState& state() const { return state_; }
@@ -237,25 +237,34 @@ public:
             redo ? "invoke native registered Redo without UI" : "invoke native registered Undo without UI");
     }
 private:
-    void find(const std::vector<explorer::ContextMenuEntry>& entries, bool ancestorsEnabled) {
+    void find(const std::vector<explorer::ContextMenuEntry>& entries, bool ancestorsEnabled, unsigned depth) {
         for (const auto& entry : entries) {
             if (!entry.separator() && !entry.submenu && entry.id) {
                 const bool undo = _wcsicmp(entry.canonicalVerb.c_str(), L"Windows.undo") == 0;
                 const bool redo = _wcsicmp(entry.canonicalVerb.c_str(), L"Windows.redo") == 0;
                 if (undo || redo) {
                     UINT& id = undo ? state_.undoId : state_.redoId;
-                    require(!id, "native history canonical command must be unambiguous");
-                    id = entry.id;
-                    (undo ? state_.undo : state_.redo) = ancestorsEnabled && entry.enabled();
+                    unsigned& bestDepth = undo ? undoDepth_ : redoDepth_;
+                    // The broad installed CommandStore also exposes these
+                    // commands inside File/QAT cascades. Prefer the direct
+                    // entry, matching production Namespace command planning.
+                    if (depth < bestDepth) {
+                        bestDepth = depth;
+                        id = entry.id;
+                        (undo ? state_.undo : state_.redo) = ancestorsEnabled && entry.enabled();
+                    } else if (depth == bestDepth) {
+                        require(!id, "native history direct canonical command must be unambiguous");
+                    }
                 }
             }
-            find(entry.children, ancestorsEnabled && entry.enabled());
+            find(entry.children, ancestorsEnabled && entry.enabled(), depth + 1);
         }
     }
     std::unique_ptr<HKEY__, KeyCloser> key_;
     ComPtr<IContextMenu> context_;
     explorer::NativeContextMenu menu_;
     HistoryState state_;
+    unsigned undoDepth_ = UINT_MAX, redoDepth_ = UINT_MAX;
 };
 
 ComPtr<IShellItem> item(const fs::path& path) {
