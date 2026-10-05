@@ -403,41 +403,122 @@ HRESULT PrivateDesktop::initialize() {
 
 const PrivateDesktop* PrivateDesktop::current() noexcept { return currentDesktop; }
 
-HRESULT PrivateDesktop::verifyEmptyForDiagnostic(DWORD& windows, bool& enumReturned, DWORD& enumError) const {
+HRESULT PrivateDesktop::verifyEmptyForDiagnostic(DWORD& windows, bool& enumReturned, DWORD& enumError,
+    DiagnosticMessageReadback* messages) const {
     windows = 0; enumReturned = false; enumError = ERROR_SUCCESS;
+    DiagnosticMessageReadback observedMessages;
+    if (messages) *messages = observedMessages;
+    const auto finish = [&](HRESULT status) {
+        observedMessages.status = status;
+        if (messages) *messages = observedMessages;
+        return status;
+    };
     const auto owned = [&] { return currentDesktop == this && GetThreadDesktop(GetCurrentThreadId()) == desktop_ && SUCCEEDED(verifyIsolation()); };
-    if (!owned()) return E_ACCESSDENIED;
-    const auto emptyOracle = [](bool messageOnly) -> HRESULT {
+    if (!owned()) return finish(E_ACCESSDENIED);
+    const auto topLevelEmpty = []() -> HRESULT {
         SetLastError(ERROR_SUCCESS);
-        const auto window = messageOnly ? FindWindowExW(HWND_MESSAGE, nullptr, nullptr, nullptr) : GetTopWindow(nullptr);
+        const auto window = GetTopWindow(nullptr);
         const auto error = GetLastError();
         if (window || error) {
             const auto thread = window ? GetWindowThreadProcessId(window, nullptr) : 0;
-            std::fprintf(stderr, "headless-preview-empty oracle=%s window=%u windowThread=%lu callerThread=%lu nativeError=%lu\n",
-                messageOnly ? "message" : "top", window ? 1U : 0U, static_cast<unsigned long>(thread),
+            std::fprintf(stderr, "headless-preview-empty oracle=top window=%u windowThread=%lu callerThread=%lu nativeError=%lu\n",
+                window ? 1U : 0U, static_cast<unsigned long>(thread),
                 static_cast<unsigned long>(GetCurrentThreadId()), static_cast<unsigned long>(error));
             std::fflush(stderr);
         }
         return window ? E_ACCESSDENIED : error ? HRESULT_FROM_WIN32(error) : S_OK;
     };
-    for (const bool messageOnly : {false, true}) {
-        const auto observed = emptyOracle(messageOnly);
-        if (FAILED(observed)) return observed;
-    }
+    const auto messageOnlyEmpty = [&]() -> HRESULT {
+        // HWND_MESSAGE searches all message-only windows. A returned window
+        // must be assigned to a proven desktop before it can affect this
+        // exact owned desktop's emptiness. Returned desktop handles are borrowed.
+        std::unordered_set<HWND> visited;
+        HWND previous = nullptr;
+        for (;;) {
+            SetLastError(ERROR_SUCCESS);
+            const auto window = FindWindowExW(HWND_MESSAGE, previous, nullptr, nullptr);
+            const auto error = GetLastError();
+            if (!window) {
+                if (error) return HRESULT_FROM_WIN32(error);
+                ++observedMessages.completedPasses;
+                return S_OK;
+            }
+            if (visited.size() == MaximumWidgets) return HRESULT_FROM_WIN32(ERROR_BUFFER_OVERFLOW);
+            if (!visited.insert(window).second) return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+            ++observedMessages.visited;
+            DWORD process = 0;
+            SetLastError(ERROR_SUCCESS);
+            const auto thread = GetWindowThreadProcessId(window, &process);
+            auto status = thread && process ? S_OK : win32Failure();
+            std::wstring firstName, secondName;
+            HDESK firstDesktop = nullptr, secondDesktop = nullptr;
+            if (SUCCEEDED(status)) {
+                SetLastError(ERROR_SUCCESS);
+                firstDesktop = GetThreadDesktop(thread);
+                status = firstDesktop ? objectName(firstDesktop, firstName) : win32Failure();
+            }
+            if (SUCCEEDED(status)) {
+                SetLastError(ERROR_SUCCESS);
+                secondDesktop = GetThreadDesktop(thread);
+                status = secondDesktop ? objectName(secondDesktop, secondName) : win32Failure();
+            }
+            DWORD currentProcess = 0;
+            SetLastError(ERROR_SUCCESS);
+            const auto currentThread = GetWindowThreadProcessId(window, &currentProcess);
+            if (!currentThread || !currentProcess) status = win32Failure();
+            else if (SUCCEEDED(status)) {
+                if (currentThread != thread || currentProcess != process || firstName.empty() || secondName.empty())
+                    status = HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+                else {
+                    SetLastError(ERROR_SUCCESS);
+                    const auto equal = CompareStringOrdinal(firstName.c_str(), -1, secondName.c_str(), -1, TRUE);
+                    if (!equal) status = win32Failure();
+                    else if (equal != CSTR_EQUAL) status = HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+                }
+            }
+            int comparison = 0;
+            if (SUCCEEDED(status)) {
+                SetLastError(ERROR_SUCCESS);
+                comparison = CompareStringOrdinal(firstName.c_str(), -1, name_.c_str(), -1, TRUE);
+                if (!comparison) status = win32Failure();
+            }
+            const bool sameDesktop = SUCCEEDED(status) && comparison == CSTR_EQUAL;
+            const bool differentDesktop = SUCCEEDED(status) && !sameDesktop;
+            if (FAILED(status)) ++observedMessages.unknownDesktop;
+            else if (sameDesktop) ++observedMessages.owned;
+            else ++observedMessages.differentDesktop;
+            if (observedMessages.visited <= 16 || sameDesktop || FAILED(status)) {
+                std::fprintf(stderr, "headless-preview-empty oracle=message row=%lu ownedDesktop=%u differentDesktop=%u unknownDesktop=%u windowThread=%lu callerThread=%lu HRESULT=%lu\n",
+                    static_cast<unsigned long>(observedMessages.visited), sameDesktop ? 1U : 0U,
+                    differentDesktop ? 1U : 0U, FAILED(status) ? 1U : 0U, static_cast<unsigned long>(thread),
+                    static_cast<unsigned long>(GetCurrentThreadId()), static_cast<unsigned long>(static_cast<ULONG>(status)));
+                std::fflush(stderr);
+            }
+            if (FAILED(status)) return status;
+            if (sameDesktop) return E_ACCESSDENIED;
+            previous = window;
+        }
+    };
+    auto observed = topLevelEmpty();
+    if (FAILED(observed)) return finish(observed);
+    try { observed = messageOnlyEmpty(); }
+    catch (const std::bad_alloc&) { observed = E_OUTOFMEMORY; }
+    if (FAILED(observed)) return finish(observed);
     SetLastError(ERROR_SUCCESS);
     enumReturned = EnumDesktopWindows(desktop_, [](HWND, LPARAM data) -> BOOL {
         ++*reinterpret_cast<DWORD*>(data); return TRUE;
     }, reinterpret_cast<LPARAM>(&windows)) != FALSE;
     enumError = enumReturned ? ERROR_SUCCESS : GetLastError();
-    if (windows) return E_ACCESSDENIED;
-    if (enumError) return HRESULT_FROM_WIN32(enumError);
-    for (const bool messageOnly : {false, true}) {
-        const auto observed = emptyOracle(messageOnly);
-        if (FAILED(observed)) return observed;
-    }
+    if (windows) return finish(E_ACCESSDENIED);
+    if (enumError) return finish(HRESULT_FROM_WIN32(enumError));
+    observed = topLevelEmpty();
+    if (FAILED(observed)) return finish(observed);
+    try { observed = messageOnlyEmpty(); }
+    catch (const std::bad_alloc&) { observed = E_OUTOFMEMORY; }
+    if (FAILED(observed)) return finish(observed);
     // Some native empty desktops return FALSE/error 0 without callbacks. Both
     // independent native oracles and renewed exact isolation must prove empty.
-    return owned() ? S_OK : E_ACCESSDENIED;
+    return finish(owned() ? S_OK : E_ACCESSDENIED);
 }
 
 HRESULT PrivateDesktop::setLowIntegrityLabelForDiagnostic(DiagnosticLabelReadback& readback) {
@@ -463,7 +544,7 @@ HRESULT PrivateDesktop::setLowIntegrityLabelForDiagnostic(DiagnosticLabelReadbac
         CloseHandle(token); return readback.guard = E_ACCESSDENIED;
     }
     if (GetLastError() != ERROR_NO_TOKEN) return readback.guard = win32Failure();
-    readback.guard = verifyEmptyForDiagnostic(readback.windows, readback.enumReturned, readback.enumError);
+    readback.guard = verifyEmptyForDiagnostic(readback.windows, readback.enumReturned, readback.enumError, &readback.messageWindows);
     if (FAILED(readback.guard)) return readback.guard;
     DesktopHandle query{OpenDesktopW(name_.c_str(), 0, FALSE,
         WRITE_OWNER | READ_CONTROL | DESKTOP_READOBJECTS | DESKTOP_WRITEOBJECTS)};

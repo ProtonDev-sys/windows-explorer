@@ -655,10 +655,11 @@ Pidl cidaPidl(const std::vector<BYTE>& bytes, UINT offset, size_t header) {
     const auto copy = static_cast<PIDLIST_ABSOLUTE>(CoTaskMemAlloc(end - offset)); require(copy != nullptr, "Copy bounded native CIDA PIDL");
     std::memcpy(copy, bytes.data() + offset, end - offset); return Pidl(copy);
 }
-void verifyCida(IDataObject* object, const std::vector<const Source*>& expected) {
+UINT verifyCida(IDataObject* object, const std::vector<const Source*>& expected) {
     const auto bytes = globalData(object, CFSTR_SHELLIDLIST);
     require(bytes.size() >= sizeof(UINT), "Native CIDA header bound");
     UINT count = 0; std::memcpy(&count, bytes.data(), sizeof(count));
+    std::cout << "Native transfer CIDA actualCount=" << count << " expectedCount=" << expected.size() << std::endl;
     require(count == expected.size() && count && count <= 8, "Native CIDA preserves full source count");
     const size_t header = sizeof(UINT) * (static_cast<size_t>(count) + 2);
     require(bytes.size() >= header, "Native CIDA offset table bound");
@@ -674,7 +675,10 @@ void verifyCida(IDataObject* object, const std::vector<const Source*>& expected)
         ComPtr<IShellItem> item; succeeded(SHCreateItemFromIDList(combined.get(), IID_PPV_ARGS(&item)), "Read authentic owned native CIDA member");
         require(actual.insert(identity(itemPath(item.Get()))).second, "Native CIDA contains a duplicate identity");
     }
+    std::cout << "Native transfer CIDA actualIdentityCount=" << actual.size() << " expectedIdentityCount="
+        << wanted.size() << " exactIdentityMatches=" << (actual == wanted) << std::endl;
     require(actual == wanted, "Native CIDA must identify only the complete owned selection");
+    return count;
 }
 bool clipboardEmpty(HWND owner) {
     require(nativeWin32("OpenClipboard.baseline", [&] { return OpenClipboard(owner); }).value != FALSE, "Open clipboard for read-only baseline");
@@ -1009,10 +1013,25 @@ public:
             "Native Copy did not publish through the exact owned private STA");
         ComPtr<IDataObject> consumer;
         succeeded(nativeCall("OleGetClipboard", [&] { return OleGetClipboard(&consumer); }, "native-copy-consumer"), "Read original native Copy consumer");
-        verifyCida(consumer.Get(), {&source_});
-        require(effectData(consumer.Get(), CFSTR_PREFERREDDROPEFFECT) == DROPEFFECT_COPY && preserved(source_),
-            "Original native Copy changed its exact selection/effect/source");
+        const UINT clipboardCount = verifyCida(consumer.Get(), {&source_});
+        const DWORD preferredEffect = effectData(consumer.Get(), CFSTR_PREFERREDDROPEFFECT);
+        const bool sourceExists = fs::exists(source_.path);
+        const bool sourceIdentityMatches = sourceExists && identity(source_.path) == source_.id;
+        const bool sourceContentMatches = sourceExists && readFile(source_.path) == source_.bytes;
+        const bool sourceModifiedMatches = sourceExists && modified(source_.path) == source_.modified;
+        std::cout << "Native Copy capture cidaCount=" << clipboardCount << " exactCidaIdentityMatches=1 preferredEffect=" << preferredEffect
+            << " exactCopyPreference=" << (preferredEffect == DROPEFFECT_COPY)
+            << " copyBit=" << ((preferredEffect & DROPEFFECT_COPY) != 0)
+            << " moveBit=" << ((preferredEffect & DROPEFFECT_MOVE) != 0)
+            << " linkBit=" << ((preferredEffect & DROPEFFECT_LINK) != 0)
+            << " scrollBit=" << ((preferredEffect & DROPEFFECT_SCROLL) != 0)
+            << " sourceExists=" << sourceExists << " sourceIdentityMatches=" << sourceIdentityMatches
+            << " sourceContentMatches=" << sourceContentMatches << " sourceModifiedMatches=" << sourceModifiedMatches
+            << " expectedSourceBytes=" << source_.bytes.size() << std::endl;
         describeShortcutHdrop("native-copy-capture", "consumer", consumer.Get(), source_);
+        require(preferredEffect == DROPEFFECT_COPY && sourceExists && sourceIdentityMatches &&
+            sourceContentMatches && sourceModifiedMatches,
+            "Original native Copy changed its exact selection/effect/source");
         require(ownedPublication(), "Original native Copy publication changed during capture");
         captured_ = true;
         std::cout << "Native Copy ownership ownerPrivateSTA=1 sequence=" << sequence_
@@ -1165,6 +1184,23 @@ void drop(Browser& browser, const Source& source, const fs::path& destination, D
     const auto selection = sourceArray({&source}); ComPtr<IDataObject> data;
     succeeded(nativeCall("selection.BindToHandler.DataObject", [&] { return selection->BindToHandler(nullptr, BHID_DataObject, IID_PPV_ARGS(&data)); }, "drop", requested), "Bind original native drop data object");
     verifyCida(data.Get(), {&source});
+    {
+        ComPtr<IDataObjectAsyncCapability> sourceAsynchronous;
+        const HRESULT asynchronousStatus = nativeCall("IDataObject.QI.AsyncCapability", [&] { return data.As(&sourceAsynchronous); }, "drop-before-enter", requested);
+        BOOL asynchronousMode = FALSE, operationActive = FALSE;
+        const HRESULT asynchronousModeStatus = sourceAsynchronous ? nativeCall("IDataObjectAsyncCapability.GetAsyncMode", [&] {
+            return sourceAsynchronous->GetAsyncMode(&asynchronousMode);
+        }, "drop-before-enter", requested) : asynchronousStatus;
+        const HRESULT operationStatus = sourceAsynchronous ? nativeCall("IDataObjectAsyncCapability.InOperation", [&] {
+            return sourceAsynchronous->InOperation(&operationActive);
+        }, "drop-before-enter", requested) : asynchronousStatus;
+        std::cout << "Native Drop source requested=" << requested << " asyncInterfaceHRESULT=" << static_cast<ULONG>(asynchronousStatus)
+            << " asyncModeHRESULT=" << static_cast<ULONG>(asynchronousModeStatus) << " asyncMode=" << asynchronousMode
+            << " operationHRESULT=" << static_cast<ULONG>(operationStatus) << " operationActive=" << operationActive
+            << " sourcePreserved=" << preserved(source) << " sourceBytes=" << source.bytes.size()
+            << " dragEnterKeys=" << keys << " dragOverKeys=" << keys << " dropKeys=" << keys
+            << " leftButton=" << ((keys & MK_LBUTTON) != 0) << " rightButton=" << ((keys & MK_RBUTTON) != 0) << std::endl;
+    }
     explorer::BreadcrumbDropOptions options; options.site = browser.view;
     options.hitTest = [destination = browser.folder](POINTL, IShellItem** result) -> HRESULT {
         if (!result) return E_POINTER; *result = destination.Get(); (*result)->AddRef(); return S_OK;

@@ -3,6 +3,7 @@
 #include "explorer/library.hpp"
 #include "explorer/headless_visual.hpp"
 #include "explorer/worker_sta.hpp"
+#include "native_menu_state_tests.hpp"
 
 #include <shlobj.h>
 #include <propkey.h>
@@ -20,6 +21,7 @@
 #include <limits>
 #include <map>
 #include <set>
+#include <span>
 #include <stdexcept>
 #include <thread>
 
@@ -1202,8 +1204,8 @@ HRESULT finishStateBatch(NamespaceCommandStateTask& task,std::vector<NamespaceSe
     return task.pollSelectionVerbBatch(result);
 }
 
-void nativeLeafStateMenuEquivalence() {
-    onPrivateDesktop([] {
+void nativeLeafStateMenuEquivalence(std::span<const DWORD> counts) {
+    onPrivateDesktop([counts] {
         Fixture fixture;const auto before=read(fixture.text),zipBefore=read(fixture.archive);
         const auto clipboard=GetClipboardSequenceNumber();
         const auto clipboardOwnerBefore=GetClipboardOwner();
@@ -1232,7 +1234,7 @@ void nativeLeafStateMenuEquivalence() {
             }
             return states;
         };
-        for(const DWORD count:{1u,2u,16u,5001u,10000u})for(const bool mixed:{false,true}) {
+        for(const DWORD count:counts)for(const bool mixed:{false,true}) {
             if(count==1&&mixed)continue;
             std::vector<PCIDLIST_ABSOLUTE> ids(count,identities.text);
             if(mixed)ids.back()=identities.directory;
@@ -2157,10 +2159,25 @@ int runAppCommandTests() {
     return static_cast<int>(failures);
 }
 
-int runNativeMenuStateTests() {
+int runNativeMenuStateTests(NativeMenuStateBucket bucket) {
+    static constexpr std::array<DWORD,5> allCounts{1u,2u,16u,5001u,10000u};
+    static constexpr std::array<DWORD,3> smallCounts{1u,2u,16u};
+    static constexpr std::array<DWORD,1> largeCounts{5001u};
+    static constexpr std::array<DWORD,1> stressCounts{10000u};
+    std::span<const DWORD> counts;
+    const char* label = nullptr;
+    switch (bucket) {
+    case NativeMenuStateBucket::All: counts = allCounts; label = "all 1/2/16/5001/10000"; break;
+    case NativeMenuStateBucket::Small: counts = smallCounts; label = "small 1/2/16"; break;
+    case NativeMenuStateBucket::Large: counts = largeCounts; label = "large 5001"; break;
+    case NativeMenuStateBucket::Stress: counts = stressCounts; label = "stress 10000"; break;
+    default:
+        std::cerr << "FAIL: invalid native menu-state bucket\n";
+        return 2;
+    }
     try {
-        nativeLeafStateMenuEquivalence();
-        std::cout << "PASS: native root-leaf state versus synchronous cascades on full 1/2/16/5001/10000 targets\n";
+        nativeLeafStateMenuEquivalence(counts);
+        std::cout << "PASS: native root-leaf state versus synchronous cascades on full " << label << " targets\n";
         return 0;
     } catch(const std::exception& error) {
         std::cerr << "FAIL: native root-leaf state equivalence: " << error.what() << '\n';

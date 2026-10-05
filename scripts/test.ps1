@@ -78,6 +78,7 @@ $historyStatus = Get-NativeTestStatus 'native_shell_history'
 $searchOptionsStatus = Get-NativeTestStatus 'native_search_options'
 $viewPersistenceStatus = Get-NativeTestStatus 'native_view_persistence'
 $transferStatus = Get-NativeTestStatus 'native_shell_transfer'
+$dropsStatus = Get-NativeTestStatus 'native_shell_drops'
 $disposableRunner = $env:GITHUB_ACTIONS -ceq 'true'
 $historyOptIn = Test-ConfiguredOptIn 'native_shell_history' 'WINDOWSEXPLORER_NATIVE_HISTORY_TEST'
 $searchOptIn = Test-ConfiguredOptIn 'native_search_options' 'WINDOWSEXPLORER_SEARCH_OPTIONS_TEST'
@@ -93,14 +94,17 @@ $transferOptIn = $env:WINDOWSEXPLORER_NATIVE_TRANSFER_TEST -ceq '1'
     nativeSearchOptionsOptInConfigured = $searchOptIn
     nativeViewPersistenceOptInConfigured = $viewPersistenceOptIn
     nativeTransferOptInExplicit = $transferOptIn
+    nativeDropsOptInExplicit = $transferOptIn
     nativeHistoryMutationEnabled = $disposableRunner -and $historyOptIn -and $historyStatus -ne 'skipped' -and $historyStatus -ne 'not-run'
     nativeSearchOptionsMutationEnabled = $disposableRunner -and $searchOptIn -and $searchOptionsStatus -ne 'skipped' -and $searchOptionsStatus -ne 'not-run'
     nativeViewPersistenceMutationEnabled = $disposableRunner -and $viewPersistenceOptIn -and $viewPersistenceStatus -ne 'skipped' -and $viewPersistenceStatus -ne 'not-run'
     nativeTransferMutationEnabled = $disposableRunner -and $transferOptIn -and $transferStatus -ne 'skipped' -and $transferStatus -ne 'not-run'
+    nativeDropsMutationEnabled = $disposableRunner -and $transferOptIn -and $dropsStatus -ne 'skipped' -and $dropsStatus -ne 'not-run'
     nativeHistoryTestStatus = $historyStatus
     nativeSearchOptionsTestStatus = $searchOptionsStatus
     nativeViewPersistenceTestStatus = $viewPersistenceStatus
     nativeTransferTestStatus = $transferStatus
+    nativeDropsTestStatus = $dropsStatus
     installedHostConfigured = $installedHostConfigured
 } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $environmentReport -Encoding utf8
 foreach ($hostReport in $hostReports) {
@@ -117,7 +121,8 @@ if ($disposableRunner) {
         @{ name = 'native_shell_history'; optedIn = $historyOptIn; status = $historyStatus },
         @{ name = 'native_search_options'; optedIn = $searchOptIn; status = $searchOptionsStatus },
         @{ name = 'native_view_persistence'; optedIn = $viewPersistenceOptIn; status = $viewPersistenceStatus },
-        @{ name = 'native_shell_transfer'; optedIn = $transferOptIn; status = $transferStatus }
+        @{ name = 'native_shell_transfer'; optedIn = $transferOptIn; status = $transferStatus },
+        @{ name = 'native_shell_drops'; optedIn = $transferOptIn; status = $dropsStatus }
     )) {
         if ($nativeGate.optedIn -and $nativeGate.status -ne 'passed') {
             throw "Opted-in disposable-CI test must actually pass: $($nativeGate.name)=$($nativeGate.status)."

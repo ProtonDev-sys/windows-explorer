@@ -15,6 +15,7 @@
 #include <iostream>
 #include <map>
 #include <stdexcept>
+#include <string_view>
 #include <thread>
 #include <uiautomation.h>
 #include <future>
@@ -95,8 +96,17 @@ std::vector<BYTE> iconPixels(HICON icon,UINT pixels) {
 }
 std::vector<BYTE> singleIconPixels(const std::wstring& path,int resource,UINT pixels) {
     Icon icon;
-    succeeded(SHDefExtractIconW(path.c_str(),resource,0,&icon.handle,nullptr,MAKELONG(pixels,0)),
-        "Independent original single-size native icon extraction");
+    const auto packedSize=MAKELONG(pixels,0);
+    const HRESULT status=SHDefExtractIconW(path.c_str(),resource,0,&icon.handle,nullptr,packedSize);
+    if(FAILED(status)||!icon.handle) {
+        auto module=std::wstring_view(path);
+        if(const auto separator=module.find_last_of(L"\\/");separator!=std::wstring_view::npos)
+            module.remove_prefix(separator+1);
+        std::wcerr<<L"Native icon reference failure api=SHDefExtractIconW module="<<module
+            <<L" resourceIndex="<<resource<<L" requestedPixels="<<pixels<<L" flags=0 packedSize="<<packedSize
+            <<L" HRESULT="<<static_cast<ULONG>(status)<<L" iconPresent="<<(icon.handle!=nullptr)<<std::endl;
+    }
+    succeeded(status,"Independent original single-size native icon extraction");
     require(icon.handle!=nullptr,"Original single-size native icon is missing");
     return iconPixels(icon.handle,pixels);
 }

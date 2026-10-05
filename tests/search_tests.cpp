@@ -487,7 +487,8 @@ ComPtr<IShellItem> reopenSearch(const fs::path& path) {
     return item;
 }
 void requireReopenedResults(const fs::path& path, const std::set<std::wstring>& expected,
-                            const char* message) {
+                            const char* message,
+                            const std::function<void(const std::set<std::wstring>&)>& failureDiagnostic = {}) {
     std::set<FileIdentity> expectedIds;
     for (const auto& value : expected) expectedIds.insert(fileIdentity(value));
     const auto started = GetTickCount64();
@@ -502,6 +503,18 @@ void requireReopenedResults(const fs::path& path, const std::set<std::wstring>& 
             return;
         }
         if (GetTickCount64() - started >= 5000) {
+            if (failureDiagnostic) {
+                std::cerr << "INFO: confirmed replacement failure retries=" << retries
+                          << " elapsed_ms=" << GetTickCount64() - started << '\n';
+                // Observe only after the original bounded result check has
+                // failed. Keep its captured membership and strict assertion,
+                // even if a diagnostic provider call itself fails.
+                try { failureDiagnostic(actual); }
+                catch (const std::exception& error) {
+                    std::cerr << "INFO: confirmed replacement diagnostic failed: " << error.what() << '\n';
+                }
+                catch (...) { std::cerr << "INFO: confirmed replacement diagnostic failed with unknown exception\n"; }
+            }
             requireResults(actual, expected, message);
             return;
         }
@@ -1428,9 +1441,78 @@ void confirmedSearchReplacement() {
             "union replacement did not publish the requested XML");
     requireReopenedResults(output, {first.native()}, "union replacement kept stale query membership");
     const std::vector<explorer::SearchScopeRule> rules{{scope, false, false}};
+    const auto beforeRuleBytes = read(output);
+    const auto beforeRuleId = fileIdentity(output.native());
+    const auto beforeRuleBasic = fileBasic(output);
     succeeded(explorer::saveSearchForScopeRules(L"System.FileName:=\"second.bin\"", rules, output,
         explorer::SearchSaveMode::UserConfirmed), "replace confirmed explicit scope-rule query");
-    requireReopenedResults(output, {second.native()}, "rule replacement changed native scope semantics");
+    requireReopenedResults(output, {second.native()}, "rule replacement changed native scope semantics",
+        [&](const std::set<std::wstring>& actual) {
+            const auto identity = [](unsigned stage, unsigned ordinal, const FileIdentity& id) {
+                std::cerr << "INFO: confirmedRule identity stage=" << stage << " ordinal=" << ordinal
+                          << " volume=" << id.volume << " id=";
+                constexpr char hex[] = "0123456789abcdef";
+                for (const auto byte : id.identifier) std::cerr << hex[byte >> 4] << hex[byte & 15];
+                std::cerr << '\n';
+            };
+            const auto bytes = [&](unsigned stage, const std::string& value, const FileIdentity& id,
+                                   const FILE_BASIC_INFO& basicInfo) {
+                std::cerr << "INFO: confirmedRule publication stage=" << stage << " bytes=" << value.size()
+                          << " firstToken=" << (value.find("first.txt") != std::string::npos)
+                          << " secondToken=" << (value.find("second.bin") != std::string::npos)
+                          << " attributes=" << basicInfo.FileAttributes
+                          << " creation=" << basicInfo.CreationTime.QuadPart
+                          << " write=" << basicInfo.LastWriteTime.QuadPart
+                          << " change=" << basicInfo.ChangeTime.QuadPart << '\n';
+                identity(stage, 0, id);
+            };
+            const auto scopeEvidence = [&](unsigned stage, const std::vector<explorer::SearchScopeRule>& values) {
+                std::cerr << "INFO: confirmedRule scopes stage=" << stage << " count=" << values.size() << '\n';
+                for (size_t index = 0; index < values.size(); ++index) {
+                    const auto& rule = values[index];
+                    std::cerr << "INFO: confirmedRule scope stage=" << stage << " ordinal=" << index
+                              << " recursive=" << rule.recursive << " excluded=" << rule.excluded
+                              << " present=" << (rule.folder != nullptr) << '\n';
+                    if (rule.folder) identity(stage, static_cast<unsigned>(index),
+                        fileIdentity(nativeFilesystemPath(rule.folder.Get())));
+                }
+            };
+            const auto membersEvidence = [&](unsigned stage, const std::set<std::wstring>& values) {
+                std::cerr << "INFO: confirmedRule members stage=" << stage << " count=" << values.size() << '\n';
+                unsigned ordinal = 0;
+                for (const auto& value : values) identity(stage, ordinal++, fileIdentity(value));
+            };
+            // Numeric stages: 1 prior union publication, 2 current rule
+            // publication, 3 expected scope, 4 imported scope, 5 captured
+            // failed native result, 6 expected result, 7 fresh rule live,
+            // 8 imported live. Diagnostics never re-save or notify the Shell.
+            bytes(1, beforeRuleBytes, beforeRuleId, beforeRuleBasic);
+            const auto afterBytes = read(output);
+            bytes(2, afterBytes, fileIdentity(output.native()), fileBasic(output));
+            std::cerr << "INFO: confirmedRule publication changedBytes=" << (beforeRuleBytes != afterBytes) << '\n';
+            scopeEvidence(3, rules);
+            membersEvidence(5, actual);
+            membersEvidence(6, {second.native()});
+            explorer::SavedSearchMetadata metadata;
+            const auto importedStatus = explorer::readSavedSearch(output, &metadata);
+            std::cerr << "INFO: confirmedRule import HRESULT=0x" << std::hex
+                      << static_cast<unsigned long>(importedStatus) << std::dec
+                      << " queryUnits=" << metadata.query.size()
+                      << " firstToken=" << (metadata.query.find(L"first.txt") != std::wstring::npos)
+                      << " secondToken=" << (metadata.query.find(L"second.bin") != std::wstring::npos)
+                      << " recursive=" << metadata.recursive << '\n';
+            if (SUCCEEDED(importedStatus)) scopeEvidence(4, metadata.scopeRules);
+            const auto liveEvidence = [&](unsigned stage, const std::wstring& query,
+                                          const std::vector<explorer::SearchScopeRule>& values) {
+                ComPtr<IShellItem> live;
+                const auto status = explorer::createSearchFolderForScopeRules(query, values, &live);
+                std::cerr << "INFO: confirmedRule live stage=" << stage << " HRESULT=0x" << std::hex
+                          << static_cast<unsigned long>(status) << std::dec << '\n';
+                if (SUCCEEDED(status)) membersEvidence(stage, searchResults(live.Get()));
+            };
+            liveEvidence(7, L"System.FileName:=\"second.bin\"", rules);
+            if (SUCCEEDED(importedStatus)) liveEvidence(8, metadata.query, metadata.scopeRules);
+        });
     const auto fresh = fixture.root / L"new-confirmed.search-ms";
     succeeded(explorer::saveSearchForScopeRules(L"System.Size:>0", rules, fresh,
         explorer::SearchSaveMode::UserConfirmed), "confirmed dialog fresh path creates a new query");

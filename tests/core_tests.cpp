@@ -1,6 +1,7 @@
 #include "explorer/core.hpp"
 #include "explorer/headless_visual.hpp"
 #include "explorer/worker_sta.hpp"
+#include "native_menu_state_tests.hpp"
 
 #include <objbase.h>
 #include <cstdlib>
@@ -26,7 +27,6 @@ int runLibraryTests();
 int runNamespaceActionTests();
 int runBreadcrumbTests();
 int runAppCommandTests();
-int runNativeMenuStateTests();
 int runSearchHistoryTests();
 int runAddressHistoryTests();
 int runTypedAddressTests();
@@ -185,10 +185,16 @@ int main(int argc, char** argv) {
         return 1;
     }
     if (argc == 2 && std::string_view(argv[1]) == "--worker-only") return runStaWorkerTests();
-    if (argc == 2 && std::string_view(argv[1]) == "--menu-state-only") {
+    const auto mode = argc == 2 ? std::string_view(argv[1]) : std::string_view{};
+    const bool coreOnly = mode == "--core-only";
+    if (argc == 2 && (mode == "--menu-state-only" || mode == "--menu-state-small" ||
+                     mode == "--menu-state-large" || mode == "--menu-state-stress")) {
+        const auto bucket = mode == "--menu-state-only" ? NativeMenuStateBucket::All :
+            mode == "--menu-state-small" ? NativeMenuStateBucket::Small :
+            mode == "--menu-state-large" ? NativeMenuStateBucket::Large : NativeMenuStateBucket::Stress;
         const auto initialized = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
         if (FAILED(initialized)) return 1;
-        const auto failures = runNativeMenuStateTests();
+        const auto failures = runNativeMenuStateTests(bucket);
         drainCreatorBeforeShutdown();
         CoUninitialize();
         return failures ? 1 : 0;
@@ -199,7 +205,6 @@ int main(int argc, char** argv) {
                      std::string_view(argv[1]) == "--direction-only")) {
         const auto initialized = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
         if (FAILED(initialized)) return 1;
-        const auto mode = std::string_view(argv[1]);
         const auto failures = mode == "--search-only" ? runSearchTests() :
             mode == "--namespace-only" ? runNamespaceActionTests() :
             mode == "--refinement-only" ? runSearchRefinementTests() :
@@ -218,7 +223,7 @@ int main(int argc, char** argv) {
         CoUninitialize();
         return failures ? 1 : 0;
     }
-    if (argc != 1) return 2;
+    if (argc != 1 && !coreOnly) return 2;
     const HRESULT initialized = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     if (FAILED(initialized)) {
         std::cerr << "FAIL: Cannot initialize COM for headless shell tests\n";
@@ -253,7 +258,7 @@ int main(int argc, char** argv) {
     failures += static_cast<unsigned>(runLibraryTests());
     failures += static_cast<unsigned>(runNamespaceActionTests());
     failures += static_cast<unsigned>(runBreadcrumbTests());
-    failures += static_cast<unsigned>(runAppCommandTests());
+    if (!coreOnly) failures += static_cast<unsigned>(runAppCommandTests());
     failures += static_cast<unsigned>(runSearchHistoryTests());
     failures += static_cast<unsigned>(runAddressHistoryTests());
     failures += static_cast<unsigned>(runTypedAddressTests());

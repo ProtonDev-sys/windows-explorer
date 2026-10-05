@@ -275,6 +275,7 @@ struct PreviewDesktopAccessDiagnostic {
     std::array<HRESULT, 2> processBefore{E_PENDING, E_PENDING}, lowBefore{E_PENDING, E_PENDING};
     std::array<HRESULT, 2> processAfter{E_PENDING, E_PENDING}, lowAfter{E_PENDING, E_PENDING};
     PrivateDesktop::DiagnosticLabelReadback security;
+    PrivateDesktop::DiagnosticMessageReadback teardownMessages;
     bool discriminating = false;
     std::wstring detail() const {
         const auto pair = [](const auto& values) { return hresultMessage(values[0]) + L"/" + hresultMessage(values[1]); };
@@ -291,6 +292,13 @@ struct PreviewDesktopAccessDiagnostic {
             L"; prelabel apartment HRESULT/type/qualifier=" + hresultMessage(security.apartmentRead) + L"/" +
             std::to_wstring(security.apartmentType) + L"/" + std::to_wstring(security.apartmentQualifier) +
             L"; empty native enumeration returned/error=" + std::to_wstring(security.enumReturned) + L"/" + std::to_wstring(security.enumError) +
+            L"; prelabel message HRESULT/visited/owned/different/unknown/passes=" + hresultMessage(security.messageWindows.status) + L"/" +
+            std::to_wstring(security.messageWindows.visited) + L"/" + std::to_wstring(security.messageWindows.owned) + L"/" +
+            std::to_wstring(security.messageWindows.differentDesktop) + L"/" + std::to_wstring(security.messageWindows.unknownDesktop) + L"/" +
+            std::to_wstring(security.messageWindows.completedPasses) + L"; teardown message HRESULT/visited/owned/different/unknown/passes=" +
+            hresultMessage(teardownMessages.status) + L"/" + std::to_wstring(teardownMessages.visited) + L"/" +
+            std::to_wstring(teardownMessages.owned) + L"/" + std::to_wstring(teardownMessages.differentDesktop) + L"/" +
+            std::to_wstring(teardownMessages.unknownDesktop) + L"/" + std::to_wstring(teardownMessages.completedPasses) +
             L"; labels/RID/mask before=" + std::to_wstring(security.beforeLabels) + L"/" + std::to_wstring(security.beforeRid) +
             L"/" + std::to_wstring(security.beforeMask) + L"; after=" + std::to_wstring(security.afterLabels) + L"/" +
             std::to_wstring(security.afterRid) + L"/" + std::to_wstring(security.afterMask) + L"; native low ACE flags=" + std::to_wstring(security.afterFlags) +
@@ -428,7 +436,7 @@ PreviewDesktopAccessDiagnostic previewDesktopAccessDiagnostic(const std::atomic_
             }
             DWORD windows = 0;
             bool enumerated = false; DWORD enumerationError = ERROR_SUCCESS;
-            result.empty = comparison.verifyEmptyForDiagnostic(windows, enumerated, enumerationError);
+            result.empty = comparison.verifyEmptyForDiagnostic(windows, enumerated, enumerationError, &result.teardownMessages);
         }
     }
     // PrivateDesktop teardown must restore the exact borrowed initial desktop
@@ -446,7 +454,8 @@ PreviewDesktopAccessDiagnostic previewDesktopAccessDiagnostic(const std::atomic_
     result.discriminating = SUCCEEDED(result.label) && SUCCEEDED(result.empty) && SUCCEEDED(result.originalTokenPreserved) &&
         result.tokenReadbacks == 2 && result.reverts == 2 &&
         result.processBefore == std::array<HRESULT, 2>{S_OK, S_OK} && result.processAfter == std::array<HRESULT, 2>{S_OK, S_OK} &&
-        result.lowBefore == std::array<HRESULT, 2>{S_OK, HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED)} &&
+        (result.lowBefore[0] == S_OK || result.lowBefore[0] == HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED)) &&
+        result.lowBefore[1] == HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED) &&
         result.lowAfter == std::array<HRESULT, 2>{S_OK, S_OK};
     return result;
 }

@@ -109,10 +109,11 @@ metadata/history, re-save, localized UIA names, cues and bounded Unicode tooltip
 The installed Ribbon independently checks four group captions against raw
 installed markup.
 
-The current Windows 10 configuration has twenty-two CTest targets: seventeen
+The current Windows 10 configuration has twenty-five CTest targets: twenty
 active and five shared-state targets that correctly skip locally. Core has a
-120-second aggregate bound, the separate native menu-equivalence target has
-90 seconds, both application suites have 150 seconds, and search-window handoff
+120-second aggregate bound. App commands and each of the Small/Large/Stress
+native menu-equivalence targets have 90 seconds; both application suites have
+150 seconds, and search-window handoff
 has 45 seconds. The disposable native-transfer target has 150 seconds. Individual
 native worker deadlines are unchanged. The independent native-drop target also
 has 150 seconds and requires the same genuine disposable-runner opt-in. Earlier
@@ -237,6 +238,51 @@ cache coverage at those DPIs. Six fresh interleaved A/B rounds are retained in
 results. The integrated v62 all-target build is warning-free; its two local
 transfer gates correctly skip without clipboard or native-drop execution.
 
+The complete integrated v62 local run records thirteen passed targets, five
+correctly skipped targets and four failures in 454.24 seconds
+(`artifacts/continuation-full-tests-v62.log`, `artifacts/continuation-core-tests-v62.xml`).
+Authored/installed App reports complete 259/267 checks with only native RTF
+Preview failing. Core reaches the sixteenth App-command group before its
+120.31-second aggregate timeout; the all-count menu fixture reaches a 10,000-item
+comparison before its 90.03-second timeout. Its printed times cover only two of
+the four or five native queries in that iteration. Source review establishes
+continued progress, without identifying a hang or its timing cause. New test
+partitions retain every comparison and individual deadline, preserve the original
+all-count/full-core diagnostic modes, and require fresh runtime validation.
+
+The subsequent v63 authored App run completes 259 checks in 87.40 seconds with
+the same sole Preview failure, executable SHA-256
+`8cc5d768b67be4337a219b9364d76adff6e67984c6f47c0ffe41ea52f41f68e9`.
+The message-only provenance guard now retains unknown desktop identity and
+`0x8007001F` rather than excluding the window. No low-label write executes;
+restoration and process-token preservation still pass. Reports are
+`artifacts/continuation-app-v63.log` and its matching JSON/JUnit files.
+
+Hosted [commit `df1aaca`](https://github.com/ProtonDev-sys/windows-explorer/actions/runs/37361365765)
+passes thirteen main-job targets and skips both ordinary transfer gates. Three
+targets fail: native Preview, saved-search replacement membership (`first.txt`
+instead of the distinct expected `second.bin` FileID), and an icon reference
+whose original single-size native extraction produces no icon. The latter fails
+before a paired-cache comparison, so it does not establish a production icon
+regression. The separate opted-in transfer process fails its original-view Copy
+publication's combined identity/effect/source predicate in 4.29 seconds. Its
+independent drop process fails at the actual `IDropTarget::Drop` call after the
+20-second active-call budget. Both absolute JUnit files and phase logs are
+retained under `artifacts/ci/run-37361365765-{main,transfer}/`. The combined
+application job correctly skips. Added diagnostics retain exact failing
+predicates, native resource requests and source async/key state; they do not
+relax eligibility, effects, output identities or deadlines.
+
+The v64 all-target Release build is warning-free. Its focused nine-target run
+passes all seven active targets and correctly skips both local transfer gates,
+in 259.89 seconds (`artifacts/continuation-partitions-v64.log` and its JUnit).
+Core passes in 94.40 seconds, all eighteen App-command groups in 44.06 seconds,
+and all three menu buckets pass within their original 90-second bounds. Both
+complete Ribbon layouts pass. The core executable SHA-256 is
+`5dee08d01443f57c1640d07145cbff642012d2b11bb9fef4368b26191bde9883`.
+This resolves the observed aggregate timeouts on this snapshot; it does not
+replace a later full run or establish the cause of the changed timings.
+
 The earlier [commit `317914b` run](https://github.com/ProtonDev-sys/windows-explorer/actions/runs/37249626987)
 failed Open File Location's folder-identity check; subsequent checks use actual
 volume/128-bit FileIDs. The earlier `aecc063` hosted run established
@@ -261,7 +307,8 @@ a separate result from native capture and functional tests.
 | CTest target | What it verifies |
 | --- | --- |
 | `core_and_shell_operations` | Owned file operations and recovery; native search and saved-query membership; preferences, input mapping, archives, shortcuts, context menus, Libraries, native command state/resources, asynchronous lifetime, breadcrumbs and search history |
-| `native_menu_state_equivalence` | Actual full-array native state/menu equivalence, resource restrictions and restoration, missing/duplicate verbs and retained-provider lifetime |
+| `native_app_commands` | All original App-command routing/provider groups, complete targets/site, native capability/state and cancellation/lifetime guards |
+| `native_menu_state_small`, `native_menu_state_large`, `native_menu_state_stress` | The same actual full-array native state/menu comparisons over 1/2/16, 5,001 and 10,000 targets respectively, resource restrictions/restoration, missing/duplicate verbs and retained-provider lifetime |
 | `native_search_window_handoff` | Complete validated search context, reduced read-only mapping, malformed output preservation and actual explicit-handle-list child inheritance; fresh native factories, exact scope/result identities and child lifetime |
 | `hidden_shell_host` | The real application, native ItemsView, navigation, eight layouts, columns, complete selection changes, search/import/refine/history, search-window Content/List restoration and Close origin, atomic Clear History, ZIP/Library contexts, native tree options, splitter, F6/Tab focus routes, Ribbon/QAT and owned UI Automation |
 | `native_view_selection` | Complete actual selection identities and complements, focus and checkbox flags on an owned 10,000-item native view |
@@ -280,7 +327,7 @@ a separate result from native capture and functional tests.
 | `native_shell_drops` | Independent native Copy/Move/Link drop process with unchanged clipboard owner/sequence/formats and exact owned identities/completion; same genuine disposable-runner gate; no current local execution proof |
 | `native_theme`, `native_theme_installed` | Theme policy, actual native dark pixels on recognized Windows builds, Light restoration, ownership guards and unchanged system configuration; installed-resource coverage on build 19045 |
 
-The four shared-state mutation targets check both `GITHUB_ACTIONS=true` and their
+The five shared-state mutation targets check both `GITHUB_ACTIONS=true` and their
 explicit test opt-in before COM, windows or fixtures. They report **skipped**
 locally. Setting those variables on a personal machine is not an authorized test
 method. All other fixtures use exclusively owned temporary paths and preserve

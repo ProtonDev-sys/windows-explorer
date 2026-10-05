@@ -28,7 +28,12 @@ public:
     HRESULT initialize();
     HRESULT verifyIsolation(bool* inputDesktopUnchanged = nullptr) const;
     HRESULT visibleWindowsOnInputDesktop(bool& visible) const;
-    HRESULT verifyEmptyForDiagnostic(DWORD& windows, bool& enumReturned, DWORD& enumError) const;
+    struct DiagnosticMessageReadback {
+        HRESULT status = E_PENDING;
+        DWORD visited = 0, owned = 0, differentDesktop = 0, unknownDesktop = 0, completedPasses = 0;
+    };
+    HRESULT verifyEmptyForDiagnostic(DWORD& windows, bool& enumReturned, DWORD& enumError,
+        DiagnosticMessageReadback* messages = nullptr) const;
     struct DiagnosticLabelReadback {
         HRESULT guard = E_PENDING, before = E_PENDING, applied = E_PENDING, after = E_PENDING;
         HRESULT apartmentRead = E_PENDING;
@@ -38,6 +43,7 @@ public:
         bool enumReturned = false;
         DWORD enumError = 0;
         bool exactOwnedCurrent = false, daclUnchanged = false, ownerUnchanged = false, groupUnchanged = false;
+        DiagnosticMessageReadback messageWindows;
     };
     // Only an empty, exact current owned desktop, before explicit COM/HWND creation.
     // This is a diagnostic comparison; initialize() retains its default SD.
