@@ -176,6 +176,14 @@ struct Browser {
         succeeded(view->UIActivate(SVUIA_ACTIVATE_NOFOCUS), "Activate only the owned private Shell view without focus");
         waitFor([&] { int count = -1; return SUCCEEDED(folderView->ItemCount(SVGIO_ALLVIEW, &count)) && count == static_cast<int>(expected); },
                 "Native view did not enumerate all ten thousand owned members");
+        require(RedrawWindow(owner,nullptr,nullptr,RDW_INVALIDATE|RDW_ALLCHILDREN|RDW_UPDATENOW)!=FALSE,
+            "Render the exact owned private selection viewport before native focus setup");
+        MSG message{};
+        unsigned dispatched=0;
+        while(dispatched++<64&&PeekMessageW(&message,nullptr,0,0,PM_REMOVE)) {
+            require(message.message!=WM_QUIT,"Private selection fixture received quit");
+            TranslateMessage(&message);DispatchMessageW(&message);
+        }
     }
     ~Browser() {
         if(owner&&GetActiveWindow()==owner)SetActiveWindow(previousActive);
@@ -286,9 +294,22 @@ void verifyDocumentedFallback(explorer::PrivateDesktop& desktop) {
     succeeded(browser.folderView->GetCurrentFolderFlags(&original), "Read fallback view flags");
     succeeded(browser.folderView->SetCurrentFolderFlags(FWF_CHECKSELECT, FWF_CHECKSELECT), "Enable fallback checkbox view flag");
     succeeded(browser.folderView->GetCurrentFolderFlags(&flags), "Read fallback checkbox flag");
-    succeeded(browser.folderView->SelectItem(2, SVSI_SELECT | SVSI_FOCUSED | SVSI_NOTAKEFOCUS), "Seed focused fallback item");
+    PITEMID_CHILD focusChild=nullptr;
+    succeeded(browser.folderView->Item(2,&focusChild),"Read actual fallback focus child PIDL");
+    const auto focusedSelection=browser.view->SelectItem(focusChild,SVSI_SELECT|SVSI_FOCUSED|SVSI_ENSUREVISIBLE);
+    CoTaskMemFree(focusChild);
+    succeeded(focusedSelection,"Seed actual private fallback item focus through the original Shell view");
     for (int index : {7, 19})
         succeeded(browser.folderView->SelectItem(index, SVSI_SELECT | SVSI_NOTAKEFOCUS), "Seed actual sparse fallback selection");
+    int seedCount=-1,seedFocus=-1;
+    browser.folderView->ItemCount(SVGIO_SELECTION,&seedCount);
+    browser.folderView->GetFocusedItem(&seedFocus);
+    std::cerr<<"Fallback seed selected="<<seedCount<<" focused="<<seedFocus<<" flags="<<flags<<'\n';
+    waitFor([&] {
+        int selected=-1,focused=-1;
+        return SUCCEEDED(browser.folderView->ItemCount(SVGIO_SELECTION,&selected))&&selected==3&&
+            SUCCEEDED(browser.folderView->GetFocusedItem(&focused))&&focused==2;
+    },"Native fallback seed did not realize its exact selection and item focus");
     const auto seed = identities(browser.folderView.Get(), SVGIO_SELECTION, folder.Get());
     require(seed.size() == 3, "Fallback sparse seed differs");
     IdentitySet complement;
@@ -477,6 +498,26 @@ int main() {
         succeeded(browser.folderView->SetCurrentFolderFlags(FWF_CHECKSELECT, originalFlags & FWF_CHECKSELECT), "Restore owned native checkbox flag");
         invoke(L"Windows.selectall", all, "SelectAllAfterMixed");
         invoke(L"Windows.selectnone", {}, "SelectNoneAfterMixed");
+        const auto fallbackFocus=GetFocus();
+        int fallbackItem=-1,afterFallbackItem=-1;
+        DWORD fallbackFlags=0,afterFallbackFlags=0;
+        succeeded(browser.folderView->GetFocusedItem(&fallbackItem),"Read large fallback focused item");
+        succeeded(browser.folderView->GetCurrentFolderFlags(&fallbackFlags),"Read large fallback view flags");
+        const auto fallbackStarted=milliseconds();
+        succeeded(explorer::changeShellSelection(browser.folderView.Get(),browser.view.Get(),explorer::SelectionAction::All,nullptr,true),
+            "Select every actual large-view member without native facade");
+        const auto fallbackCalled=milliseconds();
+        waitFor([&]{int count=-1;return SUCCEEDED(browser.folderView->ItemCount(SVGIO_SELECTION,&count))&&count==itemCount;},
+            "Large documented selection fallback did not select every member");
+        require(identities(browser.folderView.Get(),SVGIO_SELECTION,folder.Get())==all&&
+            fileIdentities(browser.folderView.Get(),folder.Get())==expectedFileIds,"Large fallback selected incorrect native or file identities");
+        succeeded(browser.folderView->GetFocusedItem(&afterFallbackItem),"Read large fallback item focus");
+        succeeded(browser.folderView->GetCurrentFolderFlags(&afterFallbackFlags),"Read large fallback flags");
+        require(fallbackFocus==GetFocus()&&fallbackItem==afterFallbackItem&&fallbackFlags==afterFallbackFlags,
+            "Large documented selection fallback changed focus or flags");
+        samples.push_back({"DocumentedAllWithoutFacade",fallbackCalled-fallbackStarted,milliseconds()-fallbackCalled,itemCount});
+        succeeded(explorer::changeShellSelection(browser.folderView.Get(),browser.view.Get(),explorer::SelectionAction::None,nullptr,true),
+            "Restore empty large selection after documented All");
         std::array<double, 3> construction{};
         for (auto& elapsed : construction) {
             explorer::NativeNamespaceActions fresh;

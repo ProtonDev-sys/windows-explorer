@@ -891,6 +891,11 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report) {
                     if(!result.passed&&accessibleRibbon)
                         result=accessibleElement(automation.Get(),accessibleRibbon.Get(),nullptr,
                             L"Quick Access Toolbar",UIA_ToolBarControlTypeId);
+                    // Server 2022's native Ribbon exposes this same toolbar
+                    // as "Quick Access"; its type and owned scope still apply.
+                    if(!result.passed&&accessibleRibbon)
+                        result=accessibleElement(automation.Get(),accessibleRibbon.Get(),nullptr,
+                            L"Quick Access",UIA_ToolBarControlTypeId);
                     return result;
                 };
                 const auto qatDeadline = GetTickCount64()+2000;

@@ -18,7 +18,7 @@ and performance runs copy the executable into a unique directory and verify its
 checksum before use. Reports describe the tested snapshot; a previous passing
 run is not evidence for later source changes.
 
-The latest functional Release checkpoint has SHA-256
+An earlier functional Release checkpoint has SHA-256
 `f01bc69d57541f86c432ff1055936b1331d801000852165524a22975f2b8a6ea`.
 Its 2026-10-04 full seventeen-target run took 206.33 seconds: thirteen active
 targets passed, one failed, and three shared-state targets were correctly
@@ -76,6 +76,27 @@ Subsequent diagnostics report toolbar names only inside the exact owned Ribbon
 when its required QAT accessibility assertion fails. They do not relax that
 assertion. Native view-state persistence remains skipped locally and unverified
 until the new disposable-runner execution.
+
+The [new disposable run at `8191269`](https://github.com/ProtonDev-sys/windows-explorer/actions/runs/37245948002)
+passed eleven of fourteen targets. Core operations passed, and the app's
+reentrant-selection check now observed one exact item with real Copy eligibility.
+Three targets still failed: documented bulk selection fallback, QAT name lookup,
+and native view-persistence membership. The actual owned Ribbon exposed the QAT
+as `Quick Access` on Server 2022, rather than Windows 10's `Quick Access Toolbar`.
+Both observed native names are now accepted within that Ribbon and with the
+required toolbar type; its Properties and New folder controls remain required.
+The selection fallback now tries preflighted, revalidated native view indices
+only when a successful bulk PIDL operation has not applied the requested count.
+Its large fixture now also proves all 10,000 exact identities without a native
+command facade. The persistence fixture reads each actual child PIDL from the
+view and binds it through that view's native parent folder. These subsequent
+changes passed focused local application checks (29.43/31.70 seconds). The
+expanded selection regression initially failed its small fixture's focus setup:
+three items were selected, but the focused item was -1. Painting the exact owned
+private viewport and establishing focus through the original Shell view produced
+the required item focus of 2. The complete selection suite then passed in 17.03
+seconds, including all 10,000 exact identities without a native facade. The
+assertions and deadlines remain intact. Disposable-runner results are pending.
 
 ## Test boundaries
 

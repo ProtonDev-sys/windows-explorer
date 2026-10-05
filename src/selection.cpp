@@ -143,9 +143,11 @@ HRESULT changeShellSelection(IFolderView2* folderView, IShellView* shellView,
         // selection-change notification for every individual item.
         std::vector<ChildPidl> owned;
         std::vector<PCUITEMID_CHILD> children;
+        std::vector<int> indices;
         const auto targetCount = static_cast<size_t>(total - selectedCount);
         owned.reserve(targetCount);
         children.reserve(targetCount);
+        indices.reserve(targetCount);
         for (int index = 0; index < total; ++index) {
             if (!selected.empty() && selected[static_cast<size_t>(index)]) continue;
             PITEMID_CHILD raw = nullptr;
@@ -154,6 +156,7 @@ HRESULT changeShellSelection(IFolderView2* folderView, IShellView* shellView,
             if (FAILED(hr)) return hr;
             if (!child || ILIsEmpty(child.get())) return E_UNEXPECTED;
             children.push_back(reinterpret_cast<PCUITEMID_CHILD>(child.get()));
+            indices.push_back(index);
             owned.push_back(std::move(child));
         }
         int currentTotal = 0, currentSelected = 0;
@@ -172,7 +175,25 @@ HRESULT changeShellSelection(IFolderView2* folderView, IShellView* shellView,
         if (SUCCEEDED(hr))
             hr = folderView->SelectAndPositionItems(static_cast<UINT>(children.size()), children.data(), nullptr,
                 SVSI_SELECT | SVSI_NOTAKEFOCUS);
-        return redraw.finish(hr);
+        hr=redraw.finish(hr);
+        if(FAILED(hr))return hr;
+        int applied=0;
+        hr=folderView->ItemCount(SVGIO_SELECTION,&applied);
+        if(FAILED(hr))return hr;
+        if(applied==static_cast<int>(indices.size()))return S_OK;
+        // Some view implementations acknowledge PIDL selection without
+        // applying it. Use the original view's documented numeric indices,
+        // already preflighted above, rather than repeating PIDL lookup.
+        for(size_t offset=0;offset<indices.size();++offset) {
+            PITEMID_CHILD raw=nullptr;
+            hr=folderView->Item(indices[offset],&raw);
+            ChildPidl current(raw);
+            if(FAILED(hr))return hr;
+            if(!current||!ILIsEqual(current.get(),owned[offset].get()))return HRESULT_FROM_WIN32(ERROR_RETRY);
+            hr=folderView->SelectItem(indices[offset],SVSI_SELECT|SVSI_NOTAKEFOCUS);
+            if(FAILED(hr))return hr;
+        }
+        return hr;
     } catch (const std::bad_alloc&) {
         return E_OUTOFMEMORY;
     } catch (...) {

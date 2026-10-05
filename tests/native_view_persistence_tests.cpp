@@ -373,10 +373,13 @@ public:
             VisibilityObserver::allowOwnedPresentation(window_);
             ShowWindow(window_,SW_SHOWNOACTIVATE);SetActiveWindow(window_);UpdateWindow(window_);
             require(GetActiveWindow()==window_,"Realize the actual owned persistence view without desktop input");
+            succeeded(view_->UIActivate(SVUIA_ACTIVATE_NOFOCUS),"Activate only the owned native persistence view without focus");
             waitFor([&] {
-                ComPtr<IShellItemArray> readyMembers;DWORD readyCount=0;
-                return SUCCEEDED(folderView_->Items(SVGIO_ALLVIEW,IID_PPV_ARGS(&readyMembers)))&&
-                    SUCCEEDED(readyMembers->GetCount(&readyCount))&&readyCount==memberCount;
+                int readyCount=0;PITEMID_CHILD first=nullptr;
+                const auto countRead=folderView_->ItemCount(SVGIO_ALLVIEW,&readyCount);
+                const auto firstRead=SUCCEEDED(countRead)&&readyCount==memberCount?folderView_->Item(0,&first):E_PENDING;
+                const bool ready=SUCCEEDED(firstRead)&&first&&!ILIsEmpty(first);
+                CoTaskMemFree(first);return ready;
             },"Native persistence view membership did not materialize");
             bool visibleInput=true;
             succeeded(privateDesktop->visibleWindowsOnInputDesktop(visibleInput),"Check input visibility during owned private rendering");
@@ -391,14 +394,20 @@ public:
         require(nativeWindow && IsChild(window_, nativeWindow) && process == GetCurrentProcessId() &&
                 thread == GetCurrentThreadId() && !IsWindowVisible(window_) && !IsWindowVisible(nativeWindow),
                 "Native view must remain an owned invisible private-desktop child");
-        ComPtr<IShellItemArray> members;
-        succeeded(folderView_->Items(SVGIO_ALLVIEW,IID_PPV_ARGS(&members)),"Read actual native owned view membership");
-        DWORD actualMembers=0;
-        succeeded(members->GetCount(&actualMembers),"Read native owned membership count");
+        ComPtr<IShellFolder> nativeFolder;
+        succeeded(folderView_->GetFolder(IID_PPV_ARGS(&nativeFolder)),"Read actual view's native folder binding");
+        int actualMembers=0;
+        succeeded(folderView_->ItemCount(SVGIO_ALLVIEW,&actualMembers),"Read native owned membership count");
         require(actualMembers==memberCount,"Native persistence membership differs from its owned fixture");
-        for (unsigned index = 0; index < actualMembers; ++index) {
+        for (int index = 0; index < actualMembers; ++index) {
             ComPtr<IShellItem> item, parent;
-            succeeded(members->GetItemAt(index,&item), "Read native owned view member");
+            PITEMID_CHILD child=nullptr;
+            const auto childRead=folderView_->Item(index,&child);
+            const auto itemRead=SUCCEEDED(childRead)&&child&&!ILIsEmpty(child)?
+                SHCreateItemWithParent(nullptr,nativeFolder.Get(),child,IID_PPV_ARGS(&item)):E_UNEXPECTED;
+            CoTaskMemFree(child);
+            succeeded(childRead,"Read actual native view member PIDL");
+            succeeded(itemRead,"Bind actual native view member with its original parent");
             succeeded(item->GetParent(&parent), "Read native member parent before inspecting file identity");
             int comparison = 1;
             succeeded(parent->Compare(folder, SICHINT_CANONICAL, &comparison), "Compare native owned folder identity");
