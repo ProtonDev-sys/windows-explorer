@@ -118,6 +118,20 @@ independent identity readback remained separate. The subsequent app suites also
 passed in 30.55/33.60 seconds before the canonical-location helper changed.
 These focused results do not constitute an all-green full local or hosted run.
 
+At `aecc063`, the 2026-10-05 complete local suite passed all fourteen active
+targets and correctly skipped the three shared-state targets (206.13 seconds).
+Its executable SHA-256 is
+`72627afa9b464166d52e2b59aeb36e6d67b06dce48c84338012416f4b77b247a`.
+The [hosted run](https://github.com/ProtonDev-sys/windows-explorer/actions/runs/37248318031)
+passed all fourteen configured functional targets with no skips in 132 seconds,
+including actual Undo/Redo (1.71 seconds), search options (2.38 seconds) and
+per-folder restoration (1.03 seconds). Its native capture step also passed.
+The overall workflow still failed its navigation benchmark: Edit, Print, Remove
+Properties and Run as another user remained pending after Select All within the
+unchanged 45-second readiness bound. Capture-only success does not establish
+Windows 10 reference-image matching. The strict visual failures remain recorded
+in the visual report, and the benchmark failure remains unresolved.
+
 ## Test boundaries
 
 | CTest target | What it verifies |
