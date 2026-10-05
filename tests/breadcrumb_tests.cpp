@@ -142,7 +142,7 @@ void foldersHiddenUnicodeAndSelection() {
     auto first = item(fixture.first),empty = item(fixture.empty);
     require(explorer::enumerateBreadcrumbChildren(first.Get(),nullptr,{},&snapshot) == S_OK && snapshot.children.size() == 1,
             "Nested breadcrumb enumeration was not lazy/direct-child only");
-    require(filePath(snapshot.children.front().item.Get()) == fixture.nested.wstring(),"Nested breadcrumb destination is incorrect");
+    require(fs::equivalent(filePath(snapshot.children.front().item.Get()),fixture.nested),"Nested breadcrumb destination has the wrong filesystem identity");
     require(explorer::enumerateBreadcrumbChildren(empty.Get(),nullptr,{},&snapshot) == S_OK && snapshot.children.empty() && snapshot.complete,
             "Empty native folder did not produce a complete empty breadcrumb snapshot");
     std::ifstream input(fixture.text,std::ios::binary);

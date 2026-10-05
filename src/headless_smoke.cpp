@@ -713,6 +713,8 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report) {
             updateFrameTitle();
             {
                 unsigned probeCalls = 0;
+                PrivatePresentation selectionPresentation(window_,true);
+                check("native_command_reentry_presentation_isolated",selectionPresentation.ready);
                 HRESULT nestedStateRead = E_PENDING;
                 const auto deferredBefore = headlessDeferredCommandUpdates();
                 PITEMID_CHILD selectedChild = nullptr;
@@ -899,6 +901,25 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report) {
                     ++qatObservations;
                 }
                 qatResult.detail+=L"; observations="+std::to_wstring(qatObservations);
+                if(!qatResult.passed&&automation&&accessibleRibbon) {
+                    // Diagnose only toolbar providers inside this owned native
+                    // Ribbon. Keep the required QAT name/type assertion intact.
+                    VARIANT toolbarType{};toolbarType.vt=VT_I4;toolbarType.lVal=UIA_ToolBarControlTypeId;
+                    ComPtr<IUIAutomationCondition> toolbarCondition;
+                    ComPtr<IUIAutomationElementArray> toolbars;
+                    auto toolbarRead=automation->CreatePropertyCondition(UIA_ControlTypePropertyId,toolbarType,&toolbarCondition);
+                    if(SUCCEEDED(toolbarRead))toolbarRead=accessibleRibbon->FindAll(TreeScope_Descendants,toolbarCondition.Get(),&toolbars);
+                    int toolbarCount=0;
+                    if(SUCCEEDED(toolbarRead)&&toolbars)toolbarRead=toolbars->get_Length(&toolbarCount);
+                    qatResult.detail+=L"; native Ribbon toolbars="+std::to_wstring(toolbarCount)+L"/"+hresultMessage(toolbarRead);
+                    for(int index=0;SUCCEEDED(toolbarRead)&&index<toolbarCount&&index<16;++index) {
+                        ComPtr<IUIAutomationElement> toolbar;BSTR toolbarName=nullptr;
+                        toolbarRead=toolbars->GetElement(index,&toolbar);
+                        if(SUCCEEDED(toolbarRead))toolbarRead=toolbar->get_CurrentName(&toolbarName);
+                        if(SUCCEEDED(toolbarRead))qatResult.detail+=L"; toolbar name="+std::wstring(toolbarName?toolbarName:L"");
+                        SysFreeString(toolbarName);
+                    }
+                }
                 accessibleCheckResult("native_accessibility_quick_access",qatResult.passed,qatResult.detail);
                 auto accessibleQat=qatResult.element;
                 accessibleCheck("native_accessibility_qat_properties", accessibleQat.Get(), nullptr, L"Properties", UIA_ButtonControlTypeId);

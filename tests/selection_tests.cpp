@@ -139,6 +139,7 @@ public:
 };
 struct Browser {
     HWND owner = nullptr;
+    HWND previousActive = nullptr;
     ComPtr<IExplorerBrowser> browser;
     ComPtr<IShellView> view;
     ComPtr<IFolderView2> folderView;
@@ -168,12 +169,16 @@ struct Browser {
         succeeded(browser->GetCurrentView(IID_PPV_ARGS(&view)), "Read exact native selection view");
         succeeded(view.As(&folderView), "Read actual native folder view");
         ShowWindow(owner, SW_SHOWNOACTIVATE);
+        previousActive=GetActiveWindow();
+        SetActiveWindow(owner);
+        require(GetActiveWindow()==owner,"Activate the exact owned private selection frame");
         UpdateWindow(owner);
         succeeded(view->UIActivate(SVUIA_ACTIVATE_NOFOCUS), "Activate only the owned private Shell view without focus");
         waitFor([&] { int count = -1; return SUCCEEDED(folderView->ItemCount(SVGIO_ALLVIEW, &count)) && count == static_cast<int>(expected); },
                 "Native view did not enumerate all ten thousand owned members");
     }
     ~Browser() {
+        if(owner&&GetActiveWindow()==owner)SetActiveWindow(previousActive);
         folderView.Reset(); view.Reset();
         if (browser) { if (cookie) browser->Unadvise(cookie); browser->Destroy(); browser.Reset(); }
         events.Reset();

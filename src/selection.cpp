@@ -172,20 +172,7 @@ HRESULT changeShellSelection(IFolderView2* folderView, IShellView* shellView,
         if (SUCCEEDED(hr))
             hr = folderView->SelectAndPositionItems(static_cast<UINT>(children.size()), children.data(), nullptr,
                 SVSI_SELECT | SVSI_NOTAKEFOCUS);
-        hr = redraw.finish(hr);
-        if (FAILED(hr)) return hr;
-        int after = -1;
-        hr = folderView->ItemCount(SVGIO_SELECTION,&after);
-        if (FAILED(hr)) return hr;
-        if (after == static_cast<int>(children.size())) return S_OK;
-        // Some ItemsView revisions acknowledge the bulk call without changing
-        // selection. Keep the preflighted complement and use the original
-        // Shell view's PIDL operation, preserving item/window focus.
-        for (const auto child : children) {
-            hr = shellView->SelectItem(child,SVSI_SELECT | SVSI_NOTAKEFOCUS);
-            if (FAILED(hr)) return hr;
-        }
-        return hr;
+        return redraw.finish(hr);
     } catch (const std::bad_alloc&) {
         return E_OUTOFMEMORY;
     } catch (...) {

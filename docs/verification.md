@@ -58,10 +58,24 @@ At public checkpoint `1d91605`, [the Windows Server 2022 CI run](https://github.
 built successfully and passed ten of fourteen targets. Breadcrumb path spelling,
 the documented selection fallback, app selection/QAT accessibility, and hidden
 folder-view persistence failed. Actual Undo/Redo and native search options passed.
-The next changes retain exact filesystem identity rather than path spelling,
-read actual whole-view member arrays, repair an acknowledged-but-unapplied bulk
-selection using the original preflighted PIDLs, and activate only the private
-owned frame for accessibility. They need their own disposable-runner evidence.
+The following [CI run at `e344c76`](https://github.com/ProtonDev-sys/windows-explorer/actions/runs/37244491657)
+again passed ten targets and failed the same four. A second breadcrumb assertion
+still compared path spelling; per-item selection repair did not fix the fallback;
+app selection and QAT accessibility still failed; whole-view item enumeration
+returned `E_INVALIDARG` in the hidden persistence fixture. The ineffective
+per-item repair is removed. The second breadcrumb now compares filesystem
+identity. Revised selection and persistence fixtures explicitly realize only
+their owned private frame, and the app reentry check uses the same guarded
+presentation phase. These changes require new disposable-runner evidence.
+
+The revised private-presentation fixtures passed their focused local run on
+2026-10-05: native selection in 11.93 seconds, the authored app in 31.33 seconds,
+and the installed app in 32.95 seconds (76.25 seconds total). The app adds an
+explicit isolation assertion around the reentrant-selection presentation.
+Subsequent diagnostics report toolbar names only inside the exact owned Ribbon
+when its required QAT accessibility assertion fails. They do not relax that
+assertion. Native view-state persistence remains skipped locally and unverified
+until the new disposable-runner execution.
 
 ## Test boundaries
 

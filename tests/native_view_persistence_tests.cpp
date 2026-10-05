@@ -101,6 +101,9 @@ public:
         current_.store(nullptr);
     }
     bool visible() const { return visible_.load(); }
+    static void allowOwnedPresentation(HWND window) {
+        if(auto observer=current_.load())observer->presentation_.store(window);
+    }
 private:
     static void CALLBACK shown(HWINEVENTHOOK, DWORD, HWND window, LONG object,
                                LONG child, DWORD, DWORD) {
@@ -112,12 +115,14 @@ private:
         if (!window || !IsWindowVisible(window) || GetAncestor(window, GA_ROOT) != window) return;
         DWORD process = 0;
         GetWindowThreadProcessId(window, &process);
+        if(process==GetCurrentProcessId()&&window==presentation_.load())return;
         if (process == GetCurrentProcessId() || !baseline_.contains(window)) visible_.store(true);
     }
     inline static std::atomic<VisibilityObserver*> current_{nullptr};
     HWINEVENTHOOK privateHook_ = nullptr;
     std::unordered_set<HWND> baseline_;
     std::atomic_bool visible_ = false;
+    std::atomic<HWND> presentation_{nullptr};
     std::atomic_bool stop_ = false;
     std::thread worker_;
 };
@@ -355,6 +360,28 @@ public:
         succeeded(browser_->GetCurrentView(IID_PPV_ARGS(&view_)), "Obtain actual native current Shell view");
         succeeded(view_.As(&folderView_), "Obtain actual native IFolderView2");
         succeeded(view_.As(&columns_), "Obtain actual native IColumnManager");
+        const auto privateDesktop=explorer::PrivateDesktop::current();
+        require(privateDesktop&&SUCCEEDED(privateDesktop->verifyIsolation()),"Realize view only on its guarded private desktop");
+        DWORD ownerProcess=0;
+        require(GetWindowThreadProcessId(window_,&ownerProcess)==GetCurrentThreadId()&&ownerProcess==GetCurrentProcessId(),
+            "Realize only the exact owned native persistence frame");
+        {
+            struct Presentation {
+                HWND frame,previous;
+                ~Presentation(){ShowWindow(frame,SW_HIDE);SetActiveWindow(previous);VisibilityObserver::allowOwnedPresentation(nullptr);}
+            } presentation{window_,GetActiveWindow()};
+            VisibilityObserver::allowOwnedPresentation(window_);
+            ShowWindow(window_,SW_SHOWNOACTIVATE);SetActiveWindow(window_);UpdateWindow(window_);
+            require(GetActiveWindow()==window_,"Realize the actual owned persistence view without desktop input");
+            waitFor([&] {
+                ComPtr<IShellItemArray> readyMembers;DWORD readyCount=0;
+                return SUCCEEDED(folderView_->Items(SVGIO_ALLVIEW,IID_PPV_ARGS(&readyMembers)))&&
+                    SUCCEEDED(readyMembers->GetCount(&readyCount))&&readyCount==memberCount;
+            },"Native persistence view membership did not materialize");
+            bool visibleInput=true;
+            succeeded(privateDesktop->visibleWindowsOnInputDesktop(visibleInput),"Check input visibility during owned private rendering");
+            require(!visibleInput&&SUCCEEDED(privateDesktop->verifyIsolation()),"Owned persistence rendering exposed input-desktop UI");
+        }
         waitFor([&] { int count = -1; return SUCCEEDED(folderView_->ItemCount(SVGIO_ALLVIEW, &count)) && count == memberCount; },
                 "Native owned folder view did not finish enumeration");
         HWND nativeWindow = nullptr;
