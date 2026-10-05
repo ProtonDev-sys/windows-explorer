@@ -19,6 +19,9 @@
 #include <uiautomation.h>
 #include <future>
 #include <chrono>
+#include <cstring>
+#include <shlobj.h>
+#include <shlwapi.h>
 
 #pragma comment(linker, "/manifestdependency:\"type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
@@ -28,6 +31,183 @@ void succeeded(HRESULT result,const char* message){if(FAILED(result))throw std::
 void pump(){const auto end=GetTickCount64()+150;do{MSG message{};while(PeekMessageW(&message,nullptr,0,0,PM_REMOVE)){TranslateMessage(&message);DispatchMessageW(&message);}MsgWaitForMultipleObjectsEx(0,nullptr,5,QS_ALLINPUT,MWMO_INPUTAVAILABLE);}while(GetTickCount64()<end);}
 struct Window{HWND handle=nullptr;~Window(){if(handle)DestroyWindow(handle);}};
 struct Variant{PROPVARIANT value{};~Variant(){PropVariantClear(&value);}};
+struct Icon {
+    HICON handle=nullptr;
+    ~Icon(){if(handle)DestroyIcon(handle);}
+};
+struct IconRaster {
+    HBITMAP bitmap=nullptr;
+    HDC dc=nullptr;
+    HGDIOBJ previous=nullptr;
+    ~IconRaster(){
+        if(dc){if(previous&&previous!=HGDI_ERROR)SelectObject(dc,previous);DeleteDC(dc);}
+        if(bitmap)DeleteObject(bitmap);
+    }
+};
+std::vector<BYTE> bitmapPixels(HBITMAP bitmap,UINT pixels) {
+    require(GdiFlush()!=FALSE,"Flush native icon raster before reading pixels");
+    DIBSECTION section{};
+    require(bitmap&&GetObjectW(bitmap,sizeof(section),&section)==sizeof(section),"Read actual native icon DIB section");
+    const auto& actual=section.dsBm;
+    require(actual.bmWidth==static_cast<LONG>(pixels)&&actual.bmHeight==static_cast<LONG>(pixels)&&actual.bmBitsPixel==32&&actual.bmPlanes==1&&
+        actual.bmWidthBytes==static_cast<LONG>(pixels*4)&&actual.bmBits&&section.dsBmih.biBitCount==32&&
+        section.dsBmih.biCompression==BI_RGB&&section.dsBmih.biPlanes==1&&
+        (section.dsBmih.biHeight==static_cast<LONG>(pixels)||section.dsBmih.biHeight==-static_cast<LONG>(pixels)),
+        "Native icon DIB dimensions, stride, orientation, or format changed");
+    BITMAPINFO info{};info.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);info.bmiHeader.biWidth=static_cast<LONG>(pixels);
+    info.bmiHeader.biHeight=-static_cast<LONG>(pixels);info.bmiHeader.biPlanes=1;info.bmiHeader.biBitCount=32;
+    info.bmiHeader.biCompression=BI_RGB;
+    IconRaster readback;readback.dc=CreateCompatibleDC(nullptr);
+    require(readback.dc!=nullptr,"Create native icon readback DC");
+    std::vector<BYTE> bytes(static_cast<size_t>(pixels)*pixels*4);
+    require(GetDIBits(readback.dc,bitmap,0,pixels,bytes.data(),&info,DIB_RGB_COLORS)==static_cast<int>(pixels),
+        "Read every native icon bitmap scanline");
+    const auto* stored=static_cast<const BYTE*>(actual.bmBits);
+    std::vector<BYTE> raw(bytes.size());
+    // Both the production ownership-transferred bitmap and this independent
+    // raster are created with negative height. GetObject reports positive
+    // height on the observed native implementation, so do not infer storage
+    // orientation from that returned sign. Require its actual raw RGB rows to
+    // equal the independently requested top-down GetDIBits rows before using
+    // all four stored bytes, including alpha, for the exact comparison.
+    std::memcpy(raw.data(),stored,raw.size());
+    for(size_t pixel=0;pixel<raw.size();pixel+=4)
+        require(std::memcmp(bytes.data()+pixel,raw.data()+pixel,3)==0,"Native top-down GetDIBits RGB readback differs from stored pixels");
+    return raw;
+}
+std::vector<BYTE> iconPixels(HICON icon,UINT pixels) {
+    BITMAPINFO info{};info.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);info.bmiHeader.biWidth=static_cast<LONG>(pixels);
+    info.bmiHeader.biHeight=-static_cast<LONG>(pixels);info.bmiHeader.biPlanes=1;info.bmiHeader.biBitCount=32;
+    info.bmiHeader.biCompression=BI_RGB;
+    IconRaster raster;void* bits=nullptr;
+    raster.bitmap=CreateDIBSection(nullptr,&info,DIB_RGB_COLORS,&bits,nullptr,0);
+    require(raster.bitmap&&bits,"Create independent native icon raster");
+    raster.dc=CreateCompatibleDC(nullptr);require(raster.dc!=nullptr,"Create independent native icon drawing DC");
+    raster.previous=SelectObject(raster.dc,raster.bitmap);
+    require(raster.previous&&raster.previous!=HGDI_ERROR,"Select independent native icon raster");
+    std::memset(bits,0,static_cast<size_t>(pixels)*pixels*4);
+    require(DrawIconEx(raster.dc,0,0,icon,static_cast<int>(pixels),static_cast<int>(pixels),0,nullptr,DI_NORMAL)!=FALSE,
+        "Draw independently extracted native icon");
+    const auto restored=SelectObject(raster.dc,raster.previous);
+    require(restored&&restored!=HGDI_ERROR,"Deselect independent native icon raster before reading pixels");
+    raster.previous=nullptr;
+    return bitmapPixels(raster.bitmap,pixels);
+}
+std::vector<BYTE> singleIconPixels(const std::wstring& path,int resource,UINT pixels) {
+    Icon icon;
+    succeeded(SHDefExtractIconW(path.c_str(),resource,0,&icon.handle,nullptr,MAKELONG(pixels,0)),
+        "Independent original single-size native icon extraction");
+    require(icon.handle!=nullptr,"Original single-size native icon is missing");
+    return iconPixels(icon.handle,pixels);
+}
+std::vector<BYTE> ribbonImagePixels(IUIImage* image,UINT pixels) {
+    require(image!=nullptr,"Actual Ribbon cached native image is missing");
+    HBITMAP bitmap=nullptr;succeeded(image->GetBitmap(&bitmap),"Get actual Ribbon cached bitmap");
+    return bitmapPixels(bitmap,pixels);
+}
+void nativeIconCacheEquivalence(explorer::NativeRibbon& ribbon,HWND window) {
+    // All extraction and image/cache calls stay on the fixture's creator STA.
+    const auto* desktop=explorer::PrivateDesktop::current();
+    require(desktop!=nullptr,"Native icon comparison lacks its private desktop");
+    succeeded(desktop->verifyIsolation(),"Native icon comparison isolation");
+    require(GetWindowThreadProcessId(window,nullptr)==GetCurrentThreadId(),"Native icon comparison left its creator thread");
+    std::array<wchar_t,32768> system{};
+    const auto characters=GetSystemDirectoryW(system.data(),static_cast<UINT>(system.size()));
+    require(characters&&characters<system.size(),"Resolve real system icon modules");
+    struct Source {const wchar_t* module;int resource;};
+    // The original measured 23 startup specifications, independent of the
+    // candidate's caches and extraction/conversion implementation.
+    constexpr std::array<Source,23> sources{{
+        {L"imageres.dll",-5315},{L"imageres.dll",-5311},{L"shell32.dll",-240},{L"imageres.dll",-5367},
+        {L"shell32.dll",-319},{L"shell32.dll",-242},{L"imageres.dll",-5100},{L"shell32.dll",-243},
+        {L"shell32.dll",-16763},{L"shell32.dll",-16762},{L"imageres.dll",-5302},{L"imageres.dll",-5301},
+        {L"imageres.dll",-5303},{L"imageres.dll",-5304},{L"imageres.dll",-5307},{L"imageres.dll",-5340},
+        {L"imageres.dll",-5306},{L"imageres.dll",-5353},{L"imageres.dll",-5308},{L"imageres.dll",-5309},
+        {L"imageres.dll",-5310},{L"imageres.dll",-8208},{L"imageres.dll",-99}
+    }};
+    const UINT dpi=GetDpiForWindow(window);require(dpi!=0,"Read real Ribbon HWND DPI");
+    const UINT largePixels=static_cast<UINT>(MulDiv(32,static_cast<int>(dpi),96));
+    const UINT smallPixels=static_cast<UINT>(MulDiv(16,static_cast<int>(dpi),96));
+    size_t publicBytes=0,requestedPairBytes=0;
+    for(const auto& source:sources) {
+        const auto path=(std::filesystem::path(system.data())/source.module).wstring();
+        const auto largeReference=singleIconPixels(path,source.resource,largePixels);
+        const auto smallReference=singleIconPixels(path,source.resource,smallPixels);
+        for(const bool largeFirst:{true,false}) {
+            // Dot-qualified absolute spellings make test keys independent of
+            // startup specifications. Each order uses a distinct cold key.
+            const auto qualified=(std::filesystem::path(system.data())/(largeFirst?L".":L".\\.")/source.module).wstring();
+            const auto specification=L"\""+qualified+L"\","+std::to_wstring(source.resource);
+            std::array<Microsoft::WRL::ComPtr<IUIImage>,2> images;
+            for(const bool large:{largeFirst,!largeFirst}) {
+                const size_t index=large?0:1;
+                succeeded(ribbon.itemImage(specification,large,&images[index]),"Actual cold-order Ribbon item image");
+                const auto bytes=ribbonImagePixels(images[index].Get(),large?largePixels:smallPixels);
+                require(bytes==(large?largeReference:smallReference),"Actual combined/cache image differs from original single-size pixels");
+                publicBytes+=bytes.size();
+            }
+            for(int repeat=0;repeat<2;++repeat)for(const bool large:{true,false}) {
+                Microsoft::WRL::ComPtr<IUIImage> cached;
+                succeeded(ribbon.itemImage(specification,large,&cached),"Actual Ribbon item cache hit");
+                require(cached.Get()==images[large?0:1].Get(),"Actual Ribbon item cache replaced an existing native image");
+                const auto bytes=ribbonImagePixels(cached.Get(),large?largePixels:smallPixels);
+                require(bytes==(large?largeReference:smallReference),"Repeated Ribbon cache hit changed a native pixel");
+                publicBytes+=bytes.size();
+            }
+        }
+        // These real native comparisons cover 125%, 150%, and 200% sizes
+        // independently. Public-cache coverage above reports actual HWND DPI;
+        // this fixture does not alter monitor or global DPI configuration.
+        for(const auto sizes:std::array{std::pair{40U,20U},std::pair{48U,24U},std::pair{64U,32U}}) {
+            Icon largeIcon,smallIcon;
+            succeeded(SHDefExtractIconW(path.c_str(),source.resource,0,&largeIcon.handle,&smallIcon.handle,MAKELONG(sizes.first,sizes.second)),
+                "Independent requested-pair native extraction");
+            require(largeIcon.handle&&smallIcon.handle,"Requested native pair is incomplete");
+            const auto largeBytes=iconPixels(largeIcon.handle,sizes.first),smallBytes=iconPixels(smallIcon.handle,sizes.second);
+            require(largeBytes==singleIconPixels(path,source.resource,sizes.first)&&
+                smallBytes==singleIconPixels(path,source.resource,sizes.second),"Requested native size pair changed original raster bytes");
+            requestedPairBytes+=largeBytes.size()+smallBytes.size();
+        }
+    }
+    explorer::NamespaceCommandMetadata copy;
+    succeeded(explorer::namespaceCommandMetadata(explorer::ribbonCommandStoreName(explorer::Copy),&copy),
+        "Independent native Copy icon metadata");
+    require(!copy.icon.empty(),"Native Copy metadata has no icon");
+    auto copyLocation=copy.icon;const int copyResource=PathParseIconLocationW(copyLocation.data());
+    copyLocation.resize(wcslen(copyLocation.c_str()));
+    std::array<wchar_t,32768> expandedCopy{};
+    const auto copyCharacters=ExpandEnvironmentStringsW(copyLocation.c_str(),expandedCopy.data(),static_cast<DWORD>(expandedCopy.size()));
+    require(copyCharacters&&copyCharacters<=expandedCopy.size(),"Expand independent native Copy icon location");
+    for(const bool large:{true,false}) {
+        Microsoft::WRL::ComPtr<IUIImage> command,item,repeated;
+        succeeded(ribbon.commandImage(explorer::Copy,large,&command),"Actual public Copy command image");
+        succeeded(ribbon.itemImage(copy.icon,large,&item),"Actual Copy metadata item image");
+        succeeded(ribbon.commandImage(explorer::Copy,large,&repeated),"Actual public Copy command cache hit");
+        require(command.Get()==item.Get()&&command.Get()==repeated.Get(),"Native command and item image paths use different caches");
+        require(ribbonImagePixels(command.Get(),large?largePixels:smallPixels)==
+            singleIconPixels(expandedCopy.data(),copyResource,large?largePixels:smallPixels),"Native Copy cache differs from original single-size raster");
+    }
+    const auto missing=(std::filesystem::temp_directory_path()/
+        (L"WindowsExplorer-MissingIcon-"+std::to_wstring(GetCurrentProcessId())+L"-"+std::to_wstring(GetTickCount64()))/L"absent.dll").wstring();
+    require(GetFileAttributesW(missing.c_str())==INVALID_FILE_ATTRIBUTES,"Missing native icon fixture already exists");
+    const auto missingError=GetLastError();
+    require(missingError==ERROR_FILE_NOT_FOUND||missingError==ERROR_PATH_NOT_FOUND,"Missing native icon fixture failed for a different reason");
+    const std::array failures{std::pair{(std::filesystem::path(system.data())/L"shell32.dll").wstring(),-65535},std::pair{missing,-1}};
+    for(const auto& [path,resource]:failures)for(const bool large:{true,false}) {
+        Icon reference;const auto status=SHDefExtractIconW(path.c_str(),resource,0,&reference.handle,nullptr,MAKELONG(large?largePixels:smallPixels,0));
+        require(FAILED(status)||!reference.handle,"Missing native resource/file unexpectedly yielded an icon");
+        const auto expected=FAILED(status)?status:E_FAIL;
+        const auto specification=L"\""+path+L"\","+std::to_wstring(resource);
+        for(int repeat=0;repeat<2;++repeat) {
+            Microsoft::WRL::ComPtr<IUIImage> image;
+            require(ribbon.itemImage(specification,large,&image)==expected&&!image,
+                "Actual missing icon/file changed original single-size HRESULT or output");
+        }
+    }
+    std::cout<<"PASS: 23 native icon public caches at HWND DPI="<<dpi<<" ("<<largePixels<<'/'<<smallPixels
+        <<"), both cold request orders and repeated hits; "<<publicBytes<<" exact public bytes; independent 40/20, 48/24, 64/32 pairs "
+        <<requestedPairBytes<<" exact bytes; missing resource/file HRESULTs\n";
+}
 class LabelReferenceHandler final : public IUIApplication, public IUICommandHandler {
 public:
     std::map<UINT,std::wstring> labels,tooltips;
@@ -717,6 +897,12 @@ int main(int argc,char** argv){
     if(FAILED(desktop.initialize()))return 2;
     const auto initialized=OleInitialize(nullptr);if(FAILED(initialized))return 3;
     int result=0;
+    bool stock=false,iconOnly=false;
+    for(int index=1;index<argc;++index) {
+        const std::string_view argument(argv[index]);
+        if(argument=="--installed")stock=true;
+        if(argument=="--icon-cache-only")iconOnly=true;
+    }
     try{
         bool isolated=false;succeeded(desktop.verifyIsolation(&isolated),"Isolation readback");require(isolated,"Input desktop changed");
         INITCOMMONCONTROLSEX controls{sizeof(controls),ICC_STANDARD_CLASSES|ICC_WIN95_CLASSES};require(InitCommonControlsEx(&controls)!=FALSE,"Common controls");
@@ -783,7 +969,6 @@ int main(int argc,char** argv){
             return items;
         };
         callbacks.heightChanged=[&](UINT){++heightEvents;};
-        const bool stock=argc>1&&std::string_view(argv[1])=="--installed";
         succeeded(ribbon.initialize(window.handle,GetModuleHandleW(nullptr),std::move(callbacks),stock?explorer::RibbonLayout::InstalledWindows10:explorer::RibbonLayout::Authored),"Native framework initialization");
         if(stock&&ribbon.layout()!=explorer::RibbonLayout::InstalledWindows10) {
             std::cout<<"SKIP: installed Windows 10 build19045 layout is unavailable, HRESULT="<<static_cast<ULONG>(ribbon.installedLayoutStatus())<<'\n';
@@ -791,6 +976,12 @@ int main(int argc,char** argv){
         }
         require(ribbon.valid()&&ribbon.height()>20&&heightEvents>0,"Native Ribbon view/height callback");
         require(!IsWindowVisible(window.handle),"Host was shown");
+        nativeIconCacheEquivalence(ribbon,window.handle);
+        if(iconOnly) {
+            bool visibleInput=true;succeeded(desktop.visibleWindowsOnInputDesktop(visibleInput),"Icon-only input desktop window guard");
+            require(!visibleInput,"Native icon comparison created a visible input desktop window");
+            ribbon.reset();DestroyWindow(window.handle);window.handle=nullptr;OleUninitialize();return 0;
+        }
         // Render solely on the non-input private desktop. This cannot surface
         // a window on the user's desktop and supplies normal native paint/layout.
         ShowWindow(window.handle,SW_SHOWNOACTIVATE);UpdateWindow(window.handle);pump();

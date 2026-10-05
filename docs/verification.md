@@ -109,12 +109,14 @@ metadata/history, re-save, localized UIA names, cues and bounded Unicode tooltip
 The installed Ribbon independently checks four group captions against raw
 installed markup.
 
-The current Windows 10 configuration has twenty-one CTest targets: seventeen
-active and four shared-state targets that correctly skip locally. Core has a
+The current Windows 10 configuration has twenty-two CTest targets: seventeen
+active and five shared-state targets that correctly skip locally. Core has a
 120-second aggregate bound, the separate native menu-equivalence target has
 90 seconds, both application suites have 150 seconds, and search-window handoff
 has 45 seconds. The disposable native-transfer target has 150 seconds. Individual
-native worker deadlines are unchanged. Earlier failures remain preserved below.
+native worker deadlines are unchanged. The independent native-drop target also
+has 150 seconds and requires the same genuine disposable-runner opt-in. Earlier
+failures remain preserved below.
 
 The earlier hosted run, [commit `f909f69`](https://github.com/ProtonDev-sys/windows-explorer/actions/runs/37346525314),
 passed fifteen active main-job targets and correctly skipped its ordinary
@@ -186,7 +188,7 @@ Reports are `artifacts/continuation-app-v58.log` and
 `artifacts/continuation-headless-smoke-v58.json`. Successful activation does not
 establish which integrity level or desktop performs the actual preview render.
 
-The latest completed hosted run, [commit `781fd49`](https://github.com/ProtonDev-sys/windows-explorer/actions/runs/37352985840),
+The earlier hosted run, [commit `781fd49`](https://github.com/ProtonDev-sys/windows-explorer/actions/runs/37352985840),
 passes all five previously failing selection, saved-item and RTL checks. Fifteen
 active main-job targets pass, the ordinary transfer target skips, and the App
 target fails only native RTF Preview among 259 checks. The actual opted-in
@@ -200,6 +202,40 @@ identities and COPY preference remain exact, but their `DVASPECT_LINK`
 or identify the cause. Reports are preserved under
 `artifacts/ci/run-37352985840-{main,transfer}/`. The combined application job
 correctly skips; this run certifies no release.
+
+The later [commit `ac238d5` run](https://github.com/ProtonDev-sys/windows-explorer/actions/runs/37356273533)
+again passes fifteen active main-job targets and the real opted-in history,
+search-options and view-persistence checks. Native RTF Preview remains the sole
+App failure. Its transfer job times out at 150 seconds before producing a native
+phase trace; that result does not identify the blocked API. The relative JUnit
+path resolved inside the build directory, so the transfer artifact contains only
+its log. Subsequent workflow changes use absolute report paths, flushed native
+call phases, a bounded active-call watchdog, and a separate drop-only process.
+Those new genuine-CI branches remain unmeasured until their hosted run completes.
+
+Local v60 and v61 each complete all 259 authored checks with only native Preview
+failing, in 112.35 and 110.08 seconds respectively. The fresh diagnostic desktop
+has no top-level windows, and both process-token access controls succeed. A
+verified duplicate low-integrity impersonation token receives `E_ACCESSDENIED`
+for both READOBJECTS and READOBJECTS|CREATEWINDOW|WRITEOBJECTS. The low-label
+comparison does not execute: v60 rejects the documented implicit-MTA apartment;
+v61 accepts that qualifier but its unscoped message-only lookup finds a different
+thread's window. Neither result establishes that window's desktop. The original
+thread desktop and process-token identity/policy are preserved; no label change
+or preview rendering call is performed by this diagnostic. Reports are
+`artifacts/continuation-app-v60.log`, `artifacts/continuation-app-v61.log` and their
+matching smoke JSON/JUnit files. The v61 executable SHA-256 is
+`240b14b73db0a7bf62b174112ca1b7b4f393bcb0e80683c285fba310e9613392`.
+
+The reviewed optimization candidate separately passes sixteen native namespace
+groups and 1,983 assertions, both public icon-cache fixtures at actual 96 DPI,
+and both complete Ribbon suites. Exact raw four-byte icon comparison includes
+706,560 bytes through the public cache and 920,000 bytes through independent
+native size-pair extraction. Noncurrent DPI pairs do not establish production
+cache coverage at those DPIs. Six fresh interleaved A/B rounds are retained in
+[performance.md](performance.md), including inconclusive startup/navigation
+results. The integrated v62 all-target build is warning-free; its two local
+transfer gates correctly skip without clipboard or native-drop execution.
 
 The earlier [commit `317914b` run](https://github.com/ProtonDev-sys/windows-explorer/actions/runs/37249626987)
 failed Open File Location's folder-identity check; subsequent checks use actual
@@ -241,6 +277,7 @@ a separate result from native capture and functional tests.
 | `native_search_options` | Actual native Contents/System/Compressed transitions, fresh-query result membership and exact settings restoration; restricted to an opted-in disposable GitHub runner |
 | `native_view_persistence` | Real native folder property-bag restoration and no-persist control; restricted to an opted-in disposable GitHub runner |
 | `native_shell_transfer` | Real Shell clipboard Copy/Paste, Cut/Paste, Paste Shortcut and native Copy/Move/Link drops with exact owned identities/completion; restricted to a fresh opted-in disposable GitHub runner; no current local execution proof |
+| `native_shell_drops` | Independent native Copy/Move/Link drop process with unchanged clipboard owner/sequence/formats and exact owned identities/completion; same genuine disposable-runner gate; no current local execution proof |
 | `native_theme`, `native_theme_installed` | Theme policy, actual native dark pixels on recognized Windows builds, Light restoration, ownership guards and unchanged system configuration; installed-resource coverage on build 19045 |
 
 The four shared-state mutation targets check both `GITHUB_ACTIONS=true` and their

@@ -32,6 +32,8 @@ if ($InstalledRibbon) { $benchmarkArguments += '--installed-ribbon' }
 $process = Start-Process -FilePath $benchmarkExecutable -ArgumentList $benchmarkArguments `
     -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $directory 'stdout.log') `
     -RedirectStandardError (Join-Path $directory 'stderr.log')
+# Windows PowerShell 5.1 reports no ExitCode unless the handle was opened.
+$null = $process.Handle
 if (-not $process.WaitForExit(180000)) {
     $process.Kill()
     throw "Headless benchmark exceeded three minutes: $directory"

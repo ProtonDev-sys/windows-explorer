@@ -65,6 +65,54 @@ is `D:/Development/fe-micro/analyze.py`. Each copied executable's actual hash
 matches its environment record. Source changes require their own correctness
 and timing validation before integration.
 
+The revised r3 candidate was then built and tested serially by the main agent.
+Sixteen native namespace groups pass 1,983 assertions, including actual 8.3
+alias and owned FSCTL junction coverage. Both authored and installed icon
+fixtures pass at the actual HWND's 96 DPI: 706,560 public-cache bytes and 920,000
+independently extracted larger-pair bytes match exactly, including raw alpha.
+Both complete native Ribbon suites pass in 31.44 seconds combined. The test
+readback was corrected after actual Windows observations showed that GetObject
+reports positive height for the known top-down DIB. Actual raw RGB must still
+match requested top-down GetDIBits rows before all four stored bytes are compared.
+Production-cache coverage at other actual HWND DPIs remains unmeasured.
+
+Six fresh alternating-order rounds ran from 18:30 to 18:37 UTC. All twelve
+reports pass the complete benchmark checks. Baseline executable remains
+`38f1de781933ee2c99540c7ad49a89ee995662134e00bcef87b3efba1d840012`;
+r3 candidate is `e6397903a6a8cd9837c7c52085ddfb68ad24341c7fc7766baee720f96a3da08c`.
+This is a separate experiment, not pooled with the earlier candidate. The same
+unadjusted bootstrap/permutation method gives:
+
+| Revised-candidate metric | Baseline → candidate (ms) | 95% interval for difference (ms) | Permutation p |
+| --- | ---: | ---: | ---: |
+| Select all: namespace preparation | 726.2 → 37.1 | [180.5, 795.0] | 0.013 |
+| Select all: creator host work | 1,633.3 → 627.8 | [-165.2, 1,274.1] | 0.022 |
+| Select all: creator queue drained | 2,671.2 → 1,636.7 | [-310.1, 1,470.9] | 0.072 |
+| Select all: all command states ready | 9,162.2 → 8,594.1 | [-457.3, 1,246.3] | 0.389 |
+| Invert none to all: namespace preparation | 762.1 → 32.5 | [191.6, 1,050.5] | 0.013 |
+| Invert none to all: creator host work | 1,493.4 → 503.4 | [-92.3, 2,129.6] | 0.068 |
+| Invert none to all: creator queue drained | 2,073.7 → 1,069.0 | [-241.0, 1,681.2] | 0.075 |
+| Invert none to all: all command states ready | 8,589.3 → 8,644.3 | [-1,612.4, 3,821.6] | 0.920 |
+| Startup: native view ready | 906.6 → 1,153.8 | [-522.4, 649.1] | 0.567 |
+| Navigation median: 10 files | 151.3 → 215.6 | [-124.2, 28.5] | 0.127 |
+| Navigation median: 1,000 files | 288.8 → 205.0 | [-22.6, 175.7] | 0.156 |
+| Navigation median: 10,000 files | 145.6 → 177.4 | [-119.7, 68.9] | 0.521 |
+
+Namespace preparation improves again. The 1,000-file navigation direction
+reverses but its interval includes zero; this does not prove either a regression
+or its absence. Complete readiness, startup, other navigation and memory remain
+inconclusive. The smaller experiment's host-work interval and permutation result
+also disagree about conventional significance, so neither establishes a reliable
+complete interaction speedup. No slow observations were removed or attributed
+to an unproven external cause. Private memory is 52.5 → 54.0 MB, difference
+interval [-3.0, 1.3] MB, p=0.323. Reports:
+`D:/Development/fe-micro/ab-edge-r3-20261005-183023/runs.txt`;
+analysis: `artifacts/continuation-perf-edge-ab-r3-analysis.txt`.
+The reviewed six-file r3 patch has SHA-256
+`fc59ab77ef02c255f36f58ee916786a44c257cc168e00e7cf8e3afcb2418b842`.
+It is integrated into the main working tree; validation of the combined current
+application remains separate from these isolated correctness and timing results.
+
 ## Latest isolated main-checkout run
 
 The 2026-10-05 17:12 UTC installed-layout v48 run used executable

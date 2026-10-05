@@ -2,6 +2,7 @@
 #include "explorer/headless_visual.hpp"
 #include "explorer/worker_sta.hpp"
 #include "explorer/ui_direction.hpp"
+#include "parent_attribute_snapshot.hpp"
 
 #include <shlobj.h>
 #include <shlwapi.h>
@@ -676,6 +677,7 @@ HRESULT describeTargets(IShellItem* folder, IShellItemArray* targets, DWORD sele
     facts.detailedTargetsKnown = count <= detailedTargetBudget;
     facts.physicalFiles = facts.physicalFolders = facts.detailedTargetsKnown;
     facts.images = facts.applications = facts.discImages = facts.media = facts.castItems = facts.uncPaths = facts.detailedTargetsKnown;
+    detail::ParentAttributeSnapshot snapshot(count);
     bool singleNativeFolder = false;
     for (DWORD index = 0; facts.detailedTargetsKnown && index < count; ++index) {
         ComPtr<IShellItem> item;
@@ -691,7 +693,7 @@ HRESULT describeTargets(IShellItem* folder, IShellItemArray* targets, DWORD sele
             continue;
         }
         if (count == 1) singleNativeFolder = (flags & SFGAO_FOLDER) != 0;
-        const DWORD attributes = GetFileAttributesW(path.c_str());
+        const DWORD attributes = snapshot.attributes(path);
         const bool exists = attributes != INVALID_FILE_ATTRIBUTES;
         const bool directory = exists && (attributes & FILE_ATTRIBUTE_DIRECTORY);
         facts.physicalFiles &= exists && !directory;

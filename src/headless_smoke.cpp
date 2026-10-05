@@ -265,6 +265,192 @@ struct PaneObservation {
     std::wstring detail;
 };
 
+struct PreviewDesktopAccessDiagnostic {
+    HRESULT created = E_PENDING, token = E_PENDING, lowToken = E_PENDING, label = E_PENDING;
+    HRESULT restored = E_PENDING, empty = E_PENDING, originalTokenPreserved = E_PENDING;
+    DWORD originalRid = 0, lowRid = 0, policy = 0;
+    unsigned tokenReadbacks = 0, reverts = 0;
+    // Index 0 is READOBJECTS (0x01), index 1 adds CREATEWINDOW and
+    // WRITEOBJECTS (0x83). The exact same masks/name/token are used twice.
+    std::array<HRESULT, 2> processBefore{E_PENDING, E_PENDING}, lowBefore{E_PENDING, E_PENDING};
+    std::array<HRESULT, 2> processAfter{E_PENDING, E_PENDING}, lowAfter{E_PENDING, E_PENDING};
+    PrivateDesktop::DiagnosticLabelReadback security;
+    bool discriminating = false;
+    std::wstring detail() const {
+        const auto pair = [](const auto& values) { return hresultMessage(values[0]) + L"/" + hresultMessage(values[1]); };
+        return L"owned empty comparison create/token/low-token/label/empty/desktop-restore=" + hresultMessage(created) + L"/" +
+            hresultMessage(token) + L"/" + hresultMessage(lowToken) + L"/" + hresultMessage(label) + L"/" +
+            hresultMessage(empty) + L"/" + hresultMessage(restored) + L"; process/low-token RID/policy=" +
+            std::to_wstring(originalRid) + L"/" + std::to_wstring(lowRid) + L"/" + std::to_wstring(policy) +
+            L"; effective low-token readbacks/reverts=" + std::to_wstring(tokenReadbacks) + L"/" + std::to_wstring(reverts) +
+            L"; same comparison READ0x01/WRITE0x83 process-before/low-before/process-after/low-after=" +
+            pair(processBefore) + L"; " + pair(lowBefore) + L"; " + pair(processAfter) + L"; " + pair(lowAfter) +
+            L"; label guard/before/set/after=" + hresultMessage(security.guard) + L"/" + hresultMessage(security.before) + L"/" +
+            hresultMessage(security.applied) + L"/" + hresultMessage(security.after) + L"; exact owned current/windows=" +
+            std::to_wstring(security.exactOwnedCurrent) + L"/" + std::to_wstring(security.windows) +
+            L"; prelabel apartment HRESULT/type/qualifier=" + hresultMessage(security.apartmentRead) + L"/" +
+            std::to_wstring(security.apartmentType) + L"/" + std::to_wstring(security.apartmentQualifier) +
+            L"; empty native enumeration returned/error=" + std::to_wstring(security.enumReturned) + L"/" + std::to_wstring(security.enumError) +
+            L"; labels/RID/mask before=" + std::to_wstring(security.beforeLabels) + L"/" + std::to_wstring(security.beforeRid) +
+            L"/" + std::to_wstring(security.beforeMask) + L"; after=" + std::to_wstring(security.afterLabels) + L"/" +
+            std::to_wstring(security.afterRid) + L"/" + std::to_wstring(security.afterMask) + L"; native low ACE flags=" + std::to_wstring(security.afterFlags) +
+            L"; DACL/owner/group unchanged=" + std::to_wstring(security.daclUnchanged) + L"/" +
+            std::to_wstring(security.ownerUnchanged) + L"/" + std::to_wstring(security.groupUnchanged) +
+            L"; original process token preserved=" + hresultMessage(originalTokenPreserved) +
+            L"; low admission changed=" + std::to_wstring(discriminating) + L"; surrogate token/render cause unproven; comparison SetWindow/DoPreview=0/0";
+    }
+};
+
+// No COM or HWND on this fresh worker. The original app desktop is never
+// relabeled. This tests low-token admission to one disposable empty desktop,
+// not the surrogate's token, parenting, messaging, or actual pane rendering.
+PreviewDesktopAccessDiagnostic previewDesktopAccessDiagnostic(const std::atomic_bool& cancelled, ULONGLONG deadline) {
+    PreviewDesktopAccessDiagnostic result;
+    const auto initialDesktop = GetThreadDesktop(GetCurrentThreadId());
+    const auto budget = [&] { return !cancelled.load() && GetTickCount64() < deadline; };
+    const auto failure = [] { const auto error = GetLastError(); return HRESULT_FROM_WIN32(error ? error : ERROR_GEN_FAILURE); };
+    const auto stopUnsafe = [] {
+        std::fprintf(stderr, "headless preview desktop/token restoration failed; no further activation\n"); std::fflush(stderr);
+        if (!TerminateProcess(GetCurrentProcess(), 9)) std::_Exit(9);
+        std::_Exit(9);
+    };
+    struct Token {
+        HANDLE value = nullptr;
+        ~Token() { if (value) CloseHandle(value); }
+    } process, low;
+    struct Identity {
+        DWORD rid = 0, policy = 0;
+        TOKEN_STATISTICS statistics{};
+    } originalIdentity, lowIdentity;
+    const auto identity = [&](HANDLE handle, Identity& value) -> HRESULT {
+        alignas(TOKEN_MANDATORY_LABEL) std::array<BYTE, sizeof(TOKEN_MANDATORY_LABEL) + SECURITY_MAX_SID_SIZE> bytes{};
+        DWORD size = 0;
+        if (!GetTokenInformation(handle, TokenIntegrityLevel, bytes.data(), static_cast<DWORD>(bytes.size()), &size)) return failure();
+        if (size < sizeof(TOKEN_MANDATORY_LABEL) || size > bytes.size()) return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+        const auto label = reinterpret_cast<const TOKEN_MANDATORY_LABEL*>(bytes.data());
+        const auto address = reinterpret_cast<UINT_PTR>(label->Label.Sid);
+        const auto begin = reinterpret_cast<UINT_PTR>(bytes.data());
+        if (address < begin + sizeof(TOKEN_MANDATORY_LABEL) || address > begin + size ||
+            begin + size - address < offsetof(SID, SubAuthority) + sizeof(DWORD)) return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+        const auto sid = static_cast<const SID*>(label->Label.Sid);
+        const SID_IDENTIFIER_AUTHORITY authority = SECURITY_MANDATORY_LABEL_AUTHORITY;
+        if (sid->SubAuthorityCount != 1 || !IsValidSid(label->Label.Sid) ||
+            std::memcmp(&sid->IdentifierAuthority, &authority, sizeof(authority)) != 0 ||
+            !(label->Label.Attributes & SE_GROUP_INTEGRITY)) return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+        value.rid = sid->SubAuthority[0];
+        TOKEN_MANDATORY_POLICY policy{};
+        if (!GetTokenInformation(handle, TokenMandatoryPolicy, &policy, sizeof(policy), &size)) return failure();
+        if (size != sizeof(policy)) return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+        if (!GetTokenInformation(handle, TokenStatistics, &value.statistics, sizeof(value.statistics), &size)) return failure();
+        if (size != sizeof(value.statistics)) return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+        value.policy = policy.Policy;
+        return S_OK;
+    };
+    // A fresh worker must have no thread impersonation token. No inherited or
+    // caller token may be discarded as part of this diagnostic.
+    const auto noThreadToken = [&] {
+        Token unexpected;
+        if (OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &unexpected.value)) return false;
+        return GetLastError() == ERROR_NO_TOKEN;
+    };
+    if (!initialDesktop || PrivateDesktop::current() || !noThreadToken() || !budget()) {
+        result.token = E_ACCESSDENIED;
+        result.restored = initialDesktop && !PrivateDesktop::current() && noThreadToken() ? S_OK : E_ACCESSDENIED;
+        return result;
+    }
+    result.token = OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_DUPLICATE, &process.value) ? S_OK : failure();
+    if (SUCCEEDED(result.token)) result.token = identity(process.value, originalIdentity);
+    result.originalRid = originalIdentity.rid; result.policy = originalIdentity.policy;
+    if (SUCCEEDED(result.token) && (originalIdentity.rid < SECURITY_MANDATORY_MEDIUM_RID ||
+        originalIdentity.statistics.TokenType != TokenPrimary)) result.token = E_ACCESSDENIED;
+    if (SUCCEEDED(result.token) && budget()) result.lowToken = DuplicateTokenEx(process.value,
+        TOKEN_QUERY | TOKEN_IMPERSONATE | TOKEN_ADJUST_DEFAULT, nullptr, SecurityImpersonation, TokenImpersonation, &low.value) ? S_OK : failure();
+    alignas(SID) std::array<BYTE, SECURITY_MAX_SID_SIZE> lowSid{};
+    DWORD sidBytes = static_cast<DWORD>(lowSid.size());
+    if (SUCCEEDED(result.lowToken)) {
+        if (!CreateWellKnownSid(WinLowLabelSid, nullptr, lowSid.data(), &sidBytes)) result.lowToken = failure();
+        else {
+            TOKEN_MANDATORY_LABEL label{{lowSid.data(), SE_GROUP_INTEGRITY}};
+            if (!SetTokenInformation(low.value, TokenIntegrityLevel, &label, sizeof(label) + sidBytes)) result.lowToken = failure();
+        }
+    }
+    if (SUCCEEDED(result.lowToken)) result.lowToken = identity(low.value, lowIdentity);
+    result.lowRid = lowIdentity.rid;
+    if (SUCCEEDED(result.lowToken) && (lowIdentity.rid != SECURITY_MANDATORY_LOW_RID || lowIdentity.policy != originalIdentity.policy ||
+        lowIdentity.statistics.TokenType != TokenImpersonation || lowIdentity.statistics.ImpersonationLevel != SecurityImpersonation))
+        result.lowToken = E_ACCESSDENIED;
+    if (SUCCEEDED(result.lowToken) && budget()) {
+        PrivateDesktop comparison;
+        result.created = comparison.initialize();
+        const auto openPair = [&](std::array<HRESULT, 2>& values, bool impersonate) {
+            if (!budget() || PrivateDesktop::current() != &comparison || FAILED(comparison.verifyIsolation()) || !noThreadToken()) return;
+            if (impersonate && !ImpersonateLoggedOnUser(low.value)) { values.fill(failure()); return; }
+            // Stack-only native reads/opens until unconditional token revert.
+            Token effective;
+            Identity actual;
+            HRESULT effectiveRead = S_OK;
+            if (impersonate) {
+                effectiveRead = OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &effective.value) ? S_OK : failure();
+                if (SUCCEEDED(effectiveRead)) effectiveRead = identity(effective.value, actual);
+                if (SUCCEEDED(effectiveRead) && (actual.rid != SECURITY_MANDATORY_LOW_RID || actual.policy != lowIdentity.policy ||
+                    actual.statistics.TokenType != TokenImpersonation || actual.statistics.ImpersonationLevel != SecurityImpersonation ||
+                    actual.statistics.TokenId.LowPart != lowIdentity.statistics.TokenId.LowPart ||
+                    actual.statistics.TokenId.HighPart != lowIdentity.statistics.TokenId.HighPart)) effectiveRead = E_ACCESSDENIED;
+                if (SUCCEEDED(effectiveRead)) ++result.tokenReadbacks;
+            }
+            std::array<HDESK, 2> handles{};
+            constexpr std::array<ACCESS_MASK, 2> masks{DESKTOP_READOBJECTS,
+                DESKTOP_READOBJECTS | DESKTOP_CREATEWINDOW | DESKTOP_WRITEOBJECTS};
+            for (size_t index = 0; index < handles.size(); ++index) {
+                if (FAILED(effectiveRead)) { values[index] = effectiveRead; continue; }
+                if (!budget()) { values[index] = HRESULT_FROM_WIN32(ERROR_TIMEOUT); continue; }
+                handles[index] = OpenDesktopW(comparison.name().c_str(), 0, FALSE, masks[index]);
+                values[index] = handles[index] ? S_OK : failure();
+            }
+            if (impersonate) {
+                if (!RevertToSelf() || !noThreadToken()) stopUnsafe();
+                ++result.reverts;
+            }
+            for (const auto handle : handles) if (handle && !CloseDesktop(handle)) {
+                const auto error = GetLastError();
+                // A close error must not masquerade as an admission denial.
+                std::fprintf(stderr, "headless preview comparison CloseDesktop error=%lu\n", static_cast<unsigned long>(error));
+                std::fflush(stderr); stopUnsafe();
+            }
+        };
+        if (SUCCEEDED(result.created)) {
+            openPair(result.processBefore, false);
+            openPair(result.lowBefore, true);
+            if (budget() && noThreadToken()) result.label = comparison.setLowIntegrityLabelForDiagnostic(result.security);
+            if (SUCCEEDED(result.label)) {
+                openPair(result.processAfter, false);
+                openPair(result.lowAfter, true);
+            }
+            DWORD windows = 0;
+            bool enumerated = false; DWORD enumerationError = ERROR_SUCCESS;
+            result.empty = comparison.verifyEmptyForDiagnostic(windows, enumerated, enumerationError);
+        }
+    }
+    // PrivateDesktop teardown must restore the exact borrowed initial desktop
+    // before the existing COM activation attaches to the original app desktop.
+    result.restored = GetThreadDesktop(GetCurrentThreadId()) == initialDesktop &&
+        !PrivateDesktop::current() && noThreadToken() ? S_OK : E_ACCESSDENIED;
+    if (FAILED(result.restored)) stopUnsafe();
+    if (SUCCEEDED(result.token)) {
+        Identity preserved;
+        result.originalTokenPreserved = identity(process.value, preserved);
+        if (SUCCEEDED(result.originalTokenPreserved) && (preserved.rid != originalIdentity.rid || preserved.policy != originalIdentity.policy ||
+            preserved.statistics.TokenType != TokenPrimary || preserved.statistics.TokenId.LowPart != originalIdentity.statistics.TokenId.LowPart ||
+            preserved.statistics.TokenId.HighPart != originalIdentity.statistics.TokenId.HighPart)) result.originalTokenPreserved = E_ACCESSDENIED;
+    }
+    result.discriminating = SUCCEEDED(result.label) && SUCCEEDED(result.empty) && SUCCEEDED(result.originalTokenPreserved) &&
+        result.tokenReadbacks == 2 && result.reverts == 2 &&
+        result.processBefore == std::array<HRESULT, 2>{S_OK, S_OK} && result.processAfter == std::array<HRESULT, 2>{S_OK, S_OK} &&
+        result.lowBefore == std::array<HRESULT, 2>{S_OK, HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED)} &&
+        result.lowAfter == std::array<HRESULT, 2>{S_OK, S_OK};
+    return result;
+}
+
 // Activation/stream initialization is diagnostic only: no preview parent is
 // supplied and DoPreview is never called. It cannot satisfy rendering proof.
 std::wstring nativePreviewActivationDiagnostic(REFCLSID handler, const std::vector<char>& source) {
@@ -367,6 +553,7 @@ std::wstring nativePreviewActivationDiagnostic(REFCLSID handler, const std::vect
     struct Activation {
         HRESULT apartment = E_PENDING, cancellation = E_PENDING, factory = E_PENDING, instance = E_PENDING;
         HRESULT preview = E_PENDING, initializer = E_PENDING, stream = E_PENDING, initialized = E_PENDING;
+        PreviewDesktopAccessDiagnostic desktopAccess;
     };
     const auto targetDesktop = GetThreadDesktop(GetCurrentThreadId());
     const auto cancelled = std::make_shared<std::atomic_bool>(false);
@@ -375,6 +562,29 @@ std::wstring nativePreviewActivationDiagnostic(REFCLSID handler, const std::vect
     auto future = promise.get_future();
     std::thread worker([handler, source, targetDesktop, cancelled, deadline, output = std::move(promise)]() mutable {
         Activation result;
+        const auto initialDesktop = GetThreadDesktop(GetCurrentThreadId());
+        const auto noThreadToken = [] {
+            HANDLE token = nullptr;
+            if (OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &token)) { CloseHandle(token); return false; }
+            return GetLastError() == ERROR_NO_TOKEN;
+        };
+        if (!initialDesktop || PrivateDesktop::current() || !noThreadToken()) {
+            result.desktopAccess.token = E_ACCESSDENIED;
+            output.set_value(result); return;
+        }
+        std::fprintf(stderr, "headless-preview-no-ui phase=desktop-access-comparison\n"); std::fflush(stderr);
+        try { result.desktopAccess = previewDesktopAccessDiagnostic(*cancelled, deadline); }
+        catch (const std::bad_alloc&) { result.desktopAccess.created = E_OUTOFMEMORY; }
+        catch (...) { result.desktopAccess.created = E_FAIL; }
+        // This check also covers exceptions during initialization/security
+        // readback. COM must not begin after an uncertain token/desktop restore.
+        result.desktopAccess.restored = GetThreadDesktop(GetCurrentThreadId()) == initialDesktop &&
+            !PrivateDesktop::current() && noThreadToken() ? S_OK : E_ACCESSDENIED;
+        if (FAILED(result.desktopAccess.restored)) {
+            std::fprintf(stderr, "headless preview comparison restoration failed; no further activation\n"); std::fflush(stderr);
+            if (!TerminateProcess(GetCurrentProcess(), 9)) std::_Exit(9);
+            std::_Exit(9);
+        }
         struct Apartment {
             HDESK previous = GetThreadDesktop(GetCurrentThreadId());
             HRESULT initialized = E_ACCESSDENIED, cancellation = E_PENDING;
@@ -445,7 +655,8 @@ std::wstring nativePreviewActivationDiagnostic(REFCLSID handler, const std::vect
         hresultMessage(actual.apartment) + L"/" + hresultMessage(actual.cancellation) + L"/" + hresultMessage(actual.factory) + L"/" +
         hresultMessage(actual.instance) + L"/" + hresultMessage(actual.preview) + L"/" + hresultMessage(actual.initializer) + L"/" +
         hresultMessage(actual.stream) + L"/" + hresultMessage(actual.initialized) + L"; completed within budget=" + std::to_wstring(completed) +
-        L"; input/private isolation=" + hresultMessage(preserved) + L"; owned RTF bytes=" + std::to_wstring(source.size()) + L"; SetWindow/DoPreview calls=0/0";
+        L"; input/private isolation=" + hresultMessage(preserved) + L"; owned RTF bytes=" + std::to_wstring(source.size()) +
+        L"; SetWindow/DoPreview calls=0/0; " + actual.desktopAccess.detail();
 }
 
 // A pane has no documented HWND getter. Derive its physical region from the

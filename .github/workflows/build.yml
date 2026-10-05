@@ -75,6 +75,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Build native transfer fixture
+        id: transfer-build
         shell: pwsh
         run: ./scripts/build.ps1 -Configuration Release
       - name: Exercise native clipboard and destination transfers headlessly
@@ -83,14 +84,34 @@ jobs:
           WINDOWSEXPLORER_NATIVE_TRANSFER_TEST: '1'
         run: |
           New-Item -ItemType Directory -Path artifacts -Force | Out-Null
-          ctest --test-dir build -C Release -R '^native_shell_transfer$' --no-tests=error --output-on-failure --output-junit artifacts/native-transfer.xml 2>&1 | Tee-Object -FilePath artifacts/native-transfer.log
+          $reportPath = Join-Path $PWD 'artifacts/native-transfer.xml'
+          ctest --test-dir build -C Release -R '^native_shell_transfer$' --no-tests=error --output-on-failure --output-junit $reportPath 2>&1 | Tee-Object -FilePath artifacts/native-transfer.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          [xml]$transferReport = Get-Content -LiteralPath artifacts/native-transfer.xml -Raw
+          [xml]$transferReport = Get-Content -LiteralPath $reportPath -Raw
           $transferCases = @($transferReport.testsuite.testcase)
           if ($transferCases.Count -ne 1 -or $transferCases[0].name -ne 'native_shell_transfer' -or
               $transferCases[0].status -ne 'run' -or $null -ne $transferCases[0].SelectSingleNode('skipped') -or
               $null -ne $transferCases[0].SelectSingleNode('failure')) {
             throw 'The dedicated native transfer job requires one actual passing test; a skip is not verification.'
+          }
+      - name: Exercise native destination drops independently
+        # Preserve the clipboard gate's failure while still collecting drop
+        # evidence from a separate process after any successful build.
+        if: ${{ always() && steps.transfer-build.outcome == 'success' }}
+        shell: pwsh
+        env:
+          WINDOWSEXPLORER_NATIVE_TRANSFER_TEST: '1'
+        run: |
+          New-Item -ItemType Directory -Path artifacts -Force | Out-Null
+          $reportPath = Join-Path $PWD 'artifacts/native-drops.xml'
+          ctest --test-dir build -C Release -R '^native_shell_drops$' --no-tests=error --output-on-failure --output-junit $reportPath 2>&1 | Tee-Object -FilePath artifacts/native-drops.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          [xml]$dropReport = Get-Content -LiteralPath $reportPath -Raw
+          $dropCases = @($dropReport.testsuite.testcase)
+          if ($dropCases.Count -ne 1 -or $dropCases[0].name -ne 'native_shell_drops' -or
+              $dropCases[0].status -ne 'run' -or $null -ne $dropCases[0].SelectSingleNode('skipped') -or
+              $null -ne $dropCases[0].SelectSingleNode('failure')) {
+            throw 'The dedicated native drop job requires one actual passing test; a skip is not verification.'
           }
       - name: Upload native transfer evidence
         if: always()
@@ -100,6 +121,8 @@ jobs:
           path: |
             artifacts/native-transfer.xml
             artifacts/native-transfer.log
+            artifacts/native-drops.xml
+            artifacts/native-drops.log
           if-no-files-found: warn
   validated-application:
     needs: [build, native-transfer]

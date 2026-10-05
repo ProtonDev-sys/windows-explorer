@@ -1,14 +1,17 @@
 #include "explorer/namespace_actions.hpp"
 #include "explorer/headless_visual.hpp"
 #include "explorer/worker_sta.hpp"
+#include "../src/parent_attribute_snapshot.hpp"
 
 #include <shlobj.h>
 #include <objbase.h>
+#include <winioctl.h>
 #include <wrl/implements.h>
 #include <array>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -1025,6 +1028,333 @@ void nativeLargeArrayTailCounterexamples() {
     require(read(fixture.text)==before&&fs::exists(fixture.image)&&GetClipboardSequenceNumber()==clipboard,
             "Native large-array attribute/state proof changed owned files or clipboard");
 }
+struct SnapshotHandle {
+    HANDLE value=INVALID_HANDLE_VALUE;
+    explicit SnapshotHandle(HANDLE handle):value(handle){}
+    ~SnapshotHandle(){if(value!=INVALID_HANDLE_VALUE)CloseHandle(value);}
+    SnapshotHandle(const SnapshotHandle&)=delete;
+    SnapshotHandle& operator=(const SnapshotHandle&)=delete;
+};
+
+void createSnapshotFile(const std::wstring& path) {
+    SnapshotHandle file(CreateFileW(path.c_str(),GENERIC_WRITE,0,nullptr,CREATE_NEW,FILE_ATTRIBUTE_NORMAL,nullptr));
+    require(file.value!=INVALID_HANDLE_VALUE,"Create only an owned snapshot fixture file");
+}
+
+BY_HANDLE_FILE_INFORMATION snapshotFileInformation(const std::wstring& path,bool reparse=false) {
+    SnapshotHandle file(CreateFileW(path.c_str(),FILE_READ_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
+        nullptr,OPEN_EXISTING,FILE_FLAG_BACKUP_SEMANTICS|(reparse?FILE_FLAG_OPEN_REPARSE_POINT:0),nullptr));
+    require(file.value!=INVALID_HANDLE_VALUE,"Open owned identity for native snapshot evidence");
+    BY_HANDLE_FILE_INFORMATION result{};
+    require(GetFileInformationByHandle(file.value,&result),"Read actual owned file ID and attributes");
+    return result;
+}
+
+bool sameSnapshotFile(const BY_HANDLE_FILE_INFORMATION& left,const BY_HANDLE_FILE_INFORMATION& right) {
+    return left.dwVolumeSerialNumber==right.dwVolumeSerialNumber&&left.nFileIndexHigh==right.nFileIndexHigh&&
+        left.nFileIndexLow==right.nFileIndexLow;
+}
+
+struct SnapshotFixture {
+    Fixture owned;
+    fs::path parent=owned.root/L"snapshot facts";
+    std::vector<std::wstring> paths;
+    SnapshotFixture() {
+        require(fs::create_directory(parent),"Create owned snapshot parent");
+        paths.reserve(64);
+        for(unsigned index=0;index<64;++index) {
+            paths.push_back((parent/(index?L"Member-"+std::to_wstring(index)+L".txt":
+                std::wstring(L"Unicode-\u65E5\u672C\u8A9E-\u03BB-\U0001F4C1.txt"))).wstring());
+            createSnapshotFile(paths.back());
+        }
+    }
+};
+
+void snapshotNativeBoundariesAndAliases() {
+    SnapshotFixture fixture;
+    explorer::detail::ParentAttributeSnapshot below(63),at(64);
+    for(unsigned index=0;index<64;++index) {
+        const auto& path=fixture.paths[index];const auto native=snapshotFileInformation(path);
+        require(native.dwFileAttributes==GetFileAttributesW(path.c_str()),"Native file-handle and per-item attributes disagree");
+        if(index<63) {
+            require(below.attributes(path)==native.dwFileAttributes&&!below.lastFromSnapshot(),
+                    "63-member selection crossed the snapshot threshold");
+        }
+        require(at.attributes(path)==native.dwFileAttributes&&at.lastFromSnapshot(),
+                "64-member snapshot changed exact Unicode/native file attributes");
+    }
+    auto alias=fixture.paths.front();const auto leaf=alias.find_last_of(L'\\')+1;
+    alias.replace(leaf,7,L"UNICODE");
+    const auto aliasAttributes=GetFileAttributesW(alias.c_str());
+    require(at.attributes(alias)==aliasAttributes&&!at.lastFromSnapshot(),"Differently cased alias bypassed the per-item call");
+    if(aliasAttributes!=INVALID_FILE_ATTRIBUTES)
+        require(sameSnapshotFile(snapshotFileInformation(alias),snapshotFileInformation(fixture.paths.front())),
+                "Case alias named a different actual file ID");
+    else std::cout<<"UNAVAILABLE: existing case alias on this owned directory; native attributes still checked\n";
+
+    std::array<wchar_t,32768> shortPath{};
+    const auto shortLength=GetShortPathNameW(fixture.paths.front().c_str(),shortPath.data(),static_cast<DWORD>(shortPath.size()));
+    if(!shortLength) {
+        const auto error=GetLastError();
+        require(error==ERROR_NOT_SUPPORTED||error==ERROR_INVALID_FUNCTION,"Unexpected owned short-path query failure");
+        std::cout<<"UNAVAILABLE: owned 8.3 alias query Win32="<<error<<'\n';
+    } else {
+        require(shortLength<shortPath.size(),"Owned short-path result exceeded bounded buffer");
+        const std::wstring shortName(shortPath.data());
+        if(shortName!=fixture.paths.front()) {
+            require(sameSnapshotFile(snapshotFileInformation(shortName),snapshotFileInformation(fixture.paths.front())),
+                    "Actual 8.3 alias changed owned file identity");
+            require(at.attributes(shortName)==GetFileAttributesW(shortName.c_str())&&!at.lastFromSnapshot(),
+                    "Actual 8.3 alias bypassed native attribute fallback");
+            std::cout<<"COVERED: actual owned 8.3 alias and matching native file ID\n";
+        } else std::cout<<"UNAVAILABLE: no actual 8.3 alias was assigned to this owned file\n";
+    }
+    const auto other=fixture.owned.root/L"different parent";
+    require(fs::create_directory(other),"Create a different owned parent");
+    const auto elsewhere=(other/fs::path(fixture.paths[1]).filename()).wstring();
+    require(CreateDirectoryW(elsewhere.c_str(),nullptr),"Create same-leaf owned directory in a different parent");
+    const auto otherInfo=snapshotFileInformation(elsewhere);
+    require((otherInfo.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY)&&
+            !sameSnapshotFile(otherInfo,snapshotFileInformation(fixture.paths[1])),"Different-parent counterexample lacks distinct native identity/type");
+    require(at.attributes(elsewhere)==otherInfo.dwFileAttributes&&!at.lastFromSnapshot(),
+            "Different parent's same-leaf directory borrowed the first parent's file attributes");
+    const auto missing=(fixture.owned.root/L"absent parent"/L"missing.txt").wstring();
+    explorer::detail::ParentAttributeSnapshot failed(64);
+    require(GetFileAttributesW(missing.c_str())==INVALID_FILE_ATTRIBUTES&&GetLastError()==ERROR_PATH_NOT_FOUND,
+            "Owned missing-parent case did not exercise a real native path failure");
+    require(failed.attributes(missing)==INVALID_FILE_ATTRIBUTES&&!failed.lastFromSnapshot(),
+            "Failed native parent enumeration fabricated attributes");
+    require(failed.attributes(fixture.paths.front())==GetFileAttributesW(fixture.paths.front().c_str())&&!failed.lastFromSnapshot(),
+            "Failed enumeration stopped returning fresh per-item attributes");
+
+    // A real resident shortcut is always per item, even after its parent is
+    // loaded. Change only its owned attributes to prove the fallback is fresh.
+    const auto shortcut=(fixture.parent/L"actual owned shortcut.LnK").wstring();
+    ComPtr<IShellLinkW> link;succeeded(CoCreateInstance(CLSID_ShellLink,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&link)),
+                                     "Create owned resident shortcut for snapshot fallback");
+    succeeded(link->SetPath(fixture.owned.text.c_str()),"Store only an owned shortcut target");
+    ComPtr<IPersistFile> saved;succeeded(link.As(&saved),"Get owned shortcut persistence");
+    succeeded(saved->Save(shortcut.c_str(),TRUE),"Save actual owned shortcut without resolving it");
+    explorer::detail::ParentAttributeSnapshot withLink(64);
+    require(withLink.attributes(fixture.paths.front())==GetFileAttributesW(fixture.paths.front().c_str())&&withLink.lastFromSnapshot(),
+            "Load shared parent including actual shortcut");
+    const auto original=GetFileAttributesW(shortcut.c_str());
+    require(original!=INVALID_FILE_ATTRIBUTES&&SetFileAttributesW(shortcut.c_str(),original|FILE_ATTRIBUTE_HIDDEN),
+            "Change only the owned resident shortcut after enumeration");
+    const auto observed=withLink.attributes(shortcut);const auto native=GetFileAttributesW(shortcut.c_str());
+    require(SetFileAttributesW(shortcut.c_str(),original),"Restore owned shortcut attributes");
+    require(observed==native&&(native&FILE_ATTRIBUTE_HIDDEN)&&!withLink.lastFromSnapshot(),
+            "Shortcut reused stale enumerated attributes instead of actual item safeguards");
+}
+
+std::wstring extendedSnapshotPath(const fs::path& path) {
+    const auto ordinary=path.wstring();
+    require(path.is_absolute()&&ordinary.size()>3&&ordinary[1]==L':',"Extended fixture must stay on its owned absolute local drive");
+    return L"\\\\?\\"+ordinary;
+}
+
+struct ExtendedSnapshotCleanup {
+    std::vector<std::wstring> files,directories;
+    ExtendedSnapshotCleanup(){files.reserve(8);directories.reserve(20);}
+    ~ExtendedSnapshotCleanup() {
+        for(const auto& file:files)DeleteFileW(file.c_str());
+        for(auto it=directories.rbegin();it!=directories.rend();++it)RemoveDirectoryW(it->c_str());
+    }
+    void removeFiles() {
+        for(const auto& file:files)require(DeleteFileW(file.c_str()),"Explicitly remove owned extended/reserved file");
+        files.clear();
+    }
+};
+
+void snapshotExtendedReservedAndLongPaths() {
+    SnapshotFixture fixture;ExtendedSnapshotCleanup cleanup;
+    explorer::detail::ParentAttributeSnapshot snapshot(64);
+    const auto extended=extendedSnapshotPath(fs::path(fixture.paths.front()));
+    require(sameSnapshotFile(snapshotFileInformation(extended),snapshotFileInformation(fixture.paths.front())),
+            "Extended spelling changed the real owned file ID");
+    require(snapshot.attributes(extended)==GetFileAttributesW(extended.c_str())&&!snapshot.lastFromSnapshot(),
+            "Extended path entered ordinary-name enumeration");
+    for(const auto name:{L"COM\u00B9.txt",L"LPT\u00B2.txt"}) {
+        cleanup.files.push_back(extendedSnapshotPath(fixture.parent/name));createSnapshotFile(cleanup.files.back());
+        const auto info=snapshotFileInformation(cleanup.files.back());
+        require(!(info.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY),"Extended literal device-name fixture is not an actual file");
+        require(!explorer::validLeafName(name),"Reserved superscript device name passed ordinary leaf validation");
+    }
+    // Load with both literal reserved entries present; ordinary device
+    // spellings must still use their actual native answer, whatever it is.
+    require(snapshot.attributes(fixture.paths.front())==GetFileAttributesW(fixture.paths.front().c_str())&&snapshot.lastFromSnapshot(),
+            "Load parent containing literal reserved superscript entries");
+    for(const auto& path:cleanup.files) {
+        const auto ordinary=path.substr(4);
+        require(snapshot.attributes(ordinary)==GetFileAttributesW(ordinary.c_str())&&!snapshot.lastFromSnapshot(),
+                "Literal superscript device name was incorrectly used for an ordinary device spelling");
+        require(snapshot.attributes(path)==snapshotFileInformation(path).dwFileAttributes&&!snapshot.lastFromSnapshot(),
+                "Extended literal reserved file bypassed native per-item attributes");
+    }
+    auto longParent=fixture.parent;
+    while(longParent.wstring().size()<MAX_PATH+32) {
+        longParent/=L"owned-long-segment-123456";
+        cleanup.directories.push_back(extendedSnapshotPath(longParent));
+        require(CreateDirectoryW(cleanup.directories.back().c_str(),nullptr),"Create only an owned extended long-path directory");
+    }
+    const auto longFile=longParent/L"Unicode-\u65E5\u672C\u8A9E.txt";
+    cleanup.files.push_back(extendedSnapshotPath(longFile));createSnapshotFile(cleanup.files.back());
+    require(snapshot.attributes(cleanup.files.back())==snapshotFileInformation(cleanup.files.back()).dwFileAttributes&&
+            !snapshot.lastFromSnapshot(),"Extended long path changed actual native attributes");
+    require(longFile.wstring().size()>=MAX_PATH&&snapshot.attributes(longFile.wstring())==GetFileAttributesW(longFile.c_str())&&
+            !snapshot.lastFromSnapshot(),"Ordinary long-path spelling bypassed its actual native result");
+    cleanup.removeFiles();
+    for(auto it=cleanup.directories.rbegin();it!=cleanup.directories.rend();++it)
+        require(RemoveDirectoryW(it->c_str()),"Explicitly remove owned extended long-path directory");
+    cleanup.directories.clear();
+}
+
+void snapshotOwnedJunctionAndMutation() {
+    SnapshotFixture fixture;
+    const auto target=fixture.owned.root/L"junction target",junction=fixture.parent/L"owned junction";
+    require(fs::create_directory(target)&&fs::create_directory(junction),"Create only owned junction and target directories");
+    struct JunctionCleanup {fs::path path;~JunctionCleanup(){if(!path.empty())RemoveDirectoryW(path.c_str());}} cleanup{junction};
+    const auto substitute=L"\\??\\"+target.wstring(),print=target.wstring();
+    // Native mount-point reparse buffer: no symlink privilege, shell command,
+    // machine policy or filesystem setting is used by this owned test.
+    struct MountPointBuffer {
+        DWORD tag=IO_REPARSE_TAG_MOUNT_POINT;WORD bytes=0,reserved=0;
+        WORD substituteOffset=0,substituteBytes=0,printOffset=0,printBytes=0;
+        wchar_t paths[MAX_PATH*2]{};
+    } buffer;
+    require(substitute.size()+print.size()+2<std::size(buffer.paths),"Owned junction target exceeded bounded native buffer");
+    buffer.substituteBytes=static_cast<WORD>(substitute.size()*sizeof(wchar_t));
+    buffer.printOffset=buffer.substituteBytes+sizeof(wchar_t);buffer.printBytes=static_cast<WORD>(print.size()*sizeof(wchar_t));
+    buffer.bytes=static_cast<WORD>(8+buffer.printOffset+buffer.printBytes+sizeof(wchar_t));
+    std::memcpy(buffer.paths,substitute.c_str(),buffer.substituteBytes);
+    std::memcpy(reinterpret_cast<BYTE*>(buffer.paths)+buffer.printOffset,print.c_str(),buffer.printBytes);
+    DWORD error=ERROR_SUCCESS;
+    {
+        SnapshotHandle handle(CreateFileW(junction.c_str(),GENERIC_WRITE,0,nullptr,OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT,nullptr));
+        require(handle.value!=INVALID_HANDLE_VALUE,"Open owned junction for native FSCTL");
+        DWORD returned=0;
+        if(!DeviceIoControl(handle.value,FSCTL_SET_REPARSE_POINT,&buffer,static_cast<DWORD>(8+buffer.bytes),
+                            nullptr,0,&returned,nullptr))error=GetLastError();
+    }
+    if(error==ERROR_SUCCESS) {
+        const auto junctionInfo=snapshotFileInformation(junction.wstring(),true);
+        const auto targetInfo=snapshotFileInformation(target.wstring());
+        require((junctionInfo.dwFileAttributes&FILE_ATTRIBUTE_REPARSE_POINT)&&
+                sameSnapshotFile(snapshotFileInformation(junction.wstring()),targetInfo)&&!sameSnapshotFile(junctionInfo,targetInfo),
+                "Owned FSCTL mount point did not establish distinct reparse and actual target file IDs");
+        explorer::detail::ParentAttributeSnapshot snapshot(64);
+        require(snapshot.attributes(fixture.paths.front())==GetFileAttributesW(fixture.paths.front().c_str())&&snapshot.lastFromSnapshot(),
+                "Load parent containing real owned junction");
+        require(snapshot.attributes(junction.wstring())==GetFileAttributesW(junction.c_str())&&!snapshot.lastFromSnapshot(),
+                "Reparse directory reused enumerated attributes");
+        std::cout<<"COVERED: owned FSCTL junction with actual reparse/target file IDs\n";
+    } else {
+        require(error==ERROR_INVALID_FUNCTION||error==ERROR_NOT_SUPPORTED||error==ERROR_PRIVILEGE_NOT_HELD||error==ERROR_ACCESS_DENIED,
+                "Owned junction FSCTL failed for an unexpected reason");
+        std::cout<<"UNAVAILABLE: owned FSCTL junction Win32="<<error<<'\n';
+    }
+    require(RemoveDirectoryW(junction.c_str()),"Remove only owned junction without traversing target");
+    cleanup.path.clear();
+
+    const auto& victim=fixture.paths.back();const auto original=snapshotFileInformation(victim);
+    explorer::detail::ParentAttributeSnapshot loaded(64);
+    require(loaded.attributes(fixture.paths.front())==GetFileAttributesW(fixture.paths.front().c_str())&&loaded.lastFromSnapshot(),
+            "Load UI snapshot before an owned mutation");
+    require(DeleteFileW(victim.c_str())&&CreateDirectoryW(victim.c_str(),nullptr),"Replace only owned file with directory after snapshot load");
+    const auto current=snapshotFileInformation(victim);
+    require(current.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY,"Owned mutation did not become a real native directory");
+    require(loaded.attributes(victim)==original.dwFileAttributes&&loaded.lastFromSnapshot(),
+            "Loaded snapshot no longer documents its instantaneous pre-mutation UI fact");
+    require(GetFileAttributesW(victim.c_str())==current.dwFileAttributes,"Fresh native per-item read missed the owned mutation");
+    explorer::detail::ParentAttributeSnapshot fresh(64);
+    require(fresh.attributes(victim)==current.dwFileAttributes&&fresh.lastFromSnapshot(),
+            "New per-call snapshot retained an older UI fact");
+    const auto& removed=fixture.paths[62];
+    require(DeleteFileW(removed.c_str()),"Remove only owned selected file before a new snapshot load");
+    require(GetFileAttributesW(removed.c_str())==INVALID_FILE_ATTRIBUTES&&GetLastError()==ERROR_FILE_NOT_FOUND,
+            "Removed-before-load fixture did not produce actual native file-not-found");
+    explorer::detail::ParentAttributeSnapshot afterRemoval(64);
+    require(afterRemoval.attributes(fixture.paths.front())==GetFileAttributesW(fixture.paths.front().c_str())&&afterRemoval.lastFromSnapshot(),
+            "Load parent after the owned selected file was removed");
+    require(afterRemoval.attributes(removed)==INVALID_FILE_ATTRIBUTES&&!afterRemoval.lastFromSnapshot(),
+            "Missing enumerated name was treated as an existing owned selected file");
+    // These observations authorize no operation. Public native activation
+    // guards and complete retained Shell arrays are tested separately below.
+}
+
+// Large same-parent selections read existence/directory facts from one parent
+// enumeration. Every case below must match the per-item native answer.
+void largeSelectionParentSnapshotFacts() {
+    Fixture fixture;
+    const auto parent=fixture.root/L"large selection";
+    const auto other=fixture.root/L"other parent";
+    require(fs::create_directory(parent)&&fs::create_directory(other),"Create owned large-selection parents");
+    struct Ids {
+        std::vector<PIDLIST_ABSOLUTE> values;
+        ~Ids(){for(const auto value:values)CoTaskMemFree(value);}
+        PCIDLIST_ABSOLUTE add(const fs::path& path) {
+            PIDLIST_ABSOLUTE raw=nullptr;succeeded(SHGetIDListFromObject(item(path).Get(),&raw),"Read owned large-selection PIDL");
+            values.push_back(raw);return raw;
+        }
+    } ids;
+    std::vector<PCIDLIST_ABSOLUTE> files,folders;
+    for(unsigned index=0;index<200;++index) {
+        const auto file=parent/(L"Item-"+std::to_wstring(index)+L".txt");
+        std::ofstream(file,std::ios::binary)<<"owned";
+        files.push_back(ids.add(file));
+    }
+    for(unsigned index=0;index<70;++index) {
+        const auto folder=parent/(L"Folder-"+std::to_wstring(index));
+        require(fs::create_directory(folder),"Create owned large-selection folder");
+        folders.push_back(ids.add(folder));
+    }
+    const auto otherFile=other/L"Elsewhere.txt";std::ofstream(otherFile,std::ios::binary)<<"owned";
+    const auto elsewhere=ids.add(otherFile);
+    const auto folder=item(parent);
+    explorer::NativeNamespaceActions actions;
+    const auto describe=[&](std::vector<PCIDLIST_ABSOLUTE> selection) {
+        ComPtr<IShellItemArray> selected;
+        succeeded(SHCreateShellItemArrayFromIDLists(static_cast<UINT>(selection.size()),selection.data(),&selected),
+                  "Create owned large-selection array");
+        DWORD count=0;succeeded(selected->GetCount(&count),"Read genuine complete snapshot selection count");
+        require(count==selection.size(),"Snapshot test lost members of the actual selected array");
+        SFGAOF native=0;
+        const auto nativeStatus=selected->GetAttributes(static_cast<SIATTRIBFLAGS>(SIATTRIBFLAGS_AND|SIATTRIBFLAGS_ALLITEMS),
+            SFGAO_FILESYSTEM|SFGAO_FOLDER|SFGAO_LINK,&native);
+        succeeded(nativeStatus,"Read independent native attributes over every actual selected item");
+        succeeded(actions.initialize(nullptr,{folder,selected,{}}),"Describe owned large selection");
+        require(actions.facts().selectionCount==count&&actions.facts().nativeAttributesStatus==nativeStatus&&
+                actions.facts().nativeAttributes==native,"UI snapshot changed whole-array native authority");
+        require(actions.invokeCommandStore(L"Windows.ShareSpecificUsers",true)==E_ACCESSDENIED&&actions.invokeZip(true)==E_ACCESSDENIED,
+                "Snapshot UI facts authorized a native operation in a headless test");
+        const auto facts=actions.facts();actions.reset();return facts;
+    };
+    auto facts=describe(files);
+    require(facts.detailedTargetsKnown&&facts.physicalFiles&&!facts.physicalFolders&&!facts.images&&!facts.discImages,
+            "Snapshot changed all-file selection facts");
+    facts=describe(std::vector(files.begin(),files.begin()+63));
+    require(facts.physicalFiles&&!facts.physicalFolders,"Per-item boundary selection changed file facts");
+    facts=describe(std::vector(files.begin(),files.begin()+64));
+    require(facts.physicalFiles&&!facts.physicalFolders,"Snapshot boundary selection changed file facts");
+    facts=describe(folders);
+    require(facts.physicalFolders&&!facts.physicalFiles,"Snapshot changed all-folder selection facts");
+    auto mixed=files;mixed.push_back(folders.back());
+    facts=describe(mixed);
+    require(!facts.physicalFiles&&!facts.physicalFolders,"Snapshot lost a final folder counterexample");
+    auto parents=files;parents.push_back(elsewhere);
+    facts=describe(parents);
+    require(facts.physicalFiles&&!facts.physicalFolders,"Another parent's existing file was not established per item");
+    // The array retains a PIDL for a file removed after construction. Absent
+    // snapshot entries must use the actual per-item answer, not stale state.
+    ComPtr<IShellItemArray> retained;
+    succeeded(SHCreateShellItemArrayFromIDLists(static_cast<UINT>(files.size()),files.data(),&retained),
+              "Retain owned identities before removal");
+    require(fs::remove(parent/L"Item-199.txt"),"Remove one owned large-selection file");
+    const auto removed=actions.initialize(nullptr,{folder,retained,{}});
+    require(FAILED(removed)||!actions.facts().physicalFiles,"A removed final file was reported as an existing physical file");
+    actions.reset();
+}
 } // namespace
 
 int runNamespaceActionTests() {
@@ -1040,7 +1370,11 @@ int runNamespaceActionTests() {
         {"actual standard-GIT lookup cancellation and initialized final release",[]{onPrivateNamespaceDesktop(realGitLookupCancellationLifetime);}},
         {"exact target registration reuse, standalone ownership and native marshal reentry",[]{onPrivateNamespaceDesktop(exactTargetRegistrationReuseAndReentry);}},
         {"full 100001-item aggregate attributes, provider site and activation guards",[]{onPrivateNamespaceDesktop(aggregateLargeSelectionAndProviderGuards);}},
-        {"real native 100001-item arrays with final file, link and virtual counterexamples",[]{onPrivateNamespaceDesktop(nativeLargeArrayTailCounterexamples);}}
+        {"real native 100001-item arrays with final file, link and virtual counterexamples",[]{onPrivateNamespaceDesktop(nativeLargeArrayTailCounterexamples);}},
+        {"large same-parent selection facts, boundaries, other parents and removed items",[]{onPrivateNamespaceDesktop(largeSelectionParentSnapshotFacts);}},
+        {"actual snapshot 63/64 threshold, Unicode, case/8.3 aliases, failure and shortcut fallback",[]{onPrivateNamespaceDesktop(snapshotNativeBoundariesAndAliases);}},
+        {"actual extended, long and reserved superscript device-name snapshot fallback",[]{onPrivateNamespaceDesktop(snapshotExtendedReservedAndLongPaths);}},
+        {"actual owned FSCTL junction and instantaneous UI snapshot mutation",[]{onPrivateNamespaceDesktop(snapshotOwnedJunctionAndMutation);}}
     };
     unsigned failures = 0;
     for (const auto& [name,test] : tests) {

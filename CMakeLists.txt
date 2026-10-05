@@ -158,9 +158,10 @@ if(BUILD_TESTING)
   add_executable(native_transfer_tests tests/native_transfer_tests.cpp)
   target_link_libraries(native_transfer_tests PRIVATE explorer_core)
   add_test(NAME native_shell_transfer COMMAND native_transfer_tests)
+  add_test(NAME native_shell_drops COMMAND native_transfer_tests --drops-only)
   # A separate fresh disposable CI job sets the explicit opt-in. The ordinary
   # suite never enables real clipboard/history transfers automatically.
-  set_tests_properties(native_shell_transfer PROPERTIES TIMEOUT 150
+  set_tests_properties(native_shell_transfer native_shell_drops PROPERTIES TIMEOUT 150
     SKIP_REGULAR_EXPRESSION "SKIP:")
   add_executable(theme_tests tests/theme_tests.cpp "${RIBBON_GENERATED_DIR}/ribbon.rc")
   add_dependencies(theme_tests explorer_ribbon_resources)

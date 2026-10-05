@@ -18,6 +18,7 @@
 #include <atomic>
 #include <limits>
 #include <map>
+#include <new>
 #include <set>
 #include <thread>
 #include <utility>
@@ -1074,15 +1075,46 @@ struct NativeRibbon::Impl {
         location.resize(comma);if(location.size()>1&&location.front()==L'"'&&location.back()==L'"')location=location.substr(1,location.size()-2);
         if(!location.empty()&&location.front()==L'@')location.erase(location.begin());
         std::array<wchar_t,32768> expanded{};const DWORD needed=ExpandEnvironmentStringsW(location.c_str(),expanded.data(),static_cast<DWORD>(expanded.size()));if(!needed||needed>expanded.size())return E_INVALIDARG;
-        HICON icon=nullptr;auto hr=SHDefExtractIconW(expanded.data(),static_cast<int>(iconIndex),0,&icon,nullptr,MAKELONG(pixels,0));if(FAILED(hr)||!icon)return FAILED(hr)?hr:E_FAIL;
-        BITMAPINFO info{};info.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);info.bmiHeader.biWidth=static_cast<LONG>(pixels);info.bmiHeader.biHeight=-static_cast<LONG>(pixels);info.bmiHeader.biPlanes=1;info.bmiHeader.biBitCount=32;info.bmiHeader.biCompression=BI_RGB;
-        void* bits=nullptr;const HBITMAP bitmap=CreateDIBSection(nullptr,&info,DIB_RGB_COLORS,&bits,nullptr,0);if(!bitmap){DestroyIcon(icon);return E_OUTOFMEMORY;}
-        const HDC dc=CreateCompatibleDC(nullptr);if(!dc){DeleteObject(bitmap);DestroyIcon(icon);return E_OUTOFMEMORY;}
-        const auto old=SelectObject(dc,bitmap);ZeroMemory(bits,static_cast<std::size_t>(pixels)*pixels*4);const BOOL drawn=DrawIconEx(dc,0,0,icon,static_cast<int>(pixels),static_cast<int>(pixels),0,nullptr,DI_NORMAL);
-        SelectObject(dc,old);DeleteDC(dc);DestroyIcon(icon);
-        if(!drawn){DeleteObject(bitmap);return E_FAIL;}
-        ComPtr<IUIImage> image;hr=images->CreateImage(bitmap,UI_OWNERSHIP_TRANSFER,&image);if(FAILED(hr)){DeleteObject(bitmap);return hr;}
-        itemImageCache.emplace(cacheKey,image);output=std::move(image);return S_OK;
+        // Ribbon controls request both sizes of each icon. One extraction
+        // returns both from a single module load. Establish the requested
+        // result first; caching the other size is optional.
+        struct OwnedIcon {HICON value=nullptr;~OwnedIcon(){if(value)DestroyIcon(value);}};
+        const UINT pair=static_cast<UINT>(MulDiv(large?16:32,static_cast<int>(dpi?dpi:96),96));
+        OwnedIcon largeIcon,smallIcon;
+        auto hr=SHDefExtractIconW(expanded.data(),static_cast<int>(iconIndex),0,&largeIcon.value,&smallIcon.value,
+            MAKELONG(large?pixels:pair,large?pair:pixels));
+        OwnedIcon& requested=large?largeIcon:smallIcon;
+        OwnedIcon& paired=large?smallIcon:largeIcon;
+        if(FAILED(hr)||!requested.value) {
+            OwnedIcon single;
+            hr=SHDefExtractIconW(expanded.data(),static_cast<int>(iconIndex),0,&single.value,nullptr,MAKELONG(pixels,0));
+            if(FAILED(hr)||!single.value)return FAILED(hr)?hr:E_FAIL;
+            std::swap(requested.value,single.value);
+            if(paired.value){DestroyIcon(paired.value);paired.value=nullptr;}
+        }
+        const auto convert=[this](HICON icon,UINT size,ComPtr<IUIImage>& result)->HRESULT {
+            BITMAPINFO info{};info.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);info.bmiHeader.biWidth=static_cast<LONG>(size);info.bmiHeader.biHeight=-static_cast<LONG>(size);info.bmiHeader.biPlanes=1;info.bmiHeader.biBitCount=32;info.bmiHeader.biCompression=BI_RGB;
+            void* bits=nullptr;const HBITMAP bitmap=CreateDIBSection(nullptr,&info,DIB_RGB_COLORS,&bits,nullptr,0);if(!bitmap)return E_OUTOFMEMORY;
+            const HDC dc=CreateCompatibleDC(nullptr);if(!dc){DeleteObject(bitmap);return E_OUTOFMEMORY;}
+            const auto old=SelectObject(dc,bitmap);ZeroMemory(bits,static_cast<std::size_t>(size)*size*4);const BOOL drawn=DrawIconEx(dc,0,0,icon,static_cast<int>(size),static_cast<int>(size),0,nullptr,DI_NORMAL);
+            SelectObject(dc,old);DeleteDC(dc);
+            if(!drawn){DeleteObject(bitmap);return E_FAIL;}
+            const auto created=images->CreateImage(bitmap,UI_OWNERSHIP_TRANSFER,&result);if(FAILED(created))DeleteObject(bitmap);
+            return created;
+        };
+        ComPtr<IUIImage> image;
+        hr=convert(requested.value,pixels,image);
+        if(FAILED(hr))return hr;
+        itemImageCache.emplace(cacheKey,image);output=std::move(image);
+        // A primary allocation failure still propagates as before. Failure
+        // to allocate the optional paired bitmap/cache must not replace a
+        // successfully created requested image with an out-of-memory error.
+        try {
+            ComPtr<IUIImage> pairedImage;
+            if(paired.value&&SUCCEEDED(convert(paired.value,pair,pairedImage)))
+                itemImageCache.emplace(std::make_pair(specification,pair),pairedImage);
+        } catch(const std::bad_alloc&) {}
+        return S_OK;
     }
     HRESULT quickCollection(ComPtr<IUICollection>& collection)const {
         Variant value;auto hr=framework->GetUICommandProperty(nativeId(RibbonQuickAccess),UI_PKEY_ItemsSource,&value.value);

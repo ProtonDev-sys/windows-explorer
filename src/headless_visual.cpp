@@ -12,9 +12,12 @@
 #include <propvarutil.h>
 #include <structuredquery.h>
 #include <shlobj.h>
+#include <aclapi.h>
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstddef>
+#include <cstdio>
 #include <cstring>
 #include <iomanip>
 #include <limits>
@@ -399,6 +402,153 @@ HRESULT PrivateDesktop::initialize() {
 }
 
 const PrivateDesktop* PrivateDesktop::current() noexcept { return currentDesktop; }
+
+HRESULT PrivateDesktop::verifyEmptyForDiagnostic(DWORD& windows, bool& enumReturned, DWORD& enumError) const {
+    windows = 0; enumReturned = false; enumError = ERROR_SUCCESS;
+    const auto owned = [&] { return currentDesktop == this && GetThreadDesktop(GetCurrentThreadId()) == desktop_ && SUCCEEDED(verifyIsolation()); };
+    if (!owned()) return E_ACCESSDENIED;
+    const auto emptyOracle = [](bool messageOnly) -> HRESULT {
+        SetLastError(ERROR_SUCCESS);
+        const auto window = messageOnly ? FindWindowExW(HWND_MESSAGE, nullptr, nullptr, nullptr) : GetTopWindow(nullptr);
+        const auto error = GetLastError();
+        if (window || error) {
+            const auto thread = window ? GetWindowThreadProcessId(window, nullptr) : 0;
+            std::fprintf(stderr, "headless-preview-empty oracle=%s window=%u windowThread=%lu callerThread=%lu nativeError=%lu\n",
+                messageOnly ? "message" : "top", window ? 1U : 0U, static_cast<unsigned long>(thread),
+                static_cast<unsigned long>(GetCurrentThreadId()), static_cast<unsigned long>(error));
+            std::fflush(stderr);
+        }
+        return window ? E_ACCESSDENIED : error ? HRESULT_FROM_WIN32(error) : S_OK;
+    };
+    for (const bool messageOnly : {false, true}) {
+        const auto observed = emptyOracle(messageOnly);
+        if (FAILED(observed)) return observed;
+    }
+    SetLastError(ERROR_SUCCESS);
+    enumReturned = EnumDesktopWindows(desktop_, [](HWND, LPARAM data) -> BOOL {
+        ++*reinterpret_cast<DWORD*>(data); return TRUE;
+    }, reinterpret_cast<LPARAM>(&windows)) != FALSE;
+    enumError = enumReturned ? ERROR_SUCCESS : GetLastError();
+    if (windows) return E_ACCESSDENIED;
+    if (enumError) return HRESULT_FROM_WIN32(enumError);
+    for (const bool messageOnly : {false, true}) {
+        const auto observed = emptyOracle(messageOnly);
+        if (FAILED(observed)) return observed;
+    }
+    // Some native empty desktops return FALSE/error 0 without callbacks. Both
+    // independent native oracles and renewed exact isolation must prove empty.
+    return owned() ? S_OK : E_ACCESSDENIED;
+}
+
+HRESULT PrivateDesktop::setLowIntegrityLabelForDiagnostic(DiagnosticLabelReadback& readback) {
+    readback = {};
+    readback.guard = verifyIsolation();
+    if (FAILED(readback.guard)) return readback.guard;
+    readback.exactOwnedCurrent = currentDesktop == this && GetThreadDesktop(GetCurrentThreadId()) == desktop_;
+    if (!readback.exactOwnedCurrent) return readback.guard = E_ACCESSDENIED;
+    APTTYPE apartment{}; APTTYPEQUALIFIER qualifier{};
+    readback.apartmentRead = CoGetApartmentType(&apartment, &qualifier);
+    if (SUCCEEDED(readback.apartmentRead)) {
+        readback.apartmentType = static_cast<int>(apartment);
+        readback.apartmentQualifier = static_cast<int>(qualifier);
+    }
+    // An implicit MTA is not initialized by this thread. A fresh diagnostic
+    // worker inherits it when another process thread initialized the MTA.
+    const bool implicitMta = readback.apartmentRead == S_OK && apartment == APTTYPE_MTA &&
+        qualifier == APTTYPEQUALIFIER_IMPLICIT_MTA;
+    if (readback.apartmentRead != CO_E_NOTINITIALIZED && !implicitMta)
+        return readback.guard = E_ACCESSDENIED;
+    HANDLE token = nullptr;
+    if (OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &token)) {
+        CloseHandle(token); return readback.guard = E_ACCESSDENIED;
+    }
+    if (GetLastError() != ERROR_NO_TOKEN) return readback.guard = win32Failure();
+    readback.guard = verifyEmptyForDiagnostic(readback.windows, readback.enumReturned, readback.enumError);
+    if (FAILED(readback.guard)) return readback.guard;
+    DesktopHandle query{OpenDesktopW(name_.c_str(), 0, FALSE,
+        WRITE_OWNER | READ_CONTROL | DESKTOP_READOBJECTS | DESKTOP_WRITEOBJECTS)};
+    if (!query.value) return readback.guard = win32Failure();
+    std::wstring opened;
+    readback.guard = objectName(query.value, opened);
+    if (FAILED(readback.guard)) return readback.guard;
+    if (_wcsicmp(opened.c_str(), name_.c_str()) != 0 || FAILED(verifyIsolation()) ||
+        currentDesktop != this || GetThreadDesktop(GetCurrentThreadId()) != desktop_)
+        return readback.guard = E_ACCESSDENIED;
+    struct Security {
+        PSECURITY_DESCRIPTOR descriptor = nullptr;
+        PSID owner = nullptr, group = nullptr;
+        PACL dacl = nullptr;
+        SECURITY_DESCRIPTOR_CONTROL control{};
+        DWORD labels = 0, rid = 0, mask = 0, flags = 0;
+        ~Security() { if (descriptor) LocalFree(descriptor); }
+        HRESULT read(HDESK handle) {
+            const auto error = GetSecurityInfo(handle, SE_WINDOW_OBJECT,
+                OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION,
+                &owner, &group, &dacl, nullptr, &descriptor);
+            if (error) return HRESULT_FROM_WIN32(error);
+            DWORD revision = 0;
+            if (!descriptor || !IsValidSecurityDescriptor(descriptor) || !owner || !IsValidSid(owner) ||
+                !group || !IsValidSid(group) || !dacl || !IsValidAcl(dacl) ||
+                !GetSecurityDescriptorControl(descriptor, &control, &revision)) return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+            PACL sacl = nullptr; BOOL present = FALSE, defaulted = FALSE;
+            if (!GetSecurityDescriptorSacl(descriptor, &present, &sacl, &defaulted)) return win32Failure();
+            if (!present || !sacl) return S_OK;
+            if (!IsValidAcl(sacl)) return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+            for (DWORD index = 0; index < sacl->AceCount; ++index) {
+                void* raw = nullptr;
+                if (!GetAce(sacl, index, &raw)) return win32Failure();
+                const auto ace = static_cast<const SYSTEM_MANDATORY_LABEL_ACE*>(raw);
+                if (ace->Header.AceType != SYSTEM_MANDATORY_LABEL_ACE_TYPE) continue;
+                constexpr auto offset = offsetof(SYSTEM_MANDATORY_LABEL_ACE, SidStart);
+                const auto bytes = ace->Header.AceSize >= offset ? ace->Header.AceSize - offset : 0;
+                const auto sid = reinterpret_cast<const SID*>(&ace->SidStart);
+                const SID_IDENTIFIER_AUTHORITY authority = SECURITY_MANDATORY_LABEL_AUTHORITY;
+                if (bytes < offsetof(SID, SubAuthority) + sizeof(DWORD) || sid->SubAuthorityCount != 1 ||
+                    !IsValidSid(const_cast<SID*>(sid)) || std::memcmp(&sid->IdentifierAuthority, &authority, sizeof(authority)) != 0)
+                    return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+                ++labels; rid = sid->SubAuthority[0]; mask = ace->Mask; flags = ace->Header.AceFlags;
+            }
+            return S_OK;
+        }
+    } before, after;
+    readback.before = before.read(query.value);
+    readback.beforeLabels = before.labels; readback.beforeRid = before.rid; readback.beforeMask = before.mask;
+    if (FAILED(readback.before)) return readback.before;
+    // Only the default unlabeled comparison is eligible; existing labels are
+    // evidence to report rather than policy this helper is allowed to replace.
+    if (before.labels) return readback.applied = HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+    alignas(SID) std::array<BYTE, SECURITY_MAX_SID_SIZE> sid{};
+    DWORD sidBytes = static_cast<DWORD>(sid.size());
+    if (!CreateWellKnownSid(WinLowLabelSid, nullptr, sid.data(), &sidBytes)) return readback.applied = win32Failure();
+    alignas(ACL) std::array<BYTE, sizeof(ACL) + sizeof(SYSTEM_MANDATORY_LABEL_ACE) + SECURITY_MAX_SID_SIZE> acl{};
+    const auto sacl = reinterpret_cast<PACL>(acl.data());
+    if (!InitializeAcl(sacl, static_cast<DWORD>(acl.size()), ACL_REVISION) ||
+        !AddMandatoryAce(sacl, ACL_REVISION, 0, SYSTEM_MANDATORY_LABEL_NO_WRITE_UP, sid.data()))
+        return readback.applied = win32Failure();
+    if (FAILED(verifyIsolation()) || currentDesktop != this || GetThreadDesktop(GetCurrentThreadId()) != desktop_)
+        return readback.applied = E_ACCESSDENIED;
+    readback.applied = HRESULT_FROM_WIN32(SetSecurityInfo(query.value, SE_WINDOW_OBJECT,
+        LABEL_SECURITY_INFORMATION, nullptr, nullptr, nullptr, sacl));
+    if (FAILED(readback.applied)) return readback.applied;
+    readback.after = after.read(query.value);
+    readback.afterLabels = after.labels; readback.afterRid = after.rid; readback.afterMask = after.mask;
+    readback.afterFlags = after.flags;
+    if (FAILED(readback.after)) return readback.after;
+    constexpr auto daclControl = SE_DACL_PRESENT | SE_DACL_DEFAULTED | SE_DACL_AUTO_INHERIT_REQ |
+        SE_DACL_AUTO_INHERITED | SE_DACL_PROTECTED;
+    readback.daclUnchanged = (before.control & daclControl) == (after.control & daclControl) &&
+        before.dacl->AclSize == after.dacl->AclSize &&
+        std::memcmp(before.dacl, after.dacl, before.dacl->AclSize) == 0;
+    readback.ownerUnchanged = EqualSid(before.owner, after.owner) != FALSE &&
+        (before.control & SE_OWNER_DEFAULTED) == (after.control & SE_OWNER_DEFAULTED);
+    readback.groupUnchanged = EqualSid(before.group, after.group) != FALSE &&
+        (before.control & SE_GROUP_DEFAULTED) == (after.control & SE_GROUP_DEFAULTED);
+    if (after.labels != 1 || after.rid != SECURITY_MANDATORY_LOW_RID || after.mask != SYSTEM_MANDATORY_LABEL_NO_WRITE_UP || after.flags != 0 ||
+        !readback.daclUnchanged || !readback.ownerUnchanged || !readback.groupUnchanged ||
+        FAILED(verifyIsolation()) || GetThreadDesktop(GetCurrentThreadId()) != desktop_)
+        return readback.after = E_ACCESSDENIED;
+    return S_OK;
+}
 
 HRESULT PrivateDesktop::verifyIsolation(bool* inputDesktopUnchanged) const {
     if (inputDesktopUnchanged) *inputDesktopUnchanged = false;

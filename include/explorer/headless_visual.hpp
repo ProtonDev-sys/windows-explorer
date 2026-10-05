@@ -28,6 +28,21 @@ public:
     HRESULT initialize();
     HRESULT verifyIsolation(bool* inputDesktopUnchanged = nullptr) const;
     HRESULT visibleWindowsOnInputDesktop(bool& visible) const;
+    HRESULT verifyEmptyForDiagnostic(DWORD& windows, bool& enumReturned, DWORD& enumError) const;
+    struct DiagnosticLabelReadback {
+        HRESULT guard = E_PENDING, before = E_PENDING, applied = E_PENDING, after = E_PENDING;
+        HRESULT apartmentRead = E_PENDING;
+        int apartmentType = -1, apartmentQualifier = -1;
+        DWORD windows = 0, beforeLabels = 0, beforeRid = 0, beforeMask = 0;
+        DWORD afterLabels = 0, afterRid = 0, afterMask = 0, afterFlags = 0;
+        bool enumReturned = false;
+        DWORD enumError = 0;
+        bool exactOwnedCurrent = false, daclUnchanged = false, ownerUnchanged = false, groupUnchanged = false;
+    };
+    // Only an empty, exact current owned desktop, before explicit COM/HWND creation.
+    // This is a diagnostic comparison; initialize() retains its default SD.
+    // Changes LABEL only, reads it back, and never permits desktop switching.
+    HRESULT setLowIntegrityLabelForDiagnostic(DiagnosticLabelReadback& readback);
     // The initialized guard on this UI thread, for bounded native rendering
     // phases in otherwise hidden tests. Null on unguarded/other threads.
     static const PrivateDesktop* current() noexcept;
