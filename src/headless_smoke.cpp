@@ -9,6 +9,7 @@
 #include <shlwapi.h>
 #include <shlguid.h>
 #include <propvarutil.h>
+#include <propsys.h>
 #include <structuredquery.h>
 #include <commctrl.h>
 #include <UIRibbonPropertyHelpers.h>
@@ -26,6 +27,7 @@
 #include <iterator>
 #include <set>
 #include <sstream>
+#include <thread>
 
 namespace explorer {
 namespace {
@@ -253,6 +255,282 @@ HRESULT nativeFileIdentity(const std::filesystem::path& path, FILE_ID_INFO& iden
     CloseHandle(handle);
     return result;
 }
+struct PaneObservation {
+    HRESULT read = E_PENDING;
+    bool matched = false, privateWindows = false, privacyChecked = false, inputUnchanged = false;
+    unsigned visibleElements = 0, handlerWindows = 0;
+    RECT bounds{};
+    std::wstring detail;
+};
+
+// A pane has no documented HWND getter. Derive its physical region from the
+// actual DefView and host client, then inspect only visible providers within
+// that region. Content-list and navigation names cannot satisfy this proof.
+PaneObservation observeNativePane(HWND host, HWND content, const std::vector<std::wstring>& expected,
+    const std::wstring& absent, bool preview) {
+    PaneObservation rejected;
+    const auto rectangle = [](const RECT& value) {
+        return std::to_wstring(value.left) + L"," + std::to_wstring(value.top) + L"," +
+            std::to_wstring(value.right) + L"," + std::to_wstring(value.bottom);
+    };
+    rejected.detail = L"pane observation guard; host HWND=" + std::to_wstring(reinterpret_cast<UINT_PTR>(host)) +
+        L"; content HWND=" + std::to_wstring(reinterpret_cast<UINT_PTR>(content));
+    const auto desktop = PrivateDesktop::current();
+    DWORD process = 0;
+    RECT hostBounds{}, contentBounds{};
+    if (!desktop || FAILED(desktop->verifyIsolation()) ||
+        GetWindowThreadProcessId(host, &process) != GetCurrentThreadId() || process != GetCurrentProcessId() ||
+        !IsChild(host, content) || !GetClientRect(host, &hostBounds) ||
+        FAILED(mapUiRect(host, nullptr, hostBounds, &hostBounds)) || !GetWindowRect(content, &contentBounds)) {
+        rejected.read = E_ACCESSDENIED;
+        rejected.detail += L"; host bounds=" + rectangle(hostBounds) + L"; content bounds=" + rectangle(contentBounds);
+        return rejected;
+    }
+    bool rtl = false;
+    if (FAILED(windowUiDirection(host, &rtl))) { rejected.read = E_INVALIDARG; return rejected; }
+    const RECT region{rtl ? hostBounds.left : contentBounds.right, contentBounds.top,
+        rtl ? contentBounds.left : hostBounds.right, contentBounds.bottom};
+    rejected.detail += L"; RTL=" + std::to_wstring(rtl) + L"; host bounds=" + rectangle(hostBounds) +
+        L"; content bounds=" + rectangle(contentBounds) + L"; pane bounds=" + rectangle(region);
+    if (region.right <= region.left || region.bottom <= region.top) {
+        rejected.read = E_UNEXPECTED;
+        return rejected;
+    }
+    const auto targetDesktop = GetThreadDesktop(GetCurrentThreadId());
+    const auto desktopName = desktop->name();
+    const auto inputName = desktop->originalInputName();
+    const auto cancelled = std::make_shared<std::atomic_bool>(false);
+    const auto deadline = GetTickCount64() + 4500;
+    std::promise<PaneObservation> promise;
+    auto future = promise.get_future();
+    std::thread worker([host, region, expected, absent, preview, targetDesktop, desktopName, inputName,
+        cancelled, deadline, output = std::move(promise)]() mutable {
+        PaneObservation result;
+        result.bounds = region;
+        unsigned phase = 1, polls = 0, names = 0, values = 0, documents = 0;
+        int availableElements = 0;
+        HRESULT nameRead = E_PENDING, valueRead = E_PENDING, documentRead = E_PENDING;
+        HRESULT valuePatternRead = E_PENDING, textPatternRead = E_PENDING, rangeRead = E_PENDING, textRead = E_PENDING;
+        std::wstring intersectingElements, samples;
+        struct Apartment {
+            HDESK previous = GetThreadDesktop(GetCurrentThreadId());
+            HRESULT read = E_ACCESSDENIED;
+            HRESULT initialized = E_ACCESSDENIED;
+            bool cancellationEnabled = false;
+            explicit Apartment(HDESK target) {
+                if (SetThreadDesktop(target)) initialized = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+                read = initialized;
+                if (SUCCEEDED(read)) { read = CoEnableCallCancellation(nullptr); cancellationEnabled = SUCCEEDED(read); }
+            }
+            ~Apartment() {
+                if (cancellationEnabled) CoDisableCallCancellation(nullptr);
+                if (SUCCEEDED(initialized)) CoUninitialize();
+                SetThreadDesktop(previous);
+            }
+        } apartment(targetDesktop);
+        try {
+            result.read = apartment.read;
+            ComPtr<IUIAutomation> automation;
+            ComPtr<IUIAutomation2> timeout;
+            ComPtr<IUIAutomationCondition> everything;
+            if (SUCCEEDED(result.read)) { phase = 2; result.read = CoCreateInstance(CLSID_CUIAutomation8, nullptr,
+                CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&automation)); }
+            if (SUCCEEDED(result.read)) { phase = 3; result.read = automation.As(&timeout); }
+            if (SUCCEEDED(result.read)) { phase = 4; result.read = timeout->put_ConnectionTimeout(700); }
+            if (SUCCEEDED(result.read)) result.read = timeout->put_TransactionTimeout(700);
+            if (SUCCEEDED(result.read)) result.read = timeout->put_AutoSetFocus(FALSE);
+            if (SUCCEEDED(result.read)) { phase = 5; result.read = automation->CreateTrueCondition(&everything); }
+            const auto budget = [&] { return !cancelled->load() && GetTickCount64() < deadline; };
+            const auto userObjectName = [](HDESK value) {
+                wchar_t name[256]{}; DWORD bytes = 0;
+                return value && GetUserObjectInformationW(value, UOI_NAME, name, sizeof(name), &bytes) ?
+                    std::wstring(name) : std::wstring{};
+            };
+            do {
+                if (FAILED(result.read) || !budget()) break;
+                ++polls;
+                ComPtr<IUIAutomationElement> root;
+                ComPtr<IUIAutomationElementArray> elements;
+                phase = 6;
+                result.read = automation->ElementFromHandle(host, &root);
+                if (SUCCEEDED(result.read) && budget()) { phase = 7; result.read = root->FindAll(TreeScope_Descendants, everything.Get(), &elements); }
+                int count = 0;
+                if (SUCCEEDED(result.read) && elements && budget()) { phase = 8; result.read = elements->get_Length(&count); }
+                availableElements = count;
+                std::wstring text;
+                result.visibleElements = 0;
+                names = values = documents = 0;
+                intersectingElements.clear();
+                samples.clear();
+                nameRead = valueRead = documentRead = valuePatternRead = textPatternRead = rangeRead = textRead = E_PENDING;
+                // Only pane-contained providers for these owned source files
+                // contribute diagnostic samples. Keep both per-value and total
+                // limits independent of the stricter semantic assertion.
+                const auto sample = [&](const wchar_t* label, BSTR value) {
+                    if (!value || samples.size() >= 1024) return;
+                    const std::wstring prefix = std::wstring(L"; ") + label + L"=[";
+                    samples.append(prefix, 0, std::min(prefix.size(), 1024 - samples.size()));
+                    samples.append(value, std::min<size_t>({SysStringLen(value), 256, 1024 - samples.size()}));
+                    if (samples.size() < 1024) samples += L']';
+                };
+                unsigned recordedElements = 0;
+                phase = SUCCEEDED(result.read) ? 9 : phase;
+                for (int index = 0; SUCCEEDED(result.read) && index < std::min(count, 256) && budget(); ++index) {
+                    ComPtr<IUIAutomationElement> element;
+                    RECT bounds{}; BOOL offscreen = TRUE;
+                    if (FAILED(elements->GetElement(index, &element)) || !element ||
+                        FAILED(element->get_CurrentIsOffscreen(&offscreen)) || offscreen ||
+                        FAILED(element->get_CurrentBoundingRectangle(&bounds)) || bounds.right <= bounds.left || bounds.bottom <= bounds.top) continue;
+                    const bool contained = bounds.left >= region.left && bounds.right <= region.right &&
+                        bounds.top >= region.top && bounds.bottom <= region.bottom;
+                    RECT intersection{};
+                    if (recordedElements < 6 && IntersectRect(&intersection, &bounds, &region)) {
+                        CONTROLTYPEID type = 0; element->get_CurrentControlType(&type);
+                        intersectingElements += L"; candidate=" + std::to_wstring(type) + L"/contained=" + std::to_wstring(contained) +
+                            L"/bounds=" + std::to_wstring(bounds.left) + L"," + std::to_wstring(bounds.top) + L"," +
+                            std::to_wstring(bounds.right) + L"," + std::to_wstring(bounds.bottom);
+                        ++recordedElements;
+                    }
+                    if (!contained) continue;
+                    ++result.visibleElements;
+                    BSTR name = nullptr;
+                    nameRead = element->get_CurrentName(&name);
+                    if (SUCCEEDED(nameRead) && name) { ++names; sample(L"Name", name); text.append(name, std::min<size_t>(SysStringLen(name), 1024)); text += L'\n'; }
+                    SysFreeString(name);
+                    ComPtr<IUIAutomationValuePattern> value;
+                    if (budget()) valuePatternRead = valueRead = element->GetCurrentPatternAs(UIA_ValuePatternId, IID_PPV_ARGS(&value));
+                    if (budget() && SUCCEEDED(valueRead) && value) {
+                        BSTR actual = nullptr;
+                        valueRead = value->get_CurrentValue(&actual);
+                        if (SUCCEEDED(valueRead) && actual) { ++values; sample(L"Value", actual); text.append(actual, std::min<size_t>(SysStringLen(actual), 1024)); text += L'\n'; }
+                        SysFreeString(actual);
+                    }
+                    if (preview && budget()) {
+                        ComPtr<IUIAutomationTextPattern> pattern;
+                        ComPtr<IUIAutomationTextRange> range;
+                        textPatternRead = documentRead = element->GetCurrentPatternAs(UIA_TextPatternId, IID_PPV_ARGS(&pattern));
+                        if (SUCCEEDED(documentRead) && pattern) rangeRead = documentRead = pattern->get_DocumentRange(&range);
+                        if (SUCCEEDED(documentRead) && range) {
+                            BSTR actual = nullptr;
+                            textRead = documentRead = range->GetText(2048, &actual);
+                            if (SUCCEEDED(documentRead) && actual) { ++documents; sample(L"Text", actual); text.append(actual, SysStringLen(actual)); text += L'\n'; }
+                            SysFreeString(actual);
+                        }
+                    }
+                    if (text.size() > 16384) { result.read = HRESULT_FROM_WIN32(ERROR_BUFFER_OVERFLOW); break; }
+                }
+                struct Windows {
+                    HWND host; RECT region; std::wstring desktop;
+                    bool valid = true; unsigned foreign = 0, visited = 0, contained = 0, invalidDesktop = 0;
+                    DWORD desktopError = ERROR_SUCCESS;
+                    std::set<DWORD> processes{GetCurrentProcessId()};
+                } windows{host, region, desktopName};
+                EnumChildWindows(host, [](HWND child, LPARAM context) -> BOOL {
+                    auto& state = *reinterpret_cast<Windows*>(context);
+                    ++state.visited;
+                    RECT bounds{};
+                    if (!IsWindowVisible(child) || !GetWindowRect(child, &bounds) || bounds.right <= bounds.left || bounds.bottom <= bounds.top ||
+                        bounds.left < state.region.left || bounds.right > state.region.right ||
+                        bounds.top < state.region.top || bounds.bottom > state.region.bottom) return TRUE;
+                    ++state.contained;
+                    DWORD childProcess = 0;
+                    const auto thread = GetWindowThreadProcessId(child, &childProcess);
+                    wchar_t name[256]{}; DWORD bytes = 0;
+                    const auto childDesktop = GetThreadDesktop(thread);
+                    if (!childDesktop) state.desktopError = GetLastError();
+                    const bool sameDesktop = childDesktop && GetUserObjectInformationW(childDesktop, UOI_NAME, name, sizeof(name), &bytes) &&
+                        state.desktop == name && IsChild(state.host, child);
+                    if (childDesktop && !name[0]) state.desktopError = GetLastError();
+                    if (!sameDesktop) ++state.invalidDesktop;
+                    state.valid = sameDesktop && state.valid;
+                    if (childProcess != GetCurrentProcessId()) { ++state.foreign; state.processes.insert(childProcess); }
+                    return TRUE;
+                }, reinterpret_cast<LPARAM>(&windows));
+                HDESK input = OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS | DESKTOP_ENUMERATE);
+                const auto inputOpenError = input ? ERROR_SUCCESS : GetLastError();
+                result.inputUnchanged = userObjectName(input) == inputName && inputName != desktopName;
+                bool visibleInput = false;
+                struct Input { const std::set<DWORD>* processes; bool* visible; } inputState{&windows.processes, &visibleInput};
+                SetLastError(ERROR_SUCCESS);
+                const bool inspected = input && EnumDesktopWindows(input, [](HWND candidate, LPARAM context) -> BOOL {
+                    auto& state = *reinterpret_cast<Input*>(context); DWORD owner = 0; GetWindowThreadProcessId(candidate, &owner);
+                    if (state.processes->contains(owner) && IsWindowVisible(candidate)) *state.visible = true;
+                    return TRUE;
+                }, reinterpret_cast<LPARAM>(&inputState));
+                const auto inputEnumError = inspected ? ERROR_SUCCESS : GetLastError();
+                if (input) CloseDesktop(input);
+                result.privacyChecked = true;
+                result.privateWindows = windows.valid && inspected && result.inputUnchanged && !visibleInput;
+                result.handlerWindows = windows.foreign;
+                const auto matched = static_cast<unsigned>(std::count_if(expected.begin(), expected.end(), [&](const auto& token) {
+                    return !token.empty() && text.find(token) != std::wstring::npos;
+                }));
+                result.matched = SUCCEEDED(result.read) && budget() && matched == expected.size() && !expected.empty() &&
+                    (absent.empty() || text.find(absent) == std::wstring::npos) && result.privateWindows && (!preview || result.handlerWindows != 0);
+                result.detail = L"pane visible elements=" + std::to_wstring(result.visibleElements) + L"; semantic matches=" +
+                    std::to_wstring(matched) + L"/" + std::to_wstring(expected.size()) + L"; obsolete token absent=" +
+                    std::to_wstring(absent.empty() || text.find(absent) == std::wstring::npos) + L"; foreign handler HWNDs=" +
+                    std::to_wstring(result.handlerWindows) + L"; private HWNDs=" + std::to_wstring(result.privateWindows) +
+                    L"; child HWNDs visited/contained/invalidDesktop=" + std::to_wstring(windows.visited) + L"/" +
+                    std::to_wstring(windows.contained) + L"/" + std::to_wstring(windows.invalidDesktop) +
+                    L"; desktop native error=" + std::to_wstring(windows.desktopError) + L"; input open/enum native error=" +
+                    std::to_wstring(inputOpenError) + L"/" + std::to_wstring(inputEnumError) + L"; input inspected/unchanged/visible=" +
+                    std::to_wstring(inspected) + L"/" + std::to_wstring(result.inputUnchanged) + L"/" + std::to_wstring(visibleInput) +
+                    L"; bounds=" + std::to_wstring(region.left) + L"," + std::to_wstring(region.top) + L"," +
+                    std::to_wstring(region.right) + L"," + std::to_wstring(region.bottom) + L"; read=" + hresultMessage(result.read);
+                if (result.matched || !result.privateWindows) break;
+                Sleep(40);
+            } while (budget());
+            if (!result.matched && SUCCEEDED(result.read)) result.read = HRESULT_FROM_WIN32(cancelled->load() ? ERROR_CANCELLED : ERROR_TIMEOUT);
+        } catch (const std::bad_alloc&) { result.read = E_OUTOFMEMORY; }
+          catch (...) { result.read = E_FAIL; }
+        result.detail += L"; observation phase=" + std::to_wstring(phase) + L"; polls=" + std::to_wstring(polls) +
+            L"; UIA available=" + std::to_wstring(availableElements) + L"; Name/Value/Text reads=" + std::to_wstring(names) + L"/" +
+            std::to_wstring(values) + L"/" + std::to_wstring(documents) + L"; Value/Text HRESULT=" + hresultMessage(valueRead) + L"/" +
+            hresultMessage(documentRead) + L"; Name/ValuePattern/TextPattern/DocumentRange/Text HRESULT=" + hresultMessage(nameRead) + L"/" +
+            hresultMessage(valuePatternRead) + L"/" + hresultMessage(textPatternRead) + L"/" + hresultMessage(rangeRead) + L"/" +
+            hresultMessage(textRead) + L"; final HRESULT=" + hresultMessage(result.read) + intersectingElements + samples;
+        output.set_value(std::move(result));
+    });
+    // Publishing the value does not prove UIA/COM teardown has returned. Wait
+    // for the real kernel thread before joining or releasing its native site.
+    const auto nativeThread = static_cast<HANDLE>(worker.native_handle());
+    const auto ready = [&] { return WaitForSingleObject(nativeThread, 0) == WAIT_OBJECT_0 &&
+        future.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready; };
+    const bool completed = pumpUntil(ready, 5000);
+    if (!completed) {
+        cancelled->store(true);
+        CoCancelCall(GetThreadId(nativeThread), 0);
+        if (!pumpUntil(ready, 5000)) {
+            std::fprintf(stderr, "headless pane UIA failed to join after cancellation; private owner/resources retained\n");
+            std::fflush(stderr);
+            if (!TerminateProcess(GetCurrentProcess(), 9)) std::_Exit(9);
+            std::_Exit(9);
+        }
+    }
+    worker.join();
+    auto result = future.get();
+    if (!completed) { result.matched = false; result.read = HRESULT_FROM_WIN32(ERROR_TIMEOUT); }
+    return result;
+}
+
+class NativePaneSite final : public Microsoft::WRL::RuntimeClass<
+    Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::ClassicCom>, IServiceProvider, IExplorerPaneVisibility> {
+public:
+    bool preview = false;
+    HRESULT STDMETHODCALLTYPE QueryService(REFGUID service, REFIID iid, void** output) override {
+        if (!output) return E_POINTER;
+        *output = nullptr;
+        return service == SID_ExplorerPaneVisibility ? QueryInterface(iid, output) : E_NOINTERFACE;
+    }
+    HRESULT STDMETHODCALLTYPE GetPaneState(REFEXPLORERPANE pane, EXPLORERPANESTATE* state) override {
+        if (!state) return E_POINTER;
+        const bool visible = preview ? pane == EP_PreviewPane : pane == EP_DetailsPane;
+        *state = static_cast<EXPLORERPANESTATE>((visible ? EPS_DEFAULT_ON : EPS_DEFAULT_OFF) | EPS_FORCE);
+        return S_OK;
+    }
+};
+
 // The paired Share fixture changes only the outer ExplorerBrowser site. This
 // independent browser never receives the App site and never displays its owner.
 // Its actual completion callback and view remain alive until Destroy returns.
@@ -307,6 +585,58 @@ struct ShareSiteReference {
             browser->Destroy(); browser.Reset();
         }
         navigation.Reset();
+        if (owner) DestroyWindow(owner);
+    }
+};
+// Independent public native browser with only the documented pane service.
+// It receives the same owned files but never receives the App's view site.
+struct NativePaneReference {
+    HWND owner = nullptr;
+    ComPtr<IExplorerBrowser> browser;
+    ComPtr<IShellView> view;
+    ComPtr<IFolderView2> folderView;
+    ComPtr<NativePaneSite> site;
+    ComPtr<ShareSiteReference::Navigation> navigation;
+    DWORD cookie = 0;
+    HRESULT create(HINSTANCE instance, IShellItem* folder, bool preview) {
+        const auto desktop = PrivateDesktop::current();
+        if (!desktop || FAILED(desktop->verifyIsolation()) || !folder) return E_ACCESSDENIED;
+        owner = CreateWindowExW(0, L"STATIC", L"Owned independent native pane reference", WS_OVERLAPPEDWINDOW,
+            20, 20, 1000, 700, nullptr, nullptr, instance, nullptr);
+        if (!owner) return HRESULT_FROM_WIN32(GetLastError());
+        auto hr = CoCreateInstance(CLSID_ExplorerBrowser, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&browser));
+        site = Microsoft::WRL::Make<NativePaneSite>();
+        if (!site) return E_OUTOFMEMORY;
+        site->preview = preview;
+        ComPtr<IObjectWithSite> located;
+        if (SUCCEEDED(hr)) hr = browser.As(&located);
+        if (SUCCEEDED(hr)) hr = located->SetSite(static_cast<IServiceProvider*>(site.Get()));
+        if (SUCCEEDED(hr)) hr = browser->SetOptions(static_cast<EXPLORER_BROWSER_OPTIONS>(
+            EBO_SHOWFRAMES | EBO_NOTRAVELLOG | EBO_NOPERSISTVIEWSTATE | EBO_NOBORDER));
+        RECT bounds{}; GetClientRect(owner, &bounds);
+        FOLDERSETTINGS settings{FVM_DETAILS, FWF_AUTOARRANGE};
+        if (SUCCEEDED(hr)) hr = browser->Initialize(owner, &bounds, &settings);
+        navigation = Microsoft::WRL::Make<ShareSiteReference::Navigation>();
+        if (SUCCEEDED(hr)) hr = navigation ? browser->Advise(navigation.Get(), &cookie) : E_OUTOFMEMORY;
+        if (SUCCEEDED(hr)) hr = browser->BrowseToObject(folder, SBSP_ABSOLUTE);
+        if (SUCCEEDED(hr) && !pumpUntil([&] { return navigation->finished; }, 4000)) hr = HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+        if (SUCCEEDED(hr)) hr = navigation->status;
+        if (SUCCEEDED(hr)) hr = browser->GetCurrentView(IID_PPV_ARGS(&view));
+        if (SUCCEEDED(hr)) hr = view.As(&folderView);
+        if (SUCCEEDED(hr) && !pumpUntil([&] { int count = 0; return SUCCEEDED(folderView->ItemCount(SVGIO_ALLVIEW, &count)) && count == 4; }, 1500))
+            hr = HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+        return hr;
+    }
+    ~NativePaneReference() {
+        folderView.Reset(); view.Reset();
+        if (browser) {
+            if (cookie) browser->Unadvise(cookie);
+            browser->Destroy();
+            ComPtr<IObjectWithSite> located;
+            if (SUCCEEDED(browser.As(&located))) located->SetSite(nullptr);
+            browser.Reset();
+        }
+        navigation.Reset(); site.Reset();
         if (owner) DestroyWindow(owner);
     }
 };
@@ -691,7 +1021,9 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report) {
     auto check = [&](const char* name, bool passed, const std::wstring& detail = L"", ULONGLONG ms = 0) {
         checks.push_back({name, passed, detail, ms});
         std::cerr << "headless-check " << name << " passed=" << (passed ? "true" : "false")
-                  << " elapsed_ms=" << GetTickCount64() - started << std::endl;
+                  << " elapsed_ms=" << GetTickCount64() - started;
+        if (!passed && !detail.empty()) std::cerr << " detail=" << jsonString(detail);
+        std::cerr << std::endl;
     };
     auto probeNativeMenus = [&](const std::vector<std::pair<const char*, const wchar_t*>>& requests, UINT tab = 0,
                                 std::vector<std::wstring> requiredLibraryRows = {}) {
@@ -1022,60 +1354,141 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report) {
         }
         supersededNativeView.Reset();
         if(ready&&view_&&folderView_) {
+            // Navigation completion alone does not activate the native view
+            // or establish its complete selection/data-object readback.
+            ComPtr<IShellView> originalView=view_;
+            ComPtr<IFolderView2> originalFolderView=folderView_;
+            PrivatePresentation selectionPresentation(window_,true);
+            const auto activation=selectionPresentation.ready?originalView->UIActivate(SVUIA_ACTIVATE_NOFOCUS):E_ACCESSDENIED;
+            const auto deadline=GetTickCount64()+10000;
+            const auto waitForSelection=[&](const std::function<bool()>& predicate) {
+                const auto now=GetTickCount64();
+                return now<deadline&&pumpUntil(predicate,static_cast<DWORD>(deadline-now));
+            };
             struct ChildIds {
                 std::vector<Pidl> owned;
                 std::vector<PCUITEMID_CHILD> children;
             } identities;
-            HRESULT prepared=S_OK;
+            HRESULT prepared=activation;
+            std::array<NativeFileIdentity,3> expectedIds{};
             for(const auto* name:{L"file-0.txt",L"file-1.txt",L"file-2.txt"}) {
+                if(FAILED(prepared))break;
                 ComPtr<IShellItem> item;PIDLIST_ABSOLUTE raw=nullptr;
                 auto hr=SHCreateItemFromParsingName((fixture/name).c_str(),nullptr,IID_PPV_ARGS(&item));
                 if(SUCCEEDED(hr))hr=SHGetIDListFromObject(item.Get(),&raw);
                 Pidl id(raw);
+                FILE_ID_INFO fileId{};
+                if(SUCCEEDED(hr))hr=nativeFileIdentity(fixture/name,fileId);
                 if(FAILED(hr)||!id){prepared=FAILED(hr)?hr:E_UNEXPECTED;break;}
+                auto& expected=expectedIds[identities.owned.size()];expected.first=fileId.VolumeSerialNumber;
+                std::copy(std::begin(fileId.FileId.Identifier),std::end(fileId.FileId.Identifier),expected.second.begin());
                 identities.children.push_back(ILFindLastID(id.get()));identities.owned.push_back(std::move(id));
             }
             const auto selectPair=[&](size_t tail)->HRESULT {
                 if(FAILED(prepared)||identities.children.size()!=3)return FAILED(prepared)?prepared:E_UNEXPECTED;
-                auto hr=view_->SelectItem(nullptr,SVSI_DESELECTOTHERS);
+                if(view_.Get()!=originalView.Get()||folderView_.Get()!=originalFolderView.Get())return E_ABORT;
+                auto hr=originalView->SelectItem(nullptr,SVSI_DESELECTOTHERS);
                 std::array<PCUITEMID_CHILD,2> pair{identities.children[0],identities.children[tail]};
-                if(SUCCEEDED(hr))hr=folderView_->SelectAndPositionItems(static_cast<UINT>(pair.size()),pair.data(),nullptr,SVSI_SELECT|SVSI_NOTAKEFOCUS);
-                if(SUCCEEDED(hr))hr=OnStateChange(view_.Get(),CDBOSC_SELCHANGE);
+                if(SUCCEEDED(hr))hr=originalFolderView->SelectAndPositionItems(static_cast<UINT>(pair.size()),pair.data(),nullptr,SVSI_SELECT|SVSI_NOTAKEFOCUS);
+                if(SUCCEEDED(hr))hr=OnStateChange(originalView.Get(),CDBOSC_SELCHANGE);
                 return hr;
             };
+            HRESULT selectionRead=E_PENDING,countRead=E_PENDING,identityRead=E_PENDING;
+            HRESULT attributesRead=E_PENDING,dataBind=E_PENDING,dataRead=E_PENDING;
+            DWORD nativeCount=0;UINT cidaCount=0;SFGAOF nativeAttributes=0;
+            const auto readPair=[&](size_t tail,ComPtr<IShellItemArray>& items,std::set<NativeFileIdentity>& ids) {
+                countRead=identityRead=attributesRead=dataBind=dataRead=E_PENDING;nativeCount=cidaCount=0;nativeAttributes=0;
+                selectionRead=originalFolderView->GetSelection(FALSE,&items);
+                if(FAILED(selectionRead)||!items)return false;
+                countRead=items->GetCount(&nativeCount);
+                if(FAILED(countRead)||nativeCount!=2)return false;
+                identityRead=nativeArrayIdentities(items.Get(),ids);
+                if(FAILED(identityRead)||ids!=std::set<NativeFileIdentity>{expectedIds[0],expectedIds[tail]})return false;
+                constexpr SFGAOF attributes=SFGAO_FILESYSTEM|SFGAO_HIDDEN|SFGAO_CANCOPY|SFGAO_CANMOVE|
+                    SFGAO_CANDELETE|SFGAO_CANRENAME|SFGAO_HASPROPSHEET|SFGAO_FOLDER|SFGAO_LINK;
+                attributesRead=items->GetAttributes(static_cast<SIATTRIBFLAGS>(SIATTRIBFLAGS_AND|SIATTRIBFLAGS_ALLITEMS),attributes,&nativeAttributes);
+                if(FAILED(attributesRead))return false;
+                ComPtr<IDataObject> data;dataBind=items->BindToHandler(nullptr,BHID_DataObject,IID_PPV_ARGS(&data));
+                if(FAILED(dataBind)||!data)return false;
+                const auto format=RegisterClipboardFormatW(CFSTR_SHELLIDLIST);
+                if(!format){dataRead=HRESULT_FROM_WIN32(GetLastError());return false;}
+                FORMATETC request{static_cast<CLIPFORMAT>(format),nullptr,DVASPECT_CONTENT,-1,TYMED_HGLOBAL};
+                struct Medium{STGMEDIUM value{};~Medium(){if(value.tymed)ReleaseStgMedium(&value);}}medium;
+                dataRead=data->GetData(&request,&medium.value);
+                if(FAILED(dataRead))return false;
+                if(medium.value.tymed!=TYMED_HGLOBAL||!medium.value.hGlobal||GlobalSize(medium.value.hGlobal)<sizeof(UINT)) {
+                    dataRead=HRESULT_FROM_WIN32(ERROR_INVALID_DATA);return false;
+                }
+                const auto bytes=GlobalLock(medium.value.hGlobal);
+                if(!bytes){const auto error=GetLastError();dataRead=error?HRESULT_FROM_WIN32(error):E_OUTOFMEMORY;return false;}
+                std::memcpy(&cidaCount,bytes,sizeof(cidaCount));GlobalUnlock(medium.value.hGlobal);
+                return cidaCount==nativeCount&&view_.Get()==originalView.Get()&&folderView_.Get()==originalFolderView.Get();
+            };
+            const auto selectionDetail=[&] {
+                auto detail=L"; activation="+hresultMessage(activation)+L"; preparation="+hresultMessage(prepared)+
+                    L"; selection="+hresultMessage(selectionRead)+L"; count="+hresultMessage(countRead)+L"/"+std::to_wstring(nativeCount)+
+                    L"; FileIDs="+hresultMessage(identityRead)+L"; attributes="+hresultMessage(attributesRead)+L"/"+std::to_wstring(nativeAttributes)+
+                    L"; data bind="+hresultMessage(dataBind)+L"; CIDA="+hresultMessage(dataRead)+L"/"+std::to_wstring(cidaCount)+
+                    L"; cached count="+std::to_wstring(selectionCount_)+L"; cached identities="+
+                    std::to_wstring(commandSelectionIdentities_?commandSelectionIdentities_->size():0)+L"; dirty="+
+                    std::to_wstring(selectionStateDirty_)+L"/"+std::to_wstring(namespaceDirty_)+L"; common deadline="+
+                    hresultMessage(GetTickCount64()>=deadline?HRESULT_FROM_WIN32(ERROR_TIMEOUT):S_OK);
+                for(const auto& [id,capability]:commandCapabilities_)if(!capability.selectionVerbs.empty())
+                    detail+=L"; native command "+std::to_wstring(id)+L"="+hresultMessage(capability.status)+
+                        L"/slow completed="+std::to_wstring(capability.slowStateCompleted);
+                return detail;
+            };
             const auto selected=selectPair(1);
-            const bool snapshotReady=SUCCEEDED(selected)&&pumpUntil([&] {
-                updateCommands();
-                return selectionCount_==2&&!selectionStateDirty_&&!namespaceDirty_&&commandSelectionIdentities_&&
-                    commandSelectionIdentities_->size()==2;
-            },5000);
-            const bool actualWorkerStarted=snapshotReady&&pumpUntil([&] {
+            ComPtr<IShellItemArray> firstSelection;std::set<NativeFileIdentity> firstIds,changedIds;
+            bool snapshotReady=false,workerCompleted=false,workerInFlight=false;
+            const bool actualWorkerStarted=SUCCEEDED(selected)&&waitForSelection([&] {
+                if(!snapshotReady) {
+                    if(!readPair(1,firstSelection,firstIds))return false;
+                    OnStateChange(originalView.Get(),CDBOSC_SELCHANGE);updateCommands();
+                    snapshotReady=selectionCount_==2&&!selectionStateDirty_&&!namespaceDirty_&&commandSelectionIdentities_&&
+                        commandSelectionIdentities_->size()==2&&commandSelectionView_==originalView.Get();
+                }
+                if(!snapshotReady)return false;
                 startPendingCommandStates();
-                return selectionStateBatch_&&!selectionStateDirty_&&!namespaceDirty_;
-            },5000);
+                if(!selectionStateBatch_||selectionStateDirty_||namespaceDirty_)return false;
+                // Record observed completion for diagnostics; both completed
+                // and in-flight native batches must retain their generation.
+                workerCompleted=selectionStateBatch_->completed();
+                workerInFlight=!workerCompleted;
+                return true;
+            });
             const auto generation=namespaceGeneration_;
             const auto batch=selectionStateBatch_.get();
             const auto reusedBefore=headlessEquivalentSelectionRefreshes_;
             bool retained=actualWorkerStarted&&batch;
+            HRESULT retainedRead=E_PENDING;
             for(unsigned duplicate=0;duplicate<3&&retained;++duplicate) {
-                retained=OnStateChange(view_.Get(),CDBOSC_SELCHANGE)==S_OK;
+                retained=OnStateChange(originalView.Get(),CDBOSC_SELCHANGE)==S_OK;
                 updateCommands();
                 retained=retained&&namespaceGeneration_==generation&&selectionStateBatch_.get()==batch&&
-                    !selectionStateDirty_&&!namespaceDirty_;
+                    !selectionStateDirty_&&!namespaceDirty_&&commandSelectionView_==originalView.Get()&&view_.Get()==originalView.Get();
                 std::vector<NamespaceSelectionVerbState> states;
-                retained=retained&&batch->pollSelectionVerbBatch(&states)!=HRESULT_FROM_WIN32(ERROR_CANCELLED);
+                if(retained)retainedRead=batch->pollSelectionVerbBatch(&states);
+                retained=retained&&retainedRead!=HRESULT_FROM_WIN32(ERROR_CANCELLED);
             }
-            check("identical_complete_selection_retains_actual_inflight_native_generation",snapshotReady&&actualWorkerStarted&&
+            check("identical_complete_selection_retains_actual_native_batch_generation",snapshotReady&&actualWorkerStarted&&
                 retained&&headlessEquivalentSelectionRefreshes_>=reusedBefore+3,
                 L"snapshot/actual worker/retained="+std::to_wstring(snapshotReady)+L"/"+std::to_wstring(actualWorkerStarted)+L"/"+
-                std::to_wstring(retained)+L"; identity reuse delta="+std::to_wstring(headlessEquivalentSelectionRefreshes_-reusedBefore));
-            ComPtr<IShellItemArray> firstSelection;std::set<NativeFileIdentity> firstIds,changedIds;
-            auto firstRead=selection(firstSelection);
+                std::to_wstring(retained)+L"; identity reuse delta="+std::to_wstring(headlessEquivalentSelectionRefreshes_-reusedBefore)+
+                L"; select="+hresultMessage(selected)+L"; worker initially completed/in flight="+std::to_wstring(workerCompleted)+L"/"+
+                std::to_wstring(workerInFlight)+
+                L"; retained poll="+hresultMessage(retainedRead)+selectionDetail());
+            auto firstRead=firstSelection?S_OK:E_PENDING;
             if(SUCCEEDED(firstRead))firstRead=nativeArrayIdentities(firstSelection.Get(),firstIds);
             const auto changed=selectPair(2);
-            updateCommands();
             ComPtr<IShellItemArray> changedSelection;
-            auto changedRead=selection(changedSelection);
+            const bool changedReady=SUCCEEDED(changed)&&waitForSelection([&] {
+                if(!readPair(2,changedSelection,changedIds))return false;
+                OnStateChange(originalView.Get(),CDBOSC_SELCHANGE);updateCommands();
+                return selectionCount_==2&&!selectionStateDirty_&&!namespaceDirty_&&namespaceGeneration_>generation&&
+                    commandSelectionIdentities_&&commandSelectionIdentities_->size()==2&&commandSelectionView_==originalView.Get();
+            });
+            auto changedRead=changedSelection?S_OK:E_PENDING;
             if(SUCCEEDED(changedRead))changedRead=nativeArrayIdentities(changedSelection.Get(),changedIds);
             const auto expectedIdentity=[&](const wchar_t* name) {
                 FILE_ID_INFO info{};std::array<BYTE,16> id{};
@@ -1086,9 +1499,14 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report) {
             const auto [headRead,headId]=expectedIdentity(L"file-0.txt");
             const auto [tailRead,tailId]=expectedIdentity(L"file-2.txt");
             check("same_count_changed_native_tail_rebuilds_command_generation",SUCCEEDED(firstRead)&&SUCCEEDED(changed)&&
-                SUCCEEDED(changedRead)&&SUCCEEDED(headRead)&&SUCCEEDED(tailRead)&&firstIds.size()==2&&changedIds.size()==2&&
-                firstIds!=changedIds&&changedIds==std::set<NativeFileIdentity>{headId,tailId}&&selectionCount_==2&&
-                namespaceGeneration_>generation&&commandSelectionIdentities_&&commandSelectionIdentities_->size()==2);
+                SUCCEEDED(changedRead)&&SUCCEEDED(headRead)&&SUCCEEDED(tailRead)&&SUCCEEDED(prepared)&&changedReady&&
+                firstIds.size()==2&&changedIds.size()==2&&firstIds!=changedIds&&changedIds==std::set<NativeFileIdentity>{headId,tailId}&&
+                headId==expectedIds[0]&&tailId==expectedIds[2]&&selectionCount_==2&&
+                namespaceGeneration_>generation&&commandSelectionIdentities_&&commandSelectionIdentities_->size()==2,
+                L"first FileIDs="+hresultMessage(firstRead)+L"/"+std::to_wstring(firstIds.size())+L"; select changed="+hresultMessage(changed)+
+                L"; changed FileIDs="+hresultMessage(changedRead)+L"/"+std::to_wstring(changedIds.size())+L"; changed ready="+
+                std::to_wstring(changedReady)+L"; expected head/tail="+hresultMessage(headRead)+L"/"+hresultMessage(tailRead)+
+                L"; generation="+std::to_wstring(generation)+L"/"+std::to_wstring(namespaceGeneration_)+selectionDetail());
             bool metadataRefresh=true;
             for(const ULONG change:{CDBOSC_RENAME,CDBOSC_STATECHANGE}) {
                 const auto before=namespaceGeneration_;
@@ -2021,6 +2439,340 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report) {
             ready = pumpUntil([&] { return !navigating_ && folderView_; }, 5000);
             GetPaneState(EP_PreviewPane, &pane);
             check("panes_mutually_exclusive", ready && preferences_.detailsPane && !preferences_.previewPane && (pane & EPS_DEFAULT_OFF));
+            {
+                // Small local files avoid cloud recall and shared associations.
+                // The actual browser selects and renders them; this fixture
+                // does not instantiate or draw a substitute preview handler.
+                const auto paneRoot = fixture / L"Subfolder" / L"Native pane rendering";
+                std::filesystem::create_directory(paneRoot);
+                const std::array paths{paneRoot / L"Owned image A.bmp", paneRoot / L"Owned image B.bmp",
+                    paneRoot / L"Owned preview A.rtf", paneRoot / L"Owned preview B.rtf"};
+                const std::array<std::wstring, 2> previewTokens{L"OWNED-PREVIEW-ALPHA-41871", L"OWNED-PREVIEW-BETA-92653"};
+                const auto writeBitmap = [](const std::filesystem::path& path, LONG width, LONG height, BYTE color) {
+                    const DWORD stride = (static_cast<DWORD>(width) * 3 + 3) & ~3u;
+                    const DWORD bytes = stride * static_cast<DWORD>(height);
+                    BITMAPFILEHEADER file{}; file.bfType = 0x4d42;
+                    file.bfOffBits = sizeof(file) + sizeof(BITMAPINFOHEADER); file.bfSize = file.bfOffBits + bytes;
+                    BITMAPINFOHEADER info{}; info.biSize = sizeof(info); info.biWidth = width; info.biHeight = height;
+                    info.biPlanes = 1; info.biBitCount = 24; info.biCompression = BI_RGB; info.biSizeImage = bytes;
+                    std::vector<BYTE> pixels(bytes, 0);
+                    for (LONG y = 0; y < height; ++y) for (LONG x = 0; x < width; ++x) {
+                        const auto offset = static_cast<size_t>(y) * stride + static_cast<size_t>(x) * 3;
+                        pixels[offset] = color; pixels[offset + 1] = static_cast<BYTE>(x * 2); pixels[offset + 2] = static_cast<BYTE>(y * 3);
+                    }
+                    std::ofstream output(path, std::ios::binary);
+                    output.write(reinterpret_cast<const char*>(&file), sizeof(file));
+                    output.write(reinterpret_cast<const char*>(&info), sizeof(info));
+                    output.write(reinterpret_cast<const char*>(pixels.data()), static_cast<std::streamsize>(pixels.size()));
+                    return output.good();
+                };
+                bool filesReady = writeBitmap(paths[0], 72, 48, 41) && writeBitmap(paths[1], 120, 80, 193);
+                for (size_t index = 0; index < previewTokens.size(); ++index) {
+                    std::ofstream output(paths[index + 2], std::ios::binary);
+                    output << "{\\rtf1\\ansi\\deff0 {\\fonttbl {\\f0 Segoe UI;}}\\f0\\fs32 ";
+                    // These fixture tokens are fixed ASCII RTF text.
+                    for (const auto character : previewTokens[index]) output.put(static_cast<char>(character));
+                    output << "\\par}";
+                    filesReady = output.good() && filesReady;
+                }
+                std::array<ComPtr<IShellItem2>, 4> items;
+                std::array<FILE_ID_INFO, 4> before{};
+                std::array<std::vector<char>, 4> originalBytes;
+                std::array<std::vector<std::wstring>, 2> detailsTokens;
+                auto stage = filesReady ? S_OK : E_FAIL;
+                const auto readBytes = [](const std::filesystem::path& path) {
+                    std::ifstream input(path, std::ios::binary);
+                    return std::vector<char>(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>{});
+                };
+                const auto identity = [](const FILE_ID_INFO& value) {
+                    std::array<BYTE, 16> bytes{};
+                    std::copy(std::begin(value.FileId.Identifier), std::end(value.FileId.Identifier), bytes.begin());
+                    return NativeFileIdentity{value.VolumeSerialNumber, bytes};
+                };
+                for (size_t index = 0; SUCCEEDED(stage) && index < paths.size(); ++index) {
+                    const auto attributes = GetFileAttributesW(paths[index].c_str());
+                    if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_OFFLINE |
+                        FILE_ATTRIBUTE_RECALL_ON_OPEN | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS))) { stage = E_ACCESSDENIED; break; }
+                    stage = SHCreateItemFromParsingName(paths[index].c_str(), nullptr, IID_PPV_ARGS(&items[index]));
+                    if (SUCCEEDED(stage)) stage = nativeFileIdentity(paths[index], before[index]);
+                    originalBytes[index] = readBytes(paths[index]);
+                }
+                for (size_t index = 0; SUCCEEDED(stage) && index < detailsTokens.size(); ++index) {
+                    detailsTokens[index].push_back(itemName(items[index].Get(), SIGDN_NORMALDISPLAY));
+                    if (detailsTokens[index].back().empty()) { stage = E_UNEXPECTED; break; }
+                    for (const auto& key : std::array<PROPERTYKEY, 2>{PKEY_Image_Dimensions, PKEY_Size}) {
+                        PROPVARIANT property{}; wchar_t text[512]{};
+                        stage = items[index]->GetProperty(key, &property);
+                        if (SUCCEEDED(stage)) stage = PSFormatForDisplay(key, property, PDFF_DEFAULT, text, static_cast<DWORD>(std::size(text)));
+                        PropVariantClear(&property);
+                        if (SUCCEEDED(stage) && text[0]) detailsTokens[index].emplace_back(text); else if (SUCCEEDED(stage)) stage = E_UNEXPECTED;
+                    }
+                }
+                ComPtr<IQueryAssociations> association;
+                wchar_t originalHandler[128]{}; DWORD handlerCharacters = static_cast<DWORD>(std::size(originalHandler));
+                auto handlerRead = SUCCEEDED(stage) ? items[2]->BindToHandler(nullptr, BHID_AssociationArray,
+                    IID_PPV_ARGS(&association)) : stage;
+                if (SUCCEEDED(handlerRead)) handlerRead = association->GetString(ASSOCF_NOTRUNCATE, ASSOCSTR_SHELLEXTENSION,
+                    L"{8895b1c6-b41f-4c1c-a562-0d564250836f}", originalHandler, &handlerCharacters);
+                GUID handler{}, nativeRtf{};
+                const bool nativeClass = SUCCEEDED(handlerRead) && SUCCEEDED(CLSIDFromString(originalHandler, &handler)) &&
+                    SUCCEEDED(CLSIDFromString(L"{a42c2ccb-67d3-46fa-abe6-7d2f3488c7a3}", &nativeRtf)) && IsEqualGUID(handler, nativeRtf);
+                HRESULT moduleRead = E_NOTIMPL;
+                bool nativeModule = false;
+                if (nativeClass) {
+                    std::array<wchar_t, 32768> server{}, expanded{}, system{};
+                    DWORD type = 0, bytes = static_cast<DWORD>(sizeof(server));
+                    const auto key = std::wstring(L"CLSID\\") + originalHandler + L"\\InprocServer32";
+                    const auto read = RegGetValueW(HKEY_CLASSES_ROOT, key.c_str(), nullptr,
+                        RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND | RRF_SUBKEY_WOW6464KEY,
+                        &type, server.data(), &bytes);
+                    moduleRead = read == ERROR_SUCCESS ? S_OK : HRESULT_FROM_WIN32(read);
+                    std::filesystem::path serverPath;
+                    if (SUCCEEDED(moduleRead)) {
+                        if (type == REG_EXPAND_SZ) {
+                            const auto length = ExpandEnvironmentStringsW(server.data(), expanded.data(), static_cast<DWORD>(expanded.size()));
+                            if (!length) moduleRead = HRESULT_FROM_WIN32(GetLastError());
+                            else if (length > expanded.size()) moduleRead = HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+                            else serverPath = expanded.data();
+                        } else serverPath = server.data();
+                    }
+                    const auto systemLength = GetSystemDirectoryW(system.data(), static_cast<UINT>(system.size()));
+                    FILE_ID_INFO expectedModule{}, actualModule{};
+                    if (SUCCEEDED(moduleRead) && (!systemLength || systemLength >= system.size() || !serverPath.is_absolute()))
+                        moduleRead = HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+                    if (SUCCEEDED(moduleRead)) moduleRead = nativeFileIdentity(std::filesystem::path(system.data()) / L"shell32.dll", expectedModule);
+                    if (SUCCEEDED(moduleRead)) moduleRead = nativeFileIdentity(serverPath, actualModule);
+                    nativeModule = SUCCEEDED(moduleRead) && identity(expectedModule) == identity(actualModule);
+                    if (SUCCEEDED(moduleRead) && !nativeModule) moduleRead = HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+                }
+                const bool nativeHandler = nativeClass && nativeModule;
+                check("native_pane_owned_sources_and_original_preview_association", SUCCEEDED(stage),
+                    L"source read=" + hresultMessage(stage) + L"; effective preview association=" + hresultMessage(handlerRead) +
+                    L"; original CLSID=" + originalHandler + L"; effective64bitserver=" + hresultMessage(moduleRead) +
+                    L"; actual native shell32 FileID=" + std::to_wstring(nativeModule) + L"; system RTF eligible=" + std::to_wstring(nativeHandler));
+                const auto mainView = view_;
+                const auto mainNavigation = navigationCount_;
+                const auto mainHistory = history_.size();
+                const auto mainHistoryIndex = historyIndex_;
+                const auto mainQuery = activeQuery_;
+                Pidl mainLocation(currentPidl_ ? ILCloneFull(currentPidl_.get()) : nullptr);
+                auto releasePaneApp = [](ExplorerApp* value) {
+                    if (value->window_ && IsWindow(value->window_)) SendMessageW(value->window_, WM_CLOSE, 0, 0);
+                    value->Release();
+                };
+                std::unique_ptr<ExplorerApp, decltype(releasePaneApp)> paneApp(
+                    new ExplorerApp(instance_, true, requestedRibbonLayout_), releasePaneApp);
+                VisualScene scene; scene.details = true;
+                auto created = SUCCEEDED(stage) ? paneApp->prepareHeadlessVisual(scene) : stage;
+                paneApp->preferences_.navigationPane = false;
+                if (SUCCEEDED(created)) created = paneApp->create(paneRoot.wstring());
+                const auto paneReady = [&] {
+                    if (paneApp->closing_ || paneApp->navigating_ || !paneApp->folderView_ || !paneApp->view_) return false;
+                    ComPtr<IShellItem> folder;
+                    int comparison = 1;
+                    ComPtr<IShellItem> expected;
+                    int total = 0;
+                    return SUCCEEDED(SHCreateItemFromParsingName(paneRoot.c_str(), nullptr, IID_PPV_ARGS(&expected))) &&
+                        SUCCEEDED(paneApp->currentFolder(folder)) && SUCCEEDED(folder->Compare(expected.Get(), SICHINT_CANONICAL, &comparison)) &&
+                        comparison == 0 && SUCCEEDED(paneApp->folderView_->ItemCount(SVGIO_ALLVIEW, &total)) && total == 4;
+                };
+                bool actualReady = SUCCEEDED(created) && pumpUntil(paneReady, 5000);
+                const auto exactSelected = [&](IFolderView2* folder, size_t index) {
+                    ComPtr<IShellItemArray> selected; std::set<NativeFileIdentity> ids;
+                    return folder && SUCCEEDED(folder->GetSelection(FALSE, &selected)) &&
+                        SUCCEEDED(nativeArrayIdentities(selected.Get(), ids)) && ids == std::set<NativeFileIdentity>{identity(before[index])};
+                };
+                struct FocusedPaneItem { HRESULT read = E_PENDING; int index = -1; bool exact = false; };
+                const auto focusedItem = [&](IFolderView2* folder, size_t index) {
+                    FocusedPaneItem result;
+                    result.read = folder ? folder->GetFocusedItem(&result.index) : E_POINTER;
+                    ComPtr<IShellItem> item;
+                    if (SUCCEEDED(result.read)) result.read = result.index >= 0 ?
+                        folder->GetItem(result.index, IID_PPV_ARGS(&item)) : E_UNEXPECTED;
+                    PWSTR path = nullptr;
+                    if (SUCCEEDED(result.read)) result.read = item->GetDisplayName(SIGDN_FILESYSPATH, &path);
+                    FILE_ID_INFO actual{};
+                    if (SUCCEEDED(result.read)) result.read = path ? nativeFileIdentity(path, actual) : E_UNEXPECTED;
+                    CoTaskMemFree(path);
+                    result.exact = SUCCEEDED(result.read) && identity(actual) == identity(before[index]);
+                    return result;
+                };
+                const auto selectOnce = [&](IShellView* nativeView, IFolderView2* folder, size_t index) {
+                    PIDLIST_ABSOLUTE raw = nullptr;
+                    auto selected = SHGetIDListFromObject(items[index].Get(), &raw); Pidl target(raw);
+                    if (SUCCEEDED(selected)) selected = nativeView->SelectItem(ILFindLastID(target.get()),
+                        SVSI_SELECT | SVSI_DESELECTOTHERS | SVSI_FOCUSED | SVSI_NOTAKEFOCUS | SVSI_ENSUREVISIBLE);
+                    return SUCCEEDED(selected) && pumpUntil([&] { return exactSelected(folder, index) && focusedItem(folder, index).exact; }, 2500);
+                };
+                const auto capturePane = [&](HWND host, HWND content, const PaneObservation& observed, const wchar_t* name, VisualCaptureReport& captured) {
+                    RECT frame{}; bool rtl = false;
+                    HWND nativeFrame = GetParent(content);
+                    for (; nativeFrame && nativeFrame != host; nativeFrame = GetParent(nativeFrame)) {
+                        if (GetClientRect(nativeFrame, &frame) && SUCCEEDED(mapUiRect(nativeFrame, nullptr, frame, &frame)) &&
+                            observed.bounds.left >= frame.left && observed.bounds.right <= frame.right &&
+                            observed.bounds.top >= frame.top && observed.bounds.bottom <= frame.bottom) break;
+                    }
+                    if (!nativeFrame || nativeFrame == host || FAILED(windowUiDirection(host, &rtl))) return E_INVALIDARG;
+                    VisualCaptureOptions options; options.includeFrame = false;
+                    options.minimumUniqueColors = 2; options.requireVisibleChildren = false;
+                    options.nativeClientCropSource = host;
+                    options.nativeClientCropPrintLayout = rtl ? LAYOUT_RTL : 0;
+                    options.nativeClientCropPrintFlags = 0;
+                    options.pixelInspectionBounds = observed.bounds;
+                    OffsetRect(&options.pixelInspectionBounds, -frame.left, -frame.top);
+                    InflateRect(&options.pixelInspectionBounds, -4, -4);
+                    const auto path = std::filesystem::absolute(report).parent_path() / (report.stem().wstring() + L"-pane-" + name + L"-" +
+                        std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()) + L".png");
+                    options.nativeClientCropSourceImage = path.parent_path() / (path.stem().wstring() + L"-root-source.png");
+                    // A verified private surface can diagnose semantic failure;
+                    // successful rendering still requires observed.matched.
+                    const auto printed = observed.privacyChecked && observed.privateWindows && PrivateDesktop::current() &&
+                        RedrawWindow(host, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN | RDW_UPDATENOW) && GdiFlush() ?
+                        captureWindowPng(*PrivateDesktop::current(), nativeFrame, path, options, captured) : E_UNEXPECTED;
+                    return printed;
+                };
+                bool paneIsolationPreserved = true;
+                const auto verifyCase = [&](bool preview) {
+                    std::array<PaneObservation, 2> observations;
+                    std::array<VisualCaptureReport, 2> captures;
+                    std::array<HRESULT, 2> prints{E_PENDING, E_PENDING};
+                    std::array<bool, 2> selections{}, retainedStates{};
+                    std::array<FocusedPaneItem, 2> focusedItems;
+                    bool passed = actualReady;
+                    PrivatePresentation presentation(paneApp->window_, true);
+                    const auto retainedView = paneApp->view_;
+                    const auto retainedFolder = paneApp->folderView_;
+                    const auto navigation = paneApp->navigationCount_;
+                    const auto historyCount = paneApp->history_.size();
+                    const auto historyIndex = paneApp->historyIndex_;
+                    const auto query = paneApp->activeQuery_;
+                    const auto revision = paneApp->searchInteractionRevision_;
+                    Pidl location(paneApp->currentPidl_ ? ILCloneFull(paneApp->currentPidl_.get()) : nullptr);
+                    ComPtr<IObjectWithSite> located, browserLocated;
+                    ComPtr<IUnknown> viewSite, siteIdentity, appIdentity;
+                    auto siteRead = paneApp->browser_.As(&browserLocated);
+                    if (SUCCEEDED(siteRead)) siteRead = browserLocated->GetSite(IID_PPV_ARGS(&siteIdentity));
+                    if (SUCCEEDED(siteRead)) siteRead = paneApp->QueryInterface(IID_PPV_ARGS(&appIdentity));
+                    if (SUCCEEDED(siteRead)) siteRead = retainedView ? retainedView.As(&located) : E_UNEXPECTED;
+                    if (SUCCEEDED(siteRead)) siteRead = located->GetSite(IID_PPV_ARGS(&viewSite));
+                    const bool originalSite = SUCCEEDED(siteRead) && siteIdentity.Get() == appIdentity.Get() && viewSite;
+                    HWND content = nullptr;
+                    const auto windowRead = retainedView ? retainedView->GetWindow(&content) : E_UNEXPECTED;
+                    passed = passed && presentation.ready && originalSite && SUCCEEDED(windowRead);
+                    // Match run(): show the owned private frame, then activate
+                    // its actual view before the file-selection notification.
+                    const auto activation = passed ? retainedView->UIActivate(SVUIA_ACTIVATE_FOCUS) : E_ACCESSDENIED;
+                    passed = passed && SUCCEEDED(activation) && !paneApp->closing_ && !paneApp->navigating_ &&
+                        paneApp->view_.Get() == retainedView.Get() && paneApp->folderView_.Get() == retainedFolder.Get();
+                    const bool caseReady = passed;
+                    for (size_t index = 0; index < observations.size(); ++index) {
+                        const size_t file = preview ? index + 2 : index;
+                        const bool selected = caseReady && (index == 0 || observations[index - 1].privateWindows) &&
+                            !paneApp->closing_ && !paneApp->navigating_ && paneApp->view_.Get() == retainedView.Get() &&
+                            paneApp->folderView_.Get() == retainedFolder.Get() && paneApp->navigationCount_ == navigation &&
+                            selectOnce(retainedView.Get(), retainedFolder.Get(), file);
+                        selections[index] = selected;
+                        if (selected) observations[index] = observeNativePane(paneApp->window_, content,
+                            preview ? std::vector<std::wstring>{previewTokens[index]} : detailsTokens[index],
+                            index ? (preview ? previewTokens[0] : detailsTokens[0].front()) : L"", preview);
+                        prints[index] = capturePane(paneApp->window_, content, observations[index], preview ? (index ? L"preview-b" : L"preview-a") :
+                            (index ? L"details-b" : L"details-a"), captures[index]);
+                        focusedItems[index] = focusedItem(retainedFolder.Get(), file);
+                        ComPtr<IUnknown> afterSite;
+                        const bool siteStable = located && SUCCEEDED(located->GetSite(IID_PPV_ARGS(&afterSite))) && afterSite.Get() == viewSite.Get();
+                        const bool stable = !paneApp->closing_ && !paneApp->navigating_ && paneApp->view_.Get() == retainedView.Get() &&
+                            paneApp->folderView_.Get() == retainedFolder.Get() && paneApp->navigationCount_ == navigation &&
+                            paneApp->history_.size() == historyCount && paneApp->historyIndex_ == historyIndex && location &&
+                            paneApp->activeQuery_ == query && paneApp->searchInteractionRevision_ == revision &&
+                            paneApp->currentPidl_ && ILIsEqual(location.get(), paneApp->currentPidl_.get()) && siteStable &&
+                            exactSelected(retainedFolder.Get(), file) && focusedItems[index].exact;
+                        retainedStates[index] = stable;
+                        passed = selected && observations[index].matched && SUCCEEDED(prints[index]) && stable &&
+                            captures[index].inspectionUniqueColors >= 2 && captures[index].inspectionInkFraction > 0.002 && passed;
+                    }
+                    const bool pixelsChanged = EqualRect(&captures[0].pixelInspectionBounds, &captures[1].pixelInspectionBounds) &&
+                        captures[0].inspectionPixelHash != captures[1].inspectionPixelHash;
+                    std::wstring diagnostic = L"created=" + hresultMessage(created) + L"; actual ready/presentation/case ready=" +
+                        std::to_wstring(actualReady) + L"/" + std::to_wstring(presentation.ready) + L"/" + std::to_wstring(caseReady) +
+                        L"; native view activation=" + hresultMessage(activation) + L"; view window=" + hresultMessage(windowRead) + L"; original App pane site=" +
+                        std::to_wstring(originalSite) + L"/" + hresultMessage(siteRead) + L"; pane pixels changed=" + std::to_wstring(pixelsChanged);
+                    for (size_t index = 0; index < observations.size(); ++index) diagnostic += L"; " + std::to_wstring(index) + L": " +
+                        L"exact selected/retained state=" + std::to_wstring(selections[index]) + L"/" + std::to_wstring(retainedStates[index]) +
+                        L"; native focused item HRESULT/index/exactFileID=" + hresultMessage(focusedItems[index].read) + L"/" +
+                        std::to_wstring(focusedItems[index].index) + L"/" + std::to_wstring(focusedItems[index].exact) +
+                        L"; observation HRESULT=" + hresultMessage(observations[index].read) + L"; " + observations[index].detail +
+                        L"; print=" + hresultMessage(prints[index]) + L"; colors=" +
+                        std::to_wstring(captures[index].inspectionUniqueColors) + L"; hash=" + std::to_wstring(captures[index].inspectionPixelHash) +
+                        L"; source HWND=" + std::to_wstring(captures[index].printSourceWindow) + L"; native frame HWND=" +
+                        std::to_wstring(captures[index].printTargetWindow) + L"; native flags=" + std::to_wstring(captures[index].printWindowFlags) +
+                        L"; source image=" + captures[index].nativeClientCropSourceImage.wstring();
+                    const bool isolationFailed = std::any_of(observations.begin(), observations.end(), [](const auto& observed) {
+                        return observed.privacyChecked && !observed.privateWindows;
+                    });
+                    paneIsolationPreserved = !isolationFailed && paneIsolationPreserved;
+                    if (!passed || !pixelsChanged) {
+                        std::cerr << "headless native " << (preview ? "Preview" : "Details") <<
+                            " pane before independent reference: " << jsonString(diagnostic) << std::endl;
+                    }
+                    if ((!passed || !pixelsChanged) && !isolationFailed) {
+                        ComPtr<IShellItem> folder;
+                        auto referenceRead = SHCreateItemFromParsingName(paneRoot.c_str(), nullptr, IID_PPV_ARGS(&folder));
+                        NativePaneReference reference;
+                        if (SUCCEEDED(referenceRead)) referenceRead = reference.create(instance_, folder.Get(), preview);
+                        PaneObservation observed;
+                        HRESULT referenceActivation = E_PENDING;
+                        FocusedPaneItem referenceFocused;
+                        if (SUCCEEDED(referenceRead)) {
+                            PrivatePresentation referencePresentation(reference.owner, true);
+                            HWND referenceContent = nullptr;
+                            referenceRead = reference.view->GetWindow(&referenceContent);
+                            if (SUCCEEDED(referenceRead) && referencePresentation.ready)
+                                referenceActivation = reference.view->UIActivate(SVUIA_ACTIVATE_FOCUS);
+                            if (SUCCEEDED(referenceRead) && referencePresentation.ready && SUCCEEDED(referenceActivation) &&
+                                selectOnce(reference.view.Get(), reference.folderView.Get(), preview ? 2 : 0))
+                                observed = observeNativePane(reference.owner, referenceContent,
+                                    preview ? std::vector<std::wstring>{previewTokens[0]} : detailsTokens[0], L"", preview);
+                            referenceFocused = focusedItem(reference.folderView.Get(), preview ? 2 : 0);
+                        }
+                        diagnostic += L"; independent native reference=" + hresultMessage(referenceRead) + L"/semantic=" +
+                            std::to_wstring(observed.matched) + L"/" + observed.detail + L"; reference activation=" + hresultMessage(referenceActivation) +
+                            L"; reference focused item HRESULT/index/exactFileID=" + hresultMessage(referenceFocused.read) + L"/" +
+                            std::to_wstring(referenceFocused.index) + L"/" + std::to_wstring(referenceFocused.exact);
+                    }
+                    check(preview ? "native_preview_rtf_content_and_pixels_follow_exact_selected_file" :
+                        "native_details_property_content_and_pixels_follow_exact_selected_file", passed && pixelsChanged, diagnostic);
+                    return passed && pixelsChanged;
+                };
+                const bool detailsRendered = verifyCase(false);
+                if (nativeHandler && paneIsolationPreserved) {
+                    // A separate real startup with Preview already enabled
+                    // cannot accidentally preview the earlier BMP selection
+                    // through an unrelated third-party image association.
+                    paneApp.reset(new ExplorerApp(instance_, true, requestedRibbonLayout_));
+                    paneApp->preferences_.navigationPane = false;
+                    paneApp->preferences_.detailsPane = false;
+                    paneApp->preferences_.previewPane = true;
+                    created = SUCCEEDED(stage) ? paneApp->create(paneRoot.wstring()) : stage;
+                    actualReady = SUCCEEDED(created) && pumpUntil(paneReady, 5000);
+                    verifyCase(true);
+                } else {
+                    // No alternate association or native substitute is installed.
+                    // This records unavailable coverage without a render PASS.
+                    check("native_preview_unavailable_original_handler_not_activated", SUCCEEDED(stage) && paneIsolationPreserved,
+                        L"effective handler=" + hresultMessage(handlerRead) + L"/" + originalHandler + L"; effective64bitserver=" +
+                        hresultMessage(moduleRead) + L"; no preview selected/invoked");
+                }
+                paneApp.reset();
+                bool sourcesPreserved = true;
+                for (size_t index = 0; index < paths.size(); ++index) {
+                    FILE_ID_INFO after{};
+                    sourcesPreserved = SUCCEEDED(nativeFileIdentity(paths[index], after)) && identity(after) == identity(before[index]) &&
+                        readBytes(paths[index]) == originalBytes[index] && sourcesPreserved;
+                }
+                check("native_pane_fixture_preserves_sources_and_original_app_view", sourcesPreserved && detailsRendered &&
+                    view_.Get() == mainView.Get() && navigationCount_ == mainNavigation && history_.size() == mainHistory &&
+                    historyIndex_ == mainHistoryIndex && activeQuery_ == mainQuery && currentPidl_ && mainLocation && ILIsEqual(currentPidl_.get(), mainLocation.get()));
+            }
             check("invalid_location_returns_error", FAILED(navigate((fixture / L"does-not-exist").wstring())));
             auto previousCount = navigationCount_;
             Pidl originalSearchScope(ILCloneFull(currentPidl_.get()));
@@ -2775,28 +3527,119 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report) {
             check("long_saved_leave_reopen_same_native_query_uses_new_source_metadata_and_presentation",variantOpened&&variantApplied&&
                 ILIsEqual(currentPidl_.get(),longReusePidl.get())&&searchFileProperties_&&*searchFileProperties_==variantProperties&&
                 sameRules(searchScopeRules_),hresultMessage(variantOpen));
-            const auto longParent=navigate(longSavedDirectory.wstring());
-            const bool longParentReady=SUCCEEDED(longParent)&&pumpUntil([&]{return !navigating_&&atLocation(longSavedDirectory)&&folderView_;},5000);
-            PIDLIST_ABSOLUTE longRaw=nullptr;
-            auto longActivate=longParentReady?SHGetIDListFromObject(longSavedItem.Get(),&longRaw):E_UNEXPECTED;
-            Pidl longSelected(longRaw);
-            if(SUCCEEDED(longActivate))longActivate=view_->SelectItem(ILFindLastID(longSelected.get()),SVSI_SELECT|SVSI_DESELECTOTHERS|SVSI_NOTAKEFOCUS);
-            ComPtr<IShellItemArray> longSelection;ComPtr<IShellItem> selectedLong;DWORD selectedLongCount=0;int selectedLongOrder=1;
-            const bool longSelectedExactly=SUCCEEDED(longActivate)&&SUCCEEDED(selection(longSelection))&&longSelection&&
-                SUCCEEDED(longSelection->GetCount(&selectedLongCount))&&selectedLongCount==1&&SUCCEEDED(longSelection->GetItemAt(0,&selectedLong))&&
-                SUCCEEDED(selectedLong->Compare(longSavedItem.Get(),SICHINT_CANONICAL,&selectedLongOrder))&&selectedLongOrder==0;
-            const bool originalNewWindow=newWindowMode_;newWindowMode_=false;
-            previousCount=navigationCount_;
-            longActivate=longSelectedExactly?OnDefaultCommand(view_.Get()):E_UNEXPECTED;
-            const bool longActivated=SUCCEEDED(longActivate)&&pumpUntil([&]{return navigationCount_>previousCount&&exactScopeMembership();},5000);
-            const bool longActivationPresentation=longActivated&&pumpUntil([&] {
-                return !searchPresentationPending_&&SUCCEEDED(searchPresentationStatus_)&&
-                    SUCCEEDED(captureSearchViewPresentation(folderView_.Get(),&longActual))&&samePresentation(longActual,importedPresentation);
-            },2000);
-            newWindowMode_=originalNewWindow;
-            check("long_saved_actual_native_selection_default_command_opens_reconstructed_query",longSelectedExactly&&longActivate==S_OK&&
-                longActivated&&longActivationPresentation&&sameRules(searchScopeRules_)&&
-                searchFileProperties_&&*searchFileProperties_==importedProperties,hresultMessage(longActivate));
+            {
+                PrivatePresentation longSelectionPresentation(window_,true);
+                const auto longDeadline=GetTickCount64()+10000;
+                const auto waitForLongSelection=[&](const std::function<bool()>& predicate) {
+                    const auto now=GetTickCount64();
+                    return now<longDeadline&&pumpUntil(predicate,static_cast<DWORD>(longDeadline-now));
+                };
+                // The subject here is default activation of the enumerated
+                // saved item, not a second long-text parent parsing operation.
+                ComPtr<IShellItem> longOriginalParent;
+                const auto longParentItemRead=longSavedItem?longSavedItem->GetParent(&longOriginalParent):E_PENDING;
+                FILE_ID_INFO longParentId{};
+                const auto longParentIdentityRead=nativeFileIdentity(extended(longSavedDirectory),longParentId);
+                const auto longParent=SUCCEEDED(longParentItemRead)&&longOriginalParent&&SUCCEEDED(longParentIdentityRead)?
+                    browser_->BrowseToObject(longOriginalParent.Get(),SBSP_ABSOLUTE):
+                    FAILED(longParentItemRead)?longParentItemRead:FAILED(longParentIdentityRead)?longParentIdentityRead:E_PENDING;
+                HRESULT longCurrentParentRead=E_PENDING,longParentCompare=E_PENDING,longParentPathRead=E_PENDING,longCurrentParentIdentityRead=E_PENDING;
+                int longParentOrder=1;
+                const bool longParentReady=SUCCEEDED(longParent)&&waitForLongSelection([&] {
+                    if(navigating_||!view_||!folderView_)return false;
+                    ComPtr<IShellItem> actualParent;longCurrentParentRead=currentFolder(actualParent);
+                    if(FAILED(longCurrentParentRead)||!actualParent)return false;
+                    longParentOrder=1;longParentCompare=actualParent->Compare(longOriginalParent.Get(),SICHINT_CANONICAL,&longParentOrder);
+                    if(FAILED(longParentCompare)||longParentOrder!=0)return false;
+                    PWSTR path=nullptr;longParentPathRead=actualParent->GetDisplayName(SIGDN_FILESYSPATH,&path);
+                    FILE_ID_INFO actual{};
+                    longCurrentParentIdentityRead=SUCCEEDED(longParentPathRead)&&path?
+                        nativeFileIdentity(extended(std::filesystem::path(path)),actual):E_PENDING;
+                    CoTaskMemFree(path);
+                    return SUCCEEDED(longCurrentParentIdentityRead)&&actual.VolumeSerialNumber==longParentId.VolumeSerialNumber&&
+                        std::equal(std::begin(actual.FileId.Identifier),std::end(actual.FileId.Identifier),std::begin(longParentId.FileId.Identifier));
+                });
+                ComPtr<IShellView> longParentView=longParentReady?view_:nullptr;
+                ComPtr<IFolderView2> longParentFolderView=longParentReady?folderView_:nullptr;
+                const auto longViewActivation=longParentReady&&longSelectionPresentation.ready?
+                    longParentView->UIActivate(SVUIA_ACTIVATE_NOFOCUS):E_PENDING;
+                ComPtr<IShellItemArray> longParentItems;ComPtr<IShellItem> enumeratedLong;
+                HRESULT longItemsRead=E_PENDING,longItemsCountRead=E_PENDING,longEnumeratedRead=E_PENDING,longEnumeratedCompare=E_PENDING;
+                HRESULT longPathRead=E_PENDING,longIdentityRead=E_PENDING;
+                DWORD longParentCount=0;int longEnumeratedOrder=1;
+                const auto isOriginalLongFile=[&](IShellItem* item) {
+                    PWSTR path=nullptr;longPathRead=item?item->GetDisplayName(SIGDN_FILESYSPATH,&path):E_POINTER;
+                    FILE_ID_INFO actual{};
+                    longIdentityRead=SUCCEEDED(longPathRead)&&path?nativeFileIdentity(extended(std::filesystem::path(path)),actual):E_PENDING;
+                    CoTaskMemFree(path);
+                    return SUCCEEDED(longIdentityRead)&&actual.VolumeSerialNumber==longSavedId.VolumeSerialNumber&&
+                        std::equal(std::begin(actual.FileId.Identifier),std::end(actual.FileId.Identifier),std::begin(longSavedId.FileId.Identifier));
+                };
+                // A completed browse does not guarantee enumeration or realized
+                // selection. Wait for this actual source item, retaining its native
+                // parent array/view and preserving canonical comparison plus FileID.
+                const bool longItemReady=SUCCEEDED(longViewActivation)&&longSavedItem&&waitForLongSelection([&] {
+                    if(view_.Get()!=longParentView.Get()||folderView_.Get()!=longParentFolderView.Get()||navigating_)return false;
+                    longItemsRead=longParentFolderView->Items(SVGIO_ALLVIEW,IID_PPV_ARGS(&longParentItems));
+                    if(FAILED(longItemsRead)||!longParentItems)return false;
+                    longItemsCountRead=longParentItems->GetCount(&longParentCount);
+                    if(FAILED(longItemsCountRead))return false;
+                    for(DWORD index=0;index<longParentCount;++index) {
+                        ComPtr<IShellItem> candidate;longEnumeratedRead=longParentItems->GetItemAt(index,&candidate);
+                        if(FAILED(longEnumeratedRead)||!candidate)return false;
+                        longEnumeratedOrder=1;longEnumeratedCompare=candidate->Compare(longSavedItem.Get(),SICHINT_CANONICAL,&longEnumeratedOrder);
+                        if(SUCCEEDED(longEnumeratedCompare)&&longEnumeratedOrder==0&&isOriginalLongFile(candidate.Get())) {
+                            enumeratedLong=candidate;return true;
+                        }
+                    }
+                    return false;
+                });
+                PIDLIST_ABSOLUTE longRaw=nullptr;
+                const auto longPidlRead=longItemReady?SHGetIDListFromObject(enumeratedLong.Get(),&longRaw):E_PENDING;
+                Pidl longSelected(longRaw);
+                const auto longSelect=SUCCEEDED(longPidlRead)&&longSelected?
+                    longParentView->SelectItem(ILFindLastID(longSelected.get()),SVSI_SELECT|SVSI_DESELECTOTHERS|SVSI_NOTAKEFOCUS):E_PENDING;
+                ComPtr<IShellItemArray> longSelection;ComPtr<IShellItem> selectedLong;DWORD selectedLongCount=0;int selectedLongOrder=1;
+                HRESULT longSelectionRead=E_PENDING,longSelectionCountRead=E_PENDING,longSelectedItemRead=E_PENDING,longSelectedCompare=E_PENDING;
+                const bool longSelectedExactly=SUCCEEDED(longSelect)&&waitForLongSelection([&] {
+                    if(view_.Get()!=longParentView.Get()||folderView_.Get()!=longParentFolderView.Get()||navigating_)return false;
+                    longSelectionRead=longParentFolderView->GetSelection(FALSE,&longSelection);
+                    if(FAILED(longSelectionRead)||!longSelection)return false;
+                    longSelectionCountRead=longSelection->GetCount(&selectedLongCount);
+                    if(FAILED(longSelectionCountRead)||selectedLongCount!=1)return false;
+                    longSelectedItemRead=longSelection->GetItemAt(0,&selectedLong);
+                    if(FAILED(longSelectedItemRead)||!selectedLong)return false;
+                    selectedLongOrder=1;longSelectedCompare=selectedLong->Compare(longSavedItem.Get(),SICHINT_CANONICAL,&selectedLongOrder);
+                    return SUCCEEDED(longSelectedCompare)&&selectedLongOrder==0&&isOriginalLongFile(selectedLong.Get());
+                });
+                const bool originalNewWindow=newWindowMode_;newWindowMode_=false;
+                previousCount=navigationCount_;
+                const auto longActivate=longSelectedExactly?OnDefaultCommand(longParentView.Get()):E_PENDING;
+                const bool longActivated=longActivate==S_OK&&waitForLongSelection([&]{return navigationCount_>previousCount&&exactScopeMembership();});
+                const bool longActivationPresentation=longActivated&&waitForLongSelection([&] {
+                    return !searchPresentationPending_&&SUCCEEDED(searchPresentationStatus_)&&
+                        SUCCEEDED(captureSearchViewPresentation(folderView_.Get(),&longActual))&&samePresentation(longActual,importedPresentation);
+                });
+                newWindowMode_=originalNewWindow;
+                check("long_saved_actual_native_selection_default_command_opens_reconstructed_query",longSelectedExactly&&longActivate==S_OK&&
+                    longActivated&&longActivationPresentation&&sameRules(searchScopeRules_)&&
+                    searchFileProperties_&&*searchFileProperties_==importedProperties,
+                    L"original parent="+hresultMessage(longParentItemRead)+L"; original parent FileID="+hresultMessage(longParentIdentityRead)+
+                    L"; parent browse="+hresultMessage(longParent)+L"/"+std::to_wstring(longParentReady)+L"; current parent="+
+                    hresultMessage(longCurrentParentRead)+L"; parent canonical="+hresultMessage(longParentCompare)+L"/"+
+                    std::to_wstring(longParentOrder)+L"; parent path="+hresultMessage(longParentPathRead)+L"; current parent FileID="+
+                    hresultMessage(longCurrentParentIdentityRead)+L"; presentation="+
+                    std::to_wstring(longSelectionPresentation.ready)+L"; view activation="+hresultMessage(longViewActivation)+
+                    L"; Items="+hresultMessage(longItemsRead)+L"; Items count="+hresultMessage(longItemsCountRead)+L"/"+std::to_wstring(longParentCount)+
+                    L"; enumerated item="+hresultMessage(longEnumeratedRead)+L"; enumerated canonical="+hresultMessage(longEnumeratedCompare)+
+                    L"/"+std::to_wstring(longEnumeratedOrder)+L"; PIDL="+hresultMessage(longPidlRead)+L"; select="+hresultMessage(longSelect)+
+                    L"; selection="+hresultMessage(longSelectionRead)+L"; selected count="+hresultMessage(longSelectionCountRead)+L"/"+
+                    std::to_wstring(selectedLongCount)+L"; selected item="+hresultMessage(longSelectedItemRead)+L"; selected canonical="+
+                    hresultMessage(longSelectedCompare)+L"/"+std::to_wstring(selectedLongOrder)+L"; selected path="+hresultMessage(longPathRead)+
+                    L"; selected FileID="+hresultMessage(longIdentityRead)+L"; default command="+hresultMessage(longActivate)+
+                    L"; native query/presentation="+std::to_wstring(longActivated)+L"/"+std::to_wstring(longActivationPresentation)+
+                    L"; common deadline="+hresultMessage(GetTickCount64()>=longDeadline?HRESULT_FROM_WIN32(ERROR_TIMEOUT):S_OK));
+            }
             FILE_ID_INFO longFinalId{};
             check("long_saved_fallback_preserves_owned_source_bytes_and_file_identity",!longSavedBytes.empty()&&
                 readLongBytes(longSavedPath)==longSavedBytes&&SUCCEEDED(nativeFileIdentity(extended(longSavedPath),longFinalId))&&
@@ -5080,7 +5923,8 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report) {
                                 std::function<void()> action;
                                 bool active = false;
                                 ~RestoreText() { if (active) action(); }
-                            } restore{[&] { candidate.setSearchText(originalText, false); }};
+                            } restore{};
+                            restore.action = [&] { candidate.setSearchText(originalText, false); };
                             Pidl originalLocation(candidate.currentPidl_ ? ILCloneFull(candidate.currentPidl_.get()) : nullptr);
                             const auto originalNavigation = candidate.navigationCount_;
                             const auto originalHistory = candidate.history_.size();
@@ -5096,11 +5940,40 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report) {
                             } reference{owned && outerRead ? CreateWindowExW(0, L"EDIT", L"",
                                 static_cast<DWORD>(GetWindowLongPtrW(candidate.search_,GWL_STYLE)),0,0,1,1,
                                 candidate.window_, nullptr, instance_, nullptr) : nullptr};
+                            // Read each native initialization stage without
+                            // changing the actual control under assertion. The
+                            // original mixed request is documented for EDIT;
+                            // its readback distinguishes rejection at 1x1 from
+                            // a later native frame/size reset on this platform.
+                            std::wstring marginLifecycle;
+                            auto observeMargins = [&](const wchar_t* stage) {
+                                RECT bounds{}, format{};
+                                const bool boundsRead = GetClientRect(reference.value, &bounds) != FALSE;
+                                SendMessageW(reference.value, EM_GETRECT, 0, reinterpret_cast<LPARAM>(&format));
+                                const auto value = SendMessageW(reference.value, EM_GETMARGINS, 0, 0);
+                                marginLifecycle += std::wstring(stage) + L"(client=" + std::to_wstring(boundsRead) + L":" +
+                                    std::to_wstring(bounds.left) + L"," + std::to_wstring(bounds.top) + L"," +
+                                    std::to_wstring(bounds.right) + L"," + std::to_wstring(bounds.bottom) + L"; format=" +
+                                    std::to_wstring(format.left) + L"," + std::to_wstring(format.top) + L"," +
+                                    std::to_wstring(format.right) + L"," + std::to_wstring(format.bottom) + L"; style=" +
+                                    std::to_wstring(GetWindowLongPtrW(reference.value, GWL_STYLE)) + L"; margins=" +
+                                    std::to_wstring(LOWORD(value)) + L"/" + std::to_wstring(HIWORD(value)) + L") ";
+                            };
+                            auto requestLeadingMargin = [&] {
+                                if (expectedRtl) SendMessageW(reference.value, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN,
+                                    MAKELPARAM(EC_USEFONTINFO, candidate.px(40)));
+                                else SendMessageW(reference.value, EM_SETMARGINS, EC_LEFTMARGIN, MAKELPARAM(candidate.px(40), 0));
+                            };
+                            observeMargins(L"created-1x1");
                             if (reference.value)
                                 SendMessageW(reference.value, WM_SETFONT, reinterpret_cast<WPARAM>(candidate.font_), TRUE);
+                            observeMargins(L"font-at-1x1");
                             const auto referenceTheme=reference.value?applyWindowTheme(reference.value):E_UNEXPECTED;
                             const auto nativeDefaultMargins = SendMessageW(reference.value, EM_GETMARGINS, 0, 0);
+                            observeMargins(L"theme-at-1x1");
                             if (reference.value) {
+                                requestLeadingMargin();
+                                observeMargins(L"original-request-before-frame");
                                 // The native Explorer theme can remove WS_BORDER.
                                 // Production restores it in applyChrome before
                                 // layout; reproduce that native frame sequence.
@@ -5108,12 +5981,17 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report) {
                                     GetWindowLongPtrW(candidate.search_, GWL_STYLE));
                                 SetWindowPos(reference.value, nullptr, 0, 0, 0, 0,
                                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+                                observeMargins(L"frame-at-1x1");
                                 SetWindowPos(reference.value,nullptr,0,0,
                                     searchOuter.right-searchOuter.left,searchOuter.bottom-searchOuter.top,SWP_NOZORDER|SWP_NOACTIVATE);
+                                observeMargins(L"resized-without-retry");
+                                requestLeadingMargin();
+                                observeMargins(L"same-request-after-size");
                                 // Calculate the opposite font margin at the
                                 // actual final native client size.
                                 SendMessageW(reference.value, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN,
                                     MAKELPARAM(EC_USEFONTINFO, EC_USEFONTINFO));
+                                observeMargins(L"native-font-baseline-after-size");
                             }
                             const auto nativeMargins = SendMessageW(reference.value, EM_GETMARGINS, 0, 0);
                             const auto actualMargins = SendMessageW(candidate.search_, EM_GETMARGINS, 0, 0);
@@ -5357,7 +6235,7 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report) {
                                 L"; native calculated font L/R=" +
                                 std::to_wstring(LOWORD(nativeMargins)) + L"/" + std::to_wstring(HIWORD(nativeMargins)) +
                                 L"; text bounds=" + std::to_wstring(textBounds) + L"; native positions=" + std::to_wstring(reading) +
-                                L"; unchanged=" + std::to_wstring(unchanged);
+                                L"; unchanged=" + std::to_wstring(unchanged) + L"; native margin lifecycle=" + marginLifecycle;
                             return std::pair{owned && presentation.ready && captured && margins&&textBounds&&reading&&unchanged&&
                                 textChanged&&glyphStable, diagnostic};
                         };

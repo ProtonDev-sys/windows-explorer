@@ -112,14 +112,58 @@ installed markup.
 The current Windows 10 configuration has twenty-one CTest targets: seventeen
 active and four shared-state targets that correctly skip locally. Core has a
 120-second aggregate bound, the separate native menu-equivalence target has
-90 seconds, both application suites have 90 seconds, and search-window handoff
+90 seconds, both application suites have 150 seconds, and search-window handoff
 has 45 seconds. The disposable native-transfer target has 150 seconds. Individual
 native worker deadlines are unchanged. Earlier failures remain preserved below.
 
-The latest completed CI run, [commit `317914b`](https://github.com/ProtonDev-sys/windows-explorer/actions/runs/37249626987),
-failed Open File Location's folder-identity check. The subsequent local App tests
-pass the native volume/128-bit FileID comparison; that newer source has no complete
-passing hosted run recorded here. The earlier `aecc063` hosted run established
+The latest completed hosted run, [commit `f909f69`](https://github.com/ProtonDev-sys/windows-explorer/actions/runs/37346525314),
+passed fifteen active main-job targets and correctly skipped its ordinary
+transfer target. The actual opted-in history, search-options and view-persistence
+targets passed on that genuine disposable runner. The App target failed five
+checks: two selection-generation checks, long saved-item default activation,
+and two RTL margin checks. The saved-item result overwrote earlier stage failures
+with an `E_UNEXPECTED` fixture sentinel; it does not identify a production API
+failure. Subsequent source changes retain stage HRESULTs and wait for complete
+native enumeration, selection and data-object readiness under common deadlines.
+RTL margins are applied after native frame restoration and size/font processing.
+These changes still require local and hosted runtime validation.
+
+The separate opted-in transfer job passed real native Copy/Paste and Cut/Paste,
+including complete CIDA, preferred effects, content and exact source/destination
+FileIDs. Paste Shortcut's native plan remained disabled, so direct drop stages
+were not reached. New read-only diagnostics preserve the producer/consumer
+formats, original view background menu and independent folder background menu;
+they do not override native eligibility. The validated-application job was
+correctly skipped because both prerequisites failed. No release is certified
+by this run. Reports remain under `artifacts/ci/run-37346525314-{main,transfer}/`.
+
+The v53 authored App run establishes the new actual Details-pane selection A/B
+semantic and pixel check, and source/view preservation. Its native RTF Preview
+check fails before capture; the old 90-second aggregate bound then terminates the
+suite before final JSON. This incomplete run is retained in
+`artifacts/continuation-app-v53.log`, executable SHA-256
+`35e062b91a635d4d4cc38b47cc3ff7ec0509af51111ec1bb18804b1e79f12e25`.
+Failure details now flush to stderr before teardown. The aggregate App bound is
+150 seconds to include these added bounded phases; individual native/UIA
+deadlines remain unchanged. Preview behavior and the complete new suite remain
+unverified until the next run.
+
+The warning-free v55 all-target build completes the authored App suite in
+99.73 seconds: 258 of 259 checks pass, with native RTF Preview as the sole
+failure. The selection-generation, saved-item activation and both RTL margin
+checks pass locally. Its full report is
+`artifacts/continuation-headless-smoke-v55.json`, executable SHA-256
+`2ee33c0d0c87c6e6e87b84c7978c2c0790f2180dce9c765d0595b50171069927`.
+Preview has an allocated pane, exact source selection and retained site/view;
+input-desktop and HWND privacy checks pass. Both the App and independent native
+reference expose zero contained preview elements or handler HWNDs. The fixture
+omitted the native view activation performed by normal `run()`; a subsequent
+fixture correction activates the actual private view and verifies the focused
+source by FileID. Its rendering result remains pending.
+
+The earlier [commit `317914b` run](https://github.com/ProtonDev-sys/windows-explorer/actions/runs/37249626987)
+failed Open File Location's folder-identity check; subsequent checks use actual
+volume/128-bit FileIDs. The earlier `aecc063` hosted run established
 actual Undo/Redo, native search-option transitions and folder-state restoration
 on its own snapshot. Those mutation tests remain restricted to genuine opted-in
 disposable runners.

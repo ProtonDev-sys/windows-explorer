@@ -1,4 +1,5 @@
 #include "explorer/breadcrumb.hpp"
+#include "explorer/context_menu.hpp"
 #include "explorer/headless_visual.hpp"
 #include "explorer/namespace_actions.hpp"
 #include "explorer/shell_operations.hpp"
@@ -23,6 +24,7 @@
 #include <string>
 #include <thread>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 // These are real shared-clipboard/native-history operations. The independent
@@ -644,6 +646,169 @@ struct Publication {
         }
     }
 };
+
+void describeTransferFormats(const char* label, IDataObject* object) {
+    const std::array<std::pair<const char*, CLIPFORMAT>, 6> formats{{
+        {"cida", static_cast<CLIPFORMAT>(RegisterClipboardFormatW(CFSTR_SHELLIDLIST))},
+        {"hdrop", static_cast<CLIPFORMAT>(CF_HDROP)},
+        {"filenameW", static_cast<CLIPFORMAT>(RegisterClipboardFormatW(CFSTR_FILENAMEW))},
+        {"descriptorW", static_cast<CLIPFORMAT>(RegisterClipboardFormatW(CFSTR_FILEDESCRIPTORW))},
+        {"preferredEffect", static_cast<CLIPFORMAT>(RegisterClipboardFormatW(CFSTR_PREFERREDDROPEFFECT))},
+        {"contents", static_cast<CLIPFORMAT>(RegisterClipboardFormatW(CFSTR_FILECONTENTS))}
+    }};
+    for (const auto& [name, format] : formats) {
+        require(format != 0, "Register owned transfer diagnostic format");
+        for (const DWORD aspect : {static_cast<DWORD>(DVASPECT_CONTENT), static_cast<DWORD>(DVASPECT_LINK)}) {
+            const bool contents = std::strcmp(name, "contents") == 0;
+            FORMATETC request{format, nullptr, aspect, contents ? 0 : -1,
+                static_cast<DWORD>(contents ? TYMED_HGLOBAL | TYMED_ISTREAM | TYMED_ISTORAGE : TYMED_HGLOBAL)};
+            const HRESULT result = object->QueryGetData(&request);
+            std::cout << "Native transfer format object=" << label << " format=" << name
+                << " aspect=" << aspect << " HRESULT=" << static_cast<ULONG>(result) << std::endl;
+        }
+    }
+}
+
+void describeShortcutHdrop(const char* phase, const char* label, IDataObject* object, const Source& source) {
+    FORMATETC request{CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
+    const HRESULT available = object->QueryGetData(&request);
+    std::cout << "Native shortcut HDROP phase=" << phase << " object=" << label
+        << " queryHRESULT=" << static_cast<ULONG>(available) << std::endl;
+    if (available != S_OK) return;
+    Medium data;
+    succeeded(object->GetData(&request, &data.value), "Read actual owned shortcut HDROP");
+    require(data.value.tymed == TYMED_HGLOBAL && data.value.hGlobal,
+        "Shortcut HDROP did not return native global data");
+    const SIZE_T size = GlobalSize(data.value.hGlobal);
+    require(size >= sizeof(DROPFILES) && size <= 1024 * 1024, "Shortcut HDROP native size bound");
+    const auto drop = static_cast<HDROP>(data.value.hGlobal);
+    const UINT count = DragQueryFileW(drop, 0xffffffff, nullptr, 0);
+    require(count == 1, "Shortcut HDROP changed the complete owned source count");
+    const UINT length = DragQueryFileW(drop, 0, nullptr, 0);
+    require(length && length <= 32767, "Shortcut HDROP native path length bound");
+    std::wstring path(static_cast<size_t>(length) + 1, L'\0');
+    require(DragQueryFileW(drop, 0, path.data(), static_cast<UINT>(path.size())) == length,
+        "Read actual complete shortcut HDROP path");
+    path.resize(length);
+    require(identity(fs::path(path)) == source.id, "Shortcut HDROP identifies an unrelated source");
+    std::cout << "Native shortcut HDROP phase=" << phase << " object=" << label
+        << " count=" << count << " sourceIdentityMatches=1" << std::endl;
+}
+
+struct ShortcutState {
+    HRESULT registeredStatus = E_PENDING;
+    explorer::NamespaceInvocationPlan registered;
+    HRESULT backgroundStatus = E_PENDING;
+    unsigned backgroundMatches = 0;
+    bool backgroundEnabled = false;
+    HRESULT viewBackgroundStatus = E_PENDING;
+    unsigned viewBackgroundMatches = 0;
+    bool viewBackgroundEnabled = false;
+};
+ShortcutState describeShortcutState(Browser& browser, Publication& clipboard, const Source& source,
+                                    const char* phase, bool formats) {
+    // Inspect the normal registered leaf and independently created, fully
+    // populated native folder background menu. Neither route invokes a leaf.
+    ShortcutState result;
+    const HRESULT refreshed = browser.actions.refresh();
+    result.registeredStatus = FAILED(refreshed) ? refreshed : browser.actions.planCommandStore(
+        L"Windows.pastelink", &result.registered, explorer::NamespaceMenuScope::Background);
+    explorer::NamespaceCommandState fast;
+    const HRESULT fastStatus = explorer::namespaceCommandState(L"Windows.pastelink", nullptr, browser.view.Get(), &fast);
+    explorer::NativeContextMenu native;
+    result.backgroundStatus = native.createBackground(browser.owner, browser.folder.Get(), browser.view.Get(), CMF_EXTENDEDVERBS);
+    std::vector<explorer::ContextMenuEntry> entries;
+    if (SUCCEEDED(result.backgroundStatus)) result.backgroundStatus = native.enumerate(entries, false);
+    const auto inspect = [&](const auto& self, const std::vector<explorer::ContextMenuEntry>& rows,
+                             const char* menu, unsigned& matches, bool& enabled) -> void {
+        for (const auto& row : rows) {
+            if (_wcsicmp(row.canonicalVerb.c_str(), L"pastelink") == 0 && !row.submenu && !row.separator()) {
+                ++matches;
+                enabled = row.enabled();
+                std::cout << "Native shortcut background phase=" << phase << " menu=" << menu << " id=" << row.id
+                    << " state=" << row.state << " enabled=" << row.enabled() << std::endl;
+            }
+            self(self, row.children, menu, matches, enabled);
+        }
+    };
+    if (SUCCEEDED(result.backgroundStatus))
+        inspect(inspect, entries, "folder", result.backgroundMatches, result.backgroundEnabled);
+    ComPtr<IContextMenu> viewContext;
+    result.viewBackgroundStatus = browser.view->GetItemObject(SVGIO_BACKGROUND, IID_PPV_ARGS(&viewContext));
+    explorer::NativeContextMenu viewMenu;
+    // This is the actual view's already-sited menu. Do not replace its native
+    // site or DFM callbacks, and do not detach that site when releasing it.
+    if (SUCCEEDED(result.viewBackgroundStatus))
+        result.viewBackgroundStatus = viewMenu.create(browser.owner, viewContext.Get(), nullptr, CMF_EXTENDEDVERBS);
+    std::vector<explorer::ContextMenuEntry> viewEntries;
+    if (SUCCEEDED(result.viewBackgroundStatus)) result.viewBackgroundStatus = viewMenu.enumerate(viewEntries, false);
+    if (SUCCEEDED(result.viewBackgroundStatus))
+        inspect(inspect, viewEntries, "view", result.viewBackgroundMatches, result.viewBackgroundEnabled);
+    SFGAOF attributes = 0;
+    const HRESULT attributesStatus = shellItem(source.path)->GetAttributes(SFGAO_CANLINK | SFGAO_FILESYSTEM, &attributes);
+    HWND child = nullptr;
+    const HRESULT childStatus = browser.view->GetWindow(&child);
+    const HRESULT current = OleIsCurrentClipboard(clipboard.producer.Get());
+    std::cout << "Native shortcut state phase=" << phase << " sequence=" << GetClipboardSequenceNumber()
+        << " registeredHRESULT=" << static_cast<ULONG>(result.registeredStatus)
+        << " planHRESULT=" << static_cast<ULONG>(result.registered.status)
+        << " registeredId=" << result.registered.commandId << " registeredEnabled=" << result.registered.enabled
+        << " fastHRESULT=" << static_cast<ULONG>(fastStatus) << " fastState=" << fast.state
+        << " fastInitialized=" << fast.initialized << " fastSited=" << fast.siteAttached
+        << " backgroundHRESULT=" << static_cast<ULONG>(result.backgroundStatus)
+        << " backgroundMatches=" << result.backgroundMatches << " backgroundEnabled=" << result.backgroundEnabled
+        << " viewBackgroundHRESULT=" << static_cast<ULONG>(result.viewBackgroundStatus)
+        << " viewBackgroundMatches=" << result.viewBackgroundMatches << " viewBackgroundEnabled=" << result.viewBackgroundEnabled
+        << " sourceAttributesHRESULT=" << static_cast<ULONG>(attributesStatus) << " sourceAttributes=" << attributes
+        << " currentProducerHRESULT=" << static_cast<ULONG>(current)
+        << " viewWindowHRESULT=" << static_cast<ULONG>(childStatus)
+        << " activeOwner=" << (GetActiveWindow() == browser.owner)
+        << " focusInView=" << (GetFocus() == child || (child && IsChild(child, GetFocus()))) << std::endl;
+    require(current == S_OK && preserved(source), "Paste Shortcut diagnostics lost the exact owned clipboard/source");
+    ComPtr<IDataObject> consumer;
+    succeeded(OleGetClipboard(&consumer), "Read actual shortcut clipboard consumer");
+    verifyCida(clipboard.producer.Get(), {&source});
+    verifyCida(consumer.Get(), {&source});
+    const DWORD producerEffect = effectData(clipboard.producer.Get(), CFSTR_PREFERREDDROPEFFECT);
+    const DWORD consumerEffect = effectData(consumer.Get(), CFSTR_PREFERREDDROPEFFECT);
+    std::cout << "Native shortcut clipboard phase=" << phase << " completeCidaIdentityMatches=1 producerEffect="
+        << producerEffect << " consumerEffect=" << consumerEffect << std::endl;
+    require(producerEffect == DROPEFFECT_COPY && consumerEffect == DROPEFFECT_COPY,
+        "Paste Shortcut producer/consumer changed its native COPY preference");
+    describeShortcutHdrop(phase, "producer", clipboard.producer.Get(), source);
+    describeShortcutHdrop(phase, "consumer", consumer.Get(), source);
+    if (formats) {
+        describeTransferFormats("producer", clipboard.producer.Get());
+        describeTransferFormats("consumer", consumer.Get());
+    }
+    return result;
+}
+
+void waitShortcutEnabled(Browser& browser, Publication& clipboard, const Source& source) {
+    const auto started = GetTickCount64();
+    const auto initial = describeShortcutState(browser, clipboard, source, "published", true);
+    bool enabled = SUCCEEDED(initial.registeredStatus) && initial.registered.enabled;
+    unsigned samples = 1;
+    // Clipboard/view work may still be queued after OleSetClipboard. Dispatch
+    // ordinary messages/COM calls, rebuilding the actual registered
+    // menu each time. The fixture never fabricates an enabled state.
+    while (!enabled && GetTickCount64() - started < 5000) {
+        pump();
+        require(OleIsCurrentClipboard(clipboard.producer.Get()) == S_OK,
+            "Shortcut readiness replaced the exact owned producer");
+        enabled = browser.plan(L"Windows.pastelink").enabled;
+        ++samples;
+    }
+    const auto settled = describeShortcutState(browser, clipboard, source, "settled", !enabled);
+    std::cout << "Native shortcut readiness samples=" << samples << " elapsedMs=" << GetTickCount64() - started << std::endl;
+    require(SUCCEEDED(settled.registeredStatus) && settled.registered.enabled,
+        "Native Paste Shortcut remained disabled after normal clipboard/view dispatch");
+    require(SUCCEEDED(settled.backgroundStatus) && settled.backgroundMatches == 1 && settled.backgroundEnabled,
+        "Native registered Paste Shortcut differs from the unique enabled folder-background leaf");
+    require(SUCCEEDED(settled.viewBackgroundStatus) && settled.viewBackgroundMatches == 1 && settled.viewBackgroundEnabled,
+        "Native registered Paste Shortcut differs from the unique enabled actual view-background leaf");
+}
+
 void waitMembership(Browser& browser, const fs::path& destination, size_t count) {
     waitFor([&] {
         const auto paths = children(destination); if (paths.size() != count) return false;
@@ -756,6 +921,7 @@ void run() {
     browser.navigate(fixture.root / L"Shortcut");
     {
         Publication clipboard(browser.owner); clipboard.publish({&fixture.sources[3]}, false);
+        waitShortcutEnabled(browser, clipboard, fixture.sources[3]);
         OperationLease operation;
         browser.invoke(L"Windows.pastelink"); clipboard.waitComplete(); waitMembership(browser, fixture.root / L"Shortcut", 1);
         verifyShortcut(fixture.sources[3], children(fixture.root / L"Shortcut").front()); fixture.verifySources({2}); operation.complete(); clipboard.clear();

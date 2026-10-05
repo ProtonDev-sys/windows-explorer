@@ -11,6 +11,34 @@ Native Ribbon property callbacks use cached results.
 
 ## Latest isolated run
 
+The 2026-10-05 17:12 UTC installed-layout v48 run used executable
+`9cea818574f6301b47becd3edcbfd419fe94bb525e35506a180d1433b3dc4573`.
+The accepted report retains complete native selections, command readiness and
+887 desktop-isolation observations:
+`artifacts/performance/run-20261005-171218-848677e46b2e4cb2886a9b0ab3f7ecbd/native-navigation.json`.
+No other owned native probe or build ran concurrently. Startup native-view
+readiness was 591.360 ms, with 51,867,648 private bytes. Navigation p95 was
+131.176 / 168.035 / 886.978 ms for 10 / 1,000 / 10,000 items. The final
+10,000-item sample took 886.978 ms; this slower observation remains in the
+report and prevents treating this isolated run as a navigation speedup.
+
+| Transition over 10,000 files | Actual count observed immediately after command | Creator queue drained | All native command states ready |
+| --- | ---: | ---: | ---: |
+| Select all | 10,000 at 450.869 ms | 1,136.775 ms | 6,984.496 ms |
+| Invert all to none | 0 at 1.286 ms | 32.178 ms | 138.514 ms |
+| Invert none to all | 10,000 at 220.692 ms | 856.546 ms | 6,440.745 ms |
+| Select none | 0 at 1.197 ms | 35.895 ms | 154.796 ms |
+
+This revision reuses exact-target native GIT registrations for queued state
+work. Its separate lifetime regressions passed after correcting two assumptions
+about native marshalling and implicit MTA behavior; the complete core target
+passed at v50. The preceding v48 complete suite had three failing core
+assertions, so its accepted performance report is not a complete functional
+certification. Interleaved baseline/candidate measurements are required before
+attributing a timing change to an optimization.
+
+## Previous complete local checkpoint
+
 The 2026-10-05 15:42 UTC installed-layout v42 run used executable
 `e5796664dcfdc48d4e2081f85d3093fefac2880e4993ecd508ebc9fc9bf2e07d`,
 matching the complete seventeen-active-test local checkpoint. No other owned

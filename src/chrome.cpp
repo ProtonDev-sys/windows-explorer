@@ -284,10 +284,25 @@ void lineGlyph(HDC dc, const RECT& bounds, UINT command, const ChromeButtonState
     SelectObject(dc, previous);
     DeleteObject(pen);
 }
+void applySearchMargins(HWND window) {
+    const UINT dpi = GetDpiForWindow(window);
+    // Classic EDIT consumes inherited mirroring into physical client
+    // coordinates. Keep the font's opposite margin and reserve the right edge
+    // for the RTL glyph without retaining an old left-side icon margin.
+    if (rightToLeft(GetAncestor(window, GA_ROOT)))
+        SendMessageW(window, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN,
+            MAKELPARAM(EC_USEFONTINFO, px(40, dpi)));
+    else SendMessageW(window, EM_SETMARGINS, EC_LEFTMARGIN, MAKELPARAM(px(40, dpi), 0));
+}
 LRESULT CALLBACK searchProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam,
                            UINT_PTR id, DWORD_PTR) {
     if (message == WM_NCDESTROY) RemoveWindowSubclass(window, searchProc, id);
     const auto result = DefSubclassProc(window, message, wParam, lParam);
+    // Creation starts at 1x1, before the native frame and final client size
+    // exist. Font-derived margins must follow native size/font/theme work;
+    // the initial request alone need not survive that recalculation.
+    if ((message == WM_SIZE || message == WM_SETFONT || message == WM_THEMECHANGED) &&
+        rightToLeft(GetAncestor(window, GA_ROOT))) applySearchMargins(window);
     if (message == WM_PAINT || message == WM_PRINTCLIENT) {
         const auto dc = message == WM_PAINT ? GetDC(window) : reinterpret_cast<HDC>(wParam);
         if (dc) {
@@ -646,13 +661,8 @@ HRESULT applyChrome(HWND navigation, HWND breadcrumbs, HWND address, HWND search
     if (addressActions) SendMessageW(addressActions, TB_SETBUTTONSIZE, 0, MAKELPARAM(px(24, dpi), px(30, dpi)));
     if (addressActions && !SetPropW(addressActions, addressActionBorder, reinterpret_cast<HANDLE>(1)))
         return HRESULT_FROM_WIN32(GetLastError());
-    // Classic RTL EDIT has physical client coordinates after converting its
-    // inherited layout style. Reserve the actual right edge and restore the
-    // opposite native font margin instead of retaining an old icon margin.
-    if (rightToLeft(GetAncestor(search, GA_ROOT)))
-        SendMessageW(search, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN,
-            MAKELPARAM(EC_USEFONTINFO, px(40, dpi)));
-    else SendMessageW(search, EM_SETMARGINS, EC_LEFTMARGIN, MAKELPARAM(px(40, dpi), 0));
+    const bool rtlSearch = rightToLeft(GetAncestor(search, GA_ROOT));
+    if (!rtlSearch) applySearchMargins(search);
     for (const auto window : {breadcrumbs, address, search}) {
         const auto style = GetWindowLongPtrW(window, GWL_STYLE);
         if (!(style & WS_BORDER)) {
@@ -661,6 +671,9 @@ HRESULT applyChrome(HWND navigation, HWND breadcrumbs, HWND address, HWND search
         }
         if (!SetWindowSubclass(window, addressBorderProc, 0x57454252, 0)) return HRESULT_FROM_WIN32(GetLastError());
     }
+    // Applying the native theme can remove WS_BORDER. Set margins only after
+    // the resulting frame recalculation; searchProc handles the later resize.
+    if (rtlSearch) applySearchMargins(search);
     return SetWindowSubclass(search, searchProc, 0x57454348, 0) ? S_OK : HRESULT_FROM_WIN32(GetLastError());
 }
 }
