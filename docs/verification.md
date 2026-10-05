@@ -98,6 +98,26 @@ the required item focus of 2. The complete selection suite then passed in 17.03
 seconds, including all 10,000 exact identities without a native facade. The
 assertions and deadlines remain intact. Disposable-runner results are pending.
 
+The [disposable run at `7f06241`](https://github.com/ProtonDev-sys/windows-explorer/actions/runs/37247491672)
+passed twelve of fourteen targets. Core passed in 54.69 seconds and the complete
+selection target in 20.17 seconds. Native QAT accessibility passed. The app's
+Open File Location assertion failed despite observing the intended selected
+file; its location helper still compared PIDL bytes rather than canonical Shell
+identity. The revised helper uses `IShellItem::Compare(SICHINT_CANONICAL)` and
+retains the separate exact selected-file identity check. Both local app layouts
+then passed in 37.34/44.75 seconds. CI persistence reached and recorded owned
+folder A's applied native state, then failed after the next browse. Its fixture
+now clears completion before `BrowseToObject`, since `OnNavigationPending` can
+arrive asynchronously. Full restoration still requires new hosted evidence.
+
+The fallback snapshot now uses batched native view-order enumeration, retaining
+indexed reads for interfaces that explicitly do not support it. Native selection
+passed locally in 11.77 seconds, and with a descending native sort in 12.19
+seconds. The two 10,000-file fallback calls measured 171.407/204.403 ms, while
+independent identity readback remained separate. The subsequent app suites also
+passed in 30.55/33.60 seconds before the canonical-location helper changed.
+These focused results do not constitute an all-green full local or hosted run.
+
 ## Test boundaries
 
 | CTest target | What it verifies |

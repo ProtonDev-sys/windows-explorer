@@ -3,6 +3,7 @@
 #include "explorer/headless_visual.hpp"
 #include <docobj.h>
 #include <algorithm>
+#include <array>
 #include <shlobj.h>
 #include <wrl/client.h>
 #include <memory>
@@ -17,6 +18,41 @@ struct ChildDeleter {
     void operator()(pointer value) const noexcept { ILFree(value); }
 };
 using ChildPidl = std::unique_ptr<ITEMIDLIST, ChildDeleter>;
+HRESULT snapshotViewChildren(IFolderView2* view,int total,std::vector<ChildPidl>& children) {
+    children.reserve(static_cast<size_t>(total));
+    ComPtr<IEnumIDList> enumeration;
+    auto hr=view->Items(SVGIO_ALLVIEW|SVGIO_FLAG_VIEWORDER,IID_PPV_ARGS(&enumeration));
+    if(hr==E_NOINTERFACE||hr==E_NOTIMPL||hr==E_INVALIDARG) {
+        for(int index=0;index<total;++index) {
+            PITEMID_CHILD raw=nullptr;hr=view->Item(index,&raw);ChildPidl child(raw);
+            if(FAILED(hr))return hr;
+            if(!child||ILIsEmpty(child.get()))return E_UNEXPECTED;
+            children.push_back(std::move(child));
+        }
+        return S_OK;
+    }
+    if(FAILED(hr))return hr;
+    if(!enumeration)return E_UNEXPECTED;
+    for(;;) {
+        struct Batch {
+            std::array<PITEMID_CHILD,64> items{};ULONG valid=0;
+            ~Batch(){for(ULONG index=0;index<valid;++index)CoTaskMemFree(items[index]);}
+        } batch;
+        ULONG fetched=0;
+        hr=enumeration->Next(static_cast<ULONG>(batch.items.size()),batch.items.data(),&fetched);
+        if(FAILED(hr))return hr; // COM specifies no valid outputs on failure.
+        batch.valid=std::min(fetched,static_cast<ULONG>(batch.items.size()));
+        if(fetched>batch.items.size()||(hr==S_OK&&fetched!=batch.items.size())||
+           (hr!=S_OK&&hr!=S_FALSE))return E_UNEXPECTED;
+        for(ULONG index=0;index<fetched;++index) {
+            if(!batch.items[index]||ILIsEmpty(batch.items[index]))return E_UNEXPECTED;
+            if(children.size()>=static_cast<size_t>(total))return HRESULT_FROM_WIN32(ERROR_RETRY);
+            children.emplace_back(batch.items[index]);batch.items[index]=nullptr;
+        }
+        if(hr==S_FALSE)break;
+    }
+    return children.size()==static_cast<size_t>(total)?S_OK:HRESULT_FROM_WIN32(ERROR_RETRY);
+}
 class RedrawScope {
 public:
     explicit RedrawScope(IFolderView2* view) noexcept : view_(view), status_(view->SetRedraw(FALSE)) {}
@@ -94,6 +130,9 @@ HRESULT changeShellSelection(IFolderView2* folderView, IShellView* shellView,
         // The generic document OLE Select All command can report success while
         // doing nothing in a Shell view without document focus. Fall back to
         // the documented bulk operation on this exact folder view instead.
+        std::vector<ChildPidl> snapshot;
+        hr=snapshotViewChildren(folderView,total,snapshot);
+        if(FAILED(hr))return hr;
 
         std::vector<bool> selected;
         int selectedCount = 0;
@@ -122,13 +161,8 @@ HRESULT changeShellSelection(IFolderView2* folderView, IShellView* shellView,
                 std::fill(selected.begin(), selected.end(), false);
                 found = 0;
                 for (int index = 0; index < total; ++index) {
-                    PITEMID_CHILD raw = nullptr;
-                    hr = folderView->Item(index, &raw);
-                    ChildPidl child(raw);
-                    if (FAILED(hr)) return hr;
-                    if (!child || ILIsEmpty(child.get())) return E_UNEXPECTED;
                     DWORD state = 0;
-                    hr = folderView->GetSelectionState(child.get(), &state);
+                    hr = folderView->GetSelectionState(snapshot[static_cast<size_t>(index)].get(), &state);
                     if (FAILED(hr)) return hr;
                     const bool isSelected = (state & SVSI_SELECT) != 0;
                     selected[static_cast<size_t>(index)] = isSelected;
@@ -150,11 +184,7 @@ HRESULT changeShellSelection(IFolderView2* folderView, IShellView* shellView,
         indices.reserve(targetCount);
         for (int index = 0; index < total; ++index) {
             if (!selected.empty() && selected[static_cast<size_t>(index)]) continue;
-            PITEMID_CHILD raw = nullptr;
-            hr = folderView->Item(index, &raw);
-            ChildPidl child(raw);
-            if (FAILED(hr)) return hr;
-            if (!child || ILIsEmpty(child.get())) return E_UNEXPECTED;
+            auto child=std::move(snapshot[static_cast<size_t>(index)]);
             children.push_back(reinterpret_cast<PCUITEMID_CHILD>(child.get()));
             indices.push_back(index);
             owned.push_back(std::move(child));

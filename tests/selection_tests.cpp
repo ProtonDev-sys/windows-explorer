@@ -4,6 +4,7 @@
 #include "explorer/selection.hpp"
 
 #include <shlobj.h>
+#include <propkey.h>
 #include <wrl/implements.h>
 #include <algorithm>
 #include <array>
@@ -270,6 +271,14 @@ void verifyDocumentedFallback(explorer::PrivateDesktop& desktop) {
     succeeded(SHCreateItemFromParsingName(fixture.root.c_str(), nullptr, IID_PPV_ARGS(&folder)), "Parse owned fallback fixture");
     Browser browser;
     browser.initialize(folder.Get(), 24);
+    const SORTCOLUMN descending{PKEY_ItemNameDisplay,SORT_DESCENDING};
+    succeeded(browser.folderView->SetSortColumns(&descending,1),"Set actual descending native fallback view order");
+    waitFor([&] {
+        SORTCOLUMN actual{};int count=0;
+        return SUCCEEDED(browser.folderView->GetSortColumnCount(&count))&&count==1&&
+            SUCCEEDED(browser.folderView->GetSortColumns(&actual,1))&&
+            IsEqualPropertyKey(actual.propkey,descending.propkey)&&actual.direction==descending.direction;
+    },"Native fallback view did not retain its descending sort");
     const auto all = identities(browser.folderView.Get(), SVGIO_ALLVIEW, folder.Get());
     require(all.size() == 24, "Documented fallback view membership differs");
     const auto change = [&](explorer::SelectionAction action, const IdentitySet& expected) {

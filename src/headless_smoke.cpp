@@ -589,10 +589,13 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report) {
     const auto fixture = std::filesystem::absolute(report).parent_path() /
         (L"WindowsExplorer-smoke-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(started));
     auto atLocation = [&](const std::filesystem::path& path) {
-        PIDLIST_ABSOLUTE raw = nullptr;
-        const auto hr = SHParseDisplayName(path.c_str(), nullptr, &raw, 0, nullptr);
-        Pidl expected(raw);
-        return SUCCEEDED(hr) && currentPidl_ && ILIsEqual(currentPidl_.get(), expected.get());
+        if(!currentPidl_)return false;
+        ComPtr<IShellItem> expected,current;
+        auto hr=SHCreateItemFromParsingName(path.c_str(),nullptr,IID_PPV_ARGS(&expected));
+        if(SUCCEEDED(hr))hr=SHCreateItemFromIDList(currentPidl_.get(),IID_PPV_ARGS(&current));
+        int comparison=1;
+        if(SUCCEEDED(hr))hr=current->Compare(expected.Get(),SICHINT_CANONICAL,&comparison);
+        return SUCCEEDED(hr)&&comparison==0;
     };
     auto nativeBoolean = [&](UINT command, const PROPERTYKEY& key, bool& value) {
         if (!ribbon_.valid()) return false;
@@ -1472,6 +1475,8 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report) {
                   L"; item=" + (locationItem ? itemName(locationItem.Get(), SIGDN_FILESYSPATH) : L"<none>") +
                   L"; total=" + std::to_wstring(locationTotal) +
                   L"; enumerated=" + std::to_wstring(resultEnumerated) + L"; countHr=" + hresultMessage(searchCountResult) +
+                  L"; ready=" + std::to_wstring(ready) + L"; canonicalLocation=" + std::to_wstring(atLocation(fixture)) +
+                  L"; navigating=" + std::to_wstring(navigating_) + L"; searchBackground=" + std::to_wstring(searchBackground_) +
                   L"; pending=" + std::to_wstring(selectionChild_ != nullptr));
             // Exercise the native ItemsView, rather than only round-tripping
             // metadata: one recursive include, one shallow include and a child

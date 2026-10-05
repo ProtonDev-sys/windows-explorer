@@ -9,6 +9,18 @@ every navigation and selection change. The current implementation reads native
 command state once per change and constructs full provider menus when requested.
 Native Ribbon property callbacks use cached results.
 
+The 2026-10-05 expanded selection regression also measures the documented
+fallback without a native command facade. Repeated indexed PIDL reads took
+approximately 4.06–4.70 seconds for its 10,000-file SelectAll call. A batched
+`IEnumIDList` snapshot with `SVGIO_FLAG_VIEWORDER` measured 171.407 ms in the
+subsequent local run; independent exact identity readback took 817.315 ms.
+The full selection suite passed in 11.77 seconds and retained exact PIDL and
+volume/FileID sets, complements, focus, checkbox flags, clipboard and isolation
+checks. These are development samples with concurrent-system effects, and do
+not repair the separate unresolved asynchronous command-readiness benchmark.
+[Native view-order enumeration](https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/ne-shobjidl_core-_svgio),
+[batched child PIDL retrieval](https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nf-shobjidl_core-ienumidlist-next).
+
 | Owned folder | Earlier navigation p95 | Cached command implementation p95 |
 | --- | ---: | ---: |
 | 10 files | 2,536.104 ms | 205.252 ms |

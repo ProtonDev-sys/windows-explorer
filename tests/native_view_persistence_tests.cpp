@@ -354,6 +354,9 @@ public:
     }
     void navigate(IShellItem* folder) {
         columns_.Reset(); folderView_.Reset(); view_.Reset();
+        // BrowseToObject is asynchronous: OnNavigationPending may arrive
+        // after this call, so a previous completion cannot satisfy this wait.
+        events_->done=false;events_->navigation=E_PENDING;
         succeeded(browser_->BrowseToObject(folder, SBSP_ABSOLUTE), "Navigate native view to owned folder");
         waitFor([&] { return events_->done; }, "Native persistence navigation timed out");
         succeeded(events_->navigation, "Complete native persistence navigation");
