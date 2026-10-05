@@ -13,6 +13,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot 'windows-environment.ps1')
 if ([string]::IsNullOrWhiteSpace($BuildDirectory)) { $BuildDirectory = Join-Path $projectRoot 'build' }
 $BuildDirectory = [IO.Path]::GetFullPath($BuildDirectory)
 $executable = Join-Path $BuildDirectory ($Configuration + '/WindowsExplorer.exe')
@@ -120,20 +121,25 @@ if (@($Scenes | Where-Object { $_ -in @('Search', 'Library', 'Application', 'Sho
         $fixtureProof.created -ne 7 -or @($fixtureProof.fixtureFiles).Count -ne 7 -or
         $fixtureProof.libraryLocations -ne 3 -or $fixtureProof.libraryDefault -ne 'Documents' -or
         $fixtureProof.libraryTemplate -ne 'Documents' -or $fixtureProof.isoBuilder -ne 'IMAPI2FS' -or
-        $fixtureProof.isoBuilderStatus -ne 0 -or $fixtureProof.isoVolumeVerified -ne $true) {
+        $fixtureProof.isoBuilderStatus -ne 0 -or $fixtureProof.isoVolumeVerified -ne $true -or
+        $fixtureProof.searchRelativeToday -ne $true -or $fixtureProof.searchRecursive -ne $true -or
+        $fixtureProof.searchScope -ne 'Search scope' -or $fixtureProof.searchResultCount -ne 2 -or
+        $fixtureProof.searchExactIdentities -ne $true -or $fixtureProof.searchEarlierExcluded -ne $true -or
+        $fixtureProof.searchOutsideScopeExcluded -ne $true) {
         throw 'The native helper did not prove valid owned semantic fixtures on its private desktop.'
     }
 }
 
 function Invoke-PrivateCapture([string]$Scene, [int]$Width, [int]$Height, [string]$Suffix, [bool]$SourceMatched = $false) {
     $nativePage = if ($Scene.StartsWith('Modern')) { $Scene.Substring(6) } else { $Scene }
-    $sceneDirectory = Join-Path $runDirectory $(if ($SourceMatched -or $Scene -eq 'Network') { 'private-source/' + $Scene } else { $Scene })
+    $sceneDirectory = Join-Path $runDirectory $(if ($SourceMatched -or $Scene -in @('Network', 'Recycle')) { 'private-source/' + $Scene } else { $Scene })
     New-Item -ItemType Directory -Path $sceneDirectory -Force | Out-Null
     $screenshot = Join-Path $sceneDirectory ($Suffix + '.png')
     $capture = Join-Path $sceneDirectory ($Suffix + '.json')
     $location = if ($SourceMatched -and $Scene -eq 'Home') { 'shell:Desktop' }
         elseif ($SourceMatched -and $Scene -in @('Computer', 'Drive')) { 'shell:MyComputerFolder' }
         elseif ($Scene -eq 'Network') { 'shell:::{f02c1a0d-be21-4350-88b0-7367fc96ef3c}' }
+        elseif ($Scene -eq 'Recycle') { 'shell:::{645ff040-5081-101b-9f08-00aa002f954e}' }
         elseif ($SourceMatched -and $Scene.StartsWith('Modern')) { 'shell:::{679f85cb-0220-4080-b29b-5540cc05aab6}' }
         elseif ($Scene -eq 'Compressed') { Join-Path $fixture 'Archive.zip' }
         elseif ($Scene -eq 'Search') { Join-Path $fixture 'Owned search.search-ms' }
@@ -141,9 +147,18 @@ function Invoke-PrivateCapture([string]$Scene, [int]$Width, [int]$Height, [strin
         elseif ($Scene -eq 'Music') { Join-Path $fixture 'Music' }
         elseif ($Scene -eq 'Video') { Join-Path $fixture 'Videos' }
         else { $fixture }
-    $argumentList = @('--headless-visual', '--path', ('"' + $location + '"'), '--screenshot', ('"' + $screenshot + '"'),
+    $argumentList = @('--headless-visual', '--screenshot', ('"' + $screenshot + '"'),
         '--report', ('"' + $capture + '"'), '--page', $nativePage, '--width', $Width, '--height', $Height, '--dpi', 96, '--theme', 'Light')
+    if ($SourceMatched -and $Scene -eq 'Library') { $argumentList += '--source-documents-library' }
+    else { $argumentList += @('--path', ('"' + $location + '"')) }
     if ($InstalledRibbon) { $argumentList += '--installed-ribbon' }
+    $searchMenuRequested = $false
+    if ($Scene -eq 'Search') {
+        $searchProtocol = @($manifest.scenes | Where-Object { $_.name -eq 'Search' })
+        $searchMenuRequested = $searchProtocol.Count -eq 1 -and
+            ([string]$searchProtocol[0].state).Contains('Date modified menu open')
+        if ($searchMenuRequested) { $argumentList += '--open-search-date-menu' }
+    }
     if ($CrashDiagnostics) {
         $dumpFilename = Join-Path $privateDumpDirectory ($Scene + '-' + $Suffix + '-' + [Guid]::NewGuid().ToString('N') + '.dmp')
         $argumentList += @('--crash-dump', ('"' + $dumpFilename + '"'))
@@ -178,10 +193,38 @@ function Invoke-PrivateCapture([string]$Scene, [int]$Width, [int]$Height, [strin
         throw "Private-desktop native capture timed out: $Scene"
     }
     $process.Refresh()
+    if ($SourceMatched -and $Scene -eq 'Library' -and $process.ExitCode -eq 9 -and
+        (Test-Path -LiteralPath $capture) -and -not (Test-Path -LiteralPath $screenshot)) {
+        $unavailable = Get-Content -LiteralPath $capture -Raw | ConvertFrom-Json
+        if ($unavailable.headless -ne $true -or $unavailable.privateDesktop -ne $true -or
+            $unavailable.inputDesktopUnchanged -ne $true -or $unavailable.visibleInputDesktopWindows -ne $false -or
+            $unavailable.documentsLibrarySource.requested -ne $true -or
+            $unavailable.documentsLibrarySource.displayUnsupported -ne $true) {
+            throw 'Documents Library preflight did not prove the explicit isolated display restriction.'
+        }
+        $source = $unavailable.documentsLibrarySource
+        if ($source.unavailable -ne $true -and ($source.leaseReadHresult -ne 0 -or $source.writeProtected -ne $true -or
+            $source.verifyReadHresult -ne 0 -or $source.currentMatches -ne $true -or
+            $source.backingFileUnchanged -ne $true -or $source.metadataUnchanged -ne $true)) {
+            throw 'Protected Documents Library metadata did not preserve its exact native source.'
+        }
+        if ($source.unavailable -eq $true -and $source.resolveReadHresult -ge 0 -and
+            $source.leaseReadHresult -ge 0 -and $source.loadReadHresult -ge 0 -and $source.fileReadHresult -ge 0) {
+            throw 'Documents Library unavailable preflight lacks a native failure HRESULT.'
+        }
+        return [PSCustomObject]@{ SourceRestricted = $true; Inventory = $unavailable; Capture = $capture; Screenshot = $null }
+    }
     if ($process.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $capture) -or -not (Test-Path -LiteralPath $screenshot)) {
         throw "Private-desktop native capture failed: $Scene exit $($process.ExitCode); artifacts: $sceneDirectory"
     }
     $inventory = Get-Content -LiteralPath $capture -Raw | ConvertFrom-Json
+    if ($SourceMatched -and $Scene -eq 'Library') { throw 'Current-profile Library display must stop before App creation.' }
+    if ($inventory.commandReadiness.requested -ne $true -or $inventory.commandReadiness.ready -ne $true -or
+        $inventory.commandReadiness.readHresult -ne 0 -or $inventory.commandReadiness.pendingCapabilities -ne 0 -or
+        $inventory.commandReadiness.workerTasks -ne 0 -or $inventory.commandReadiness.selectionBatchPending -ne $false -or
+        @($inventory.nativeRibbonProviders | Where-Object { $_.pending -eq $true }).Count -ne 0) {
+        throw "Native contextual command state did not settle before capture: $Scene"
+    }
     $requestedLayout = if ($InstalledRibbon) { 'InstalledWindows10' } else { 'Authored' }
     if ($inventory.ribbonLayout -ne $requestedLayout -or ($InstalledRibbon -and $inventory.installedRibbonStatus -ne 0)) {
         throw "Native Ribbon layout did not match the requested backend: requested $requestedLayout; actual $($inventory.ribbonLayout); HRESULT $($inventory.installedRibbonStatus)"
@@ -200,6 +243,43 @@ function Invoke-PrivateCapture([string]$Scene, [int]$Width, [int]$Height, [strin
             throw "Modern source fixture did not prove the actual native Quick Access namespace: $Scene"
         }
     }
+    if ($Scene -eq 'Recycle') {
+        $addressEntries = @($inventory.widgets | Where-Object { $_.id -eq 104 -and $_.class -eq 'Edit' })
+        if ($addressEntries.Count -ne 1 -or -not ([string]$addressEntries[0].text).EndsWith(
+                '::{645ff040-5081-101b-9f08-00aa002f954e}', [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'Recycle source fixture did not prove the actual read-only Recycle Bin namespace.'
+        }
+    }
+    if ($searchMenuRequested -and ($inventory.searchDateMenu.requested -ne $true -or
+            $inventory.searchDateMenu.readHresult -ne 0 -or $inventory.searchDateMenu.expanded -ne $true -or
+            $inventory.searchDateMenu.expectedRows -ne 8 -or $inventory.searchDateMenu.matchedRows -ne 8 -or
+            $inventory.searchDateMenu.relativeToday -ne $true -or $inventory.searchDateMenu.scopeReadHresult -ne 0 -or
+            $inventory.searchDateMenu.resultReadHresult -ne 0 -or $inventory.searchDateMenu.resultCount -ne 2 -or
+            $inventory.searchDateMenu.expectedResults -ne 2 -or $inventory.searchDateMenu.matchedIdentities -ne 2 -or
+            $inventory.searchDateMenu.unexpectedPaths -ne 0 -or $inventory.searchDateMenu.duplicateIdentities -ne 0 -or
+            $inventory.searchDatePopup.window -eq 0 -or $inventory.searchDatePopup.readHresult -ne 0 -or
+            $inventory.searchDatePopup.ownedPrivate -ne $true -or $inventory.searchDatePopup.printed -ne $true -or
+            $inventory.searchDatePopup.physicalRows -ne 8 -or $inventory.searchDatePopup.uniqueColors -lt 12 -or
+            $inventory.searchDatePopup.inkFraction -lt 0.002 -or $inventory.searchDatePopup.unpaintedFraction -gt 0.001 -or
+            $inventory.searchDatePopup.minimumRowUniqueColors -lt 2 -or $inventory.searchDatePopup.minimumRowInkFraction -lt 0.002)) {
+        throw 'Search capture did not prove the declared native Date modified popup and all eight installed filter rows.'
+    }
+    if ($searchMenuRequested -and ($inventory.searchDateExpansion.executionAttempts -ne 0 -or
+            $inventory.searchDateExpansion.ribbonWindow -eq 0 -or $inventory.searchDateExpansion.nativeCommand -eq 0 -or
+            @($inventory.searchDateExpansion.parents | Where-Object accepted).Count -ne 1)) {
+        throw 'Search Date expansion did not prove one actual Ribbon gallery and zero execution callbacks.'
+    }
+    if ($searchMenuRequested -and ($inventory.searchDateMenu.submitReadHresult -ne 0 -or
+            $inventory.searchDateMenu.submitCount -ne 1 -or $inventory.searchDateMenu.recentCount -ne 1 -or
+            $inventory.searchDateMenu.recentMatchesQuery -ne $true -or $inventory.searchDateMenu.scopeNavigationReadHresult -ne 0 -or
+            $inventory.searchDateMenu.physicalScopeReady -ne $true -or $inventory.searchDateMenu.savedInputUnchanged -ne $true -or
+            $inventory.searchDateMenu.nativeViewChanged -ne $true -or $inventory.searchDateMenu.scopePreserved -ne $true -or
+            $inventory.searchDateMenu.historyCommitted -ne $true -or $inventory.searchDateMenu.factoryRetained -ne $true -or
+            $inventory.searchDateMenu.retainedFactoriesBefore -ne 0 -or $inventory.searchDateMenu.retainedFactoriesAfter -ne 1 -or
+            $inventory.searchDateMenu.navigationDelta -ne 1 -or $inventory.searchDateMenu.recentEnabledReadHresult -ne 0 -or
+            $inventory.searchDateMenu.recentEnabled -ne $true)) {
+        throw 'Search source fixture did not prove its genuine physical scope, one Enter submission, one completed native search navigation/factory, committed history, sole MRU entry and unchanged saved input.'
+    }
     if ($inventory.headless -ne $true -or $inventory.privateDesktop -ne $true -or $inventory.inputDesktopUnchanged -ne $true -or
         $inventory.visibleInputDesktopWindows -ne $false -or $inventory.renderer -ne 'native-PrintWindow-WIC' -or
         $inventory.printWindowSucceeded -ne $true -or $inventory.windowDpi -ne $inventory.layoutDpi -or
@@ -211,7 +291,7 @@ function Invoke-PrivateCapture([string]$Scene, [int]$Width, [int]$Height, [strin
     }
     & $pythonPath -B $comparer --manifest $manifestPath --validate-capture --require-ribbon --actual $screenshot --capture $capture | Out-Host
     if ($LASTEXITCODE -ne 0) { throw "Actual native PNG or command band failed capture invariants: $Scene" }
-    return [PSCustomObject]@{ Inventory = $inventory; Screenshot = $screenshot; Capture = $capture }
+    return [PSCustomObject]@{ SourceRestricted = $false; Inventory = $inventory; Screenshot = $screenshot; Capture = $capture }
 }
 
 $results = [Collections.Generic.List[object]]::new()
@@ -238,12 +318,27 @@ foreach ($scene in $Scenes) {
         $row.layoutDpi = $final.Inventory.layoutDpi
         $row.screenshot = $final.Screenshot
         $row.inventory = $final.Capture
-        if ($scene -eq 'Network') {
-            $row.sourceFixture = 'Native Network namespace; read-only; current network item names are private.'
+        if ($scene -in @('Network', 'Recycle')) {
+            $row.sourceFixture = if ($scene -eq 'Recycle') { 'Actual native Recycle Bin namespace; read-only, no selection or command invocation; private item names.' }
+                else { 'Native Network namespace; read-only; current network item names are private.' }
             $row.sourceCapturePublishable = $false
+            $row.privateSourceInventory = $final.Capture
+            $row.privateSourceScreenshot = $final.Screenshot
         }
         if (-not $CaptureOnly -and $referenceScene.Count -eq 1) {
             $comparedCapture = $final
+            if ($scene -eq 'Library') {
+                $source = Invoke-PrivateCapture $scene $width $height 'protected-metadata' $true
+                if ($source.SourceRestricted -ne $true) { throw 'Current-profile Library display did not stop at protected metadata.' }
+                $row.referenceRestriction = 'Current-profile Library display is unsupported: native browsing can rewrite its descriptor, and a protective read lease changes provider availability. No source image or custom-library substitute was compared.'
+                $row.sourceFixture = 'Protected actual Documents Library metadata only; no App or content view created.'
+                $row.sourceCapturePublishable = $false
+                $row.comparisonCapturePublishable = $false
+                $row.privateSourceInventory = $source.Capture
+                $row.sourceLibrary = $source.Inventory.documentsLibrarySource
+                $results.Add([PSCustomObject]$row)
+                continue
+            }
             if ($scene -in @('Home', 'Computer', 'Drive') -or $scene.StartsWith('Modern')) {
                 # This read-only native namespace fixture reproduces the source's
                 # actual SFGAO selection eligibility. Its Desktop body may have
@@ -259,8 +354,14 @@ foreach ($scene in $Scenes) {
                 $row.sourceCapturePublishable = $false
                 $row.privateSourceInventory = $comparedCapture.Capture
             }
+            $comparisonDirectory = if ($scene -eq 'Recycle') { Join-Path $runDirectory 'private-source/Recycle/comparison' }
+                else { Join-Path $runDirectory 'comparison' }
+            if ($scene -eq 'Recycle') {
+                $row.privateDerivedComparisonDirectory = $comparisonDirectory
+                $row.comparisonCapturePublishable = $false
+            }
             $comparisonArguments = @('-B', $comparer, '--manifest', $manifestPath, '--scene', $scene, '--actual', $comparedCapture.Screenshot,
-                '--capture', $comparedCapture.Capture, '--output', (Join-Path $runDirectory 'comparison'))
+                '--capture', $comparedCapture.Capture, '--output', $comparisonDirectory)
             if ($scene -in @('Home', 'View')) {
                 $chromeScene = 'Modern' + $scene
                 $chromePilot = Invoke-PrivateCapture $chromeScene $width $height 'chrome-pilot' $true
@@ -285,6 +386,7 @@ $compared = @($results | Where-Object { $null -ne $_.referenceComparison }).Coun
 $summary = [ordered]@{ headless = $true; privateDesktop = $true; captureOnly = [bool]$CaptureOnly;
     executableSha256 = $binarySha256;
     captureEnvironment = [ordered]@{ os = [Environment]::OSVersion.VersionString;
+        windows = Get-ExplorerWindowsEnvironment;
         uiCulture = [Globalization.CultureInfo]::CurrentUICulture.Name;
         culture = [Globalization.CultureInfo]::CurrentCulture.Name; requestedTheme = 'Light';
         sourceBuildThemeAccent = 'Not stated by publishers; palette and state differences remain compared.' };

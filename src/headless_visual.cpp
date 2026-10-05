@@ -1,6 +1,7 @@
 #include "explorer/headless_visual.hpp"
 #include "explorer/commands.hpp"
 #include "explorer/ribbon_commands.hpp"
+#include "explorer/library.hpp"
 
 #include <wincodec.h>
 #include <dwmapi.h>
@@ -9,6 +10,8 @@
 #include <uiribbon.h>
 #include <UIRibbonPropertyHelpers.h>
 #include <propvarutil.h>
+#include <structuredquery.h>
+#include <shlobj.h>
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -274,6 +277,82 @@ void pixelStatistics(const Dib& dib, unsigned width, unsigned height,
 
 } // namespace
 
+std::string nativePopupExpansionJson(const NativePopupCapture& popup) {
+    std::ostringstream out;
+    out << "{\"stage\":" << popup.stage << ",\"candidateCount\":" << popup.candidateCount
+        << ",\"ribbonWindow\":" << popup.ribbonWindow << ",\"ribbonBounds\":";
+    rectJson(out,popup.ribbonBounds);
+    out << ",\"nativeCommand\":" << popup.nativeCommand << ",\"commandType\":" << popup.commandType
+        << ",\"executionAttempts\":" << popup.executionAttempts << ",\"parents\":[";
+    bool first=true;
+    for(const auto& parent:popup.parents) {
+        out << (first?"":",") << "{\"type\":" << parent.type
+            << ",\"enabled\":" << (parent.enabled?"true":"false")
+            << ",\"offscreen\":" << (parent.offscreen?"true":"false") << ",\"bounds\":";
+        rectJson(out,parent.bounds);
+        out << ",\"elementReadHresult\":" << static_cast<long>(parent.elementRead)
+            << ",\"typeReadHresult\":" << static_cast<long>(parent.typeRead)
+            << ",\"enabledReadHresult\":" << static_cast<long>(parent.enabledRead)
+            << ",\"offscreenReadHresult\":" << static_cast<long>(parent.offscreenRead)
+            << ",\"boundsReadHresult\":" << static_cast<long>(parent.boundsRead)
+            << ",\"patternReadHresult\":" << static_cast<long>(parent.patternRead)
+            << ",\"stateReadHresult\":" << static_cast<long>(parent.stateRead)
+            << ",\"expandState\":" << parent.expandState
+            << ",\"parentReadHresult\":" << static_cast<long>(parent.parentRead)
+            << ",\"parentType\":" << parent.parentType
+            << ",\"parentSameName\":" << (parent.parentSameName?"true":"false") << ",\"parentBounds\":";
+        rectJson(out,parent.parentBounds);
+        out << ",\"ribbonAncestorReadHresult\":" << static_cast<long>(parent.ribbonAncestorRead)
+            << ",\"ribbonAncestor\":" << (parent.ribbonAncestor?"true":"false")
+            << ",\"ribbonBoundsContain\":" << (parent.ribbonBoundsContain?"true":"false")
+            << ",\"toolbarBoundsContain\":" << (parent.toolbarBoundsContain?"true":"false")
+            << ",\"accepted\":" << (parent.accepted?"true":"false")
+            << ",\"automationIdReadHresult\":" << static_cast<long>(parent.automationIdRead)
+            << ",\"automationId\":" << json(parent.automationId) << '}';first=false;
+    }
+    out << "]}";return out.str();
+}
+
+HRESULT validateRelativeTodayQuery(std::wstring_view query) noexcept {
+    if(query.empty()||query.size()>32768||query.find(L'\0')!=std::wstring_view::npos)return E_INVALIDARG;
+    try {
+        ComPtr<IQueryParserManager> manager;
+        auto hr=CoCreateInstance(__uuidof(QueryParserManager),nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&manager));
+        if(FAILED(hr))return hr;
+        ComPtr<IQueryParser> parser;
+        hr=manager->CreateLoadedParser(L"SystemIndex",GetUserDefaultUILanguage(),IID_PPV_ARGS(&parser));if(FAILED(hr))return hr;
+        hr=manager->InitializeOptions(FALSE,TRUE,parser.Get());if(FAILED(hr))return hr;
+        struct Leaf {
+            PWSTR property=nullptr,semantic=nullptr;
+            CONDITION_OPERATION operation{};
+            PROPVARIANT value{};
+            ~Leaf(){CoTaskMemFree(property);CoTaskMemFree(semantic);PropVariantClear(&value);}
+        } expected,actual;
+        const auto read=[&](const wchar_t* text,Leaf& leaf)->HRESULT {
+            ComPtr<IQuerySolution> solution;
+            auto result=parser->Parse(text,nullptr,&solution);if(FAILED(result))return result;
+            ComPtr<ICondition> condition;result=solution->GetQuery(&condition,nullptr);if(FAILED(result))return result;
+            CONDITION_TYPE type{};result=condition->GetConditionType(&type);if(FAILED(result))return result;
+            if(type!=CT_LEAF_CONDITION)return E_INVALIDARG;
+            result=condition->GetComparisonInfo(&leaf.property,&leaf.operation,&leaf.value);if(FAILED(result))return result;
+            return condition->GetValueType(&leaf.semantic);
+        };
+        hr=read(L"System.DateModified:System.StructuredQueryType.DateTime#Today",expected);if(FAILED(hr))return hr;
+        const std::wstring text(query);
+        hr=read(text.c_str(),actual);if(FAILED(hr))return hr;
+        // Compare the public unresolved condition fields against Windows' own
+        // Today parser result. Never decode its internal relative-date token
+        // or resolve it to the current calendar day for this persistence proof.
+        const auto valid=expected.property&&expected.semantic&&expected.value.vt==VT_LPWSTR&&expected.value.pwszVal&&
+            wcscmp(expected.property,L"System.DateModified")==0&&
+            wcscmp(expected.semantic,L"System.StructuredQueryType.DateTime")==0&&
+            actual.property&&actual.semantic&&actual.value.vt==VT_LPWSTR&&actual.value.pwszVal&&
+            actual.operation==expected.operation&&wcscmp(actual.property,expected.property)==0&&
+            wcscmp(actual.semantic,expected.semantic)==0&&wcscmp(actual.value.pwszVal,expected.value.pwszVal)==0;
+        return valid?S_OK:E_INVALIDARG;
+    }catch(...){return E_OUTOFMEMORY;}
+}
+
 PrivateDesktop::~PrivateDesktop() {
     if (currentDesktop == this) currentDesktop = nullptr;
     if (!desktop_) return;
@@ -356,17 +435,330 @@ HRESULT PrivateDesktop::visibleWindowsOnInputDesktop(bool& visible) const {
     return S_OK;
 }
 
+VisualSourceReadLease::~VisualSourceReadLease() {
+    if (file_ != INVALID_HANDLE_VALUE) CloseHandle(file_);
+}
+
+HRESULT VisualSourceReadLease::acquire(const PrivateDesktop& desktop, const std::filesystem::path& path) {
+    if (FAILED(desktop.verifyIsolation()) || PrivateDesktop::current() != &desktop) return E_ACCESSDENIED;
+    if (held()) return HRESULT_FROM_WIN32(ERROR_ALREADY_INITIALIZED);
+    if (path.empty() || !path.is_absolute()) return E_INVALIDARG;
+    struct File { HANDLE value = INVALID_HANDLE_VALUE;
+        ~File() { if (value != INVALID_HANDLE_VALUE) CloseHandle(value); } } file;
+    file.value = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+        FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_OPEN_NO_RECALL, nullptr);
+    if (file.value == INVALID_HANDLE_VALUE) return win32Failure();
+    FILE_ATTRIBUTE_TAG_INFO tag{};
+    DWORD flags = 0;
+    if (!GetFileInformationByHandleEx(file.value, FileAttributeTagInfo, &tag, sizeof(tag)) ||
+        !GetHandleInformation(file.value, &flags)) return win32Failure();
+    if (flags & HANDLE_FLAG_INHERIT) return E_ACCESSDENIED;
+    if (tag.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_OFFLINE |
+        FILE_ATTRIBUTE_RECALL_ON_OPEN | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS)) return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+    file_ = file.value;
+    file.value = INVALID_HANDLE_VALUE;
+    return S_OK;
+}
+
+struct DocumentsLibraryVisualSource::Impl {
+    VisualSourceReadLease lease; // Destroyed after retained native interfaces.
+    struct FileSnapshot {
+        FILE_ID_INFO identity{};
+        FILE_BASIC_INFO basic{};
+        LARGE_INTEGER size{};
+        std::vector<BYTE> bytes;
+    } file;
+    struct Metadata {
+        DocumentsLibrarySourceReadback readback;
+        GUID type{};
+        ComPtr<IShellItem> privateSave, publicSave;
+    } metadata;
+    ComPtr<IShellItem> item;
+    std::wstring path;
+    std::wstring parsingName;
+    DWORD thread = 0;
+
+    static bool sameIdentity(const FILE_ID_INFO& a, const FILE_ID_INFO& b) noexcept {
+        return a.VolumeSerialNumber == b.VolumeSerialNumber &&
+            std::memcmp(a.FileId.Identifier, b.FileId.Identifier, sizeof(a.FileId.Identifier)) == 0;
+    }
+    static bool sameFileMetadata(const FileSnapshot& a, const FileSnapshot& b) noexcept {
+        return sameIdentity(a.identity, b.identity) && a.size.QuadPart == b.size.QuadPart &&
+            a.basic.CreationTime.QuadPart == b.basic.CreationTime.QuadPart &&
+            a.basic.LastWriteTime.QuadPart == b.basic.LastWriteTime.QuadPart &&
+            a.basic.ChangeTime.QuadPart == b.basic.ChangeTime.QuadPart &&
+            a.basic.FileAttributes == b.basic.FileAttributes;
+    }
+    static HRESULT readFile(const std::wstring& path, FileSnapshot& result) {
+        struct File { HANDLE value = INVALID_HANDLE_VALUE;
+            ~File() { if (value != INVALID_HANDLE_VALUE) CloseHandle(value); } } file;
+        file.value = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_OPEN_NO_RECALL, nullptr);
+        if (file.value == INVALID_HANDLE_VALUE) return win32Failure();
+        FILE_ATTRIBUTE_TAG_INFO tag{};
+        if (!GetFileInformationByHandleEx(file.value, FileAttributeTagInfo, &tag, sizeof(tag))) return win32Failure();
+        constexpr DWORD unsupportedAttributes = FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_OFFLINE |
+            FILE_ATTRIBUTE_RECALL_ON_OPEN | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS;
+        if (tag.FileAttributes & unsupportedAttributes) return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+        const auto readMetadata = [&](FileSnapshot& value) -> HRESULT {
+            if (!GetFileInformationByHandleEx(file.value, FileIdInfo, &value.identity, sizeof(value.identity)) ||
+                !GetFileInformationByHandleEx(file.value, FileBasicInfo, &value.basic, sizeof(value.basic)) ||
+                !GetFileSizeEx(file.value, &value.size)) return win32Failure();
+            if (value.basic.FileAttributes & unsupportedAttributes) return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+            return (value.basic.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? E_INVALIDARG : S_OK;
+        };
+        FileSnapshot before, after;
+        auto hr = readMetadata(before);
+        if (FAILED(hr)) return hr;
+        if (before.size.QuadPart <= 0 || before.size.QuadPart > 1024 * 1024)
+            return HRESULT_FROM_WIN32(ERROR_FILE_TOO_LARGE);
+        const auto byteCount = static_cast<DWORD>(before.size.QuadPart); // bounded above to 1 MiB
+        before.bytes.resize(byteCount);
+        DWORD copied = 0;
+        if (!ReadFile(file.value, before.bytes.data(), byteCount, &copied, nullptr))
+            return win32Failure();
+        if (copied != byteCount) return HRESULT_FROM_WIN32(ERROR_HANDLE_EOF);
+        hr = readMetadata(after);
+        if (FAILED(hr)) return hr;
+        if (!sameFileMetadata(before, after)) return HRESULT_FROM_WIN32(ERROR_RETRY);
+        result = std::move(before);
+        return S_OK;
+    }
+    static HRESULT readMetadata(Metadata& result) {
+        ComPtr<IShellLibrary> library;
+        auto hr = SHLoadLibraryFromKnownFolder(FOLDERID_DocumentsLibrary,
+            STGM_READ | STGM_SHARE_DENY_NONE, IID_PPV_ARGS(&library));
+        result.readback.loadRead = hr;
+        if (FAILED(hr)) return hr;
+        if (!library) return E_UNEXPECTED;
+        LIBRARYOPTIONFLAGS options{};
+        result.readback.optionsRead = library->GetOptions(&options);
+        result.readback.options = static_cast<DWORD>(options);
+        result.readback.typeRead = library->GetFolderType(&result.type);
+        result.readback.documentsType = SUCCEEDED(result.readback.typeRead) &&
+            libraryKindForType(result.type) == LibraryKind::Documents;
+        ComPtr<IShellItemArray> folders;
+        result.readback.foldersRead = library->GetFolders(LFF_ALLITEMS, IID_PPV_ARGS(&folders));
+        if (SUCCEEDED(result.readback.foldersRead)) result.readback.foldersRead = folders ?
+            folders->GetCount(&result.readback.folderCount) : E_UNEXPECTED;
+        result.readback.privateSaveRead = library->GetDefaultSaveFolder(DSFT_PRIVATE, IID_PPV_ARGS(&result.privateSave));
+        result.readback.publicSaveRead = library->GetDefaultSaveFolder(DSFT_PUBLIC, IID_PPV_ARGS(&result.publicSave));
+        if (FAILED(result.readback.optionsRead)) return result.readback.optionsRead;
+        if (FAILED(result.readback.typeRead)) return result.readback.typeRead;
+        return result.readback.foldersRead;
+    }
+    static bool sourceUnavailable(HRESULT hr) noexcept {
+        return hr == E_INVALIDARG || hr == E_ACCESSDENIED || hr == E_FAIL || hr == E_NOTIMPL ||
+            hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) || hr == HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND) ||
+            hr == HRESULT_FROM_WIN32(ERROR_INVALID_DATA) || hr == HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED) ||
+            hr == HRESULT_FROM_WIN32(ERROR_SHARING_VIOLATION) || hr == HRESULT_FROM_WIN32(ERROR_LOCK_VIOLATION) ||
+            hr == STG_E_SHAREVIOLATION || hr == STG_E_LOCKVIOLATION || hr == STG_E_ACCESSDENIED;
+    }
+    static bool sameItem(IShellItem* a, IShellItem* b) {
+        if (!a || !b) return a == b;
+        int order = 1;
+        return SUCCEEDED(a->Compare(b, SICHINT_CANONICAL, &order)) && order == 0;
+    }
+};
+
+DocumentsLibraryVisualSource::DocumentsLibraryVisualSource() noexcept = default;
+DocumentsLibraryVisualSource::~DocumentsLibraryVisualSource() = default;
+
+HRESULT DocumentsLibraryVisualSource::resolve(const PrivateDesktop& desktop, std::wstring& location,
+                                               DocumentsLibrarySourceReadback& readback) {
+    readback = {};
+    readback.requested = true;
+    if (FAILED(desktop.verifyIsolation()) || PrivateDesktop::current() != &desktop) return E_ACCESSDENIED;
+    if (impl_) return HRESULT_FROM_WIN32(ERROR_ALREADY_INITIALIZED);
+    APTTYPE apartment{}; APTTYPEQUALIFIER qualifier{};
+    const auto initialized = CoGetApartmentType(&apartment, &qualifier);
+    if (FAILED(initialized)) return initialized;
+    if (apartment != APTTYPE_STA && apartment != APTTYPE_MAINSTA) return E_ACCESSDENIED;
+    try {
+        auto candidate = std::make_unique<Impl>();
+        // Protect the descriptor before any namespace/library binding can
+        // inspect it. No known-folder creation or data-provider recall flags.
+        PWSTR path = nullptr;
+        readback.pathRead = SHGetKnownFolderPath(FOLDERID_DocumentsLibrary, 0, nullptr, &path);
+        struct Text { PWSTR value; ~Text() { CoTaskMemFree(value); } } text{path};
+        readback.resolveRead = readback.pathRead;
+        if (FAILED(readback.pathRead)) {
+            readback.unavailable = Impl::sourceUnavailable(readback.pathRead);
+            return readback.pathRead;
+        }
+        if (!path || !*path || !std::filesystem::path(path).is_absolute()) return E_UNEXPECTED;
+        candidate->path = path;
+        readback.leaseRead = candidate->lease.acquire(desktop, candidate->path);
+        readback.writeProtected = candidate->lease.held();
+        if (FAILED(readback.leaseRead)) {
+            readback.unsupported = readback.leaseRead == HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+            readback.unavailable = Impl::sourceUnavailable(readback.leaseRead);
+            return readback.leaseRead;
+        }
+        readback.fileRead = Impl::readFile(candidate->path, candidate->file);
+        if (FAILED(readback.fileRead)) {
+            readback.unavailable = Impl::sourceUnavailable(readback.fileRead);
+            return readback.fileRead;
+        }
+        PIDLIST_ABSOLUTE raw = nullptr;
+        readback.knownFolderRead = SHGetKnownFolderIDList(FOLDERID_DocumentsLibrary, 0, nullptr, &raw);
+        readback.resolveRead = readback.knownFolderRead;
+        struct Pidl { PIDLIST_ABSOLUTE value; ~Pidl() { CoTaskMemFree(value); } } pidl{raw};
+        if (SUCCEEDED(readback.resolveRead)) {
+            readback.itemRead = raw ? SHCreateItemFromIDList(raw, IID_PPV_ARGS(&candidate->item)) : E_UNEXPECTED;
+            readback.resolveRead = readback.itemRead;
+        }
+        PWSTR parsingName = nullptr;
+        if (SUCCEEDED(readback.resolveRead)) {
+            readback.parsingNameRead = candidate->item->GetDisplayName(SIGDN_DESKTOPABSOLUTEPARSING, &parsingName);
+            readback.resolveRead = readback.parsingNameRead;
+        }
+        Text parsingText{parsingName};
+        if (FAILED(readback.resolveRead)) {
+            readback.unavailable = Impl::sourceUnavailable(readback.resolveRead);
+            return readback.resolveRead;
+        }
+        if (!path || !*path || !std::filesystem::path(path).is_absolute() || !parsingName || !*parsingName) return E_UNEXPECTED;
+        candidate->parsingName = parsingName;
+        ComPtr<IShellItem> parsed;
+        readback.parsingItemRead = SHCreateItemFromParsingName(candidate->parsingName.c_str(), nullptr, IID_PPV_ARGS(&parsed));
+        if (FAILED(readback.parsingItemRead)) return readback.resolveRead = readback.parsingItemRead;
+        int same = 1;
+        readback.parsingIdentityRead = candidate->item->Compare(parsed.Get(), SICHINT_CANONICAL, &same);
+        if (FAILED(readback.parsingIdentityRead)) return readback.resolveRead = readback.parsingIdentityRead;
+        if (same != 0) return readback.resolveRead = E_INVALIDARG;
+        auto hr = Impl::readMetadata(candidate->metadata);
+        const auto resolution = readback;
+        readback = candidate->metadata.readback;
+        readback.requested = true;
+        readback.leaseRead = resolution.leaseRead;
+        readback.writeProtected = resolution.writeProtected;
+        readback.resolveRead = resolution.resolveRead;
+        readback.knownFolderRead = resolution.knownFolderRead;
+        readback.itemRead = resolution.itemRead;
+        readback.pathRead = resolution.pathRead;
+        readback.parsingNameRead = resolution.parsingNameRead;
+        readback.parsingItemRead = resolution.parsingItemRead;
+        readback.parsingIdentityRead = resolution.parsingIdentityRead;
+        readback.fileRead = resolution.fileRead;
+        const auto metadataRead = hr;
+        Impl::FileSnapshot after;
+        readback.fileRead = Impl::readFile(candidate->path, after);
+        if (FAILED(readback.fileRead)) return readback.fileRead;
+        readback.backingFileUnchanged = Impl::sameFileMetadata(candidate->file, after) && candidate->file.bytes == after.bytes;
+        if (!readback.backingFileUnchanged)
+            return HRESULT_FROM_WIN32(ERROR_RETRY);
+        if (FAILED(metadataRead)) {
+            readback.unavailable = FAILED(readback.loadRead) && Impl::sourceUnavailable(readback.loadRead);
+            return metadataRead;
+        }
+        const auto isolation = desktop.verifyIsolation();
+        if (FAILED(isolation)) return isolation;
+        candidate->thread = GetCurrentThreadId();
+        location = candidate->parsingName;
+        impl_ = std::move(candidate);
+        return S_OK;
+    } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
+}
+
+HRESULT DocumentsLibraryVisualSource::verify(const PrivateDesktop& desktop, IShellItem* current,
+                                              DocumentsLibrarySourceReadback& readback) const {
+    readback.verification = {};
+    readback.verification.stage = 1;
+    readback.currentMatches = readback.backingFileUnchanged = readback.metadataUnchanged = false;
+    if (!impl_ || !impl_->lease.held() || !current || impl_->thread != GetCurrentThreadId() ||
+        FAILED(desktop.verifyIsolation()) || PrivateDesktop::current() != &desktop) return readback.verifyRead = E_ACCESSDENIED;
+    try {
+        auto& proof = readback.verification;
+        proof.stage = 2;
+        int same = 1;
+        proof.currentRead = impl_->item->Compare(current, SICHINT_CANONICAL, &same);
+        readback.currentMatches = SUCCEEDED(proof.currentRead) && same == 0;
+        if (!readback.currentMatches) return readback.verifyRead = E_INVALIDARG;
+        proof.stage = 3;
+        PIDLIST_ABSOLUTE raw = nullptr;
+        proof.knownFolderRead = SHGetKnownFolderIDList(FOLDERID_DocumentsLibrary, 0, nullptr, &raw);
+        auto hr = proof.knownFolderRead;
+        struct Pidl { PIDLIST_ABSOLUTE value; ~Pidl() { CoTaskMemFree(value); } } pidl{raw};
+        ComPtr<IShellItem> known;
+        if (SUCCEEDED(hr)) hr = proof.knownItemRead = raw ? SHCreateItemFromIDList(raw, IID_PPV_ARGS(&known)) : E_UNEXPECTED;
+        if (FAILED(hr)) return readback.verifyRead = hr;
+        proof.stage = 4;
+        same = 1;
+        proof.knownIdentityRead = impl_->item->Compare(known.Get(), SICHINT_CANONICAL, &same);
+        proof.knownMatches = SUCCEEDED(proof.knownIdentityRead) && same == 0;
+        if (!proof.knownMatches) return readback.verifyRead = HRESULT_FROM_WIN32(ERROR_RETRY);
+        proof.stage = 5;
+        PWSTR path = nullptr;
+        hr = proof.pathRead = SHGetKnownFolderPath(FOLDERID_DocumentsLibrary, 0, nullptr, &path);
+        struct Text { PWSTR value; ~Text() { CoTaskMemFree(value); } } text{path};
+        if (FAILED(hr)) return readback.verifyRead = hr;
+        proof.pathMatches = path && _wcsicmp(path, impl_->path.c_str()) == 0;
+        if (!proof.pathMatches)
+            return readback.verifyRead = HRESULT_FROM_WIN32(ERROR_RETRY);
+        proof.stage = 6;
+        Impl::Metadata metadata;
+        hr = proof.metadataRead = Impl::readMetadata(metadata);
+        if (FAILED(hr)) return readback.verifyRead = hr;
+        const auto& before = impl_->metadata.readback;
+        const auto& after = metadata.readback;
+        proof.stage = 7;
+        proof.optionsUnchanged = before.options == after.options;
+        proof.typeUnchanged = impl_->metadata.type == metadata.type;
+        proof.folderCountUnchanged = before.folderCount == after.folderCount;
+        proof.privateSaveStatusUnchanged = before.privateSaveRead == after.privateSaveRead;
+        proof.publicSaveStatusUnchanged = before.publicSaveRead == after.publicSaveRead;
+        const auto compareSave = [](IShellItem* a, IShellItem* b, HRESULT& status) {
+            if (!a || !b) return a == b; // Getter HRESULTs separately prove unchanged absence.
+            int order = 1;
+            status = a->Compare(b, SICHINT_CANONICAL, &order);
+            return SUCCEEDED(status) && order == 0;
+        };
+        proof.privateSaveMatches = compareSave(impl_->metadata.privateSave.Get(), metadata.privateSave.Get(), proof.privateSaveRead);
+        proof.publicSaveMatches = compareSave(impl_->metadata.publicSave.Get(), metadata.publicSave.Get(), proof.publicSaveRead);
+        readback.metadataUnchanged = proof.optionsUnchanged && proof.typeUnchanged && proof.folderCountUnchanged &&
+            proof.privateSaveStatusUnchanged && proof.publicSaveStatusUnchanged && proof.privateSaveMatches && proof.publicSaveMatches;
+        proof.stage = 8;
+        Impl::FileSnapshot file;
+        readback.fileRead = Impl::readFile(impl_->path, file);
+        if (FAILED(readback.fileRead)) return readback.verifyRead = readback.fileRead;
+        proof.stage = 9;
+        proof.fileIdentityUnchanged = Impl::sameIdentity(impl_->file.identity, file.identity);
+        proof.fileSizeUnchanged = impl_->file.size.QuadPart == file.size.QuadPart;
+        proof.fileCreationUnchanged = impl_->file.basic.CreationTime.QuadPart == file.basic.CreationTime.QuadPart;
+        proof.fileWriteUnchanged = impl_->file.basic.LastWriteTime.QuadPart == file.basic.LastWriteTime.QuadPart;
+        proof.fileChangeUnchanged = impl_->file.basic.ChangeTime.QuadPart == file.basic.ChangeTime.QuadPart;
+        proof.fileAttributesUnchanged = impl_->file.basic.FileAttributes == file.basic.FileAttributes;
+        proof.fileBytesUnchanged = impl_->file.bytes == file.bytes;
+        readback.backingFileUnchanged = proof.fileIdentityUnchanged && proof.fileSizeUnchanged && proof.fileCreationUnchanged &&
+            proof.fileWriteUnchanged && proof.fileChangeUnchanged && proof.fileAttributesUnchanged && proof.fileBytesUnchanged;
+        proof.stage = 10;
+        hr = desktop.verifyIsolation();
+        if (FAILED(hr)) return readback.verifyRead = hr;
+        proof.stage = 11;
+        return readback.verifyRead = readback.metadataUnchanged && readback.backingFileUnchanged ? S_OK :
+            HRESULT_FROM_WIN32(ERROR_RETRY);
+    } catch (const std::bad_alloc&) { return readback.verifyRead = E_OUTOFMEMORY; }
+}
+
+HRESULT DocumentsLibraryVisualSource::verifyMetadata(const PrivateDesktop& desktop,
+                                                     DocumentsLibrarySourceReadback& readback) const {
+    return verify(desktop, impl_ ? impl_->item.Get() : nullptr, readback);
+}
+
 HRESULT captureWindowPng(const PrivateDesktop& desktop, HWND window,
                          const std::filesystem::path& output,
                          const VisualCaptureOptions& options,
                          VisualCaptureReport& report) {
     if (!window || !IsWindow(window) || output.empty() || !output.is_absolute() ||
+        (options.nativeClientPrint && options.includeFrame) ||
         options.layoutDpi < 48 || options.layoutDpi > 768 || options.minimumInkFraction < 0 ||
         options.minimumInkFraction > 1 || options.maximumUnpaintedFraction < 0 ||
         options.maximumUnpaintedFraction > 1) return E_INVALIDARG;
     const auto owner = GetWindowThreadProcessId(window, nullptr);
     if (owner != GetCurrentThreadId()) return E_ACCESSDENIED;
     VisualCaptureReport result;
+    result.searchDateExpansion=options.searchDatePopup;
     auto hr = desktop.verifyIsolation(&result.inputDesktopUnchanged);
     if (FAILED(hr)) return hr;
     hr = desktop.visibleWindowsOnInputDesktop(result.visibleInputDesktopWindows);
@@ -383,6 +775,8 @@ HRESULT captureWindowPng(const PrivateDesktop& desktop, HWND window,
         result.ribbonFeatures = options.ribbonFeatures;
         result.ribbonContexts = options.ribbonContexts;
         result.ribbonProviders = options.ribbonProviders;
+        result.searchDateMenu = options.searchDateMenu;
+        result.commandReadiness = options.commandReadiness;
         DWORD size = sizeof(result.hideFileExt);
         const auto registry = RegGetValueW(HKEY_CURRENT_USER,
             L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced", L"HideFileExt",
@@ -445,8 +839,39 @@ HRESULT captureWindowPng(const PrivateDesktop& desktop, HWND window,
     RECT windowRect{};
     if (!GetWindowRect(window, &windowRect) || !GetClientRect(window, &result.clientBounds)) return win32Failure();
     MapWindowPoints(window, nullptr, reinterpret_cast<POINT*>(&result.clientBounds), 2);
-    const RECT printRect = options.includeFrame ? windowRect : result.clientBounds;
+    RECT printRect = options.includeFrame ? windowRect : result.clientBounds;
     RECT captureRect = printRect;
+    HWND printSource = window;
+    const auto targetClientScreen = result.clientBounds;
+    if (options.nativeClientCropPrintLayout &&
+        (!options.nativeClientCropSource ||
+         (*options.nativeClientCropPrintLayout & ~static_cast<DWORD>(LAYOUT_RTL | LAYOUT_BITMAPORIENTATIONPRESERVED)))) return E_INVALIDARG;
+    if (options.nativeClientCropPrintFlags && (!options.nativeClientCropSource ||
+        (*options.nativeClientCropPrintFlags != 0 && *options.nativeClientCropPrintFlags != PW_RENDERFULLCONTENT))) return E_INVALIDARG;
+    if (options.nativeClientCropSource) {
+        printSource = options.nativeClientCropSource;
+        DWORD sourceProcess=0;
+        if(options.includeFrame||options.nativeClientPrint||options.nativeClientCropSourceImage.empty()||
+            !options.nativeClientCropSourceImage.is_absolute()||options.nativeClientCropSourceImage==output||
+            !IsWindow(printSource)||GetWindowThreadProcessId(printSource,&sourceProcess)!=GetCurrentThreadId()||
+            sourceProcess!=GetCurrentProcessId()||GetAncestor(window,GA_ROOT)!=printSource||!IsChild(printSource,window))return E_ACCESSDENIED;
+        if(!GetWindowRect(printSource,&printRect))return win32Failure();
+        if(captureRect.left<printRect.left||captureRect.top<printRect.top||captureRect.right>printRect.right||
+            captureRect.bottom>printRect.bottom)return E_INVALIDARG;
+        result.nativeClientCropped=true;
+        result.nativeClientCropSourceImage=options.nativeClientCropSourceImage;
+        result.nativeClientCropPrintLayout=options.nativeClientCropPrintLayout;
+        const auto sourceDc=GetWindowDC(printSource);
+        if(!sourceDc)return win32Failure();
+        result.printSourceDcLayout=GetLayout(sourceDc);
+        result.printSourceDcMapMode=GetMapMode(sourceDc);
+        ReleaseDC(printSource,sourceDc);
+        if(result.printSourceDcLayout==GDI_ERROR||!result.printSourceDcMapMode)return E_FAIL;
+    }
+    result.printSourceWindow=reinterpret_cast<UINT_PTR>(printSource);
+    result.printTargetWindow=reinterpret_cast<UINT_PTR>(window);
+    result.printSourceBounds=printRect;
+    result.printTargetClientBounds=targetClientScreen;
     if (options.includeFrame && options.trimInvisibleFrame) {
         RECT extended{};
         if (SUCCEEDED(DwmGetWindowAttribute(window, DWMWA_EXTENDED_FRAME_BOUNDS, &extended, sizeof(extended))) &&
@@ -473,13 +898,38 @@ HRESULT captureWindowPng(const PrivateDesktop& desktop, HWND window,
         static_cast<size_t>(printWidth) * printHeight > MaximumPixels) return E_INVALIDARG;
     hr = nativeDib.initialize(printWidth, printHeight);
     if (FAILED(hr)) return hr;
+    if(result.nativeClientCropped) {
+        result.printMemoryDcInitialLayout=GetLayout(nativeDib.dc);
+        result.printMemoryDcInitialMapMode=GetMapMode(nativeDib.dc);
+        if(options.nativeClientCropPrintLayout&&SetLayout(nativeDib.dc,*options.nativeClientCropPrintLayout)==GDI_ERROR)return win32Failure();
+        result.printMemoryDcBeforeLayout=GetLayout(nativeDib.dc);
+        result.printMemoryDcBeforeMapMode=GetMapMode(nativeDib.dc);
+    }
     // PW_RENDERFULLCONTENT asks modern native controls to draw their content.
     // This captures the HWND's actual native surface/print implementation;
     // Windows can use a painted surface without dispatching WM_PRINT.
-    result.printWindowSucceeded = PrintWindow(window, nativeDib.dc,
-        PW_RENDERFULLCONTENT | (options.includeFrame ? 0 : PW_CLIENTONLY)) != FALSE;
+    result.printWindowFlags = options.nativeClientCropPrintFlags ? *options.nativeClientCropPrintFlags :
+        options.nativeClientPrint ? PW_CLIENTONLY :
+        PW_RENDERFULLCONTENT | (options.includeFrame || result.nativeClientCropped ? 0 : PW_CLIENTONLY);
+    result.printWindowSucceeded = PrintWindow(printSource, nativeDib.dc, result.printWindowFlags) != FALSE;
     GdiFlush();
+    if(result.nativeClientCropped) {
+        result.printMemoryDcAfterLayout=GetLayout(nativeDib.dc);
+        result.printMemoryDcAfterMapMode=GetMapMode(nativeDib.dc);
+    }
     if (!result.printWindowSucceeded) return win32Failure();
+    if(result.nativeClientCropped) {
+        RECT sourceNow{},targetNow{},clientNow{};
+        if(!IsWindow(window)||!IsWindow(printSource)||GetAncestor(window,GA_ROOT)!=printSource||!IsChild(printSource,window)||
+            !GetWindowRect(printSource,&sourceNow)||!EqualRect(&sourceNow,&printRect)||
+            !GetWindowRect(window,&targetNow)||!EqualRect(&targetNow,&windowRect)||!GetClientRect(window,&clientNow))return E_FAIL;
+        SetLastError(ERROR_SUCCESS);
+        const auto mapped=MapWindowPoints(window,nullptr,reinterpret_cast<POINT*>(&clientNow),2);
+        if((!mapped&&GetLastError()!=ERROR_SUCCESS)||!EqualRect(&clientNow,&targetClientScreen))return E_FAIL;
+        hr=desktop.verifyIsolation();if(FAILED(hr))return hr;
+        hr=encodePng(options.nativeClientCropSourceImage,nativeDib,printWidth,printHeight,options.layoutDpi);
+        if(FAILED(hr))return hr;
+    }
     if(options.ribbonFramework) {
         PROPVARIANT selected{};
         result.layoutGallerySelectedRead=options.ribbonFramework->GetUICommandProperty(
@@ -508,8 +958,84 @@ HRESULT captureWindowPng(const PrivateDesktop& desktop, HWND window,
     for (auto& button : result.breadcrumbButtons)
         button.drawRead = breadcrumb ? chromeToolbarDrawReadback(breadcrumb,
             static_cast<UINT>(button.command), &button.draw) : HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+    if(options.searchDateMenu.requested) {
+        auto& popupRead=result.searchDatePopup;
+        const auto& popup=options.searchDatePopup;
+        popupRead.window=reinterpret_cast<UINT_PTR>(popup.window);
+        popupRead.physicalRows=static_cast<UINT>(popup.rowBounds.size());
+        const auto printPopup=[&]()->HRESULT {
+            if(!options.searchDateMenu.expanded||FAILED(options.searchDateMenu.read)||
+                options.searchDateMenu.expectedRows!=8||options.searchDateMenu.matchedRows!=8||
+                popup.rowBounds.size()!=8||!popup.window||!IsWindow(popup.window)||!IsWindowVisible(popup.window)||
+                popup.window==window||GetAncestor(popup.window,GA_ROOTOWNER)!=window)return E_INVALIDARG;
+            DWORD process=0;
+            const auto thread=GetWindowThreadProcessId(popup.window,&process);
+            if(thread!=owner||process!=GetCurrentProcessId())return E_ACCESSDENIED;
+            std::wstring popupDesktop;
+            auto checked=objectName(GetThreadDesktop(thread),popupDesktop);
+            if(FAILED(checked))return checked;
+            if(popupDesktop!=desktop.name())return E_ACCESSDENIED;
+            checked=desktop.verifyIsolation();if(FAILED(checked))return checked;
+            RECT popupRect{};
+            if(!GetWindowRect(popup.window,&popupRect))return win32Failure();
+            if(!EqualRect(&popupRect,&popup.bounds))return HRESULT_FROM_WIN32(ERROR_RETRY);
+            popupRead.bounds=popupRect;OffsetRect(&popupRead.bounds,-captureRect.left,-captureRect.top);
+            const auto popupWidth=popupRect.right-popupRect.left,popupHeight=popupRect.bottom-popupRect.top;
+            if(popupWidth<=0||popupHeight<=0||popupWidth>8192||popupHeight>8192||
+                static_cast<size_t>(popupWidth)*popupHeight>MaximumPixels)return E_INVALIDARG;
+            for(const auto& row:popup.rowBounds) {
+                if(row.right<=row.left||row.bottom<=row.top||row.left<popupRect.left||row.top<popupRect.top||
+                    row.right>popupRect.right||row.bottom>popupRect.bottom||row.left<captureRect.left||
+                    row.top<captureRect.top||row.right>captureRect.right||row.bottom>captureRect.bottom)return E_INVALIDARG;
+            }
+            Dib popupDib;
+            checked=popupDib.initialize(static_cast<unsigned>(popupWidth),static_cast<unsigned>(popupHeight));
+            if(FAILED(checked))return checked;
+            // The Date menu is a separate native owned HWND. Render its actual
+            // surface, then place the unscaled pixels at its measured location.
+            popupRead.printed=PrintWindow(popup.window,popupDib.dc,PW_RENDERFULLCONTENT)!=FALSE;
+            if(!GdiFlush()||!popupRead.printed)return win32Failure();
+            VisualCaptureReport popupStats;
+            pixelStatistics(popupDib,static_cast<unsigned>(popupWidth),static_cast<unsigned>(popupHeight),popupStats);
+            popupRead.uniqueColors=popupStats.uniqueColors;popupRead.inkFraction=popupStats.inkFraction;
+            popupRead.unpaintedFraction=popupStats.unpaintedFraction;
+            if(popupStats.uniqueColors<options.minimumUniqueColors||popupStats.inkFraction<options.minimumInkFraction||
+                popupStats.unpaintedFraction>options.maximumUnpaintedFraction)return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+            popupRead.minimumRowUniqueColors=std::numeric_limits<unsigned>::max();
+            popupRead.minimumRowInkFraction=1;
+            for(const auto& row:popup.rowBounds) {
+                std::unordered_set<uint32_t> colors;size_t ink=0;
+                for(LONG y=row.top;y<row.bottom;++y)for(LONG x=row.left;x<row.right;++x) {
+                    const auto rgb=popupDib.pixels[static_cast<size_t>(y-popupRect.top)*popupWidth+
+                        static_cast<size_t>(x-popupRect.left)]&0x00ffffff;
+                    colors.insert(rgb);
+                    if((rgb&0xff)<220||((rgb>>8)&0xff)<220||((rgb>>16)&0xff)<220)++ink;
+                }
+                const auto fraction=static_cast<double>(ink)/
+                    (static_cast<double>(row.right-row.left)*(row.bottom-row.top));
+                popupRead.minimumRowUniqueColors=std::min(popupRead.minimumRowUniqueColors,static_cast<unsigned>(colors.size()));
+                popupRead.minimumRowInkFraction=std::min(popupRead.minimumRowInkFraction,fraction);
+                if(colors.size()<2||fraction<options.minimumInkFraction)return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+            }
+            RECT currentRect{};
+            if(!IsWindowVisible(popup.window)||GetAncestor(popup.window,GA_ROOTOWNER)!=window||
+                !GetWindowRect(popup.window,&currentRect)||!EqualRect(&currentRect,&popupRect))
+                return HRESULT_FROM_WIN32(ERROR_RETRY);
+            RECT overlap{};
+            if(!IntersectRect(&overlap,&popupRect,&printRect))return E_INVALIDARG;
+            for(LONG y=overlap.top;y<overlap.bottom;++y)
+                std::copy_n(popupDib.pixels+static_cast<size_t>(y-popupRect.top)*popupWidth+
+                        static_cast<size_t>(overlap.left-popupRect.left),static_cast<size_t>(overlap.right-overlap.left),
+                    nativeDib.pixels+static_cast<size_t>(y-printRect.top)*printWidth+
+                        static_cast<size_t>(overlap.left-printRect.left));
+            popupRead.ownedPrivate=true;
+            return desktop.verifyIsolation();
+        };
+        popupRead.read=printPopup();
+        if(FAILED(popupRead.read)) {report=std::move(result);return report.searchDatePopup.read;}
+    } else if(options.searchDatePopup.window)return E_INVALIDARG;
     std::unique_ptr<Dib> cropped;
-    if (result.invisibleFrameTrimmed) {
+    if (result.invisibleFrameTrimmed || result.nativeClientCropped) {
         cropped = std::make_unique<Dib>();
         hr = cropped->initialize(result.width, result.height);
         if (FAILED(hr)) return hr;
@@ -526,13 +1052,20 @@ HRESULT captureWindowPng(const PrivateDesktop& desktop, HWND window,
         if(inspection.left < 0 || inspection.top < 0 || inspection.right > width ||
             inspection.bottom > height) return E_INVALIDARG;
         result.pixelInspectionBounds=inspection;
+        result.pixelInspectionBackground=options.pixelInspectionBackground;
         std::unordered_set<uint32_t> colors;
         size_t ink=0;
+        uint64_t hash=14695981039346656037ull;
+        const auto background=options.pixelInspectionBackground;
+        const auto backgroundRgb=background ? (static_cast<uint32_t>(GetRValue(*background))<<16) |
+            (static_cast<uint32_t>(GetGValue(*background))<<8) | GetBValue(*background) : 0u;
         for(LONG y=inspection.top;y<inspection.bottom;++y)for(LONG x=inspection.left;x<inspection.right;++x) {
             const auto rgb=dib.pixels[static_cast<size_t>(y)*result.width+static_cast<size_t>(x)]&0x00ffffff;
             colors.insert(rgb);
-            if((rgb&0xff)<220 || ((rgb>>8)&0xff)<220 || ((rgb>>16)&0xff)<220)++ink;
+            if(background ? rgb!=backgroundRgb : (rgb&0xff)<220 || ((rgb>>8)&0xff)<220 || ((rgb>>16)&0xff)<220)++ink;
+            for(unsigned shift=0;shift<24;shift+=8) {hash^=(rgb>>shift)&0xff;hash*=1099511628211ull;}
         }
+        result.inspectionPixelHash=hash;
         result.inspectionUniqueColors=static_cast<unsigned>(colors.size());
         result.inspectionInkFraction=static_cast<double>(ink)/
             (static_cast<double>(inspection.right-inspection.left)*(inspection.bottom-inspection.top));
@@ -551,6 +1084,55 @@ HRESULT captureWindowPng(const PrivateDesktop& desktop, HWND window,
     return S_OK;
 }
 
+std::string documentsLibrarySourceJson(const DocumentsLibrarySourceReadback& source) {
+    std::ostringstream stream;
+    stream << std::boolalpha << "{\"requested\":" << source.requested
+        << ",\"publishable\":" << (source.requested ? "false" : "null");
+    const auto field = [&](const char* name, auto value) { stream << ",\"" << name << "\":" << value; };
+    field("unavailable", source.unavailable); field("unsupported", source.unsupported);
+    field("displayUnsupported", source.displayUnsupported); field("writeProtected", source.writeProtected);
+    field("leaseReadHresult", static_cast<long>(source.leaseRead));
+    field("resolveReadHresult", static_cast<long>(source.resolveRead));
+    field("knownFolderReadHresult", static_cast<long>(source.knownFolderRead));
+    field("itemReadHresult", static_cast<long>(source.itemRead));
+    field("pathReadHresult", static_cast<long>(source.pathRead));
+    field("parsingNameReadHresult", static_cast<long>(source.parsingNameRead));
+    field("parsingItemReadHresult", static_cast<long>(source.parsingItemRead));
+    field("parsingIdentityReadHresult", static_cast<long>(source.parsingIdentityRead));
+    field("loadReadHresult", static_cast<long>(source.loadRead));
+    field("fileReadHresult", static_cast<long>(source.fileRead));
+    field("verifyReadHresult", static_cast<long>(source.verifyRead));
+    field("currentMatches", source.currentMatches); field("backingFileUnchanged", source.backingFileUnchanged);
+    field("metadataUnchanged", source.metadataUnchanged);
+    field("optionsReadHresult", static_cast<long>(source.optionsRead)); field("options", source.options);
+    field("typeReadHresult", static_cast<long>(source.typeRead)); field("documentsType", source.documentsType);
+    field("foldersReadHresult", static_cast<long>(source.foldersRead)); field("folderCount", source.folderCount);
+    field("privateSaveReadHresult", static_cast<long>(source.privateSaveRead));
+    field("publicSaveReadHresult", static_cast<long>(source.publicSaveRead));
+    const auto& proof = source.verification;
+    stream << ",\"verification\":{\"stage\":" << proof.stage;
+    field("currentReadHresult", static_cast<long>(proof.currentRead));
+    field("knownFolderReadHresult", static_cast<long>(proof.knownFolderRead));
+    field("knownItemReadHresult", static_cast<long>(proof.knownItemRead));
+    field("knownIdentityReadHresult", static_cast<long>(proof.knownIdentityRead));
+    field("pathReadHresult", static_cast<long>(proof.pathRead));
+    field("metadataReadHresult", static_cast<long>(proof.metadataRead));
+    field("privateSaveReadHresult", static_cast<long>(proof.privateSaveRead));
+    field("publicSaveReadHresult", static_cast<long>(proof.publicSaveRead));
+    field("knownMatches", proof.knownMatches); field("pathMatches", proof.pathMatches);
+    field("optionsUnchanged", proof.optionsUnchanged); field("typeUnchanged", proof.typeUnchanged);
+    field("folderCountUnchanged", proof.folderCountUnchanged);
+    field("privateSaveStatusUnchanged", proof.privateSaveStatusUnchanged);
+    field("publicSaveStatusUnchanged", proof.publicSaveStatusUnchanged);
+    field("privateSaveMatches", proof.privateSaveMatches); field("publicSaveMatches", proof.publicSaveMatches);
+    field("fileIdentityUnchanged", proof.fileIdentityUnchanged); field("fileSizeUnchanged", proof.fileSizeUnchanged);
+    field("fileCreationUnchanged", proof.fileCreationUnchanged); field("fileWriteUnchanged", proof.fileWriteUnchanged);
+    field("fileChangeUnchanged", proof.fileChangeUnchanged); field("fileAttributesUnchanged", proof.fileAttributesUnchanged);
+    field("fileBytesUnchanged", proof.fileBytesUnchanged);
+    stream << "}}";
+    return stream.str();
+}
+
 HRESULT writeVisualCaptureReport(const std::filesystem::path& output,
                                  const VisualCaptureReport& report) {
     std::ostringstream stream;
@@ -559,10 +1141,23 @@ HRESULT writeVisualCaptureReport(const std::filesystem::path& output,
         << ",\n  \"windowDpi\":" << report.windowDpi << ",\n  \"layoutDpi\":" << report.layoutDpi
         << ",\n  \"ribbonLayout\":" << json(report.ribbonLayout)
         << ",\n  \"installedRibbonStatus\":" << static_cast<long>(report.installedRibbonStatus)
+        << ",\n  \"documentsLibrarySource\":" << documentsLibrarySourceJson(report.documentsLibrarySource)
         << ",\n  \"desktop\":" << json(report.desktopName) << ",\n  \"inputDesktop\":" << json(report.inputDesktopName)
         << ",\n  \"inputDesktopUnchanged\":" << (report.inputDesktopUnchanged ? "true" : "false")
         << ",\n  \"visibleInputDesktopWindows\":" << (report.visibleInputDesktopWindows ? "true" : "false")
         << ",\n  \"printWindowSucceeded\":" << (report.printWindowSucceeded ? "true" : "false")
+        << ",\n  \"printWindowFlags\":" << report.printWindowFlags
+        << ",\n  \"nativeClientCrop\":{\"cropped\":" << (report.nativeClientCropped?"true":"false")
+        << ",\"sourceWindow\":" << report.printSourceWindow << ",\"targetWindow\":" << report.printTargetWindow
+        << ",\"sourceImage\":" << json(report.nativeClientCropSourceImage.wstring())
+        << ",\"requestedDcLayout\":" << (report.nativeClientCropPrintLayout?std::to_string(*report.nativeClientCropPrintLayout):"null")
+        << ",\"sourceDcLayout\":" << report.printSourceDcLayout << ",\"sourceDcMapMode\":" << report.printSourceDcMapMode
+        << ",\"memoryDcInitialLayout\":" << report.printMemoryDcInitialLayout << ",\"memoryDcInitialMapMode\":" << report.printMemoryDcInitialMapMode
+        << ",\"memoryDcBeforeLayout\":" << report.printMemoryDcBeforeLayout << ",\"memoryDcBeforeMapMode\":" << report.printMemoryDcBeforeMapMode
+        << ",\"memoryDcAfterLayout\":" << report.printMemoryDcAfterLayout << ",\"memoryDcAfterMapMode\":" << report.printMemoryDcAfterMapMode
+        << ",\"sourceBounds\":";
+    rectJson(stream,report.printSourceBounds);stream << ",\"targetClientBounds\":";
+    rectJson(stream,report.printTargetClientBounds);stream << '}'
         << ",\n  \"invisibleFrameTrimmed\":" << (report.invisibleFrameTrimmed ? "true" : "false")
         << ",\n  \"uniqueColors\":" << report.uniqueColors
         << ",\n  \"inkFraction\":" << std::setprecision(8) << report.inkFraction
@@ -570,7 +1165,9 @@ HRESULT writeVisualCaptureReport(const std::filesystem::path& output,
         << ",\n  \"pixelInspection\":{\"bounds\":";
     rectJson(stream,report.pixelInspectionBounds);
     stream << ",\"uniqueColors\":" << report.inspectionUniqueColors
-        << ",\"inkFraction\":" << report.inspectionInkFraction << '}'
+        << ",\"inkFraction\":" << report.inspectionInkFraction
+        << ",\"pixelHash\":\"" << report.inspectionPixelHash << "\",\"backgroundColorref\":"
+        << (report.pixelInspectionBackground ? std::to_string(*report.pixelInspectionBackground) : "null") << '}'
         << ",\n  \"visibleChildren\":" << report.visibleChildren << ",\n  \"clientBounds\":";
     rectJson(stream, report.clientBounds);
     stream << ",\n  \"nativeLayoutGallery\":{\"logicalCommand\":" << RibbonLayoutGallery
@@ -605,10 +1202,64 @@ HRESULT writeVisualCaptureReport(const std::filesystem::path& output,
             << ",\"selectedCount\":" << provider.selectedCount
             << ",\"cachedReadHresult\":" << static_cast<long>(provider.cachedRead)
             << ",\"cachedEnabled\":" << (provider.cachedEnabled ? "true" : "false")
+            << ",\"cachedChecked\":" << (provider.cachedChecked ? "true" : "false")
+            << ",\"cachedNativeState\":" << provider.cachedNativeState
+            << ",\"pending\":" << (provider.pending ? "true" : "false")
+            << ",\"slowStateCompleted\":" << (provider.slowStateCompleted ? "true" : "false")
             << ",\"nativeReadHresult\":" << static_cast<long>(provider.nativeRead)
             << ",\"nativeState\":" << provider.nativeState << '}';
     }
     stream << ']';
+    stream << ",\n  \"commandReadiness\":{\"requested\":" << (report.commandReadiness.requested ? "true" : "false")
+        << ",\"ready\":" << (report.commandReadiness.ready ? "true" : "false")
+        << ",\"readHresult\":" << static_cast<long>(report.commandReadiness.read)
+        << ",\"waitMs\":" << report.commandReadiness.waitMs
+        << ",\"namespaceGeneration\":" << report.commandReadiness.namespaceGeneration
+        << ",\"pendingCapabilities\":" << report.commandReadiness.pendingCapabilities
+        << ",\"workerTasks\":" << report.commandReadiness.workerTasks
+        << ",\"statePolls\":" << report.commandReadiness.statePolls
+        << ",\"selectionBatchPending\":" << (report.commandReadiness.selectionBatchPending ? "true" : "false") << '}';
+    stream << ",\n  \"searchDateMenu\":{\"requested\":" << (report.searchDateMenu.requested ? "true" : "false")
+        << ",\"readHresult\":" << static_cast<long>(report.searchDateMenu.read)
+        << ",\"expanded\":" << (report.searchDateMenu.expanded ? "true" : "false")
+        << ",\"expectedRows\":" << report.searchDateMenu.expectedRows
+        << ",\"matchedRows\":" << report.searchDateMenu.matchedRows
+        << ",\"relativeToday\":" << (report.searchDateMenu.relativeToday ? "true" : "false")
+        << ",\"scopeReadHresult\":" << static_cast<long>(report.searchDateMenu.scopeRead)
+        << ",\"resultReadHresult\":" << static_cast<long>(report.searchDateMenu.resultRead)
+        << ",\"resultCount\":" << report.searchDateMenu.resultCount
+        << ",\"expectedResults\":" << report.searchDateMenu.expectedResults
+        << ",\"matchedIdentities\":" << report.searchDateMenu.matchedIdentities
+        << ",\"unexpectedPaths\":" << report.searchDateMenu.unexpectedPaths
+        << ",\"duplicateIdentities\":" << report.searchDateMenu.duplicateIdentities
+        << ",\"submitReadHresult\":" << static_cast<long>(report.searchDateMenu.submitRead)
+        << ",\"submitCount\":" << report.searchDateMenu.submitCount
+        << ",\"recentCount\":" << report.searchDateMenu.recentCount
+        << ",\"recentMatchesQuery\":" << (report.searchDateMenu.recentMatchesQuery?"true":"false")
+        << ",\"scopeNavigationReadHresult\":" << static_cast<long>(report.searchDateMenu.scopeNavigationRead)
+        << ",\"physicalScopeReady\":" << (report.searchDateMenu.physicalScopeReady?"true":"false")
+        << ",\"savedInputUnchanged\":" << (report.searchDateMenu.savedInputUnchanged?"true":"false")
+        << ",\"nativeViewChanged\":" << (report.searchDateMenu.nativeViewChanged?"true":"false")
+        << ",\"scopePreserved\":" << (report.searchDateMenu.scopePreserved?"true":"false")
+        << ",\"historyCommitted\":" << (report.searchDateMenu.historyCommitted?"true":"false")
+        << ",\"factoryRetained\":" << (report.searchDateMenu.factoryRetained?"true":"false")
+        << ",\"retainedFactoriesBefore\":" << report.searchDateMenu.retainedFactoriesBefore
+        << ",\"retainedFactoriesAfter\":" << report.searchDateMenu.retainedFactoriesAfter
+        << ",\"navigationDelta\":" << report.searchDateMenu.navigationDelta
+        << ",\"recentEnabledReadHresult\":" << static_cast<long>(report.searchDateMenu.recentEnabledRead)
+        << ",\"recentEnabled\":" << (report.searchDateMenu.recentEnabled?"true":"false") << '}';
+    stream << ",\n  \"searchDatePopup\":{\"window\":" << report.searchDatePopup.window
+        << ",\"readHresult\":" << static_cast<long>(report.searchDatePopup.read)
+        << ",\"ownedPrivate\":" << (report.searchDatePopup.ownedPrivate?"true":"false")
+        << ",\"printed\":" << (report.searchDatePopup.printed?"true":"false")
+        << ",\"physicalRows\":" << report.searchDatePopup.physicalRows << ",\"bounds\":";
+    rectJson(stream,report.searchDatePopup.bounds);
+    stream << ",\"uniqueColors\":" << report.searchDatePopup.uniqueColors
+        << ",\"inkFraction\":" << report.searchDatePopup.inkFraction
+        << ",\"unpaintedFraction\":" << report.searchDatePopup.unpaintedFraction
+        << ",\"minimumRowUniqueColors\":" << report.searchDatePopup.minimumRowUniqueColors
+        << ",\"minimumRowInkFraction\":" << report.searchDatePopup.minimumRowInkFraction << '}';
+    stream << ",\n  \"searchDateExpansion\":" << nativePopupExpansionJson(report.searchDateExpansion);
     stream << ",\n  \"globalSettings\":{\"fileNameExtensions\":{\"source\":\"HKCU Explorer Advanced HideFileExt and native UI_PKEY_BooleanValue\","
         << "\"readSucceeded\":" << (report.fileExtensionsRead ? "true" : "false")
         << ",\"registryValue\":" << report.hideFileExt

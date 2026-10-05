@@ -18,126 +18,132 @@ and performance runs copy the executable into a unique directory and verify its
 checksum before use. Reports describe the tested snapshot; a previous passing
 run is not evidence for later source changes.
 
-An earlier functional Release checkpoint has SHA-256
-`f01bc69d57541f86c432ff1055936b1331d801000852165524a22975f2b8a6ea`.
-Its 2026-10-04 full seventeen-target run took 206.33 seconds: thirteen active
-targets passed, one failed, and three shared-state targets were correctly
-skipped. The failure was an added test attempting an unsupported native Ribbon
-group-label property read. After removing that invalid probe, the actual
-installed-Ribbon suite passed separately in 11.81 seconds. This is a full run
-plus a corrected focused recheck, not a single all-green full run.
+## Current evidence
 
-Both application suites passed: 130 authored checks in 35.88 seconds and 137
-installed checks in 29.73 seconds. The core suite passed in 96.18 seconds,
-including all six saved-search ACL profiles, native large-array menu equivalence,
-retained-handler reentrancy and actual kernel worker termination. Quiet complete
-core runs measured approximately 88–96 seconds; its aggregate bound is now 120
-seconds with per-worker deadlines unchanged. Application bounds remain 90 seconds.
+The latest proven complete local checkpoint is 2026-10-05 v42, executable SHA-256
+`e5796664dcfdc48d4e2081f85d3093fefac2880e4993ecd508ebc9fc9bf2e07d`.
+All seventeen active targets passed; four shared-state mutation targets correctly
+skipped locally. Total time was 342.88 seconds, recorded in
+`artifacts/continuation-full-tests-v42.log` and `artifacts/continuation-core-tests-v42.xml`. The
+all-target Release build completed without warnings
+(`artifacts/continuation-build-v42.log`). Both authored and installed App,
+Ribbon, recent-item and theme targets passed, along with native search semantics,
+menu equivalence, owned selection/operations and the real search-window child.
 
-The preceding immutable `797d8295` full run passed thirteen active targets,
-failed the large native-menu fixture's combined isolation guard, and skipped
-three targets in 202.81 seconds. Subsequent separate and full core runs passed,
-but did not reproduce that failure. The guard now reports payload, visibility
-and clipboard-sequence conditions separately without dropping any assertion.
-The clipboard sequence belongs to the window station, shared with other
-desktops; the original failure has not been attributed to a particular condition
-or writer. Historical failures remain evidence, not silently corrected reports.
+The App reports contain exactly 254 authored checks in 57.109 seconds and 262
+installed checks in 58.672 seconds, with zero failures
+(`artifacts/continuation-headless-smoke-v42.json`, `artifacts/continuation-headless-smoke-installed-v42.json`). Both
+report a private desktop, an unchanged input desktop and no visible input-desktop
+windows. Each includes ten complete search-window checks and three atomic Clear
+History checks. The separate `native_search_window_handoff` target passed all
+three groups, including a real child launched through the production explicit
+`HANDLE_LIST` path, in 0.32 seconds.
 
-The later `e40e8c2c` complete local run took 209.86 seconds: twelve active
-targets passed, two failed, and three were skipped. Both application hosts
-passed all 130/137 checks. The core diagnostic retained unchanged payloads,
-an empty owned directory and a hidden owner; the window-station clipboard
-sequence increased by 13, with the same foreign owner and no owner in this
-process. That evidence does not distinguish external publication from delayed
-format rendering triggered by native menu inspection. Its assertion remains.
-The installed RecentItems fixture also failed on an immediately absent row
-after opening its menu. A bounded wait for that exact owned row, without
-repeating its action, subsequently passed both layouts in 10.35 seconds.
+The original v42 environment report remains preserved; its shallow JSON encoding
+truncated the nested native-binary versions. A later read-only observation with
+the same executable checksum is recorded in
+`artifacts/continuation-environment-supplement-v42.json` (15:40:31 UTC), including
+Windows 10 22H2 build 19045.6466 and complete native version fields. It supplements
+the original report rather than replacing its test-time evidence.
 
-At public checkpoint `1d91605`, [the Windows Server 2022 CI run](https://github.com/ProtonDev-sys/windows-explorer/actions/runs/37243073658)
-built successfully and passed ten of fourteen targets. Breadcrumb path spelling,
-the documented selection fallback, app selection/QAT accessibility, and hidden
-folder-view persistence failed. Actual Undo/Redo and native search options passed.
-The following [CI run at `e344c76`](https://github.com/ProtonDev-sys/windows-explorer/actions/runs/37244491657)
-again passed ten targets and failed the same four. A second breadcrumb assertion
-still compared path spelling; per-item selection repair did not fix the fallback;
-app selection and QAT accessibility still failed; whole-view item enumeration
-returned `E_INVALIDARG` in the hidden persistence fixture. The ineffective
-per-item repair is removed. The second breadcrumb now compares filesystem
-identity. Revised selection and persistence fixtures explicitly realize only
-their owned private frame, and the app reentry check uses the same guarded
-presentation phase. These changes require new disposable-runner evidence.
+The complete v42 visual run
+`artifacts/visual/run-20261005-153919-bb5eb675b4814b8d92a9455e4d486b6b/summary.json`
+passed native capture/isolation checks for all nineteen scenes. Strict source
+comparison passed six, failed ten and restricted three. The new source-matched
+Library setup returned `E_INVALIDARG`; that restriction is a fixture/API failure
+under diagnosis, not proof that the profile lacks the source. The report explicitly
+records that whole-application parity is not established. Earlier visual results
+remain tied to their snapshots below.
 
-The revised private-presentation fixtures passed their focused local run on
-2026-10-05: native selection in 11.93 seconds, the authored app in 31.33 seconds,
-and the installed app in 32.95 seconds (76.25 seconds total). The app adds an
-explicit isolation assertion around the reentrant-selection presentation.
-Subsequent diagnostics report toolbar names only inside the exact owned Ribbon
-when its required QAT accessibility assertion fails. They do not relax that
-assertion. Native view-state persistence remains skipped locally and unverified
-until the new disposable-runner execution.
+The v48 all-target build is warning-free. Its full local run records sixteen
+active targets passed, four correctly skipped and one failed core target in
+365.18 seconds; three new assertions assumed COM behavior that the actual
+Windows implementation does not guarantee. Both application reports pass all
+255 authored and 263 installed checks, including a paired Share-site comparison
+against a distinct native browser over the same file. Modern Share is enabled
+in both. Specific people and Remove access return `E_NOTIMPL` and have no matching
+registered menu leaf in both; this does not establish an edition or policy cause.
+Exact file identities, owner/group/DACL, selection, history and isolation remain
+unchanged. Reports are preserved as `artifacts/continuation-*-v48.*`.
 
-The [new disposable run at `8191269`](https://github.com/ProtonDev-sys/windows-explorer/actions/runs/37245948002)
-passed eleven of fourteen targets. Core operations passed, and the app's
-reentrant-selection check now observed one exact item with real Copy eligibility.
-Three targets still failed: documented bulk selection fallback, QAT name lookup,
-and native view-persistence membership. The actual owned Ribbon exposed the QAT
-as `Quick Access` on Server 2022, rather than Windows 10's `Quick Access Toolbar`.
-Both observed native names are now accepted within that Ribbon and with the
-required toolbar type; its Properties and New folder controls remain required.
-The selection fallback now tries preflighted, revalidated native view indices
-only when a successful bulk PIDL operation has not applied the requested count.
-Its large fixture now also proves all 10,000 exact identities without a native
-command facade. The persistence fixture reads each actual child PIDL from the
-view and binds it through that view's native parent folder. These subsequent
-changes passed focused local application checks (29.43/31.70 seconds). The
-expanded selection regression initially failed its small fixture's focus setup:
-three items were selected, but the focused item was -1. Painting the exact owned
-private viewport and establishing focus through the original Shell view produced
-the required item focus of 2. The complete selection suite then passed in 17.03
-seconds, including all 10,000 exact identities without a native facade. The
-assertions and deadlines remain intact. Disposable-runner results are pending.
+The corrected v49 namespace test passes twelve groups and 618 assertions. It
+observes the real standard GIT's creator-thread `GetUnmarshalClass` callback;
+zero `MarshalInterface` calls are legitimate for the observed free-threaded
+marshaler optimization. Full native CIDA/Properties results, exact selection/site
+and separate background registrations, same-object reuse, standalone ownership,
+generation replacement, cancellation and actual registration reentry remain
+strict. The worker lifecycle test also passes: its complete native payload stays
+alive until kernel termination and releases on the initialized creator STA
+outside the bookkeeping lock. A fresh thread and a thread after balanced own
+initialization may have an implicit MTA when another process thread initialized
+the MTA; this follows the [documented apartment qualifier](https://learn.microsoft.com/en-us/windows/win32/api/objidlbase/ne-objidlbase-apttypequalifier).
+Focused logs are `artifacts/continuation-namespace-v49.log` and
+`artifacts/continuation-worker-v49.log`; they do not replace a full later run.
+The complete core target then passes in 114.48 seconds on the clean v50 build
+(`artifacts/continuation-core-tests-v50.log` and its matching JUnit report).
+Independent unmodified installed BML renders empty Video group captions for
+both `0x2c20` and `0x2c21`; the host's previous `Play` override fails that exact
+comparison. Preserving the native empty caption fixes the regression and the
+installed Ribbon target passes in 21.25 seconds on v51
+(`artifacts/continuation-installed-caption-v51.log`). Command labels and native
+eligibility are unchanged; this focused fix is not a new full visual result.
 
-The [disposable run at `7f06241`](https://github.com/ProtonDev-sys/windows-explorer/actions/runs/37247491672)
-passed twelve of fourteen targets. Core passed in 54.69 seconds and the complete
-selection target in 20.17 seconds. Native QAT accessibility passed. The app's
-Open File Location assertion failed despite observing the intended selected
-file; its location helper still compared PIDL bytes rather than canonical Shell
-identity. The revised helper uses `IShellItem::Compare(SICHINT_CANONICAL)` and
-retains the separate exact selected-file identity check. Both local app layouts
-then passed in 37.34/44.75 seconds. CI persistence reached and recorded owned
-folder A's applied native state, then failed after the next browse. Its fixture
-now clears completion before `BrowseToObject`, since `OnNavigationPending` can
-arrive asynchronously. Full restoration still requires new hosted evidence.
+The v48 full visual report at
+`artifacts/visual/run-20261005-165943-60d83fb583cc485395cc4dcec41330da/summary.json`
+records nineteen native captures passed, six strict comparisons passed, ten
+failed and three restricted, executable SHA-256
+`9cea818574f6301b47becd3edcbfd419fe94bb525e35506a180d1433b3dc4573`.
+The built-in Documents Library resolves under its protected read-sharing lease;
+all byte/identity/metadata preservation checks pass before any application view
+is constructed. Its display comparison remains restricted. Protocol and
+comparison thresholds are unchanged; whole-application parity remains unproven.
 
-The fallback snapshot now uses batched native view-order enumeration, retaining
-indexed reads for interfaces that explicitly do not support it. Native selection
-passed locally in 11.77 seconds, and with a descending native sort in 12.19
-seconds. The two 10,000-file fallback calls measured 171.407/204.403 ms, while
-independent identity readback remained separate. The subsequent app suites also
-passed in 30.55/33.60 seconds before the canonical-location helper changed.
-These focused results do not constitute an all-green full local or hosted run.
+The v42 core target passed nine native search groups and all saved-search metadata
+groups, including protective shallow/equal-root/direct-child exclusions, aliases
+and newly matching files across live/native-save/import/re-save routes. Native
+Date, Kind and Size replacement retains complete predicate semantics, relative
+and absolute dates, exact FileIDs and metadata; all twenty-three installed Kind
+expressions pass full-field validation. Both App layouts verify actual native
+refinement SelectedItem and complete ItemsSource after parent-only expansion,
+metadata/history, re-save, localized UIA names, cues and bounded Unicode tooltips.
+The installed Ribbon independently checks four group captions against raw
+installed markup.
 
-At `aecc063`, the 2026-10-05 complete local suite passed all fourteen active
-targets and correctly skipped the three shared-state targets (206.13 seconds).
-Its executable SHA-256 is
-`72627afa9b464166d52e2b59aeb36e6d67b06dce48c84338012416f4b77b247a`.
-The [hosted run](https://github.com/ProtonDev-sys/windows-explorer/actions/runs/37248318031)
-passed all fourteen configured functional targets with no skips in 132 seconds,
-including actual Undo/Redo (1.71 seconds), search options (2.38 seconds) and
-per-folder restoration (1.03 seconds). Its native capture step also passed.
-The overall workflow still failed its navigation benchmark: Edit, Print, Remove
-Properties and Run as another user remained pending after Select All within the
-unchanged 45-second readiness bound. Capture-only success does not establish
-Windows 10 reference-image matching. The strict visual failures remain recorded
-in the visual report, and the benchmark failure remains unresolved.
+The current Windows 10 configuration has twenty-one CTest targets: seventeen
+active and four shared-state targets that correctly skip locally. Core has a
+120-second aggregate bound, the separate native menu-equivalence target has
+90 seconds, both application suites have 90 seconds, and search-window handoff
+has 45 seconds. The disposable native-transfer target has 150 seconds. Individual
+native worker deadlines are unchanged. Earlier failures remain preserved below.
+
+The latest completed CI run, [commit `317914b`](https://github.com/ProtonDev-sys/windows-explorer/actions/runs/37249626987),
+failed Open File Location's folder-identity check. The subsequent local App tests
+pass the native volume/128-bit FileID comparison; that newer source has no complete
+passing hosted run recorded here. The earlier `aecc063` hosted run established
+actual Undo/Redo, native search-option transitions and folder-state restoration
+on its own snapshot. Those mutation tests remain restricted to genuine opted-in
+disposable runners.
+
+The independent quiet benchmark of the same v42 executable passed all native
+states and isolation checks, with 853 desktop-visibility observations
+(`artifacts/performance/run-20261005-154226-0c040b1504b445b3b87b8b24fb00bfa6/native-navigation.json`).
+Process-entry-to-native-view startup was 758.411 ms; navigation p95 was
+120.430/153.477/146.275 ms for 10/1,000/10,000 files. Select all and invert none to
+all reached complete native command readiness in 7,919.048/7,242.882 ms, distinct
+from immediate selected-count readback at 1,004.726/201.164 ms and queue-drained
+readback at 2,187.767/1,801.294 ms. See
+[the performance report](performance.md) for immediate count readback, queue-drain
+boundaries, worker profiling and prior failures. Strict visual comparison remains
+a separate result from native capture and functional tests.
 
 ## Test boundaries
 
 | CTest target | What it verifies |
 | --- | --- |
 | `core_and_shell_operations` | Owned file operations and recovery; native search and saved-query membership; preferences, input mapping, archives, shortcuts, context menus, Libraries, native command state/resources, asynchronous lifetime, breadcrumbs and search history |
-| `hidden_shell_host` | The real application, native ItemsView, navigation, eight layouts, columns, selection, search/import/refine/history, ZIP and Library contexts, native tree options, splitter, Ribbon/QAT and read-only UI Automation |
+| `native_menu_state_equivalence` | Actual full-array native state/menu equivalence, resource restrictions and restoration, missing/duplicate verbs and retained-provider lifetime |
+| `native_search_window_handoff` | Complete validated search context, reduced read-only mapping, malformed output preservation and actual explicit-handle-list child inheritance; fresh native factories, exact scope/result identities and child lifetime |
+| `hidden_shell_host` | The real application, native ItemsView, navigation, eight layouts, columns, complete selection changes, search/import/refine/history, search-window Content/List restoration and Close origin, atomic Clear History, ZIP/Library contexts, native tree options, splitter, F6/Tab focus routes, Ribbon/QAT and owned UI Automation |
 | `native_view_selection` | Complete actual selection identities and complements, focus and checkbox flags on an owned 10,000-item native view |
 | `installed_ribbon_features` | Read-only edition, media, recording and policy-dependent native capabilities |
 | `hidden_native_ribbon` | The compiled native Ribbon, pages, contextual state, collections and images, native customization, persistence, minimized/docking state, accessibility and bounded tab selection |
@@ -150,9 +156,10 @@ in the visual report, and the benchmark failure remains unresolved.
 | `native_shell_history` | Actual normal Shell Undo/Redo and registered-command state; restricted to an opted-in disposable GitHub runner |
 | `native_search_options` | Actual native Contents/System/Compressed transitions, fresh-query result membership and exact settings restoration; restricted to an opted-in disposable GitHub runner |
 | `native_view_persistence` | Real native folder property-bag restoration and no-persist control; restricted to an opted-in disposable GitHub runner |
-| `native_theme` | Theme policy, actual native dark pixels on recognized Windows builds, Light restoration, ownership guards and unchanged system configuration |
+| `native_shell_transfer` | Real Shell clipboard Copy/Paste, Cut/Paste, Paste Shortcut and native Copy/Move/Link drops with exact owned identities/completion; restricted to a fresh opted-in disposable GitHub runner; no current local execution proof |
+| `native_theme`, `native_theme_installed` | Theme policy, actual native dark pixels on recognized Windows builds, Light restoration, ownership guards and unchanged system configuration; installed-resource coverage on build 19045 |
 
-The three shared-state mutation targets check both `GITHUB_ACTIONS=true` and their
+The four shared-state mutation targets check both `GITHUB_ACTIONS=true` and their
 explicit test opt-in before COM, windows or fixtures. They report **skipped**
 locally. Setting those variables on a personal machine is not an authorized test
 method. All other fixtures use exclusively owned temporary paths and preserve
@@ -167,6 +174,26 @@ teardown. Read-only UI Automation runs on a windowless worker in that same
 private desktop while the owner thread dispatches messages. No desktop-root UI
 automation or input injection is used.
 
+The core native-menu fixture creates a distinct fresh private desktop before its
+worker STA initializes COM. Its visibility guard therefore measures those native
+menu calls separately from earlier EDIT/InputSwitch helpers. The v42 log records
+different creator/fixture desktop identities, zero visible windows at every
+fixture stage, an empty window inventory after resource/STA release and unchanged
+creator/input isolation. The creator pumps COM until the worker thread actually
+exits; no menu is displayed or invoked. This passing fixture does not explain the
+historical isolation failure retained below.
+
+Shutdown normally drains native workers before releasing their borrowed sites,
+COM apartments or desktops. If bounded draining fails, the failure path retains
+those resources and terminates only its own process with a nonzero status, using
+`TerminateProcess(GetCurrentProcess(), ...)` and a `std::_Exit` fallback. This
+avoids the DLL-detach deadlock documented for `ExitProcess` when another thread
+holds an unknown lock.
+([TerminateProcess](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-terminateprocess),
+[ExitProcess](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-exitprocess).)
+Successful v42 teardown passed; forced drain failure was reviewed in source and
+is not claimed as an exercised runtime branch.
+
 ## Native behavior evidence
 
 Result tests compare strict cardinality and exact volume/128-bit file identities,
@@ -178,23 +205,39 @@ generic word matching and saved-query discovery of new files. See the
 [saved-search verification](saved-search-verification.md) for the supported
 condition and provider combinations.
 
+Search-window handoff preserves the complete query, every original scope and rule,
+file metadata, native Content/List presentation and a distinct Close origin. The
+production child consumes a bounded immutable packet through an inherited
+read-only mapping and rebuilds a fresh public native search folder. The standalone
+test verifies actual process inheritance, exact object identity for excluded and
+consumed handles, malformed-packet output preservation and exact native result
+FileIDs. The App checks use the same startup preparation path and prove native
+Date gallery publication, Back/Close/Escape/clear behavior and unchanged parent
+state/source files. The normal headless New Window command still refuses a launch.
+
+Clear History saves the empty codec before publishing a cleared MRU or suggestion
+list. Both App layouts prove that an owned directory-target write failure preserves
+the exact codec, MRU, actual suggestion source, displayed snapshot and native view
+state; a relative override is rejected unchanged. Successful owned persistence
+then clears all four lists while retaining the same suggestion source. These tests
+use a real suggestion object without attaching autocomplete or modifying personal
+history.
+
 Normal Shell commands retain their actual target array, provider and view site.
 Fast native state is compared with installed context menus; full cascades are
-enumerated when needed. Headless guards reject associated-app launches,
+enumerated when needed. The application's headless guards reject associated-app launches,
 recipients, wizards, device operations, clipboard publication and native drops.
 Mock handlers test routing, effects, failure and lifetime without treating a mock
 invocation as proof that every installed extension works.
 
-The [disposable hosted verification at `928dfcd`](https://github.com/ProtonDev-sys/windows-explorer/actions/runs/37194199690)
-passed its four isolated targets. Real native Undo/Redo passed in 2.79 seconds;
-Contents/System/Compressed passed in 2.25 seconds. OFF/ON states came from the
-actual `IExplorerCommand::GetState(FALSE)`, rather than guessed host flags. The
-content-only file and ZIP member changed membership as required, and freshly
-created searches matched the active native option state and exact owned results.
-The fixture restored each original native state and registry value/type/absence.
-This Windows Server 2022 run complements local Windows 10 evidence; it does not
-establish identical rendering or arbitrary provider behavior on both systems.
-The detailed method is in [native advanced search verification](search-options-verification.md).
+Disposable Windows Server 2022 evidence includes the earlier
+[`928dfcd` isolated run](https://github.com/ProtonDev-sys/windows-explorer/actions/runs/37194199690)
+and the later `aecc063` complete run below. Search-option OFF/ON states came from
+actual `IExplorerCommand::GetState(FALSE)`; content-only files and ZIP members
+changed exact membership, and each original native setting/value/type/absence
+was restored. These runs complement local Windows 10 evidence without establishing
+identical rendering or arbitrary provider behavior. See
+[native advanced search verification](search-options-verification.md).
 
 ## UI and performance evidence
 
@@ -225,3 +268,30 @@ delegation and established tests. Hardware, accounts, network/cloud providers,
 interactive recipients, elevation, arbitrary preview/extension handlers,
 screen-reader operation, mixed monitors and localization need appropriate
 controlled fixtures before their behavior can be claimed as verified.
+
+## Retained checkpoints and failures
+
+Dates and results belong to the listed snapshots. Abbreviated local identifiers
+are executable SHA-256 prefixes; public identifiers are commits. Local reports
+are ignored research artifacts, while the linked hosted runs remain public.
+
+| Date / snapshot | Retained result |
+| --- | --- |
+| Earlier local `797d8295` | 13 passed, 1 failed, 3 skipped in 202.81 s. The large native-menu fixture's combined isolation guard failed; subsequent runs did not reproduce it or identify its original cause. |
+| 2026-10-04 local `f01bc69d` | 13 passed, 1 failed, 3 skipped in 206.33 s. An unsupported Ribbon group-label property probe failed; removing that invalid probe gave a separate installed-Ribbon pass in 11.81 s. Full SHA-256: `f01bc69d57541f86c432ff1055936b1331d801000852165524a22975f2b8a6ea`. |
+| Later local `e40e8c2c` | 12 passed, 2 failed, 3 skipped in 209.86 s. Clipboard sequence rose by 13 with the same foreign owner, unchanged payloads and no owned publication; external publication versus delayed rendering was not distinguished. Installed RecentItems also missed an immediate row; bounded exact-row waiting later passed both layouts. Neither assertion was removed. |
+| 2026-10-05 CI [`1d91605`](https://github.com/ProtonDev-sys/windows-explorer/actions/runs/37243073658), [`e344c76`](https://github.com/ProtonDev-sys/windows-explorer/actions/runs/37244491657) | Each passed 10/14. Breadcrumb spelling, selection fallback, app selection/QAT and native persistence failed. |
+| 2026-10-05 CI [`8191269`](https://github.com/ProtonDev-sys/windows-explorer/actions/runs/37245948002) | 11/14 passed; bulk selection fallback, actual QAT name lookup and persistence membership failed. Subsequent fixtures retained exact native selection/focus and accepted the observed owned Windows 10/Server QAT names. |
+| 2026-10-05 CI [`7f06241`](https://github.com/ProtonDev-sys/windows-explorer/actions/runs/37247491672) | 12/14 passed; Open File Location folder identity and restoration after the next browse failed. |
+| 2026-10-05 `aecc063` | Local: 14 passed, 3 skipped in 206.13 s, executable `72627afa9b464166d52e2b59aeb36e6d67b06dce48c84338012416f4b77b247a`. [Hosted](https://github.com/ProtonDev-sys/windows-explorer/actions/runs/37248318031): all 14 configured functional targets passed in 132 s, including Undo/Redo, search options and restoration. The workflow still failed its 45-second large-selection command-readiness benchmark; native capture success did not establish strict visual matching. |
+| 2026-10-05 CI [`317914b`](https://github.com/ProtonDev-sys/windows-explorer/actions/runs/37249626987) | Open File Location folder identity failed. Later local App tests pass the native volume/128-bit FileID fix; hosted verification of that later source remains distinct. |
+| 2026-10-05 local v11 | `artifacts/continuation-full-tests-v11.log`: 14 passed, 2 failed, 3 skipped in 290.25 s. The escaped Title test assumed a scalar XML root; installed App live-search navigation also failed. |
+| 2026-10-05 local v12 | `artifacts/continuation-full-tests-v12.log`: 12 passed, 4 failed, 3 skipped in 284.54 s. Title comparison rejected native duplicate OR expansion; authored/installed standalone Ribbon and installed App accessibility checks also failed. |
+| 2026-10-05 local v13 focused gates | App passed 209 authored/217 installed checks; native search passed eight groups. Installed standalone Ribbon failed a caption fixture that expected authored `Organize` instead of native British `Organise`. Independent UI Automation now compares the actual resource-specific group caption; both layouts pass in v15. Reports: `artifacts/app-gates-v13.log`, `artifacts/title-semantic-v13.log`, `artifacts/ribbon-label-gates-v13.log`. |
+| 2026-10-05 local v23 | Full functional suite: 16 passed, 3 skipped in 325.11 s, executable `ae94ed350901158f8a4a45ffb198eb2654e74b730d965cfa25f83d92866d15b3`, `artifacts/continuation-full-tests-v23.log`. Complete visual run `run-20261005-120823-3ad69938256a4a988ef4edd1d82fc2e7`: 19 native captures passed; strict comparison 6 passed, 11 failed, 2 restricted. Its quiet benchmark recorded 7,650.251/6,805.953 ms full large-selection state readiness. |
+
+The clipboard sequence is shared across the window station, including other
+desktops. Its historical isolation failures are retained without attributing
+them to a writer or treating a later pass as proof of their cause. Subsequent
+native-state cancellation and resource-menu improvements have accepted local
+benchmark reports in [performance.md](performance.md).

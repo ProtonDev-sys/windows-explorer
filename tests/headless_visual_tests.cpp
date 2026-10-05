@@ -3,6 +3,7 @@
 #include <commctrl.h>
 #include <wincodec.h>
 #include <wrl/client.h>
+#include <shlobj.h>
 #include <algorithm>
 #include <array>
 #include <filesystem>
@@ -61,6 +62,13 @@ int main() {
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX);
     // This executable has no COM or HWND before the desktop transition.
     if (explorer::PrivateDesktop::current()) return 3;
+    {
+        explorer::PrivateDesktop unattached;
+        explorer::DocumentsLibraryVisualSource source;
+        explorer::DocumentsLibrarySourceReadback provenance;
+        std::wstring unchanged = L"unchanged";
+        if (source.resolve(unattached, unchanged, provenance) != E_ACCESSDENIED || unchanged != L"unchanged") return 3;
+    }
     explorer::PrivateDesktop desktop;
     auto hr = desktop.initialize();
     if (FAILED(hr)) {
@@ -87,6 +95,41 @@ int main() {
         differentThread.join();
         require(otherThreadResult == E_ACCESSDENIED, "Desktop guard accepted the wrong thread");
         require(!wrongThreadHasGuard, "Private render guard leaked across threads");
+        {
+            // Optional actual profile source: metadata only, no content view,
+            // creation, update, Commit or library-location enumeration.
+            explorer::DocumentsLibraryVisualSource source;
+            explorer::DocumentsLibrarySourceReadback provenance;
+            std::wstring location = L"unchanged";
+            const auto resolved = source.resolve(desktop, location, provenance);
+            using Microsoft::WRL::ComPtr;
+            ComPtr<IShellItem> computerItem;
+            succeeded(SHCreateItemInKnownFolder(FOLDERID_ComputerFolder, 0, nullptr, IID_PPV_ARGS(&computerItem)), "Independent virtual native item");
+            SFGAOF attributes = SFGAO_FILESYSTEM;
+            succeeded(computerItem->GetAttributes(SFGAO_FILESYSTEM, &attributes), "Virtual native item attributes");
+            require(!(attributes & SFGAO_FILESYSTEM), "Virtual canonical-negative fixture became filesystem-backed");
+            PWSTR filesystemPath = nullptr;
+            const auto pathRead = computerItem->GetDisplayName(SIGDN_FILESYSPATH, &filesystemPath);
+            CoTaskMemFree(filesystemPath);
+            require(FAILED(pathRead), "Virtual native item unexpectedly exposed a filesystem path");
+            if (SUCCEEDED(resolved)) {
+                PIDLIST_ABSOLUTE raw = nullptr;
+                succeeded(SHGetKnownFolderIDList(FOLDERID_DocumentsLibrary, 0, nullptr, &raw), "Independent Documents Library identity");
+                struct Pidl { PIDLIST_ABSOLUTE value; ~Pidl() { CoTaskMemFree(value); } } pidl{raw};
+                ComPtr<IShellItem> actual;
+                succeeded(SHCreateItemFromIDList(raw, IID_PPV_ARGS(&actual)), "Independent Documents Library item");
+                succeeded(source.verify(desktop, actual.Get(), provenance), "Unchanged actual Documents Library source");
+                require(provenance.currentMatches && provenance.backingFileUnchanged && provenance.metadataUnchanged,
+                    "Actual Documents Library source lost native identity or backing bytes");
+                ComPtr<IShellItem> parsed;
+                succeeded(SHCreateItemFromParsingName(location.c_str(), nullptr, IID_PPV_ARGS(&parsed)), "Native source navigation name");
+                succeeded(source.verify(desktop, parsed.Get(), provenance), "Native source navigation preserves canonical identity");
+                require(source.verify(desktop, computerItem.Get(), provenance) == E_INVALIDARG && !provenance.currentMatches,
+                    "Documents Library source accepted an unrelated canonical native item");
+            } else {
+                require(provenance.unavailable && location == L"unchanged", "Native source failure lost explicit restriction or changed output");
+            }
+        }
         INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_WIN95_CLASSES | ICC_STANDARD_CLASSES};
         require(InitCommonControlsEx(&controls) != FALSE, "Common control initialization failed");
         WNDCLASSW klass{};
@@ -128,6 +171,79 @@ int main() {
             auto directory = std::filesystem::absolute(std::filesystem::temp_directory_path() /
                 (L"windows-explorer-visual-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64())));
             require(std::filesystem::create_directory(directory), "Owned snapshot directory was not created");
+            {
+                const auto original = directory / L"read-lease-source.bin";
+                const auto replacement = directory / L"read-lease-replacement.bin";
+                { std::ofstream stream(original, std::ios::binary); stream << "owned original descriptor"; }
+                { std::ofstream stream(replacement, std::ios::binary); stream << "owned replacement descriptor"; }
+                const auto originalBytes = read(original), replacementBytes = read(replacement);
+                const auto identity = [](const std::filesystem::path& path) {
+                    struct File { HANDLE value; ~File() { if (value != INVALID_HANDLE_VALUE) CloseHandle(value); } } file{
+                        CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                            nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_OPEN_NO_RECALL, nullptr)};
+                    require(file.value != INVALID_HANDLE_VALUE, "Owned lease identity handle failed");
+                    FILE_ID_INFO id{};
+                    require(GetFileInformationByHandleEx(file.value, FileIdInfo, &id, sizeof(id)) != FALSE, "Owned lease FileID failed");
+                    return id;
+                };
+                const auto before = identity(original);
+                const auto replacementBefore = identity(replacement);
+                const auto sameIdentity = [](const FILE_ID_INFO& a, const FILE_ID_INFO& b) {
+                    return a.VolumeSerialNumber == b.VolumeSerialNumber &&
+                        std::equal(std::begin(a.FileId.Identifier), std::end(a.FileId.Identifier), std::begin(b.FileId.Identifier));
+                };
+                {
+                    struct File { HANDLE value; ~File() { if (value != INVALID_HANDLE_VALUE) CloseHandle(value); } } writer{
+                        CreateFileW(original.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr)};
+                    require(writer.value != INVALID_HANDLE_VALUE, "Owned preexisting writer failed");
+                    explorer::VisualSourceReadLease rejected;
+                    require(rejected.acquire(desktop, original) == HRESULT_FROM_WIN32(ERROR_SHARING_VIOLATION) && !rejected.held(),
+                        "Read lease accepted a preexisting writer");
+                }
+                {
+                    explorer::VisualSourceReadLease lease;
+                    succeeded(lease.acquire(desktop, original), "Owned descriptor read lease");
+                    require(lease.held(), "Read lease did not retain its handle");
+                    for (const DWORD access : {static_cast<DWORD>(GENERIC_WRITE), static_cast<DWORD>(DELETE)}) {
+                        const auto blocked = CreateFileW(original.c_str(), access, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+                        const auto error = GetLastError();
+                        if (blocked != INVALID_HANDLE_VALUE) CloseHandle(blocked);
+                        require(blocked == INVALID_HANDLE_VALUE && error == ERROR_SHARING_VIOLATION,
+                            "Read lease allowed native write or delete access");
+                    }
+                    require(!DeleteFileW(original.c_str()) && GetLastError() == ERROR_SHARING_VIOLATION,
+                        "Read lease allowed native descriptor deletion");
+                    SetLastError(ERROR_SUCCESS);
+                    const auto moved = MoveFileExW(replacement.c_str(), original.c_str(),
+                        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+                    const auto moveError = GetLastError();
+                    const auto filesUnchanged = std::filesystem::exists(original) && std::filesystem::exists(replacement) &&
+                        read(original) == originalBytes && read(replacement) == replacementBytes &&
+                        sameIdentity(before, identity(original)) && sameIdentity(replacementBefore, identity(replacement));
+                    std::cout << "Owned read lease replacement BOOL=" << moved << " GetLastError=" << moveError
+                        << " unchanged=" << filesUnchanged << std::endl;
+                    require(filesUnchanged, "Native replacement changed owned source or replacement bytes or identity");
+                    require(moved == FALSE && (moveError == ERROR_SHARING_VIOLATION || moveError == ERROR_ACCESS_DENIED),
+                        "Read lease did not deny native atomic replacement with an access or sharing error");
+                }
+                const auto released = CreateFileW(original.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+                require(released != INVALID_HANDLE_VALUE, "Read lease did not release write exclusion");
+                CloseHandle(released);
+                SetLastError(ERROR_SUCCESS);
+                const auto movedAfterRelease = MoveFileExW(replacement.c_str(), original.c_str(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+                const auto releasedMoveError = GetLastError();
+                std::cout << "Owned released lease replacement BOOL=" << movedAfterRelease
+                    << " GetLastError=" << releasedMoveError << std::endl;
+                require(movedAfterRelease != FALSE, "Read lease did not release native atomic replacement exclusion");
+                require(!std::filesystem::exists(replacement) && read(original) == replacementBytes &&
+                    sameIdentity(replacementBefore, identity(original)) && !sameIdentity(before, identity(original)),
+                    "Released native replacement did not publish the exact owned replacement identity and bytes");
+                require(DeleteFileW(original.c_str()) != FALSE, "Owned lease fixture cleanup failed after release");
+            }
             explorer::VisualCaptureOptions options;
             RECT buttonPixels{},framePixels{};GetWindowRect(button,&buttonPixels);GetWindowRect(host.value,&framePixels);
             OffsetRect(&buttonPixels,-framePixels.left,-framePixels.top);InflateRect(&buttonPixels,-4,-4);

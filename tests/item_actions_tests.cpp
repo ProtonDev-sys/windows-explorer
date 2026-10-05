@@ -1,11 +1,9 @@
 #include "explorer/item_actions.hpp"
 
 #include <shlobj.h>
-#include <winioctl.h>
 #include <wrl/client.h>
 #include <wrl/implements.h>
 #include <algorithm>
-#include <cstddef>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -99,31 +97,14 @@ ComPtr<IShellItemArray> selectItems(const std::vector<ComPtr<IShellItem>>& items
     return result;
 }
 
-ComPtr<IShellItemArray> selectPaths(const std::vector<fs::path>& paths) {
-    std::vector<ComPtr<IShellItem>> items;
-    for (const auto& path : paths) items.push_back(shellItem(path));
-    return selectItems(items);
-}
-
 void writeFile(const fs::path& path) {
     std::ofstream stream(path, std::ios::binary);
     stream << "headless item-action fixture";
     require(stream.good(), "write owned fixture");
 }
 
-DWORD attributes(const fs::path& path) {
-    const DWORD result = GetFileAttributesW(path.c_str());
-    require(result != INVALID_FILE_ATTRIBUTES, "read fixture attributes");
-    return result;
-}
-
-void setAttributes(const fs::path& path, DWORD value) {
-    require(SetFileAttributesW(path.c_str(), value) != FALSE, "set fixture attributes");
-}
-
 struct Fixture {
     fs::path root;
-    fs::path junction;
     Fixture() {
         GUID guid{};
         succeeded(CoCreateGuid(&guid), "create fixture identifier");
@@ -133,17 +114,7 @@ struct Fixture {
         require(fs::create_directory(root), "create owned fixture directory");
     }
     ~Fixture() {
-        // Remove our junction itself before recursive cleanup; never traverse
-        // a reparse target. Normalize read-only fixtures so cleanup succeeds.
-        if (!junction.empty()) RemoveDirectoryW(junction.c_str());
         std::error_code error;
-        for (fs::recursive_directory_iterator it(root, error), end; it != end && !error;
-             it.increment(error)) {
-            const DWORD value = GetFileAttributesW(it->path().c_str());
-            if (value != INVALID_FILE_ATTRIBUTES && !(value & FILE_ATTRIBUTE_REPARSE_POINT)) {
-                SetFileAttributesW(it->path().c_str(), value & ~FILE_ATTRIBUTE_READONLY);
-            }
-        }
         fs::remove_all(root, error);
     }
 };
@@ -255,20 +226,14 @@ void shellPathResolution() {
     filesystem->attributeResult = S_OK;
     array->countResult = HRESULT_FROM_WIN32(ERROR_NOT_READY);
     require(ItemActions::quotedPaths(array.Get(), result) == array->countResult, "selection count error preserved");
-    bool hide = true;
-    require(ItemActions::canToggleHidden(array.Get(), hide) == array->countResult,
-            "hidden capability preserves count error");
-    require(hide, "failed capability preserves direction output");
     array->countResult = S_OK;
     array->itemResult = E_PENDING;
     require(ItemActions::quotedPaths(array.Get(), result) == E_PENDING, "item error preserved");
     require(result == unchanged, "all Shell failures preserve output");
     require(ItemActions::quotedPaths(nullptr, result) == E_INVALIDARG, "null path selection rejected");
-    require(ItemActions::toggleHidden(nullptr) == E_INVALIDARG, "null hidden selection rejected");
     array->itemResult = S_OK;
     array->items.clear();
     require(ItemActions::quotedPaths(array.Get(), result) == E_INVALIDARG, "empty path selection rejected");
-    require(ItemActions::canToggleHidden(array.Get(), hide) == E_INVALIDARG, "empty hidden selection rejected");
 
     Fixture fixture;
     const auto path = fixture.root / L"native \u03bb.txt";
@@ -318,166 +283,6 @@ void shellPathResolution() {
     }
 }
 
-void mixedHiddenSelection() {
-    Fixture fixture;
-    const auto first = fixture.root / L"first \u03bb.txt";
-    const auto second = fixture.root / L"second.txt";
-    writeFile(first);
-    writeFile(second);
-    setAttributes(first, FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_ARCHIVE | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED);
-    setAttributes(second, FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_ARCHIVE | FILE_ATTRIBUTE_TEMPORARY);
-    const DWORD firstOriginal = attributes(first);
-    const DWORD secondOriginal = attributes(second);
-    const auto selected = selectPaths({first, second});
-    bool hide = false;
-    succeeded(ItemActions::canToggleHidden(selected.Get(), hide), "mixed-selection capability");
-    require(hide, "mixed selection hides all items");
-    require(attributes(first) == firstOriginal && attributes(second) == secondOriginal,
-            "capability check does not mutate attributes");
-    HRESULT rollback = E_FAIL;
-    succeeded(ItemActions::toggleHidden(selected.Get(), &rollback), "hide mixed selection");
-    require(rollback == S_OK, "successful operation has no rollback failure");
-    require(attributes(first) == (firstOriginal | FILE_ATTRIBUTE_HIDDEN), "hide preserves read-only and indexing attributes");
-    require(attributes(second) == secondOriginal, "already-hidden item preserves attributes");
-    succeeded(ItemActions::canToggleHidden(selected.Get(), hide), "all-hidden capability");
-    require(!hide, "all hidden selection becomes unhide");
-    succeeded(ItemActions::toggleHidden(selected.Get()), "unhide all selected items");
-    require(attributes(first) == firstOriginal, "unhide restores original unrelated attributes");
-    require(attributes(second) == (secondOriginal & ~FILE_ATTRIBUTE_HIDDEN), "unhide preserves second unrelated attributes");
-
-    const auto normal = fixture.root / L"normal.txt";
-    writeFile(normal);
-    setAttributes(normal, FILE_ATTRIBUTE_NORMAL);
-    const auto normalSelection = selectPaths({normal});
-    succeeded(ItemActions::toggleHidden(normalSelection.Get()), "hide normal file");
-    require(attributes(normal) == FILE_ATTRIBUTE_HIDDEN, "NORMAL is not combined with other attributes");
-    succeeded(ItemActions::toggleHidden(normalSelection.Get()), "unhide normal file");
-    require(attributes(normal) == FILE_ATTRIBUTE_NORMAL, "clearing final attribute restores NORMAL");
-}
-
-void foldersAndRejections() {
-    Fixture fixture;
-    const auto folder = fixture.root / L"selected folder";
-    require(fs::create_directory(folder), "create owned folder");
-    const auto child = folder / L"child.txt";
-    writeFile(child);
-    const DWORD folderOriginal = attributes(folder);
-    const DWORD childOriginal = attributes(child);
-    const auto selected = selectPaths({folder});
-    succeeded(ItemActions::toggleHidden(selected.Get()), "hide selected folder");
-    require(attributes(folder) == (folderOriginal | FILE_ATTRIBUTE_HIDDEN), "folder keeps directory attribute");
-    require(attributes(child) == childOriginal, "hiding folder does not recurse");
-    succeeded(ItemActions::toggleHidden(selected.Get()), "unhide selected folder");
-    require(attributes(folder) == folderOriginal && attributes(child) == childOriginal, "unhiding folder does not recurse");
-
-    const auto protectedFile = fixture.root / L"protected.txt";
-    writeFile(protectedFile);
-    setAttributes(protectedFile, FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_ARCHIVE);
-    const DWORD protectedOriginal = attributes(protectedFile);
-    auto batch = selectPaths({child, protectedFile});
-    bool hide = false;
-    require(ItemActions::canToggleHidden(batch.Get(), hide) == E_ACCESSDENIED, "protected capability rejected");
-    require(ItemActions::toggleHidden(batch.Get()) == E_ACCESSDENIED, "protected batch rejected");
-    require(attributes(child) == childOriginal && attributes(protectedFile) == protectedOriginal,
-            "protected selection rejection changes no earlier item");
-
-    const auto missing = fixture.root / L"now missing.txt";
-    writeFile(missing);
-    batch = selectPaths({child, missing});
-    require(DeleteFileW(missing.c_str()) != FALSE, "remove own fixture after Shell selection");
-    const HRESULT missingHr = ItemActions::toggleHidden(batch.Get());
-    require(missingHr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) ||
-            missingHr == HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND), "missing item retains native failure");
-    require(attributes(child) == childOriginal, "missing selection rejection changes no earlier item");
-
-    ComPtr<IShellItem> thisPc;
-    succeeded(SHCreateItemInKnownFolder(FOLDERID_ComputerFolder, 0, nullptr, IID_PPV_ARGS(&thisPc)),
-              "create virtual selection");
-    batch = selectItems({shellItem(child), thisPc});
-    require(ItemActions::toggleHidden(batch.Get()) == HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED),
-            "virtual selection rejected");
-    require(attributes(child) == childOriginal, "virtual selection rejection changes no earlier item");
-}
-
-void storageAttributePreservation() {
-    Fixture fixture;
-    for (const bool compressed : {false, true}) {
-        const auto path = fixture.root / (compressed ? L"compressed.txt" : L"sparse.txt");
-        writeFile(path);
-        const HANDLE file = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
-        require(file != INVALID_HANDLE_VALUE, "open owned storage-attribute fixture");
-        DWORD returned = 0;
-        USHORT format = COMPRESSION_FORMAT_DEFAULT;
-        const BOOL changed = DeviceIoControl(file, compressed ? FSCTL_SET_COMPRESSION : FSCTL_SET_SPARSE,
-            compressed ? &format : nullptr, compressed ? sizeof(format) : 0,
-            nullptr, 0, &returned, nullptr);
-        const DWORD error = changed ? ERROR_SUCCESS : GetLastError();
-        CloseHandle(file);
-        if (!changed) succeeded(HRESULT_FROM_WIN32(error), "set owned storage attribute");
-        const DWORD original = attributes(path);
-        require((original & (compressed ? FILE_ATTRIBUTE_COMPRESSED : FILE_ATTRIBUTE_SPARSE_FILE)) != 0,
-                "native storage attribute was set");
-        const auto selected = selectPaths({path});
-        succeeded(ItemActions::toggleHidden(selected.Get()), "hide native storage-attribute fixture");
-        require(attributes(path) == (original | FILE_ATTRIBUTE_HIDDEN), "hidden mutation preserves native storage attribute");
-        succeeded(ItemActions::toggleHidden(selected.Get()), "unhide native storage-attribute fixture");
-        require(attributes(path) == original, "unhide preserves native storage attribute");
-    }
-}
-
-// A junction can be created in an owned directory without the symbolic-link
-// privilege. Its target remains inside the same fixture and is never traversed.
-void reparseRejection() {
-    Fixture fixture;
-    const auto target = fixture.root / L"target";
-    require(fs::create_directory(target), "create owned junction target");
-    const auto file = target / L"child.txt";
-    writeFile(file);
-    const DWORD targetOriginal = attributes(target);
-    const DWORD childOriginal = attributes(file);
-    fixture.junction = fixture.root / L"junction";
-    require(fs::create_directory(fixture.junction), "create owned junction directory");
-    const HANDLE directory = CreateFileW(fixture.junction.c_str(), GENERIC_WRITE, 0, nullptr,
-        OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
-    require(directory != INVALID_HANDLE_VALUE, "open owned junction");
-    struct MountPoint {
-        DWORD tag;
-        WORD dataLength;
-        WORD reserved;
-        WORD substituteOffset;
-        WORD substituteLength;
-        WORD printOffset;
-        WORD printLength;
-        wchar_t names[1];
-    };
-    const std::wstring substitute = L"\\??\\" + target.wstring();
-    const std::wstring print = target.wstring();
-    const auto nameBytes = (substitute.size() + print.size() + 2) * sizeof(wchar_t);
-    std::vector<unsigned char> buffer(offsetof(MountPoint, names) + nameBytes);
-    auto* data = reinterpret_cast<MountPoint*>(buffer.data());
-    data->tag = IO_REPARSE_TAG_MOUNT_POINT;
-    data->dataLength = static_cast<WORD>(8 + nameBytes);
-    data->substituteLength = static_cast<WORD>(substitute.size() * sizeof(wchar_t));
-    data->printOffset = static_cast<WORD>((substitute.size() + 1) * sizeof(wchar_t));
-    data->printLength = static_cast<WORD>(print.size() * sizeof(wchar_t));
-    std::copy(substitute.begin(), substitute.end(), data->names);
-    std::copy(print.begin(), print.end(), data->names + substitute.size() + 1);
-    DWORD returned = 0;
-    const BOOL created = DeviceIoControl(directory, FSCTL_SET_REPARSE_POINT, buffer.data(),
-        static_cast<DWORD>(buffer.size()), nullptr, 0, &returned, nullptr);
-    const DWORD error = created ? ERROR_SUCCESS : GetLastError();
-    CloseHandle(directory);
-    if (!created) succeeded(HRESULT_FROM_WIN32(error), "create owned junction reparse point");
-    require((attributes(fixture.junction) & FILE_ATTRIBUTE_REPARSE_POINT) != 0, "fixture is a real junction");
-    const auto batch = selectPaths({file, fixture.junction});
-    require(ItemActions::toggleHidden(batch.Get()) == HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED),
-            "reparse item rejected before target or prior selection mutation");
-    require(attributes(target) == targetOriginal && attributes(file) == childOriginal,
-            "junction rejection leaves target and first selection unchanged");
-    require(RemoveDirectoryW(fixture.junction.c_str()) != FALSE, "remove own junction itself");
-    fixture.junction.clear();
-}
 } // namespace
 
 int runItemActionTests() {
@@ -485,11 +290,7 @@ int runItemActionTests() {
     // Shell dialogs, or operations on user files are performed by these tests.
     const std::vector<std::pair<const char*, std::function<void()>>> tests{
         {"quoted Unicode path formatting", formatting},
-        {"Shell path resolution and HRESULT preservation", shellPathResolution},
-        {"mixed hidden selection and unrelated attribute preservation", mixedHiddenSelection},
-        {"nonrecursive folder attributes and batch preflight rejection", foldersAndRejections},
-        {"compressed and sparse attribute preservation", storageAttributePreservation},
-        {"real junction rejection without target mutation", reparseRejection}
+        {"Shell path resolution and HRESULT preservation", shellPathResolution}
     };
     int failures = 0;
     for (const auto& [name, test] : tests) {

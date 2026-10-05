@@ -1,5 +1,6 @@
 #include "explorer/app.hpp"
 #include "explorer/commands.hpp"
+#include "explorer/worker_sta.hpp"
 #include <docobj.h>
 #include <psapi.h>
 #include <algorithm>
@@ -54,6 +55,9 @@ struct SelectionSample {
     double duration, command, deferredWork, countReadback, commandStateReady;
     int selected;
     HeadlessCommandTimings hostWork;
+    unsigned long long generationChanges, equivalentSelectionRefreshes, uncertainSelectionRefreshes;
+    int immediateSelected;
+    double immediateCountReadAt, immediateCountReadCost;
 };
 double percentile(std::vector<double> values, double fraction) {
     std::sort(values.begin(), values.end());
@@ -68,7 +72,7 @@ void summary(std::ostream& output, const std::vector<NavigationSample>& samples,
            << ",\"p95Ms\":" << percentile(values, .95) << ",\"maxMs\":" << *std::max_element(values.begin(), values.end()) << '}';
 }
 }
-int ExplorerApp::headlessBenchmark(const std::filesystem::path& report) {
+int ExplorerApp::headlessBenchmark(const std::filesystem::path& report, const HeadlessStartupTimings& startup) {
     if (!headless_) return 2;
     try {
         const auto desktop = PrivateDesktop::current();
@@ -76,7 +80,9 @@ int ExplorerApp::headlessBenchmark(const std::filesystem::path& report) {
             "Benchmark requires an isolated private desktop");
         bool inputDesktopUnchanged = false, visibleInputWindows = false;
         unsigned desktopObservations = 0;
+        double desktopObservationMs = 0, maximumDesktopObservationMs = 0;
         auto observeDesktop = [&] {
+            const auto started = nowMs();
             bool unchanged = false, visible = false;
             requireBenchmark(SUCCEEDED(desktop->verifyIsolation(&unchanged)) && unchanged,
                 "Benchmark changed the input desktop");
@@ -86,23 +92,65 @@ int ExplorerApp::headlessBenchmark(const std::filesystem::path& report) {
             visibleInputWindows = visibleInputWindows || visible;
             ++desktopObservations;
             requireBenchmark(!visible, "Benchmark displayed a window on the input desktop");
+            const auto elapsed = nowMs() - started;
+            desktopObservationMs += elapsed;
+            maximumDesktopObservationMs = std::max(maximumDesktopObservationMs, elapsed);
         };
         observeDesktop();
         requireBenchmark(!IsWindowVisible(window_), "Benchmark host must stay hidden");
+        struct PumpWake {
+            HANDLE value=CreateEventW(nullptr,TRUE,FALSE,nullptr);
+            ~PumpWake(){if(value)CloseHandle(value);}
+        } pumpWake;
+        requireBenchmark(pumpWake.value!=nullptr,"Create bounded COM-dispatch wait handle");
         const char* waitPhase = "navigation";
-        auto pumpUntil = [this, &observeDesktop, &waitPhase](const std::function<bool()>& predicate, DWORD timeout) {
+        auto pumpUntil = [this, &observeDesktop, &waitPhase, &pumpWake, &desktopObservationMs,
+                          &maximumDesktopObservationMs, &desktopObservations](const std::function<bool()>& predicate, DWORD timeout) {
             const auto deadline = GetTickCount64() + timeout;
+            const auto firstGeneration = namespaceGeneration_;
+            const auto firstUpdates = commandTimings_.updateCount;
+            const auto firstObservations = desktopObservations;
+            const auto firstObservationMs = desktopObservationMs;
+            const auto firstCurrentViewEvents = headlessCurrentViewStateEvents_;
+            const auto firstStaleViewEvents = headlessStaleViewStateEvents_;
             while (!predicate()) {
                 if (GetTickCount64() >= deadline) {
                     std::fprintf(stderr,"Benchmark wait timed out: phase=%s batch=%u tasks=%zu namespaceDirty=%u selectionDirty=%u navigating=%u clipboardChanged=%u\n",
                         waitPhase,selectionStateBatch_?1u:0u,commandStateTasks_.size(),namespaceDirty_?1u:0u,
                         selectionStateDirty_?1u:0u,navigating_?1u:0u,GetClipboardSequenceNumber()!=clipboardSequence_?1u:0u);
+                    std::fprintf(stderr,"Benchmark wait diagnostics: generations=%llu updates=%llu observations=%u observation_ms=%.3f maximum_observation_ms=%.3f\n",
+                        static_cast<unsigned long long>(namespaceGeneration_-firstGeneration),
+                        commandTimings_.updateCount-firstUpdates,desktopObservations-firstObservations,
+                        desktopObservationMs-firstObservationMs,maximumDesktopObservationMs);
+                    for(size_t index=0;index<firstCurrentViewEvents.size();++index)
+                        std::fprintf(stderr,"Benchmark view events: kind=%zu current=%llu stale=%llu\n",index,
+                            headlessCurrentViewStateEvents_[index]-firstCurrentViewEvents[index],
+                            headlessStaleViewStateEvents_[index]-firstStaleViewEvents[index]);
                     for(const auto& [id,capability]:commandCapabilities_)if(capability.status==E_PENDING)
                         std::fprintf(stderr,"Benchmark pending command: id=%u scope=%u selectionVerbs=%zu task=%u\n",
                             id,static_cast<unsigned>(capability.binding.scope),capability.selectionVerbs.size(),commandStateTasks_.contains(id)?1u:0u);
+                    for(const auto& [id,task]:commandStateTasks_) {
+                        NamespaceCommandStateTimings timings;
+                        NamespaceCommandState state;
+                        const auto status=task->poll(&state);
+                        const auto measured=task->pollTimings(&timings);
+                        std::fprintf(stderr,"Benchmark task: id=%u completed=%u status=0x%08lX timings=0x%08lX worker_us=%llu query_us=%llu\n",
+                            id,task->completed()?1u:0u,static_cast<unsigned long>(status),static_cast<unsigned long>(measured),
+                            timings.workerMicroseconds,timings.menuQueryMicroseconds);
+                    }
+                    StaWorkerDiagnostics workers;
+                    const auto workerStatus=staWorkerDiagnostics(&workers);
+                    std::fprintf(stderr,"Benchmark workers: status=0x%08lX pending=%u terminated=%u creatorWindows=%u otherWindows=%u\n",
+                        static_cast<unsigned long>(workerStatus),workers.pending,workers.completedThreads,workers.creatorWindows,workers.otherWindows);
                     requireBenchmark(false,"Native benchmark timed out");
                 }
-                MsgWaitForMultipleObjects(0, nullptr, FALSE, 5, QS_ALLINPUT);
+                // A headless wait must dispatch incoming apartment calls as
+                // well as window messages. A window-only loop can strand a
+                // correctly marshaled native view during menu-state queries.
+                DWORD signaled=0;
+                const auto waited=CoWaitForMultipleHandles(COWAIT_DISPATCH_CALLS|COWAIT_DISPATCH_WINDOW_MESSAGES,
+                    5,1,&pumpWake.value,&signaled);
+                requireBenchmark(SUCCEEDED(waited)||waited==RPC_S_CALLPENDING,"Dispatch native benchmark apartment calls");
                 MSG message{};
                 unsigned dispatched = 0;
                 while (dispatched < 16 && GetTickCount64() < deadline &&
@@ -115,7 +163,42 @@ int ExplorerApp::headlessBenchmark(const std::filesystem::path& report) {
                 observeDesktop();
             }
         };
-        pumpUntil([this] { return folderView_ && !navigating_; }, 15000);
+        requireBenchmark(std::isfinite(startup.clockStartMs) && startup.clockStartMs > 0 &&
+            std::isfinite(startup.desktopReadyMs) && startup.desktopReadyMs >= 0 &&
+            std::isfinite(startup.platformReadyMs) && startup.platformReadyMs >= startup.desktopReadyMs &&
+            std::isfinite(startup.createReturnedMs) && startup.createReturnedMs >= startup.platformReadyMs,
+            "Startup phase observations must use the process entry clock");
+        const auto requestedStartup = navigating_ ? pendingPidl_.get() : currentPidl_.get();
+        Pidl startupTarget(requestedStartup ? ILCloneFull(requestedStartup) : nullptr);
+        requireBenchmark(startupTarget != nullptr, "Retain actual initial native navigation target");
+        bool startupTargetMatched = false;
+        pumpUntil([this, &startupTarget, &startupTargetMatched] {
+            if (closing_ || !folderView_ || navigating_ || !navigationCount_ || !currentPidl_) return false;
+            const auto startupView = folderView_;
+            const auto startupNavigation = navigationCount_;
+            Pidl startupCurrent(ILCloneFull(currentPidl_.get()));
+            if (!startupCurrent) return false;
+            ComPtr<IShellFolder> nativeFolder;
+            auto read = startupView->GetFolder(IID_PPV_ARGS(&nativeFolder));
+            PIDLIST_ABSOLUTE raw = nullptr;
+            if (SUCCEEDED(read)) read = SHGetIDListFromObject(nativeFolder.Get(), &raw);
+            Pidl actual(raw);
+            if (FAILED(read) || !actual) return false;
+            ComPtr<IShellItem> requested, realized;
+            read = SHCreateItemFromIDList(startupTarget.get(), IID_PPV_ARGS(&requested));
+            if (SUCCEEDED(read)) read = SHCreateItemFromIDList(actual.get(), IID_PPV_ARGS(&realized));
+            int order = 1;
+            if (SUCCEEDED(read)) read = requested->Compare(realized.Get(), SICHINT_CANONICAL, &order);
+            // Native folder/identity calls can dispatch a navigation callback.
+            // A replaced view cannot establish this startup observation.
+            startupTargetMatched = SUCCEEDED(read) && order == 0 && !closing_ && !navigating_ &&
+                folderView_.Get() == startupView.Get() && navigationCount_ == startupNavigation && currentPidl_ &&
+                ILIsEqual(startupCurrent.get(), currentPidl_.get());
+            return startupTargetMatched;
+        }, 15000);
+        const auto startupViewReadyMs = nowMs() - startup.clockStartMs;
+        requireBenchmark(std::isfinite(startupViewReadyMs) && startupViewReadyMs >= startup.createReturnedMs,
+            "Initial native view readiness must follow creation return");
         BenchmarkFixture fixture;
         const auto empty = fixture.folder(0);
         std::vector<Case> cases;
@@ -182,6 +265,9 @@ int ExplorerApp::headlessBenchmark(const std::filesystem::path& report) {
             {Invert, "invertAllToNone", 0}, {Invert, "invertNoneToAll", 10000},
             {SelectNone, "selectNone", 0}}) {
             resetHeadlessCommandTimings();
+            const auto generationBefore=namespaceGeneration_;
+            const auto equivalentBefore=headlessEquivalentSelectionRefreshes_;
+            const auto uncertainBefore=headlessUncertainSelectionRefreshes_;
             const auto started = nowMs();
             const auto selectionResult = execute(command);
             const auto commandCompleted = nowMs();
@@ -189,6 +275,15 @@ int ExplorerApp::headlessBenchmark(const std::filesystem::path& report) {
                 std::fprintf(stderr, "Selection %s failed (HRESULT=0x%08lX).\n",
                     action, static_cast<unsigned long>(selectionResult));
             requireBenchmark(SUCCEEDED(selectionResult), "Change native benchmark selection");
+            // Observe the native count before deferred creator callbacks run.
+            // The historical duration below also includes draining that queue;
+            // it is not the first observation of the completed selection.
+            int immediateCount = -1;
+            const auto immediateReadStarted = nowMs();
+            const auto immediateReadResult = folderView_->ItemCount(SVGIO_SELECTION, &immediateCount);
+            const auto immediateReadCompleted = nowMs();
+            requireBenchmark(SUCCEEDED(immediateReadResult) && immediateCount >= 0 && immediateCount <= 10000,
+                "Read native selection count immediately after command");
             // Include the actual deferred host/Ribbon work, not just the time
             // required to queue selection notifications.
             MSG message{};
@@ -214,11 +309,21 @@ int ExplorerApp::headlessBenchmark(const std::filesystem::path& report) {
             // emptying the message queue does not prove those states are ready.
             waitPhase = action;
             pumpUntil([this] { pollCommandStates(); return !commandStatesPending(); }, 45000);
+            for(const auto& [id,capability]:commandCapabilities_) {
+                if(capability.status==E_PENDING) {
+                    std::fprintf(stderr,"Benchmark provider returned unresolved state after worker completion: id=%u HRESULT=0x%08lX\n",
+                        id,static_cast<unsigned long>(capability.status));
+                    requireBenchmark(false,"Native provider state remained unresolved after worker completion");
+                }
+            }
             const auto stateReady = nowMs();
             selectionChanges.push_back({action, readbackCompleted - started,
                 commandCompleted - started, deferredCompleted - commandCompleted,
                 readbackCompleted - deferredCompleted, stateReady - readbackCompleted,
-                count, headlessCommandTimings()});
+                count, headlessCommandTimings(),namespaceGeneration_-generationBefore,
+                headlessEquivalentSelectionRefreshes_-equivalentBefore,
+                headlessUncertainSelectionRefreshes_-uncertainBefore, immediateCount,
+                immediateReadCompleted - started, immediateReadCompleted - immediateReadStarted});
         }
         PROCESS_MEMORY_COUNTERS_EX memory{};
         memory.cb = sizeof(memory);
@@ -247,6 +352,12 @@ int ExplorerApp::headlessBenchmark(const std::filesystem::path& report) {
             << ",\"desktopVisibilityObservations\":" << desktopObservations
             << ",\"passed\":true,\"samplesPerFolder\":5,"
             << "\"measurement\":\"hidden native Shell view; cold-first plus warm samples; no stock Explorer baseline\",\n"
+            << "  \"startup\":{\"measurement\":\"process entry to first native view; excludes image loading and visible paint\","
+            << "\"privateDesktopReadyMs\":" << startup.desktopReadyMs
+            << ",\"platformReadyMs\":" << startup.platformReadyMs
+            << ",\"createReturnedMs\":" << startup.createReturnedMs
+            << ",\"nativeViewReadyMs\":" << startupViewReadyMs
+            << ",\"nativeTargetMatched\":" << (startupTargetMatched ? "true" : "false") << "},\n"
             << "  \"workingSetBytes\":" << memory.WorkingSetSize << ",\"privateBytes\":" << memory.PrivateUsage << ",\n"
             << "  \"ribbonLayout\":\"" << (ribbon_.layout() == RibbonLayout::InstalledWindows10 ? "InstalledWindows10" : "Authored")
             << "\",\"installedRibbonStatus\":" << static_cast<long>(ribbon_.installedLayoutStatus()) << ",\n"
@@ -283,7 +394,13 @@ int ExplorerApp::headlessBenchmark(const std::filesystem::path& report) {
                    << ",\"countReadbackMs\":" << sample.countReadback
                    << ",\"commandStateReadyAfterReadbackMs\":" << sample.commandStateReady
                    << ",\"commandStateReadyTotalMs\":" << sample.duration + sample.commandStateReady
-                   << ",\"selected\":" << sample.selected;
+                   << ",\"selected\":" << sample.selected
+                   << ",\"immediateSelectedCount\":" << sample.immediateSelected
+                   << ",\"immediateCountReadAtMs\":" << sample.immediateCountReadAt
+                   << ",\"immediateCountReadCostMs\":" << sample.immediateCountReadCost
+                   << ",\"generationChanges\":" << sample.generationChanges
+                   << ",\"equivalentSelectionRefreshes\":" << sample.equivalentSelectionRefreshes
+                   << ",\"uncertainSelectionRefreshes\":" << sample.uncertainSelectionRefreshes;
             const auto& work = sample.hostWork;
             output << ",\"hostWork\":{\"status\":" << static_cast<long>(work.status)
                    << ",\"updateCount\":" << work.updateCount << ",\"totalUpdateMs\":" << work.totalMs
@@ -297,7 +414,23 @@ int ExplorerApp::headlessBenchmark(const std::filesystem::path& report) {
                    << ",\"stateTaskSchedulingMs\":" << work.stateTaskSchedulingMs
                    << ",\"contextMs\":" << work.contextMs
                    << ",\"ribbonInvalidationMs\":" << work.ribbonInvalidationMs
-                   << ",\"measurement\":\"creator STA phase totals; nested phases and direct context calls are not additive\"}}";
+                   << ",\"measurement\":\"creator STA phase totals; nested phases and direct context calls are not additive\""
+                   << ",\"completedStateWorkers\":[";
+            for(size_t workerIndex=0;workerIndex<work.completedStateWorkers.size();++workerIndex) {
+                if(workerIndex)output << ',';
+                const auto& worker=work.completedStateWorkers[workerIndex];
+                output << "{\"command\":" << worker.command << ",\"selectionBatch\":" << (worker.selectionBatch?"true":"false")
+                       << ",\"status\":" << static_cast<long>(worker.status)
+                       << ",\"timingStatus\":" << static_cast<long>(worker.timingStatus)
+                       << ",\"workerMs\":" << worker.native.workerMicroseconds/1000.0
+                       << ",\"dataObjectExportMs\":" << worker.native.dataObjectExportMicroseconds/1000.0
+                       << ",\"identityConstructionMs\":" << worker.native.identityConstructionMicroseconds/1000.0
+                       << ",\"contextBindMs\":" << worker.native.contextBindMicroseconds/1000.0
+                       << ",\"menuQueryMs\":" << worker.native.menuQueryMicroseconds/1000.0
+                       << ",\"menuEnumerationMs\":" << worker.native.menuEnumerationMicroseconds/1000.0
+                       << ",\"stateReductionMs\":" << worker.native.stateReductionMicroseconds/1000.0 << '}';
+            }
+            output << "]}}";
         }
         output << "]\n}\n";
         auto text = output.str();

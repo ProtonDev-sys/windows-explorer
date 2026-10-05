@@ -1,10 +1,13 @@
 #include "explorer/search.hpp"
 #include "explorer/saved_search.hpp"
 #include "explorer/search_presentation_store.hpp"
+#include "../src/search_scope_internal.hpp"
 
 #include <shlobj.h>
 #include <shlguid.h>
 #include <propkey.h>
+#include <propvarutil.h>
+#include <structuredquery.h>
 #include <sddl.h>
 #include <aclapi.h>
 #include <winioctl.h>
@@ -22,6 +25,7 @@
 #include <algorithm>
 #include <compare>
 #include <cstring>
+#include <tuple>
 
 namespace {
 namespace fs = std::filesystem;
@@ -186,6 +190,243 @@ std::wstring xmlAttribute(IXMLDOMElement* element, const wchar_t* name) {
     succeeded(element->getAttribute(attribute.value, &value.value), "read saved search attribute");
     require(value.value.vt == VT_BSTR && value.value.bstrVal, "saved search attribute missing");
     return {value.value.bstrVal, SysStringLen(value.value.bstrVal)};
+}
+
+struct NativeQuerySignature {
+    std::wstring tree, normalizedTree;
+    CONDITION_TYPE root = CT_LEAF_CONDITION, normalizedRoot = CT_LEAF_CONDITION;
+    unsigned nodes = 0, literalLeaves = 0;
+    unsigned normalizedNodes = 0, normalizedLiteralLeaves = 0;
+};
+NativeQuerySignature resolvedLiteralSignature(const std::wstring& query, const std::wstring& literal,
+                                             const SYSTEMTIME& reference, ICondition* nativeCondition = nullptr,
+                                             bool requireExactLiteral = true) {
+    ComPtr<IQueryParserManager> manager;
+    succeeded(CoCreateInstance(__uuidof(QueryParserManager), nullptr, CLSCTX_INPROC_SERVER,
+                               IID_PPV_ARGS(&manager)), "create independent native condition parser");
+    ComPtr<IQueryParser> parser;
+    succeeded(manager->CreateLoadedParser(L"SystemIndex", GetUserDefaultUILanguage(), IID_PPV_ARGS(&parser)),
+              "load canonical native query schema");
+    succeeded(manager->InitializeOptions(FALSE, TRUE, parser.Get()), "initialize native query generators");
+    const std::array<std::pair<const wchar_t*, const wchar_t*>, 5> defaults{{
+        {L"System.StructuredQueryType.String", L"System.Generic.String"},
+        {L"System.StructuredQueryType.Integer", L"System.Generic.Integer"},
+        {L"System.StructuredQueryType.DateTime", L"System.Generic.DateTime"},
+        {L"System.StructuredQueryType.Boolean", L"System.Generic.Boolean"},
+        {L"System.StructuredQueryType.FloatingPoint", L"System.Generic.FloatingPoint"}
+    }};
+    for (const auto& [type, property] : defaults) {
+        PROPVARIANT value{};
+        succeeded(InitPropVariantFromString(property, &value), "make native default property option");
+        const auto status = parser->SetMultiOption(SQMO_DEFAULT_PROPERTY, type, &value);
+        PropVariantClear(&value);
+        succeeded(status, "retain native generic query defaults");
+    }
+    ComPtr<IQuerySolution> solution;
+    ComPtr<ICondition> parsed, resolved;
+    if (nativeCondition) resolved = nativeCondition;
+    else {
+        succeeded(parser->Parse(query.c_str(), nullptr, &solution), "parse original or imported literal query");
+        succeeded(solution->GetQuery(&parsed, nullptr), "read complete native literal condition");
+        succeeded(solution->Resolve(parsed.Get(), SQRO_DONT_SPLIT_WORDS, &reference, &resolved),
+                  "resolve complete native condition at the same reference time");
+    }
+    require(resolved != nullptr, "native literal resolution returned no condition");
+    NativeQuerySignature result;
+    succeeded(resolved->GetConditionType(&result.root), "read resolved native root type");
+    const auto field = [](std::wstring& target, std::wstring_view text) {
+        target += std::to_wstring(text.size()) + L":"; target += text;
+    };
+    std::function<std::wstring(ICondition*, unsigned)> visit;
+    visit = [&](ICondition* condition, unsigned depth) -> std::wstring {
+        require(condition && depth <= 64 && ++result.nodes <= 128, "literal condition tree exceeded fixture bounds");
+        CONDITION_TYPE type{};
+        succeeded(condition->GetConditionType(&type), "read every native condition type");
+        std::wstring signature = std::to_wstring(type) + L"{";
+        if (type == CT_LEAF_CONDITION) {
+            struct Comparison {
+                PWSTR property = nullptr, semantic = nullptr;
+                PROPVARIANT value{};
+                ~Comparison() { CoTaskMemFree(property); CoTaskMemFree(semantic); PropVariantClear(&value); }
+            } comparison;
+            CONDITION_OPERATION operation{};
+            succeeded(condition->GetComparisonInfo(&comparison.property, &operation, &comparison.value),
+                      "read exact native leaf property, operation and typed value");
+            succeeded(condition->GetValueType(&comparison.semantic), "read exact native leaf semantic type");
+            require(comparison.property && *comparison.property, "resolved literal lost its canonical native property");
+            // This fixture's complete Title expansion must retain every copy
+            // of the original string. A changed VARTYPE, omitted branch or
+            // partial phrase fails instead of becoming a textual equivalent.
+            require(comparison.value.vt == VT_LPWSTR && comparison.value.pwszVal,
+                    "native Title expansion changed its exact value type");
+            const bool exactLiteral = std::wstring_view(comparison.value.pwszVal) == literal;
+            if (requireExactLiteral) require(exactLiteral, "native Title expansion changed an exact Unicode literal occurrence");
+            if (exactLiteral) ++result.literalLeaves;
+            field(signature, comparison.property);
+            signature += comparison.semantic ? L"1:" : L"0:";
+            field(signature, comparison.semantic ? comparison.semantic : L"");
+            signature += std::to_wstring(operation) + L":" + std::to_wstring(comparison.value.vt) + L":";
+            field(signature, comparison.value.pwszVal);
+        } else {
+            std::vector<std::wstring> children;
+            if (type == CT_NOT_CONDITION) {
+                ComPtr<ICondition> child;
+                succeeded(condition->GetSubConditions(IID_PPV_ARGS(&child)), "read native negated condition");
+                children.push_back(visit(child.Get(), depth + 1));
+            } else {
+                require(type == CT_AND_CONDITION || type == CT_OR_CONDITION, "unknown native connective in Title expansion");
+                ComPtr<IEnumUnknown> enumeration;
+                succeeded(condition->GetSubConditions(IID_PPV_ARGS(&enumeration)), "read every native compound branch");
+                for (;;) {
+                    ComPtr<IUnknown> unknown;
+                    const auto status = enumeration->Next(1, &unknown, nullptr);
+                    if (status == S_FALSE) break;
+                    succeeded(status, "enumerate complete native Title expansion");
+                    require(unknown != nullptr, "native compound branch has no identity");
+                    ComPtr<ICondition> child;
+                    succeeded(unknown.As(&child), "read actual native compound child");
+                    children.push_back(visit(child.Get(), depth + 1));
+                }
+                // AND/OR branch order is immaterial; connective type, nesting
+                // and every duplicate branch remain in the exact signature.
+                std::sort(children.begin(), children.end());
+            }
+            require(!children.empty(), "native literal compound lost all branches");
+            signature += std::to_wstring(children.size()) + L":";
+            for (const auto& child : children) field(signature, child);
+        }
+        signature += L"}"; return signature;
+    };
+    result.tree = visit(resolved.Get(), 0);
+    if (requireExactLiteral) require(result.literalLeaves != 0, "native literal condition has no exact literal leaves");
+    auto raw = std::move(result);
+    ComPtr<IConditionFactory> factory;
+    succeeded(CoCreateInstance(__uuidof(ConditionFactory), nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory)),
+              "create independent native Boolean simplifier");
+    ComPtr<ICondition> normalized;
+    if (raw.root == CT_AND_CONDITION || raw.root == CT_OR_CONDITION) {
+        ComPtr<IEnumUnknown> children;
+        succeeded(resolved->GetSubConditions(IID_PPV_ARGS(&children)), "retain every actual branch for native simplification");
+        succeeded(factory->MakeAndOr(raw.root, children.Get(), TRUE, &normalized),
+                  "ask Windows to simplify the complete native Boolean condition");
+    } else if (raw.root == CT_NOT_CONDITION) {
+        ComPtr<ICondition> child;
+        succeeded(resolved->GetSubConditions(IID_PPV_ARGS(&child)), "retain actual negated condition for simplification");
+        succeeded(factory->MakeNot(child.Get(), TRUE, &normalized), "let Windows simplify actual native negation");
+    } else normalized = resolved;
+    require(normalized != nullptr, "native condition simplifier returned no condition");
+    result = {};
+    // The installed native factory retains the parser's repeated OR leaves
+    // even with fSimplify=TRUE. Apply only Boolean associativity, idempotence
+    // and singleton identity to complete child signatures. No leaf field is
+    // discarded, and different connectives and NOT boundaries remain distinct.
+    struct BooleanSignature {
+        std::wstring text;
+        CONDITION_TYPE type = CT_LEAF_CONDITION;
+        unsigned nodes = 1, literalLeaves = 0;
+    };
+    unsigned normalizedVisits = 0;
+    std::function<BooleanSignature(ICondition*, unsigned)> booleanSignature;
+    booleanSignature = [&](ICondition* condition, unsigned depth) -> BooleanSignature {
+        require(condition && depth <= 64 && ++normalizedVisits <= 128, "normalized condition exceeded fixture bounds");
+        BooleanSignature signature;
+        succeeded(condition->GetConditionType(&signature.type), "retain each Boolean condition's actual connective");
+        if (signature.type == CT_LEAF_CONDITION) {
+            const auto before = result.literalLeaves;
+            signature.text = visit(condition, depth);
+            signature.literalLeaves = result.literalLeaves - before;
+            return signature;
+        }
+        std::vector<BooleanSignature> children;
+        if (signature.type == CT_NOT_CONDITION) {
+            ComPtr<ICondition> child;
+            succeeded(condition->GetSubConditions(IID_PPV_ARGS(&child)), "retain complete normalized NOT boundary");
+            children.push_back(booleanSignature(child.Get(), depth + 1));
+        } else {
+            require(signature.type == CT_AND_CONDITION || signature.type == CT_OR_CONDITION,
+                    "unknown connective during native Boolean comparison");
+            std::function<void(ICondition*, unsigned)> collect;
+            collect = [&](ICondition* child, unsigned childDepth) {
+                require(child && childDepth <= 64, "associative native condition exceeded fixture depth");
+                CONDITION_TYPE childType{};
+                succeeded(child->GetConditionType(&childType), "read actual child connective before associative flattening");
+                if (childType != signature.type) { children.push_back(booleanSignature(child, childDepth)); return; }
+                require(++normalizedVisits <= 128, "associative native condition exceeded fixture node bound");
+                ComPtr<IEnumUnknown> enumeration;
+                succeeded(child->GetSubConditions(IID_PPV_ARGS(&enumeration)), "retain every same-connective native branch");
+                for (;;) {
+                    ComPtr<IUnknown> unknown;
+                    const auto status = enumeration->Next(1, &unknown, nullptr);
+                    if (status == S_FALSE) break;
+                    succeeded(status, "read complete associative native branch");
+                    require(unknown != nullptr, "associative native branch has no identity");
+                    ComPtr<ICondition> nested;
+                    succeeded(unknown.As(&nested), "read actual same-connective native child");
+                    collect(nested.Get(), childDepth + 1);
+                }
+            };
+            collect(condition, depth);
+            std::sort(children.begin(), children.end(), [](const auto& first, const auto& second) { return first.text < second.text; });
+            children.erase(std::unique(children.begin(), children.end(), [](const auto& first, const auto& second) {
+                return first.text == second.text;
+            }), children.end());
+            if (children.size() == 1) return std::move(children.front());
+        }
+        signature.text = std::to_wstring(signature.type) + L"{" + std::to_wstring(children.size()) + L":";
+        for (const auto& child : children) {
+            field(signature.text, child.text); signature.nodes += child.nodes; signature.literalLeaves += child.literalLeaves;
+        }
+        signature.text += L"}"; return signature;
+    };
+    const auto semantic = booleanSignature(normalized.Get(), 0);
+    raw.normalizedRoot = semantic.type; raw.normalizedTree = semantic.text;
+    raw.normalizedNodes = semantic.nodes; raw.normalizedLiteralLeaves = semantic.literalLeaves;
+    return raw;
+}
+
+void nativeLiteralComparatorCounterexamples(const std::wstring& query, const std::wstring& literal,
+                                          const SYSTEMTIME& reference, const NativeQuerySignature& expected) {
+    ComPtr<IConditionFactory2> factory;
+    succeeded(CoCreateInstance(__uuidof(ConditionFactory), nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory)),
+              "create real native counterfeit-condition factory");
+    const auto leaf = [&](const wchar_t* property, CONDITION_OPERATION operation, const std::wstring& text) {
+        PROPVARIANT value{};
+        succeeded(InitPropVariantFromString(text.c_str(), &value), "create actual native comparison value");
+        ComPtr<ICondition> result;
+        const auto status = factory->MakeLeaf(property, operation, L"System.StructuredQueryType.String", &value,
+                                              nullptr, nullptr, nullptr, FALSE, &result);
+        PropVariantClear(&value); succeeded(status, "create actual native comparison leaf"); return result;
+    };
+    const auto compound = [&](CONDITION_TYPE type, std::initializer_list<ICondition*> children) {
+        std::vector<ICondition*> items(children);
+        ComPtr<ICondition> result;
+        succeeded(factory->CreateCompoundFromArray(type, items.data(), static_cast<ULONG>(items.size()),
+                                                   CONDITION_CREATION_DEFAULT, IID_PPV_ARGS(&result)),
+                  "create actual native structured Boolean control"); return result;
+    };
+    const auto signature = [&](ICondition* condition) {
+        return resolvedLiteralSignature(query, literal, reference, condition, false).normalizedTree;
+    };
+    const auto original = leaf(L"System.Title", COP_EQUAL, literal);
+    require(signature(original.Get()) == expected.normalizedTree, "normalized original Title changed exact native leaf meaning");
+    const auto repeated = compound(CT_OR_CONDITION, {original.Get(), original.Get(), original.Get()});
+    const auto nested = compound(CT_OR_CONDITION, {original.Get(), repeated.Get()});
+    const auto singleton = compound(CT_OR_CONDITION, {original.Get()});
+    require(signature(repeated.Get()) == expected.normalizedTree && signature(nested.Get()) == expected.normalizedTree &&
+            signature(singleton.Get()) == expected.normalizedTree,
+            "native Boolean normalization did not preserve exact associative/idempotent/singleton meaning");
+    const auto changedValue = leaf(L"System.Title", COP_EQUAL, literal + L" altered");
+    const auto changedOperation = leaf(L"System.Title", COP_NOTEQUAL, literal);
+    const auto changedProperty = leaf(L"System.Subject", COP_EQUAL, literal);
+    ComPtr<ICondition> negated;
+    succeeded(factory->MakeNot(original.Get(), FALSE, &negated), "construct actual native NOT counterexample");
+    for (const auto changed : {changedValue.Get(), changedOperation.Get(), changedProperty.Get(), negated.Get()})
+        require(signature(changed) != expected.normalizedTree,
+                "complete native condition comparator ignored a changed value, operation, property or NOT");
+    const auto conjunction = compound(CT_AND_CONDITION, {original.Get(), changedProperty.Get()});
+    const auto disjunction = compound(CT_OR_CONDITION, {original.Get(), changedProperty.Get()});
+    require(signature(conjunction.Get()) != signature(disjunction.Get()),
+            "complete native condition comparator confused AND and OR with identical actual leaf fields");
 }
 
 // This binds and executes the real native Search Folder without a window,
@@ -598,6 +839,7 @@ void absoluteDateDayAndRangeResults() {
 void xmlEscapingAndThisPcScope() {
     Fixture fixture;
     auto scope = shellItem(fixture.root);
+    const std::wstring literal = L"猫 & \"quoted\" < > ' \U0001F680";
     const std::wstring query = L"System.Title:=\"猫 & \"\"quoted\"\" < > ' \U0001F680\"";
     const auto path = fixture.root / L"escaped.search-ms";
     succeeded(explorer::saveSearch(query, scope.Get(), true, path), "save escaped Unicode query");
@@ -606,7 +848,42 @@ void xmlEscapingAndThisPcScope() {
         require(bytes.find(escape) != std::string::npos, "XML metacharacter was not escaped");
     const auto document = loadXml(path);
     const auto condition = xmlElement(document.Get(), L"/persistedQuery/query/conditions/condition");
-    require(xmlAttribute(condition.Get(), L"value") == L"猫 & \"quoted\" < > ' \U0001F680", "XML escaping changed literal query text");
+    const auto rootType = xmlAttribute(condition.Get(), L"type");
+    XmlString leafExpression(L"/persistedQuery/query/conditions//condition[@type='leafCondition']");
+    ComPtr<IXMLDOMNodeList> leaves;
+    succeeded(document->selectNodes(leafExpression.value, &leaves), "read every emitted Title value leaf");
+    require(leaves != nullptr, "saved Title query has no condition collection");
+    long leafCount = 0;
+    succeeded(leaves->get_length(&leafCount), "count all emitted literal occurrences");
+    std::cout << "INFO: escaped Title XML root=" << utf8(rootType) << " literalLeaves=" << leafCount
+              << " literalUtf16Units=" << literal.size() << '\n';
+    require(leafCount > 0, "saved Title query omitted every literal value leaf");
+    for (long index = 0; index < leafCount; ++index) {
+        ComPtr<IXMLDOMNode> node;
+        succeeded(leaves->get_item(index, &node), "read each emitted literal node");
+        ComPtr<IXMLDOMElement> leaf;
+        succeeded(node.As(&leaf), "read emitted native Title leaf attributes");
+        require(xmlAttribute(leaf.Get(), L"value") == literal, "XML escaping changed a literal Unicode occurrence");
+    }
+    explorer::SavedSearchMetadata imported;
+    succeeded(explorer::readSavedSearch(path, &imported), "import exact escaped Title query semantics");
+    SYSTEMTIME reference{}; reference.wYear = 2024; reference.wMonth = 8; reference.wDay = 19; reference.wHour = 12;
+    const auto expected = resolvedLiteralSignature(query, literal, reference);
+    const auto actual = resolvedLiteralSignature(imported.query, literal, reference);
+    std::cout << "INFO: escaped Title comparison originalRoot=" << static_cast<unsigned>(expected.root)
+              << " importedRoot=" << static_cast<unsigned>(actual.root) << " originalNodes=" << expected.nodes
+              << " importedNodes=" << actual.nodes << " originalLeaves=" << expected.literalLeaves
+              << " importedLeaves=" << actual.literalLeaves << " completeSignatureEqual=" << (actual.tree == expected.tree) << '\n';
+    std::cout << "INFO: escaped Title normalized originalRoot=" << static_cast<unsigned>(expected.normalizedRoot)
+              << " importedRoot=" << static_cast<unsigned>(actual.normalizedRoot) << " originalNodes=" << expected.normalizedNodes
+              << " importedNodes=" << actual.normalizedNodes << " completeSignatureEqual="
+              << (actual.normalizedTree == expected.normalizedTree) << '\n';
+    require(actual.normalizedTree == expected.normalizedTree && actual.normalizedNodes == expected.normalizedNodes &&
+            actual.normalizedLiteralLeaves == expected.normalizedLiteralLeaves && expected.literalLeaves == static_cast<unsigned>(leafCount),
+            "saved Title query changed its complete native connective/property/operation/type/value tree");
+    nativeLiteralComparatorCounterexamples(query, literal, reference, expected);
+    std::cout << "INFO: escaped Title native root=" << static_cast<unsigned>(expected.root)
+              << " nodes=" << expected.nodes << " exactLiteralOccurrences=" << expected.literalLeaves << '\n';
     const auto saved = reopenSearch(path);
     require(searchResults(saved.Get()).empty(), "unmatched literal query was broadened while saving");
 
@@ -617,6 +894,16 @@ void xmlEscapingAndThisPcScope() {
     wchar_t identifier[40]{};
     require(StringFromGUID2(FOLDERID_ComputerFolder, identifier, 40) != 0, "format This PC known-folder id");
     require(xmlAttribute(include.Get(), L"knownFolder") == identifier, "saved This PC scope used a filesystem substitute");
+    explorer::SavedSearchMetadata computer;
+    succeeded(explorer::readSavedSearch(computerPath, &computer), "import native This PC saved-search scope");
+    require(computer.scope != nullptr, "saved This PC metadata omitted its native scope");
+    ComPtr<IShellItem> computerFolder;
+    succeeded(SHGetKnownFolderItem(FOLDERID_ComputerFolder, KF_FLAG_DEFAULT, nullptr, IID_PPV_ARGS(&computerFolder)),
+              "retain actual native This PC scope identity");
+    int scopeComparison = 1;
+    succeeded(computer.scope->Compare(computerFolder.Get(), SICHINT_CANONICAL, &scopeComparison),
+              "compare saved native This PC scope without userwide enumeration");
+    require(scopeComparison == 0 && computer.recursive, "saved This PC metadata names a different native folder");
     reopenSearch(computerPath); // Bind/identity only; never enumerate userwide results.
     const auto namedDirectory = fixture.root / L"ordinary-directory.search-ms";
     require(fs::create_directory(namedDirectory), "create ordinary directory with search-ms suffix");
@@ -683,7 +970,6 @@ void rejectedInputsAndNoOverwrite() {
     require(explorer::saveSearch(std::wstring(L"a\0b", 3), scope.Get(), true, rejected) == E_INVALIDARG, "embedded NUL query accepted");
     require(explorer::saveSearch(L"System.FileName:=\"report\"", scope.Get(), true, fixture.root / L"wrong.txt") == E_INVALIDARG, "non-search-ms output accepted");
     require(explorer::saveSearch(L"System.FileName:=\"report\"", scope.Get(), true, {}) == E_INVALIDARG, "empty output path accepted");
-    require(explorer::saveSearch(L"System.FileName:$<\"match\"", scope.Get(), true, rejected) == unsupported, "unverified prefix-word serializer operator guessed");
     require(!fs::exists(rejected), "rejected query left a saved-search file");
     write(fixture.root / L"ordinary-file.txt", "not a folder");
     auto file = shellItem(fixture.root / L"ordinary-file.txt");
@@ -693,22 +979,22 @@ void rejectedInputsAndNoOverwrite() {
     require(explorer::saveSearch(L"System.FileName:=\"report\"", nullptr, false, rejected) == unsupported, "saved shallow virtual scope was silently recursive");
     require(explorer::createSearchFolder(L"report", scope.Get(), nullptr) == E_POINTER, "null search output accepted");
     require(explorer::createSearchFolder(L"", scope.Get(), &result) == E_INVALIDARG && !result, "invalid live search retained result");
-    // Exercise only parsing and the guard; never enumerate the rejected native
-    // filename word-prefix condition on affected Windows 10 implementations.
+    // Native filename word-prefix membership and persistence are covered by
+    // the owned saved-metadata fixture; all nested parsed forms remain valid.
     for (const auto* query : {
         L"System.FileName:$<\"match\"", L"System.FILENAME:$<\"match\"",
         L"System.Kind:=System.Kind#Document AND System.FileName:$<\"match\"",
         L"System.FileName:$<\"match\" OR System.Size:>1",
         L"NOT System.FileName:$<\"match\""}) {
         result.Reset();
-        require(explorer::createSearchFolder(query, scope.Get(), &result) == unsupported && !result,
-                "explicit filename word-prefix escaped parsed-condition guard");
+        succeeded(explorer::createSearchFolder(query, scope.Get(), &result), "construct explicit native filename word-prefix query");
+        require(result != nullptr, "valid filename prefix has no native identity");
     }
     for (const auto* query : {L"\"literal $< text\"", L"System.FileName:\"literal $< text\"",
                               L"System.Search.Contents:$<\"match\"", L"ordinary default term"}) {
         result.Reset();
         succeeded(explorer::createSearchFolder(query, scope.Get(), &result),
-                  "filename prefix guard rejected unrelated property or literal/default text");
+                  "native search rejected unrelated property or literal/default text");
         require(result != nullptr, "permitted search has no native identity");
     }
     const auto percentPath = fixture.root / L"literal %USERPROFILE% scope";
@@ -787,6 +1073,263 @@ std::set<std::wstring> fixtureMembers(const fs::path& root) {
     for (const auto& entry : fs::recursive_directory_iterator(root)) paths.insert(entry.path().lexically_relative(root).native());
     return paths;
 }
+
+void protectiveScopeGuardsAndNewMatches() {
+    Fixture fixture;
+    const auto scopePath = fixture.root / L"Guard scope 資料";
+    const auto childPath = scopePath / L"target-folder", deepPath = childPath / L"deep";
+    const auto peerPath = fixture.root / L"peer", outsidePath = fixture.root / L"Guard scope 資料 suffix";
+    require(fs::create_directories(deepPath) && fs::create_directories(peerPath / L"deep") &&
+            fs::create_directory(outsidePath) && fs::create_directory(scopePath / L"historic"),
+            "create exclusively owned guard hierarchy");
+    const std::vector<fs::path> initial{
+        scopePath / L"target.txt", childPath, childPath / L"target.txt", deepPath / L"target.txt",
+        peerPath / L"target.txt", peerPath / L"deep" / L"target.txt", outsidePath / L"target.txt",
+        scopePath / L"historic" / L"target.txt"};
+    for (size_t i = 0; i < initial.size(); ++i) if (i != 1) write(initial[i], "unchanged guard source");
+    setOwnedTimestamp(initial.back(), localTimestamp(2000, 1, 1));
+    std::vector<FileIdentity> initialIds;
+    std::vector<FILE_BASIC_INFO> initialBasic;
+    for (const auto& path : initial) { initialIds.push_back(fileIdentity(path.native())); initialBasic.push_back(fileBasic(path)); }
+    auto scope = shellItem(scopePath), child = shellItem(childPath), peer = shellItem(peerPath);
+    auto aliasPath = fixture.root / L"guard SCOPE 資料" / L".";
+    const auto shortLength = GetShortPathNameW(scopePath.c_str(), nullptr, 0);
+    bool distinctShortAlias = false;
+    if (shortLength && shortLength <= 32768) {
+        std::wstring shortPath(shortLength, L'\0');
+        const auto copied = GetShortPathNameW(scopePath.c_str(), shortPath.data(), shortLength);
+        if (copied && copied < shortLength) {
+            shortPath.resize(copied);
+            distinctShortAlias = _wcsicmp(shortPath.c_str(), scopePath.c_str()) != 0;
+            if (distinctShortAlias) aliasPath = shortPath;
+        }
+    }
+    auto alias = shellItem(aliasPath);
+    require(fileIdentity(nativeFilesystemPath(alias.Get())) == fileIdentity(scopePath.native()),
+            "guard alias changed actual native directory identity");
+    std::cout << "INFO: protective scope owned alias shortDistinct=" << distinctShortAlias << '\n';
+
+    // Native comparison uses every field rather than accepting a textual
+    // prefix, a matching property alone, or a coincidentally equal file count.
+    ComPtr<IConditionFactory2> factory;
+    succeeded(CoCreateInstance(__uuidof(ConditionFactory), nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory)),
+              "create real native guard comparator conditions");
+    const auto canonicalPath = nativeFilesystemPath(scope.Get());
+    const auto leaf = [&](const wchar_t* property, CONDITION_OPERATION operation, const std::wstring& text,
+                          const wchar_t* semantic, VARTYPE type = VT_LPWSTR) {
+        struct Value { PROPVARIANT value{}; ~Value() { PropVariantClear(&value); } } value;
+        if (type == VT_BSTR) {
+            value.value.vt = VT_BSTR; value.value.bstrVal = SysAllocString(text.c_str());
+            require(value.value.bstrVal != nullptr, "allocate owned native guard BSTR");
+        } else succeeded(InitPropVariantFromString(text.c_str(), &value.value), "allocate owned native guard literal");
+        ComPtr<ICondition> condition;
+        succeeded(factory->MakeLeaf(property, operation, semantic, &value.value, nullptr, nullptr, nullptr, FALSE, &condition),
+                  "construct real native guard counterexample leaf");
+        PROPVARIANT readback{}; CONDITION_OPERATION readOperation{}; PWSTR readProperty = nullptr;
+        const auto readStatus = condition->GetComparisonInfo(&readProperty, &readOperation, &readback);
+        const auto actualType = readback.vt;
+        CoTaskMemFree(readProperty); PropVariantClear(&readback);
+        succeeded(readStatus, "read native counterexample VARTYPE");
+        require(actualType == type, "native counterexample did not retain its requested actual VARTYPE");
+        return condition;
+    };
+    constexpr auto stringType = L"System.StructuredQueryType.String";
+    auto expectedLeaf = leaf(L"System.ItemFolderPathDisplay", COP_EQUAL, canonicalPath, stringType);
+    const auto compare = [&](ICondition* actual, bool expected) {
+        bool same = !expected;
+        succeeded(explorer::search_scope_internal::sameScopeGuard(expectedLeaf.Get(), actual, &same),
+                  "compare complete native guard fields");
+        require(same == expected, "native guard comparator lost a complete leaf/connective field");
+    };
+    compare(expectedLeaf.Get(), true);
+    for (auto different : {
+        leaf(L"System.ItemFolderPathDisplay", COP_EQUAL, canonicalPath + L" suffix", stringType),
+        leaf(L"System.ItemFolderPathDisplay", COP_NOTEQUAL, canonicalPath, stringType),
+        leaf(L"System.ItemPathDisplay", COP_EQUAL, canonicalPath, stringType),
+        leaf(L"System.ItemFolderPathDisplay", COP_EQUAL, canonicalPath, nullptr),
+        leaf(L"System.ItemFolderPathDisplay", COP_EQUAL, canonicalPath, stringType, VT_BSTR)}) compare(different.Get(), false);
+    ComPtr<ICondition> inverse, repeated;
+    succeeded(factory->MakeNot(expectedLeaf.Get(), FALSE, &inverse), "construct real native NOT counterexample");
+    compare(inverse.Get(), false);
+    ICondition* duplicates[]{expectedLeaf.Get(), expectedLeaf.Get()};
+    succeeded(factory->CreateCompoundFromArray(CT_OR_CONDITION, duplicates, 2, CONDITION_CREATION_DEFAULT,
+                                               IID_PPV_ARGS(&repeated)), "construct real native duplicate OR");
+    compare(repeated.Get(), true);
+    auto otherLeaf = leaf(L"System.ItemFolderPathDisplay", COP_EQUAL, nativeFilesystemPath(peer.Get()), stringType);
+    ICondition* distinct[]{expectedLeaf.Get(), otherLeaf.Get()};
+    ComPtr<ICondition> conjunction, disjunction;
+    succeeded(factory->CreateCompoundFromArray(CT_AND_CONDITION, distinct, 2, CONDITION_CREATION_DEFAULT,
+                                               IID_PPV_ARGS(&conjunction)), "construct real native distinct AND");
+    succeeded(factory->CreateCompoundFromArray(CT_OR_CONDITION, distinct, 2, CONDITION_CREATION_DEFAULT,
+                                               IID_PPV_ARGS(&disjunction)), "construct real native distinct OR");
+    bool same = true;
+    succeeded(explorer::search_scope_internal::sameScopeGuard(conjunction.Get(), disjunction.Get(), &same),
+              "compare real native distinct Boolean connectives");
+    require(!same, "native guard comparator conflated distinct AND and OR");
+    same = true;
+    require(explorer::search_scope_internal::sameScopeGuard(nullptr, expectedLeaf.Get(), &same) == E_INVALIDARG && same,
+            "failed native guard comparison changed its public output");
+    bool required = true;
+    require(explorer::search_scope_internal::requiresProtectiveGuard({}, &required) == unsupported && required,
+            "failed guard eligibility changed its public output");
+    ICondition* retained = expectedLeaf.Get();
+    retained->AddRef();
+    const auto invalidGuard = explorer::search_scope_internal::createScopeGuard({{nullptr, true, false}}, &retained);
+    const bool retainedOutput = retained == expectedLeaf.Get();
+    if (retained) retained->Release();
+    require(invalidGuard == E_INVALIDARG && retainedOutput, "failed guard construction replaced its public native output");
+
+    using Rule = explorer::SearchScopeRule;
+    struct Example {
+        std::vector<Rule> rules;
+        std::vector<size_t> members, added;
+        fs::path saved, again;
+        explorer::SavedSearchMetadata imported;
+        std::string bytes;
+        FileIdentity savedId;
+    };
+    std::vector<Example> examples{
+        {{{scope, true, false}, {child, false, true}, {peer, true, false}}, {0, 3, 4, 5}, {0, 2, 3}},
+        // A shallow exclusion also removes the immediate child folder object;
+        // files within that folder and all deeper matches remain eligible.
+        {{{scope, true, false}, {alias, false, true}, {peer, true, false}}, {2, 3, 4, 5}, {1, 2, 3}},
+        {{{scope, false, false}, {child, true, true}, {peer, true, false}}, {0, 4, 5}, {0, 3}},
+        {{{scope, true, false}, {alias, true, true}, {child, true, false}, {peer, true, false}}, {4, 5}, {3}},
+        {{{scope, false, false}, {alias, true, true}}, {}, {}}
+    };
+    const std::wstring query = L"(System.FileName:=\"target.txt\" OR System.FileName:=\"target-new.txt\" OR "
+        L"System.FileName:=\"target-folder\") AND NOT System.FileName:=\"unmatched.txt\" AND "
+        L"System.DateModified:System.StructuredQueryType.DateTime#Today";
+    const auto expectedPaths = [&](const Example& example, const std::vector<fs::path>& added) {
+        std::set<std::wstring> result;
+        for (auto index : example.members) result.insert(initial[index].native());
+        for (auto index : example.added) if (!added.empty()) result.insert(added[index].native());
+        return result;
+    };
+    const auto verify = [&](IShellItem* search, const std::set<std::wstring>& expected, size_t example, unsigned route) {
+        const auto actual = searchResults(search);
+        std::set<FileIdentity> actualIds, expectedIds;
+        for (const auto& path : actual) actualIds.insert(fileIdentity(path));
+        for (const auto& path : expected) expectedIds.insert(fileIdentity(path));
+        const bool equal = actual.size() == expected.size() && actualIds == expectedIds && actual.size() == actualIds.size();
+        if (!equal) {
+            std::cerr << "protectiveScope example=" << example << " route=" << route << " expected=" << expected.size()
+                      << " actual=" << actual.size() << " distinct=" << actualIds.size() << '\n';
+            const auto identityEvidence = [](const char* difference, const FileIdentity& identity) {
+                std::cerr << "protectiveScope " << difference << " volume=" << identity.volume << " id=";
+                constexpr char hex[] = "0123456789abcdef";
+                for (auto byte : identity.identifier) std::cerr << hex[byte >> 4] << hex[byte & 15];
+                std::cerr << '\n';
+            };
+            for (const auto& identity : expectedIds) if (!actualIds.contains(identity)) identityEvidence("missing", identity);
+            for (const auto& identity : actualIds) if (!expectedIds.contains(identity)) identityEvidence("unexpected", identity);
+            for (size_t i = 0; i < initialIds.size(); ++i)
+                if (expectedIds.contains(initialIds[i]) != actualIds.contains(initialIds[i]))
+                    std::cerr << "protectiveScope differenceOwnedMember=" << i << " expected=" << expectedIds.contains(initialIds[i])
+                              << " actual=" << actualIds.contains(initialIds[i]) << '\n';
+        }
+        require(equal, "protective scope changed complete actual native FileID membership");
+    };
+    // The original native query must independently match the folder that a
+    // shallow equal-root exclusion later removes, and both deeper files.
+    // This makes absence a scope semantic assertion rather than an unnoticed
+    // filename/date predicate mismatch.
+    ComPtr<IShellItem> unrestricted;
+    succeeded(explorer::createSearchFolderForScopeRules(query, {{scope, true, false}, {peer, true, false}}, &unrestricted),
+              "create genuine recursive-union scope baseline");
+    verify(unrestricted.Get(), {initial[0].native(), initial[1].native(), initial[2].native(),
+                               initial[3].native(), initial[4].native(), initial[5].native()}, examples.size(), 8);
+    unrestricted.Reset();
+    for (size_t i = 0; i < examples.size(); ++i) {
+        auto& example = examples[i]; required = false;
+        succeeded(explorer::search_scope_internal::requiresProtectiveGuard(example.rules, &required), "inspect genuine unsafe physical scope");
+        require(required, "unsafe physical scope did not require exact guard");
+        ComPtr<ICondition> guard;
+        succeeded(explorer::search_scope_internal::createScopeGuard(example.rules, &guard), "create complete native protective predicate");
+        ComPtr<IShellItem> live;
+        succeeded(explorer::createSearchFolderForScopeRules(query, example.rules, &live), "create guarded native live scope");
+        const auto expected = expectedPaths(example, {});
+        verify(live.Get(), expected, i, 0);
+        example.saved = fixture.root / (L"guard-" + std::to_wstring(i) + L".search-ms");
+        example.again = fixture.root / (L"guard-again-" + std::to_wstring(i) + L".search-ms");
+        succeeded(explorer::saveSearchForScopeRules(query, example.rules, example.saved), "save original query and exact scope guard");
+        example.bytes = read(example.saved); example.savedId = fileIdentity(example.saved.native());
+        verify(reopenSearch(example.saved).Get(), expected, i, 1);
+        succeeded(explorer::readSavedSearch(example.saved, &example.imported), "import exact guard without editing source");
+        require(example.imported.scopeRules.size() == example.rules.size(), "guard import changed scope count");
+        const auto scopeFacts = [](const std::vector<Rule>& rules) {
+            std::multiset<std::tuple<FileIdentity, bool, bool>> facts;
+            for (const auto& rule : rules) {
+                require(rule.folder != nullptr, "guard import lost actual folder identity");
+                facts.emplace(fileIdentity(nativeFilesystemPath(rule.folder.Get())), rule.recursive, rule.excluded);
+            }
+            return facts;
+        };
+        // The public XML groups include elements before exclude elements;
+        // preserve every rule and duplicate occurrence independently of order.
+        require(scopeFacts(example.imported.scopeRules) == scopeFacts(example.rules),
+                "guard import changed actual directory identity/recursion/exclusion or rule multiplicity");
+        require(example.imported.query.find(L"System.ItemFolderPathDisplay") == std::wstring::npos &&
+                example.imported.query.find(L"System.ItemPathDisplay") == std::wstring::npos,
+                "scope guard leaked into editable original native query");
+        live.Reset();
+        succeeded(explorer::createSearchFolderForScopeRules(example.imported.query, example.imported.scopeRules, &live),
+                  "restore imported original query and individual scope flags");
+        verify(live.Get(), expected, i, 2);
+        succeeded(explorer::saveSearchForScopeRules(example.imported.query, example.imported.scopeRules, example.again),
+                  "re-save imported original query with recognized guard");
+        verify(reopenSearch(example.again).Get(), expected, i, 3);
+        require(example.bytes.find("R00UUUUUUUUZDNNU") != std::string::npos && read(example.again).find("R00UUUUUUUUZDNNU") != std::string::npos,
+                "protective scope froze original unresolved Today condition");
+    }
+
+    const std::vector<fs::path> added{
+        scopePath / L"target-new.txt", childPath / L"target-new.txt", deepPath / L"target-new.txt",
+        peerPath / L"target-new.txt", outsidePath / L"target-new.txt"};
+    for (const auto& path : added) write(path, "new match after original saved publication");
+    std::vector<FileIdentity> addedIds;
+    std::vector<FILE_BASIC_INFO> addedBasic;
+    for (const auto& path : added) { addedIds.push_back(fileIdentity(path.native())); addedBasic.push_back(fileBasic(path)); }
+    for (size_t i = 0; i < examples.size(); ++i) {
+        const auto& example = examples[i]; const auto expected = expectedPaths(example, added);
+        ComPtr<IShellItem> live;
+        succeeded(explorer::createSearchFolderForScopeRules(query, example.rules, &live), "rerun guarded live query on new owned matches");
+        verify(live.Get(), expected, i, 4);
+        requireReopenedResults(example.saved, expected, "original protective saved query froze matching FileIDs");
+        live.Reset();
+        succeeded(explorer::createSearchFolderForScopeRules(example.imported.query, example.imported.scopeRules, &live),
+                  "rerun guarded imported query on new owned matches");
+        verify(live.Get(), expected, i, 6);
+        requireReopenedResults(example.again, expected, "re-saved protective query froze matching FileIDs");
+        require(read(example.saved) == example.bytes && fileIdentity(example.saved.native()) == example.savedId,
+                "native protective query execution changed original saved bytes or FileID");
+    }
+    const auto& first = examples.front();
+    const auto outputMembers = fixtureMembers(fixture.root);
+    for (const auto& invalid : {std::vector<Rule>{{nullptr, true, false}}, std::vector<Rule>(257, {scope, true, false})}) {
+        require(FAILED(explorer::saveSearchForScopeRules(query, invalid, first.saved, explorer::SearchSaveMode::UserConfirmed)),
+                "invalid protective scope accepted confirmed overwrite");
+        require(read(first.saved) == first.bytes && fileIdentity(first.saved.native()) == first.savedId &&
+                fixtureMembers(fixture.root) == outputMembers, "invalid protective scope changed output or leaked staging file");
+    }
+    ComPtr<IShellItem> computer;
+    succeeded(SHGetKnownFolderItem(FOLDERID_ComputerFolder, KF_FLAG_DEFAULT, nullptr, IID_PPV_ARGS(&computer)),
+              "get native This PC metadata only for unsupported mixed guard");
+    const auto rejected = fixture.root / L"unsafe-virtual.search-ms";
+    require(explorer::saveSearchForScopeRules(query, {{computer, true, false}, {child, false, true}}, rejected) == unsupported &&
+            !fs::exists(rejected), "unsafe virtual protective scope was partially written");
+    for (size_t i = 0; i < initial.size(); ++i) {
+        require(fileIdentity(initial[i].native()) == initialIds[i], "protective query changed original member FileID");
+        if (i != 1) require(read(initial[i]) == "unchanged guard source" &&
+                            fileBasic(initial[i]).LastWriteTime.QuadPart == initialBasic[i].LastWriteTime.QuadPart,
+                            "protective query changed original member bytes/timestamp");
+    }
+    for (size_t i = 0; i < added.size(); ++i)
+        require(fileIdentity(added[i].native()) == addedIds[i] && read(added[i]) == "new match after original saved publication" &&
+                fileBasic(added[i]).LastWriteTime.QuadPart == addedBasic[i].LastWriteTime.QuadPart,
+                "protective query changed newly matching source bytes/FileID/timestamp");
+}
+
 void confirmedSearchReplacement() {
     Fixture fixture;
     const auto scopePath = fixture.root / L"scope";
@@ -1046,6 +1589,7 @@ int runSearchTests() {
         {"typed day/range inclusive boundaries and live/saved/restored native identities", absoluteDateDayAndRangeResults},
         {"native saved numeric/string/wildcard/Boolean comparison results", comparisonOperatorSemantics},
         {"saved-search XML escaping, Unicode and This PC identity", xmlEscapingAndThisPcScope},
+        {"full-field native scope guards, aliases and newly matching four-route FileIDs", protectiveScopeGuardsAndNewMatches},
         {"confirmed saved-search replacement, native results, permissions and failure preservation", confirmedSearchReplacement},
         {"confirmed saves preserve exact legacy/protected/modern/deny ACLs and native identities", confirmedSearchSecurityProfiles},
         {"saved-search invalid input, unsupported scope and no overwrite", rejectedInputsAndNoOverwrite}

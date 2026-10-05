@@ -207,43 +207,41 @@ void focusCycleOrderAndAvailability() {
     using explorer::FocusRegion;
     const explorer::FocusAvailability all;
     constexpr std::array forward{
-        FocusRegion::Address, FocusRegion::Search, FocusRegion::FolderView,
-        FocusRegion::CommandBand, FocusRegion::Navigation, FocusRegion::Address};
+        FocusRegion::FolderView, FocusRegion::Sorting, FocusRegion::Status,
+        FocusRegion::Toolbar, FocusRegion::Navigation, FocusRegion::FolderView};
     std::optional<FocusRegion> current = FocusRegion::Navigation;
     for (const auto expected : forward) {
-        expectFocus(current, false, all, expected, "Forward focus cycle must retain order and wrap around");
+        expectFocus(current, false, all, expected, "Windows 10 forward focus order must wrap around");
         current = expected;
     }
     constexpr std::array backward{
-        FocusRegion::Navigation, FocusRegion::CommandBand, FocusRegion::FolderView,
-        FocusRegion::Search, FocusRegion::Address, FocusRegion::Navigation};
-    current = FocusRegion::Address;
+        FocusRegion::Navigation, FocusRegion::Toolbar, FocusRegion::Status,
+        FocusRegion::Sorting, FocusRegion::FolderView, FocusRegion::Navigation};
+    current = FocusRegion::FolderView;
     for (const auto expected : backward) {
-        expectFocus(current, true, all, expected, "Backward focus cycle must reverse order and wrap around");
+        expectFocus(current, true, all, expected, "Windows 10 backward focus order must reverse the same regions");
         current = expected;
     }
-    expectFocus(std::nullopt, false, all, FocusRegion::Address, "Unknown focus starts at the address region forward");
-    expectFocus(std::nullopt, true, all, FocusRegion::Navigation, "Unknown focus starts at navigation backward");
-    expectFocus(static_cast<FocusRegion>(-1), false, all, FocusRegion::Address, "Invalid negative focus is treated as unknown");
+    expectFocus(std::nullopt, false, all, FocusRegion::FolderView, "Unknown forward focus starts at content");
+    expectFocus(std::nullopt, true, all, FocusRegion::Navigation, "Unknown backward focus starts at navigation");
+    expectFocus(static_cast<FocusRegion>(-1), false, all, FocusRegion::FolderView, "Invalid negative focus is treated as unknown");
     expectFocus(static_cast<FocusRegion>(999), true, all, FocusRegion::Navigation, "Invalid focus is treated as unknown");
 
-    const explorer::FocusAvailability noBandOrNavigation{true, true, true, false, false};
-    expectFocus(FocusRegion::FolderView, false, noBandOrNavigation, FocusRegion::Address,
-                "Forward focus skips a collapsed command band and hidden navigation");
-    expectFocus(FocusRegion::Address, true, noBandOrNavigation, FocusRegion::FolderView,
-                "Backward focus skips hidden trailing regions");
-    expectFocus(FocusRegion::CommandBand, false, noBandOrNavigation, FocusRegion::Address,
-                "A now-hidden current region still advances from its original position");
-    expectFocus(FocusRegion::Navigation, true, noBandOrNavigation, FocusRegion::FolderView,
-                "A hidden current region cycles safely backward");
+    const explorer::FocusAvailability iconsWithoutNavigation{true, false, true, true, false};
+    expectFocus(FocusRegion::FolderView, false, iconsWithoutNavigation, FocusRegion::Status,
+                "Icon views skip the unavailable Details sorting header");
+    expectFocus(FocusRegion::Status, true, iconsWithoutNavigation, FocusRegion::FolderView,
+                "Backward focus skips the unavailable sorting header");
+    expectFocus(FocusRegion::Toolbar, false, iconsWithoutNavigation, FocusRegion::FolderView,
+                "A hidden navigation pane is skipped on wraparound");
+    expectFocus(FocusRegion::Navigation, true, iconsWithoutNavigation, FocusRegion::Toolbar,
+                "A newly hidden current region advances from its original position");
 
-    const explorer::FocusAvailability noAddressOrView{false, true, false, true, true};
-    expectFocus(std::nullopt, false, noAddressOrView, FocusRegion::Search,
-                "Unknown forward focus skips an unavailable address region");
-    expectFocus(FocusRegion::Search, false, noAddressOrView, FocusRegion::CommandBand,
-                "Forward focus skips a missing native folder view");
-    expectFocus(FocusRegion::CommandBand, true, noAddressOrView, FocusRegion::Search,
-                "Backward focus skips a missing native folder view");
+    const explorer::FocusAvailability noNativeFrame{false, false, false, true, false};
+    expectFocus(std::nullopt, false, noNativeFrame, FocusRegion::Toolbar,
+                "A toolbar remains usable when the native view/frame is unavailable");
+    expectFocus(FocusRegion::Toolbar, true, noNativeFrame, FocusRegion::Toolbar,
+                "The sole available region is its own backward cycle");
 
     const explorer::FocusAvailability none{false, false, false, false, false};
     for (const auto region : forward) {
@@ -253,12 +251,11 @@ void focusCycleOrderAndAvailability() {
     expectFocus(std::nullopt, false, none, std::nullopt, "Unknown focus with an empty set stays empty");
     expectFocus(std::nullopt, true, none, std::nullopt, "Unknown backward focus with an empty set stays empty");
 }
-
 void focusCycleSubsetInvariants() {
     using explorer::FocusRegion;
     constexpr std::array regions{
-        FocusRegion::Address, FocusRegion::Search, FocusRegion::FolderView,
-        FocusRegion::CommandBand, FocusRegion::Navigation};
+        FocusRegion::FolderView, FocusRegion::Sorting, FocusRegion::Status,
+        FocusRegion::Toolbar, FocusRegion::Navigation};
     auto require = [](bool passed, const char* description) {
         ++assertions;
         if (!passed) throw std::runtime_error(description);
@@ -330,7 +327,3 @@ int runInputTests() {
               << '/' << tests.size() << " headless groups; " << assertions << " assertions\n";
     return failures;
 }
-
-#ifdef EXPLORER_INPUT_TEST_STANDALONE
-int main() { return runInputTests(); }
-#endif

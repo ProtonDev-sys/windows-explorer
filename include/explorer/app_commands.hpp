@@ -54,6 +54,11 @@ struct AppCommandCapability {
     // Missing component, unavailable native state, E_PENDING and applicability
     // are kept separate from a successfully queried disabled provider.
     HRESULT status = HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+    // The slow-state attempt has settled for this exact capability generation.
+    // Start failures also settle an attempt; ERROR_BUSY remains retryable. Its
+    // actual provider status may still be E_PENDING: completion is not a
+    // successful native state or permission to enable/invoke the command.
+    bool slowStateCompleted = false;
     // Exact default-selection-menu fallback selected by this query. Empty for
     // actual registered/background/Ribbon-only state routes; never inferred
     // later from an arbitrary CommandStore name.

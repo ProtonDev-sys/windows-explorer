@@ -1,5 +1,7 @@
 #include "explorer/search.hpp"
 #include "file_security.hpp"
+#include "saved_search_internal.hpp"
+#include "search_scope_internal.hpp"
 #include <shlobj.h>
 #include <shlguid.h>
 #include <structuredquery.h>
@@ -11,6 +13,7 @@
 #include <array>
 #include <algorithm>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <new>
 #include <string_view>
@@ -62,11 +65,7 @@ HRESULT validateLiveCondition(ICondition* condition, unsigned depth, unsigned& c
         hr = condition->GetComparisonInfo(&rawProperty, &operation, &value.value);
         TaskString property(rawProperty);
         if (FAILED(hr)) return hr;
-        // Explicit filename word-prefix conditions remain unsupported until
-        // live and saved native fixture compatibility is established. Inspect
-        // the AST so quoted "$<" text and implicit/default terms still work.
-        return operation == COP_WORD_STARTSWITH && rawProperty &&
-               _wcsicmp(rawProperty, L"System.FileName") == 0 ? unsupported : S_OK;
+        return S_OK;
     }
     if (type == CT_NOT_CONDITION) {
         ComPtr<ICondition> child;
@@ -167,6 +166,66 @@ HRESULT filesystemScope(IShellItem* scope, std::wstring& path) {
     return S_OK;
 }
 
+HRESULT canonicalScopePath(IShellItem* scope, std::wstring& path) {
+    auto hr = filesystemScope(scope, path);
+    if (FAILED(hr)) return hr;
+    const auto needed = GetLongPathNameW(path.c_str(), nullptr, 0);
+    if (!needed) return HRESULT_FROM_WIN32(GetLastError() ? GetLastError() : ERROR_INVALID_NAME);
+    if (needed > 32768) return unsupported;
+    std::wstring canonical(needed, L'\0');
+    const auto copied = GetLongPathNameW(path.c_str(), canonical.data(), needed);
+    if (!copied || copied >= needed) return HRESULT_FROM_WIN32(GetLastError() ? GetLastError() : ERROR_INSUFFICIENT_BUFFER);
+    canonical.resize(copied);
+    while (canonical.size() > 3 && (canonical.back() == L'\\' || canonical.back() == L'/')) canonical.pop_back();
+    path = std::move(canonical); return S_OK;
+}
+
+HRESULT protectiveGuardRequired(const std::vector<SearchScopeRule>& rules, bool& required) {
+    if (rules.empty() || rules.size() > 256) return unsupported;
+    bool included = false, candidate = false, excluded = false;
+    for (const auto& rule : rules) {
+        if (!rule.folder) return E_INVALIDARG;
+        included = included || !rule.excluded;
+        excluded = excluded || rule.excluded;
+        candidate = candidate || (rule.excluded && !rule.recursive);
+    }
+    if (!included) return unsupported;
+    if (!excluded) { required = false; return S_OK; }
+    std::vector<std::wstring> paths(rules.size());
+    for (size_t i = 0; i < rules.size(); ++i) {
+        const auto& rule = rules[i];
+        // A virtual recursive include remains supported with ordinary physical
+        // recursive exclusions. Only a required protective guard needs every
+        // include to have a complete physical domain.
+        if (FAILED(canonicalScopePath(rule.folder.Get(), paths[i]))) paths[i].clear();
+    }
+    for (size_t i = 0; i < rules.size(); ++i) {
+        const auto& rule = rules[i];
+        if (!rule.excluded) continue;
+        ComPtr<IShellItem> parent; std::wstring parentPath;
+        if (std::any_of(rules.begin(), rules.end(), [](const auto& include) { return !include.excluded && !include.recursive; })) {
+            const auto hr = rule.folder->GetParent(&parent);
+            if (FAILED(hr)) return hr;
+            if (FAILED(canonicalScopePath(parent.Get(), parentPath))) parentPath.clear();
+        }
+        for (size_t j = 0; j < rules.size(); ++j) {
+            const auto& include = rules[j];
+            if (include.excluded) continue;
+            int comparison = 1;
+            auto hr = rule.folder->Compare(include.folder.Get(), SICHINT_CANONICAL, &comparison);
+            if (FAILED(hr)) return hr;
+            if (comparison == 0 || (!paths[i].empty() && !paths[j].empty() &&
+                CompareStringOrdinal(paths[i].c_str(), -1, paths[j].c_str(), -1, TRUE) == CSTR_EQUAL)) candidate = true;
+            if (include.recursive) continue;
+            hr = parent->Compare(include.folder.Get(), SICHINT_CANONICAL, &comparison);
+            if (FAILED(hr)) return hr;
+            if (comparison == 0 || (!parentPath.empty() && !paths[j].empty() &&
+                CompareStringOrdinal(parentPath.c_str(), -1, paths[j].c_str(), -1, TRUE) == CSTR_EQUAL)) candidate = true;
+        }
+    }
+    required = candidate; return S_OK;
+}
+
 HRESULT normalizedScopes(IShellItemArray* source, IShellItemArray** result) {
     if (!source) return E_INVALIDARG;
     DWORD count = 0;
@@ -255,10 +314,6 @@ HRESULT normalizeRules(const std::vector<SearchScopeRule>& source, std::vector<S
     bool included = false;
     for (const auto& rule : source) {
         if (!rule.folder) return E_INVALIDARG;
-        // Shallow exclusions are documented, but the native unindexed loader
-        // does not give them the same membership as a direct-path condition.
-        // Do not create an editable saved search with divergent behavior.
-        if (rule.excluded && !rule.recursive) return unsupported;
         ComPtr<IShellItemArray> single, normalized;
         auto hr = SHCreateShellItemArrayFromShellItem(rule.folder.Get(), IID_PPV_ARGS(&single));
         if (SUCCEEDED(hr)) hr = normalizedScopes(single.Get(), &normalized);
@@ -281,20 +336,15 @@ HRESULT normalizeRules(const std::vector<SearchScopeRule>& source, std::vector<S
         std::wstring path;
         const auto hr = filesystemScope(rule.folder.Get(), path);
         if (FAILED(hr)) return hr;
-        if (rule.excluded) for (const auto& includedRule : result) {
-            if (includedRule.excluded) continue;
-            int order = 0;
-            if (SUCCEEDED(rule.folder->Compare(includedRule.folder.Get(), SICHINT_CANONICAL, &order)) && order == 0)
-                return unsupported;
-            if (!includedRule.recursive) {
-                ComPtr<IShellItem> parent;
-                if (SUCCEEDED(rule.folder->GetParent(&parent)) &&
-                    SUCCEEDED(parent->Compare(includedRule.folder.Get(), SICHINT_CANONICAL, &order)) && order == 0)
-                    return unsupported;
-            }
-        }
     }
-    return included ? S_OK : unsupported;
+    if (!included) return unsupported;
+    bool guarded = false;
+    auto hr = protectiveGuardRequired(result, guarded);
+    if (SUCCEEDED(hr) && guarded) for (const auto& rule : result) {
+        std::wstring path;
+        if (FAILED(hr = canonicalScopePath(rule.folder.Get(), path))) return hr;
+    }
+    return hr;
 }
 
 HRESULT includedArray(const std::vector<SearchScopeRule>& rules, IShellItemArray** result) {
@@ -313,17 +363,19 @@ HRESULT includedArray(const std::vector<SearchScopeRule>& rules, IShellItemArray
     return SHCreateShellItemArrayFromIDLists(static_cast<UINT>(pidls.size()), pidls.data(), result);
 }
 
-HRESULT scopeDomain(IConditionFactory2* factory, const SearchScopeRule& rule, ICondition** result) {
+HRESULT scopeDomain(IConditionFactory2* factory, const SearchScopeRule& rule, ICondition** result, bool canonicalGuard = false) {
     std::wstring path;
-    auto hr = filesystemScope(rule.folder.Get(), path);
+    auto hr = canonicalGuard ? canonicalScopePath(rule.folder.Get(), path) : filesystemScope(rule.folder.Get(), path);
     if (FAILED(hr)) return hr;
     // Match the provider's canonical long filesystem paths, including when
     // the supplied scope used an existing 8.3 alias.
-    const auto needed = GetLongPathNameW(path.c_str(), nullptr, 0);
-    if (needed && needed <= 32768) {
-        std::wstring canonical(needed, L'\0');
-        const auto copied = GetLongPathNameW(path.c_str(), canonical.data(), needed);
-        if (copied && copied < needed) { canonical.resize(copied); path = std::move(canonical); }
+    if (!canonicalGuard) {
+        const auto needed = GetLongPathNameW(path.c_str(), nullptr, 0);
+        if (needed && needed <= 32768) {
+            std::wstring canonical(needed, L'\0');
+            const auto copied = GetLongPathNameW(path.c_str(), canonical.data(), needed);
+            if (copied && copied < needed) { canonical.resize(copied); path = std::move(canonical); }
+        }
     }
     std::vector<ComPtr<ICondition>> owned;
     std::vector<ICondition*> children;
@@ -331,7 +383,8 @@ HRESULT scopeDomain(IConditionFactory2* factory, const SearchScopeRule& rule, IC
         Variant value;
         auto made = InitPropVariantFromString(text.c_str(), &value.value);
         ComPtr<ICondition> condition;
-        if (SUCCEEDED(made)) made = factory->MakeLeaf(property, operation, nullptr, &value.value,
+        if (SUCCEEDED(made)) made = factory->MakeLeaf(property, operation,
+            canonicalGuard ? L"System.StructuredQueryType.String" : nullptr, &value.value,
             nullptr, nullptr, nullptr, FALSE, &condition);
         if (SUCCEEDED(made)) { children.push_back(condition.Get()); owned.push_back(std::move(condition)); }
         return made;
@@ -348,13 +401,142 @@ HRESULT scopeDomain(IConditionFactory2* factory, const SearchScopeRule& rule, IC
         CONDITION_CREATION_DEFAULT, IID_PPV_ARGS(result));
 }
 
+HRESULT scopeGuard(const std::vector<SearchScopeRule>& rules, ICondition** result) {
+    bool ignored = false;
+    auto hr = protectiveGuardRequired(rules, ignored);
+    if (FAILED(hr)) return hr;
+    ComPtr<IConditionFactory2> factory;
+    hr = CoCreateInstance(__uuidof(ConditionFactory), nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory));
+    if (FAILED(hr)) return hr;
+    std::array<std::vector<ComPtr<ICondition>>, 2> domains;
+    for (const auto& rule : rules) {
+        ComPtr<ICondition> domain;
+        if (FAILED(hr = scopeDomain(factory.Get(), rule, &domain, true))) return hr;
+        domains[rule.excluded ? 1 : 0].push_back(std::move(domain));
+    }
+    std::vector<ComPtr<ICondition>> clauses;
+    for (unsigned exclude = 0; exclude < domains.size(); ++exclude) {
+        if (domains[exclude].empty()) continue;
+        ComPtr<ICondition> combined;
+        if (domains[exclude].size() == 1) combined = domains[exclude].front();
+        else {
+            std::vector<ICondition*> raw;
+            for (const auto& domain : domains[exclude]) raw.push_back(domain.Get());
+            if (FAILED(hr = factory->CreateCompoundFromArray(CT_OR_CONDITION, raw.data(), static_cast<ULONG>(raw.size()),
+                CONDITION_CREATION_DEFAULT, IID_PPV_ARGS(&combined)))) return hr;
+        }
+        if (exclude) {
+            ComPtr<ICondition> inverse;
+            if (FAILED(hr = factory->MakeNot(combined.Get(), FALSE, &inverse))) return hr;
+            combined = std::move(inverse);
+        }
+        clauses.push_back(std::move(combined));
+    }
+    if (clauses.size() == 1) return clauses.front().CopyTo(result);
+    std::vector<ICondition*> raw;
+    for (const auto& clause : clauses) raw.push_back(clause.Get());
+    return factory->CreateCompoundFromArray(CT_AND_CONDITION, raw.data(), static_cast<ULONG>(raw.size()),
+        CONDITION_CREATION_DEFAULT, IID_PPV_ARGS(result));
+}
+
+HRESULT guardChildren(ICondition* condition, std::vector<ComPtr<ICondition>>& result) {
+    CONDITION_TYPE type{};
+    auto hr = condition->GetConditionType(&type); if (FAILED(hr)) return hr;
+    if (type == CT_NOT_CONDITION) {
+        ComPtr<ICondition> child;
+        hr = condition->GetSubConditions(IID_PPV_ARGS(&child));
+        if (SUCCEEDED(hr) && child) result.push_back(std::move(child));
+        return FAILED(hr) ? hr : result.empty() ? unsupported : S_OK;
+    }
+    if (type != CT_AND_CONDITION && type != CT_OR_CONDITION) return unsupported;
+    ComPtr<IEnumUnknown> enumeration;
+    hr = condition->GetSubConditions(IID_PPV_ARGS(&enumeration)); if (FAILED(hr)) return hr;
+    for (;;) {
+        ComPtr<IUnknown> unknown;
+        hr = enumeration->Next(1, &unknown, nullptr);
+        if (hr == S_FALSE) break;
+        if (FAILED(hr)) return hr;
+        if (!unknown || result.size() == 4096) return unsupported;
+        ComPtr<ICondition> child;
+        if (FAILED(hr = unknown.As(&child))) return hr;
+        result.push_back(std::move(child));
+    }
+    return result.empty() ? unsupported : S_OK;
+}
+
+HRESULT guardSignature(ICondition* condition, std::wstring& result, unsigned& nodes, unsigned depth = 0) {
+    constexpr size_t maximumSignature = 4 * 1024 * 1024;
+    if (!condition || depth > 64 || ++nodes > 4096) return unsupported;
+    CONDITION_TYPE type{};
+    auto hr = condition->GetConditionType(&type); if (FAILED(hr)) return hr;
+    const auto field = [&](std::wstring_view value) { result += std::to_wstring(value.size()) + L":"; result += value; };
+    if (type == CT_LEAF_CONDITION) {
+        PWSTR rawProperty = nullptr, rawSemantic = nullptr;
+        CONDITION_OPERATION operation{}; Variant value;
+        hr = condition->GetComparisonInfo(&rawProperty, &operation, &value.value); TaskString property(rawProperty);
+        if (FAILED(hr)) return hr;
+        hr = condition->GetValueType(&rawSemantic); TaskString semantic(rawSemantic);
+        if (FAILED(hr)) return hr;
+        if ((rawProperty && wcslen(rawProperty) > 32768) || (rawSemantic && wcslen(rawSemantic) > 32768)) return unsupported;
+        std::wstring canonical = rawProperty ? rawProperty : L"";
+        std::transform(canonical.begin(), canonical.end(), canonical.begin(), [](wchar_t code) { return static_cast<wchar_t>(towlower(code)); });
+        result = L"3{"; result += rawProperty ? L"1:" : L"0:"; field(canonical);
+        result += rawSemantic ? L"1:" : L"0:"; field(rawSemantic ? rawSemantic : L"");
+        result += std::to_wstring(operation) + L":" + std::to_wstring(value.value.vt) + L":";
+        SERIALIZEDPROPERTYVALUE* bytes = nullptr; ULONG count = 0;
+        hr = StgSerializePropVariant(&value.value, &bytes, &count);
+        const std::unique_ptr<SERIALIZEDPROPERTYVALUE, decltype(&CoTaskMemFree)> storage(bytes, &CoTaskMemFree);
+        if (FAILED(hr)) return hr;
+        if ((!bytes && count) || count > maximumSignature / 2) return unsupported;
+        constexpr wchar_t hex[] = L"0123456789abcdef";
+        const auto data = reinterpret_cast<const BYTE*>(bytes);
+        for (ULONG i = 0; i < count; ++i) { result += hex[data[i] >> 4]; result += hex[data[i] & 15]; }
+        result += L"}"; return result.size() > maximumSignature ? unsupported : S_OK;
+    }
+    std::vector<std::wstring> signatures;
+    std::function<HRESULT(ICondition*, unsigned)> append = [&](ICondition* child, unsigned level) -> HRESULT {
+        if (!child || level > 64 || ++nodes > 4096) return unsupported;
+        CONDITION_TYPE childType{}; auto status = child->GetConditionType(&childType); if (FAILED(status)) return status;
+        if (type != CT_NOT_CONDITION && childType == type) {
+            std::vector<ComPtr<ICondition>> nested;
+            if (FAILED(status = guardChildren(child, nested))) return status;
+            for (const auto& node : nested) if (FAILED(status = append(node.Get(), level + 1))) return status;
+            return S_OK;
+        }
+        std::wstring signature;
+        status = guardSignature(child, signature, nodes, level);
+        if (SUCCEEDED(status)) signatures.push_back(std::move(signature));
+        return status;
+    };
+    std::vector<ComPtr<ICondition>> children;
+    if (FAILED(hr = guardChildren(condition, children))) return hr;
+    for (const auto& child : children) if (FAILED(hr = append(child.Get(), depth + 1))) return hr;
+    if (type != CT_NOT_CONDITION) {
+        std::sort(signatures.begin(), signatures.end());
+        signatures.erase(std::unique(signatures.begin(), signatures.end()), signatures.end());
+        if (signatures.size() == 1) { result = std::move(signatures.front()); return S_OK; }
+    }
+    result = std::to_wstring(type) + L"{";
+    for (const auto& signature : signatures) { field(signature); if (result.size() > maximumSignature) return unsupported; }
+    result += L"}"; return S_OK;
+}
+
 HRESULT restrictToRules(ICondition* query, const std::vector<SearchScopeRule>& rules, ICondition** result) {
     const bool mixed = std::any_of(rules.begin(), rules.end(), [](const SearchScopeRule& rule) { return !rule.excluded && !rule.recursive; });
     const bool excluded = std::any_of(rules.begin(), rules.end(), [](const SearchScopeRule& rule) { return rule.excluded; });
     if (!mixed && !excluded) return query->QueryInterface(IID_PPV_ARGS(result));
-    ComPtr<IConditionFactory2> factory;
-    auto hr = CoCreateInstance(__uuidof(ConditionFactory), nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory));
+    bool guarded = false;
+    auto hr = protectiveGuardRequired(rules, guarded);
     if (FAILED(hr)) return hr;
+    ComPtr<IConditionFactory2> factory;
+    hr = CoCreateInstance(__uuidof(ConditionFactory), nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory));
+    if (FAILED(hr)) return hr;
+    if (guarded) {
+        ComPtr<ICondition> guard;
+        if (FAILED(hr = scopeGuard(rules, &guard))) return hr;
+        ICondition* clauses[]{query, guard.Get()};
+        return factory->CreateCompoundFromArray(CT_AND_CONDITION, clauses, 2, CONDITION_CREATION_DEFAULT, IID_PPV_ARGS(result));
+    }
     std::vector<ComPtr<ICondition>> includedDomains, excludedDomains, owned;
     std::vector<ICondition*> clauses{query};
     for (const auto& rule : rules) {
@@ -457,15 +639,13 @@ HRESULT conditionXml(ICondition* condition, std::wstring& xml, unsigned depth, u
         hr = condition->GetValueType(&rawType);
         TaskString semanticType(rawType);
         if (FAILED(hr)) return hr;
-        const bool genericStringToken = rawProperty && _wcsicmp(rawProperty, L"System.Generic.String") == 0 &&
-                                        rawType && wcscmp(rawType, L"System.StructuredQueryType.Blurb") == 0;
-        if (!rawProperty || (genericStringToken && !genericResolved)) {
+        const bool parserStringToken = rawType && wcscmp(rawType, L"System.StructuredQueryType.Blurb") == 0;
+        if (!rawProperty || (parserStringToken && !genericResolved)) {
             if (!resolver || genericResolved) return unsupported;
-            // Resolve only the generic leaf with its original parser context.
-            // Restated Generic.String leaves also carry parser-dependent Blurb
-            // tokens; resolve those before a search is saved a second time.
-            // Named siblings, especially relative-date expressions, retain
-            // their unresolved representation for evaluation when reopened.
+            // Generic and named Blurb tokens require their original parser
+            // context. FileExtension, for example, resolves to a String leaf;
+            // emitting its unresolved Blurb value makes the loader return no
+            // results. Date siblings retain their unresolved representation.
             ComPtr<ICondition> resolved;
             hr = resolver->Resolve(condition,
                 static_cast<STRUCTURED_QUERY_RESOLVE_OPTION>(SQRO_DONT_SPLIT_WORDS | SQRO_DONT_RESOLVE_DATETIME),
@@ -499,6 +679,7 @@ HRESULT conditionXml(ICondition* condition, std::wstring& xml, unsigned depth, u
             xml += L"</condition>\r\n";
             return S_OK;
         }
+        if (rawType && !saved_search_internal::supportedValueType(rawType)) return unsupported;
         const auto* op = xmlOperator(operation);
         const wchar_t* text = nullptr;
         if (value.value.vt == VT_LPWSTR) text = value.value.pwszVal;
@@ -661,6 +842,28 @@ HRESULT writeContents(HANDLE file, const std::string& bytes) {
     }
     if (SUCCEEDED(hr) && !FlushFileBuffers(file)) hr = HRESULT_FROM_WIN32(GetLastError());
     return hr;
+}
+
+HRESULT filePropertiesXml(const SearchFileProperties& properties, std::wstring& xml) {
+    xml += L"<properties>\r\n";
+    const auto field = [&](const wchar_t* name, const std::optional<std::wstring>& value) -> HRESULT {
+        if (!value) return S_OK;
+        if (value->size() > maximumQueryLength) return E_INVALIDARG;
+        xml += L"<" + std::wstring(name) + L">";
+        // Escaping whitespace also avoids XML end-of-line normalization
+        // changing an imported literal value on the following read.
+        const auto hr = xmlAttribute(*value, xml);
+        if (FAILED(hr)) return hr;
+        xml += L"</" + std::wstring(name) + L">\r\n";
+        return S_OK;
+    };
+    auto hr = field(L"author", properties.author);
+    if (SUCCEEDED(hr)) hr = field(L"kind", properties.kind);
+    if (SUCCEEDED(hr)) hr = field(L"description", properties.description);
+    if (SUCCEEDED(hr)) hr = field(L"tags", properties.tags);
+    if (FAILED(hr)) return hr;
+    xml += L"</properties>\r\n";
+    return S_OK;
 }
 HRESULT writeNewFile(const std::filesystem::path& path, const std::string& bytes) {
     SaveFile file;
@@ -938,6 +1141,30 @@ HRESULT nativeSearchViewPresentation(const SearchViewPresentation& actual, Searc
     } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
 }
 
+HRESULT search_scope_internal::requiresProtectiveGuard(const std::vector<SearchScopeRule>& rules, bool* required) {
+    if (!required) return E_POINTER;
+    try { bool candidate = false; const auto hr = protectiveGuardRequired(rules, candidate); if (SUCCEEDED(hr)) *required = candidate; return hr; }
+    catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
+}
+
+HRESULT search_scope_internal::createScopeGuard(const std::vector<SearchScopeRule>& rules, ICondition** result) {
+    if (!result) return E_POINTER;
+    try { ComPtr<ICondition> guard; const auto hr = scopeGuard(rules, &guard); return FAILED(hr) ? hr : guard.CopyTo(result); }
+    catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
+}
+
+HRESULT search_scope_internal::sameScopeGuard(ICondition* expected, ICondition* actual, bool* same) {
+    if (!same) return E_POINTER;
+    if (!expected || !actual) return E_INVALIDARG;
+    try {
+        std::wstring first, second; unsigned nodes = 0;
+        auto hr = guardSignature(expected, first, nodes); if (FAILED(hr)) return hr;
+        nodes = 0; hr = guardSignature(actual, second, nodes);
+        if (SUCCEEDED(hr)) *same = first == second;
+        return hr;
+    } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
+}
+
 HRESULT createSearchFolder(const std::wstring& query, IShellItem* scope, IShellItem** result, bool recursive) {
     if (!result) return E_POINTER;
     *result = nullptr;
@@ -999,28 +1226,28 @@ HRESULT createSearchFolderForScopeRules(const std::wstring& query,
 
 HRESULT saveSearch(const std::wstring& query, IShellItem* scope, bool recursive,
                    const std::filesystem::path& path, SearchSaveMode mode,
-                   const SearchViewPresentation* presentation) {
+                   const SearchViewPresentation* presentation, const SearchFileProperties* fileProperties) {
     ComPtr<IShellItem> item;
     auto hr = validatedScope(scope, &item);
     if (FAILED(hr)) return hr;
     ComPtr<IShellItemArray> scopes;
     hr = SHCreateShellItemArrayFromShellItem(item.Get(), IID_PPV_ARGS(&scopes));
-    return FAILED(hr) ? hr : saveSearchForScopes(query, scopes.Get(), recursive, path, mode, presentation);
+    return FAILED(hr) ? hr : saveSearchForScopes(query, scopes.Get(), recursive, path, mode, presentation, fileProperties);
 }
 
 HRESULT saveSearchForScopes(const std::wstring& query, IShellItemArray* scopes, bool recursive,
                             const std::filesystem::path& path, SearchSaveMode mode,
-                            const SearchViewPresentation* presentation) {
+                            const SearchViewPresentation* presentation, const SearchFileProperties* fileProperties) {
     try {
         std::vector<SearchScopeRule> rules;
         const auto hr = rulesFromArray(scopes, recursive, rules);
-        return FAILED(hr) ? hr : saveSearchForScopeRules(query, rules, path, mode, presentation);
+        return FAILED(hr) ? hr : saveSearchForScopeRules(query, rules, path, mode, presentation, fileProperties);
     } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
 }
 
 HRESULT saveSearchForScopeRules(const std::wstring& query, const std::vector<SearchScopeRule>& scopes,
                                const std::filesystem::path& path, SearchSaveMode mode,
-                               const SearchViewPresentation* presentation) {
+                               const SearchViewPresentation* presentation, const SearchFileProperties* fileProperties) {
     try {
         if (mode != SearchSaveMode::CreateNew && mode != SearchSaveMode::UserConfirmed) return E_INVALIDARG;
         if (path.empty() || path.native().find(L'\0') != std::wstring::npos) return E_INVALIDARG;
@@ -1040,6 +1267,26 @@ HRESULT saveSearchForScopeRules(const std::wstring& query, const std::vector<Sea
         ComPtr<IQueryParser> parser;
         hr = parseQuery(text, false, &condition, &resolver, &parser);
         if (FAILED(hr)) return hr;
+        bool guarded = false;
+        if (FAILED(hr = protectiveGuardRequired(searchScopes, guarded))) return hr;
+        if (guarded) {
+            ComPtr<ICondition> guard;
+            if (FAILED(hr = scopeGuard(searchScopes, &guard))) return hr;
+            // Keep a recognizable two-child boundary around the original
+            // condition. Never simplify or freeze its relative-date context.
+            bool indistinguishable = false;
+            if (FAILED(hr = search_scope_internal::sameScopeGuard(guard.Get(), condition.Get(), &indistinguishable))) return hr;
+            if (indistinguishable) return unsupported;
+            ComPtr<IConditionFactory2> factory;
+            hr = CoCreateInstance(__uuidof(ConditionFactory), nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory));
+            if (FAILED(hr)) return hr;
+            ICondition* branches[]{condition.Get(), guard.Get()};
+            ComPtr<ICondition> protectedQuery;
+            hr = factory->CreateCompoundFromArray(CT_AND_CONDITION, branches, 2,
+                CONDITION_CREATION_DEFAULT, IID_PPV_ARGS(&protectedQuery));
+            if (FAILED(hr)) return hr;
+            condition = std::move(protectedQuery);
+        }
         SearchViewPresentation defaultPresentation;
         defaultPresentation.mode = SearchViewMode::Details;
         defaultPresentation.iconSize = 16;
@@ -1087,11 +1334,16 @@ HRESULT saveSearchForScopeRules(const std::wstring& query, const std::vector<Sea
         if (FAILED(hr)) return hr;
         // Windows 10's loader requires an explicit kind union even when the
         // query does not narrow file kinds. "item" includes every item kind.
-        xml += L"</conditions>\r\n<kindList><kind name=\"item\"/></kindList>\r\n"
-               L"</query>\r\n</persistedQuery>\r\n";
+        xml += L"</conditions>\r\n<kindList><kind name=\"item\"/></kindList>\r\n</query>\r\n";
+        if (fileProperties && FAILED(hr = filePropertiesXml(*fileProperties, xml))) return hr;
+        xml += L"</persistedQuery>\r\n";
         std::string bytes;
         hr = xmlBytes(xml, bytes);
         if (FAILED(hr)) return hr;
+        // Generated files must respect the reader's resource limits, even
+        // for large scopes and escaped property values. Unsupported native
+        // semantic shapes still remain available through the native viewer.
+        if (FAILED(hr = saved_search_internal::validateSerializedLimits(bytes))) return hr;
         bool replaced = false;
         hr = mode == SearchSaveMode::CreateNew ? writeNewFile(path, bytes) : writeConfirmedFile(path, bytes, replaced);
         if (SUCCEEDED(hr)) {

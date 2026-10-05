@@ -1,6 +1,8 @@
 #include "explorer/ribbon.hpp"
 #include "explorer/commands.hpp"
 #include "explorer/namespace_actions.hpp"
+#include "explorer/headless_visual.hpp"
+#include "state_file.hpp"
 
 #include <UIRibbonPropertyHelpers.h>
 #include <propvarutil.h>
@@ -30,13 +32,186 @@ struct Variant {
 
 struct TabSelection {
     HWND window = nullptr;
+    HWND ribbonWindow = nullptr;
+    UINT nativeCommand = 0;
+    UINT commandType = UI_COMMANDTYPE_UNKNOWN;
     std::wstring name;
     std::wstring desktop;
     HANDLE done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     std::atomic<HRESULT> result{E_PENDING};
     std::atomic<bool> cancelled{false};
+    bool searchDateMenu = false;
+    std::vector<std::wstring> expectedRows;
+    UINT matchedRows = 0;
+    NativePopupCapture popup;
     ~TabSelection() { if(done)CloseHandle(done); }
 };
+
+HRESULT expandNativeSearchDateMenu(IUIAutomation* automation, TabSelection& request) {
+    request.popup.stage=1;
+    request.popup.ribbonWindow=reinterpret_cast<UINT_PTR>(request.ribbonWindow);
+    request.popup.nativeCommand=request.nativeCommand;request.popup.commandType=request.commandType;
+    DWORD ribbonProcess=0;
+    const auto ribbonThread=GetWindowThreadProcessId(request.ribbonWindow,&ribbonProcess);
+    if(!request.ribbonWindow||!IsWindow(request.ribbonWindow)||ribbonProcess!=GetCurrentProcessId()||
+        ribbonThread!=GetWindowThreadProcessId(request.window,nullptr)||!IsChild(request.window,request.ribbonWindow)||
+        request.commandType!=UI_COMMANDTYPE_COLLECTION||!request.nativeCommand)return E_ACCESSDENIED;
+    if(!GetWindowRect(request.ribbonWindow,&request.popup.ribbonBounds))return HRESULT_FROM_WIN32(GetLastError());
+    ComPtr<IUIAutomationElement> ribbonRoot;
+    auto hr=automation->ElementFromHandle(request.ribbonWindow,&ribbonRoot);if(FAILED(hr))return hr;
+    ComPtr<IUIAutomationElement> root;
+    hr=automation->ElementFromHandle(request.window,&root);if(FAILED(hr))return hr;
+    VARIANT caption{};caption.vt=VT_BSTR;caption.bstrVal=SysAllocString(request.name.c_str());
+    if(!caption.bstrVal)return E_OUTOFMEMORY;
+    ComPtr<IUIAutomationCondition> named;
+    hr=automation->CreatePropertyCondition(UIA_NamePropertyId,caption,&named);VariantClear(&caption);
+    if(FAILED(hr))return hr;
+    ComPtr<IUIAutomationElementArray> candidates;
+    request.popup.stage=2;
+    hr=root->FindAll(TreeScope_Descendants,named.Get(),&candidates);if(FAILED(hr))return hr;
+    int count=0;hr=candidates?candidates->get_Length(&count):E_UNEXPECTED;if(FAILED(hr))return hr;
+    request.popup.candidateCount=static_cast<UINT>(count);
+    if(count<0||count>4096)return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+    request.popup.stage=3;
+    ComPtr<IUIAutomationTreeWalker> walker;
+    const auto walkerRead=automation->get_ControlViewWalker(&walker);
+    ComPtr<IUIAutomationTreeWalker> rawWalker;
+    const auto rawWalkerRead=automation->get_RawViewWalker(&rawWalker);
+    ComPtr<IUIAutomationExpandCollapsePattern> expand;
+    for(int index=0;index<count;++index) {
+        if(request.cancelled)return E_ABORT;
+        NativePopupCapture::ParentReadback observed;
+        ComPtr<IUIAutomationElement> candidate;BOOL enabled=FALSE,offscreen=TRUE;
+        observed.elementRead=candidates->GetElement(index,&candidate);
+        ComPtr<IUIAutomationExpandCollapsePattern> pattern;
+        ExpandCollapseState state=ExpandCollapseState_LeafNode;
+        if(SUCCEEDED(observed.elementRead)&&candidate) {
+            observed.enabledRead=candidate->get_CurrentIsEnabled(&enabled);observed.enabled=enabled!=FALSE;
+            observed.offscreenRead=candidate->get_CurrentIsOffscreen(&offscreen);observed.offscreen=offscreen!=FALSE;
+            observed.typeRead=candidate->get_CurrentControlType(&observed.type);
+            observed.boundsRead=candidate->get_CurrentBoundingRectangle(&observed.bounds);
+            BSTR automationId=nullptr;
+            observed.automationIdRead=candidate->get_CurrentAutomationId(&automationId);
+            if(SUCCEEDED(observed.automationIdRead)&&automationId)observed.automationId=automationId;
+            SysFreeString(automationId);
+            observed.patternRead=candidate->GetCurrentPatternAs(UIA_ExpandCollapsePatternId,IID_PPV_ARGS(&pattern));
+            if(SUCCEEDED(observed.patternRead)&&pattern)observed.stateRead=pattern->get_CurrentExpandCollapseState(&state);
+            observed.expandState=static_cast<int>(state);
+            observed.parentRead=walkerRead;
+            ComPtr<IUIAutomationElement> parent;
+            if(SUCCEEDED(observed.parentRead))observed.parentRead=walker?walker->GetParentElement(candidate.Get(),&parent):E_UNEXPECTED;
+            if(SUCCEEDED(observed.parentRead))observed.parentRead=parent?parent->get_CurrentControlType(&observed.parentType):E_UNEXPECTED;
+            if(SUCCEEDED(observed.parentRead))observed.parentRead=parent->get_CurrentBoundingRectangle(&observed.parentBounds);
+            BSTR parentName=nullptr;
+            if(SUCCEEDED(observed.parentRead))observed.parentRead=parent->get_CurrentName(&parentName);
+            observed.parentSameName=SUCCEEDED(observed.parentRead)&&parentName&&request.name==parentName;
+            SysFreeString(parentName);
+            const auto contains=[](const RECT& outer,const RECT& inner) {
+                return inner.right>inner.left&&inner.bottom>inner.top&&inner.left>=outer.left&&
+                    inner.top>=outer.top&&inner.right<=outer.right&&inner.bottom<=outer.bottom;
+            };
+            observed.ribbonBoundsContain=SUCCEEDED(observed.boundsRead)&&contains(request.popup.ribbonBounds,observed.bounds);
+            observed.toolbarBoundsContain=SUCCEEDED(observed.parentRead)&&contains(observed.parentBounds,observed.bounds)&&
+                contains(request.popup.ribbonBounds,observed.parentBounds);
+            observed.ribbonAncestorRead=rawWalkerRead;
+            ComPtr<IUIAutomationElement> ancestor=candidate;
+            for(UINT depth=0;SUCCEEDED(observed.ribbonAncestorRead)&&ancestor&&depth<128;++depth) {
+                if(request.cancelled)return E_ABORT;
+                BOOL same=FALSE;
+                observed.ribbonAncestorRead=automation->CompareElements(ancestor.Get(),ribbonRoot.Get(),&same);
+                if(FAILED(observed.ribbonAncestorRead))break;
+                if(same){observed.ribbonAncestor=true;break;}
+                ComPtr<IUIAutomationElement> next;
+                observed.ribbonAncestorRead=rawWalker?rawWalker->GetParentElement(ancestor.Get(),&next):E_UNEXPECTED;
+                ancestor=std::move(next);
+            }
+        }
+        // The installed Date collection's whole gallery is a SplitButton under
+        // a Ribbon toolbar. Identically named folder headers/row edits and
+        // split-button action/arrow children are outside this exact domain.
+        observed.accepted=SUCCEEDED(observed.enabledRead)&&observed.enabled&&SUCCEEDED(observed.offscreenRead)&&!observed.offscreen&&
+            SUCCEEDED(observed.typeRead)&&observed.type==UIA_SplitButtonControlTypeId&&
+            SUCCEEDED(observed.parentRead)&&observed.parentType==UIA_ToolBarControlTypeId&&!observed.parentSameName&&
+            observed.ribbonBoundsContain&&observed.toolbarBoundsContain&&SUCCEEDED(observed.ribbonAncestorRead)&&
+            observed.ribbonAncestor&&SUCCEEDED(observed.patternRead)&&pattern&&
+            SUCCEEDED(observed.stateRead)&&state!=ExpandCollapseState_LeafNode;
+        request.popup.parents.push_back(observed);
+        if(observed.accepted) {
+            // Reject ambiguous parents before any action. Filter leaves never
+            // receive Invoke, Select, focus or any other action.
+            if(expand)return E_UNEXPECTED;
+            expand=std::move(pattern);
+        }
+    }
+    request.popup.stage=4;
+    if(!expand)return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+    if(request.cancelled)return E_ABORT;
+    request.popup.stage=5;
+    hr=expand->Expand();if(FAILED(hr))return hr;
+    ComPtr<IUIAutomationCondition> everything;
+    hr=automation->CreateTrueCondition(&everything);if(FAILED(hr))return hr;
+    struct Popups {HWND host;std::vector<HWND> windows;} popups{request.window,{}};
+    const auto collect=[](HWND popup,LPARAM value)->BOOL {
+        auto& found=*reinterpret_cast<Popups*>(value);DWORD process=0;GetWindowThreadProcessId(popup,&process);
+        if(process==GetCurrentProcessId()&&popup!=found.host&&IsWindowVisible(popup)&&
+            GetAncestor(popup,GA_ROOTOWNER)==found.host)found.windows.push_back(popup);
+        return TRUE;
+    };
+    const auto deadline=GetTickCount64()+2000;
+    request.popup.stage=6;
+    do {
+        if(request.cancelled)return E_ABORT;
+        ExpandCollapseState state=ExpandCollapseState_LeafNode;
+        hr=expand->get_CurrentExpandCollapseState(&state);if(FAILED(hr))return hr;
+        popups.windows.clear();
+        EnumThreadWindows(GetWindowThreadProcessId(request.window,nullptr),collect,reinterpret_cast<LPARAM>(&popups));
+        request.matchedRows=0;
+        NativePopupCapture completePopup;
+        for(const auto popup:popups.windows) {
+            RECT popupBounds{};
+            if(!GetWindowRect(popup,&popupBounds))continue;
+            std::vector<bool> matched(request.expectedRows.size(),false);
+            std::vector<RECT> matchedBounds(request.expectedRows.size());
+            ComPtr<IUIAutomationElement> popupRoot;
+            if(FAILED(automation->ElementFromHandle(popup,&popupRoot))||!popupRoot)continue;
+            ComPtr<IUIAutomationElementArray> rows;
+            if(FAILED(popupRoot->FindAll(TreeScope_Descendants,everything.Get(),&rows))||!rows)continue;
+            int rowCount=0;hr=rows->get_Length(&rowCount);if(FAILED(hr))return hr;
+            for(int index=0;index<rowCount;++index) {
+                if(request.cancelled)return E_ABORT;
+                ComPtr<IUIAutomationElement> row;BOOL offscreen=TRUE;RECT bounds{};CONTROLTYPEID type=0;
+                if(FAILED(rows->GetElement(index,&row))||!row||FAILED(row->get_CurrentControlType(&type))||
+                    (type!=UIA_MenuItemControlTypeId&&type!=UIA_ListItemControlTypeId&&type!=UIA_ButtonControlTypeId)||
+                    FAILED(row->get_CurrentIsOffscreen(&offscreen))||offscreen||
+                    FAILED(row->get_CurrentBoundingRectangle(&bounds))||bounds.right<=bounds.left||bounds.bottom<=bounds.top||
+                    bounds.left<popupBounds.left||bounds.top<popupBounds.top||
+                    bounds.right>popupBounds.right||bounds.bottom>popupBounds.bottom)continue;
+                BSTR name=nullptr;
+                if(SUCCEEDED(row->get_CurrentName(&name))&&name)
+                    for(size_t wanted=0;wanted<matched.size();++wanted)if(request.expectedRows[wanted]==name) {
+                        matched[wanted]=true;matchedBounds[wanted]=bounds;
+                    }
+                SysFreeString(name);
+            }
+            const auto matchedCount=static_cast<UINT>(std::count(matched.begin(),matched.end(),true));
+            request.matchedRows=std::max(request.matchedRows,matchedCount);
+            if(matchedCount==request.expectedRows.size()) {
+                if(completePopup.window)return E_UNEXPECTED;
+                completePopup.window=popup;completePopup.bounds=popupBounds;
+                completePopup.rowBounds=std::move(matchedBounds);
+            }
+        }
+        if(state==ExpandCollapseState_Expanded&&completePopup.window) {
+            completePopup.stage=7;completePopup.candidateCount=request.popup.candidateCount;
+            completePopup.parents=std::move(request.popup.parents);
+            completePopup.ribbonWindow=request.popup.ribbonWindow;completePopup.ribbonBounds=request.popup.ribbonBounds;
+            completePopup.nativeCommand=request.popup.nativeCommand;completePopup.commandType=request.popup.commandType;
+            request.popup=std::move(completePopup);return S_OK;
+        }
+        Sleep(10); // The creator STA continues dispatching while rows materialize.
+    }while(GetTickCount64()<deadline);
+    return HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+}
 
 HRESULT selectNativeTab(IUIAutomation* automation, const TabSelection& request) {
     if(request.cancelled)return E_ABORT;
@@ -77,12 +252,18 @@ HRESULT selectNativeTab(IUIAutomation* automation, const TabSelection& request) 
     return HRESULT_FROM_WIN32(ERROR_TIMEOUT);
 }
 
-HRESULT selectTabOnMta(HWND window,const wchar_t* name) {
+HRESULT selectTabOnMta(HWND window,const wchar_t* name,
+                       std::span<const std::wstring> expectedRows={},UINT* matchedRows=nullptr,
+                       NativePopupCapture* popup=nullptr,HWND ribbonWindow=nullptr,
+                       UINT nativeCommand=0,UINT commandType=UI_COMMANDTYPE_UNKNOWN) {
     // Microsoft requires own-UI automation to run on a separate windowless MTA.
     // Only HWND/name cross apartments; no Ribbon COM object leaves its STA.
     auto request=std::make_shared<TabSelection>();
     if(!request->done)return HRESULT_FROM_WIN32(GetLastError());
     request->window=window;request->name=name;
+    request->ribbonWindow=ribbonWindow;request->nativeCommand=nativeCommand;request->commandType=commandType;
+    request->searchDateMenu=!expectedRows.empty();
+    request->expectedRows.assign(expectedRows.begin(),expectedRows.end());
     wchar_t desktopName[256]{};DWORD bytes=0;
     if(!GetUserObjectInformationW(GetThreadDesktop(GetCurrentThreadId()),UOI_NAME,desktopName,sizeof(desktopName),&bytes))
         return HRESULT_FROM_WIN32(GetLastError());
@@ -100,7 +281,8 @@ HRESULT selectTabOnMta(HWND window,const wchar_t* name) {
                 result=CoCreateInstance(CLSID_CUIAutomation8,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&automation));
                 if(SUCCEEDED(result)) {
                     automation->put_ConnectionTimeout(1000);automation->put_TransactionTimeout(2000);automation->put_AutoSetFocus(FALSE);
-                    result=selectNativeTab(automation.Get(),*request);
+                    result=request->searchDateMenu?expandNativeSearchDateMenu(automation.Get(),*request):
+                        selectNativeTab(automation.Get(),*request);
                 }
             }
             CoDisableCallCancellation(nullptr);CoUninitialize();
@@ -135,10 +317,27 @@ HRESULT selectTabOnMta(HWND window,const wchar_t* name) {
         }
     }
     if(complete)worker.join();else worker.detach();
+    if(complete&&matchedRows)*matchedRows=request->matchedRows;
+    if(complete&&popup)*popup=std::move(request->popup);
     return complete?request->result.load():HRESULT_FROM_WIN32(ERROR_TIMEOUT);
 }
 struct RegistryCommand { UINT command; const wchar_t* key; };
 struct CompiledLabel { UINT command; const wchar_t* label; };
+bool englishPresentationLanguage() {
+    // Read the same ordered thread/process/user/system fallback list used by
+    // the resource loader. Regional date/number settings are not UI language.
+    constexpr DWORD flags=MUI_LANGUAGE_NAME|MUI_UI_FALLBACK;
+    ULONG count=0,characters=0;
+    if(GetThreadPreferredUILanguages(flags,&count,nullptr,&characters)&&characters>1) {
+        std::vector<wchar_t> languages(characters,L'\0');
+        if(GetThreadPreferredUILanguages(flags,&count,languages.data(),&characters)&&count&&languages.front()) {
+            wchar_t language[16]{};
+            if(GetLocaleInfoEx(languages.data(),LOCALE_SISO639LANGNAME,language,static_cast<int>(std::size(language))))
+                return wcscmp(language,L"en")==0;
+        }
+    }
+    return PRIMARYLANGID(GetThreadUILanguage())==LANG_ENGLISH;
+}
 constexpr CompiledLabel compiledLabels[]{
 #include "../resources/ribbon_labels.inc"
 };
@@ -276,13 +475,17 @@ struct StockTranslation {
         return stockNativeId(command);
     }
 };
-class StockFramework final : public IUIFramework {
+class StockFramework final : public IUIFramework, public IPropertyStore {
 public:
-    StockFramework(IUIFramework* native,std::shared_ptr<StockTranslation> translation):native_(native),translation_(std::move(translation)) {}
+    StockFramework(IUIFramework* native,std::shared_ptr<StockTranslation> translation):native_(native),translation_(std::move(translation)) {
+        native_->QueryInterface(IID_PPV_ARGS(&properties_));
+    }
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid,void** output) override {
         if(!output)return E_POINTER;*output=nullptr;
-        if(iid!=IID_IUnknown&&iid!=__uuidof(IUIFramework))return E_NOINTERFACE;
-        *output=static_cast<IUIFramework*>(this);AddRef();return S_OK;
+        if(iid==IID_IUnknown||iid==__uuidof(IUIFramework))*output=static_cast<IUIFramework*>(this);
+        else if(iid==__uuidof(IPropertyStore)&&properties_)*output=static_cast<IPropertyStore*>(this);
+        else return E_NOINTERFACE;
+        AddRef();return S_OK;
     }
     ULONG STDMETHODCALLTYPE AddRef() override{return ++references_;}
     ULONG STDMETHODCALLTYPE Release() override{const auto value=--references_;if(!value)delete this;return value;}
@@ -305,9 +508,17 @@ public:
     }
     HRESULT STDMETHODCALLTYPE FlushPendingInvalidations() override{return native_->FlushPendingInvalidations();}
     HRESULT STDMETHODCALLTYPE SetModes(INT32 modes) override{return native_->SetModes(modes);}
+    // Framework-wide theme properties are not command identifiers. Preserve
+    // their native store and this facade's COM identity across both interfaces.
+    HRESULT STDMETHODCALLTYPE GetCount(DWORD* count) override{return properties_?properties_->GetCount(count):E_NOINTERFACE;}
+    HRESULT STDMETHODCALLTYPE GetAt(DWORD index,PROPERTYKEY* key) override{return properties_?properties_->GetAt(index,key):E_NOINTERFACE;}
+    HRESULT STDMETHODCALLTYPE GetValue(REFPROPERTYKEY key,PROPVARIANT* value) override{return properties_?properties_->GetValue(key,value):E_NOINTERFACE;}
+    HRESULT STDMETHODCALLTYPE SetValue(REFPROPERTYKEY key,REFPROPVARIANT value) override{return properties_?properties_->SetValue(key,value):E_NOINTERFACE;}
+    HRESULT STDMETHODCALLTYPE Commit() override{return properties_?properties_->Commit():E_NOINTERFACE;}
 private:
     std::atomic<ULONG> references_{1};
     ComPtr<IUIFramework> native_;
+    ComPtr<IPropertyStore> properties_;
     std::shared_ptr<StockTranslation> translation_;
 };
 class Item final : public IUISimplePropertySet {
@@ -356,35 +567,14 @@ HRESULT readFile(const std::filesystem::path& path, std::vector<BYTE>& output) {
     }
     CloseHandle(file); return result;
 }
-HRESULT writeAtomic(const std::filesystem::path& path, std::span<const BYTE> bytes) {
-    if (path.empty() || !path.is_absolute() || bytes.empty() || bytes.size() > maximumSettingsBytes) return E_INVALIDARG;
-    std::error_code error;
-    std::filesystem::create_directories(path.parent_path(),error);
-    if (error) return HRESULT_FROM_WIN32(static_cast<DWORD>(error.value()));
-    std::filesystem::path temporary;
-    HANDLE file = INVALID_HANDLE_VALUE;
-    for (unsigned attempt=0; attempt<32 && file==INVALID_HANDLE_VALUE; ++attempt) {
-        temporary = path;
-        temporary += L".tmp-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()) + L"-" + std::to_wstring(attempt);
-        file = CreateFileW(temporary.c_str(),GENERIC_WRITE,0,nullptr,CREATE_NEW,FILE_ATTRIBUTE_NORMAL,nullptr);
-        if (file==INVALID_HANDLE_VALUE && GetLastError()!=ERROR_FILE_EXISTS) return HRESULT_FROM_WIN32(GetLastError());
-    }
-    if (file==INVALID_HANDLE_VALUE) return HRESULT_FROM_WIN32(ERROR_FILE_EXISTS);
-    DWORD written=0;
-    HRESULT result=S_OK;
-    if (!WriteFile(file,bytes.data(),static_cast<DWORD>(bytes.size()),&written,nullptr)) result=HRESULT_FROM_WIN32(GetLastError());
-    else if (written!=bytes.size()) result=HRESULT_FROM_WIN32(ERROR_WRITE_FAULT);
-    else if (!FlushFileBuffers(file)) result=HRESULT_FROM_WIN32(GetLastError());
-    CloseHandle(file);
-    if (SUCCEEDED(result) && !MoveFileExW(temporary.c_str(),path.c_str(),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH))
-        result=HRESULT_FROM_WIN32(GetLastError());
-    if (FAILED(result)) DeleteFileW(temporary.c_str());
-    return result;
-}
 }
 
 struct NativeRibbon::Impl {
-    struct Metadata { std::wstring label,description,icon; };
+    enum class LabelSource { NativeProvider, AuthoredFallback, EnglishPresentation };
+    struct Metadata {
+        std::wstring label,description,icon;
+        LabelSource labelSource=LabelSource::AuthoredFallback;
+    };
     HWND window=nullptr;
     DWORD thread=0;
     UINT height=0;
@@ -394,6 +584,7 @@ struct NativeRibbon::Impl {
     RibbonFeatures features;
     RibbonContext contexts=RibbonContext::None;
     bool activeContext=false;
+    bool englishPresentation=true;
     RibbonLayout layout=RibbonLayout::Authored;
     HRESULT stockStatus=E_NOTIMPL;
     HMODULE stockModule=nullptr;
@@ -405,7 +596,14 @@ struct NativeRibbon::Impl {
     ComPtr<IWICImagingFactory> imaging;
     std::map<UINT,UI_COMMANDTYPE> commandTypes;
     std::map<UINT,UI_COMMANDTYPE> nativeCommandTypes;
+    bool readOnlyMenuExpansion=false;
+    UINT menuExpansionExecutionAttempts=0;
     std::map<UINT,Metadata> metadata;
+    // Resource properties are not GetUICommandProperty-readable. Copy their
+    // initial native callback values while valid; never mistake a later value
+    // supplied by this host for an installed localized resource.
+    std::set<UINT> observedNativeLabels,observedNativeTooltips;
+    std::map<UINT,std::wstring> nativeLabels,nativeTooltips;
     std::array<std::wstring,8> viewTitles;
     std::map<std::pair<UINT,UINT>,ComPtr<IUIImage>> imageCache;
     std::map<std::pair<std::wstring,UINT>,ComPtr<IUIImage>> itemImageCache;
@@ -538,9 +736,13 @@ struct NativeRibbon::Impl {
                 *output=static_cast<IUICommandHandler*>(this);AddRef();return S_OK;}
             catch(...) {return E_OUTOFMEMORY;}
         }
-        HRESULT STDMETHODCALLTYPE OnDestroyUICommand(UINT32,UI_COMMANDTYPE,IUICommandHandler*) override {return S_OK;}
+        HRESULT STDMETHODCALLTYPE OnDestroyUICommand(UINT32 id,UI_COMMANDTYPE,IUICommandHandler*) override {
+            owner_.observedNativeLabels.erase(id);owner_.observedNativeTooltips.erase(id);
+            owner_.nativeLabels.erase(id);owner_.nativeTooltips.erase(id);return S_OK;
+        }
         HRESULT STDMETHODCALLTYPE Execute(UINT32 id,UI_EXECUTIONVERB verb,const PROPERTYKEY* key,const PROPVARIANT* value,IUISimplePropertySet* properties) override {
             if(verb!=UI_EXECUTIONVERB_EXECUTE)return S_OK;
+            if(owner_.readOnlyMenuExpansion){++owner_.menuExpansionExecutionAttempts;return E_ACCESSDENIED;}
             try {
                 const auto originalId=id;
                 if(const auto dynamic=owner_.dynamicCommands.find(id);dynamic!=owner_.dynamicCommands.end())
@@ -645,15 +847,46 @@ struct NativeRibbon::Impl {
                 const auto state=action&&owner_.callbacks.query?owner_.callbacks.query(id):RibbonCommandState{};
                 if(IsEqualPropertyKey(key,UI_PKEY_Enabled))return InitPropVariantFromBoolean(state.enabled,value);
                 if(IsEqualPropertyKey(key,UI_PKEY_BooleanValue))return InitPropVariantFromBoolean(state.checked,value);
-                if(IsEqualPropertyKey(key,UI_PKEY_SelectedItem))return InitPropVariantFromUInt32(state.selectedIndex,value);
+                if(IsEqualPropertyKey(key,UI_PKEY_SelectedItem)) {
+                    auto selected=state.selectedIndex;
+                    if(type!=owner_.commandTypes.end()&&type->second==UI_COMMANDTYPE_COLLECTION) {
+                        const auto rows=owner_.collectionInvocationIndices.find(originalId);
+                        if(rows==owner_.collectionInvocationIndices.end()||selected>=rows->second.size())
+                            selected=UI_COLLECTION_INVALIDINDEX;
+                    }
+                    auto& read=owner_.collectionReads[id];++read.selectedRequests;read.lastSelectedIndex=selected;
+                    return InitPropVariantFromUInt32(selected,value);
+                }
                 if(IsEqualPropertyKey(key,UI_PKEY_Label)||IsEqualPropertyKey(key,UI_PKEY_TooltipTitle)){
                     if(owner_.layout==RibbonLayout::InstalledWindows10) {
-                        if(originalId==0x2c60)return InitPropVariantFromString(L"Run",value);
-                        if(originalId==0x2012||originalId==0x2c61||originalId==0x2931)return InitPropVariantFromString(L"",value);
+                        if(originalId==0x2c60&&owner_.englishPresentation)return InitPropVariantFromString(L"Run",value);
+                        // Independent installed BML UIA readback proves that
+                        // Search Close and both Video group variants have empty
+                        // captions; their separately labelled leaves remain.
+                        if(originalId==0x2012||originalId==0x2c61||originalId==0x2931||originalId==0x2803||
+                           originalId==0x2c20||originalId==0x2c21)
+                            return InitPropVariantFromString(L"",value);
                     }
                     if(!state.label.empty())return InitPropVariantFromString(state.label.c_str(),value);
                     const auto found=owner_.metadata.find(id);
-                    if(found!=owner_.metadata.end()&&!found->second.label.empty())return InitPropVariantFromString(found->second.label.c_str(),value);
+                    if(found!=owner_.metadata.end()&&owner_.layout==RibbonLayout::InstalledWindows10&&
+                       found->second.labelSource==LabelSource::AuthoredFallback) {
+                        const bool title=IsEqualPropertyKey(key,UI_PKEY_Label);
+                        auto& observed=title?owner_.observedNativeLabels:owner_.observedNativeTooltips;
+                        auto& resources=title?owner_.nativeLabels:owner_.nativeTooltips;
+                        if(observed.insert(originalId).second&&current&&current->vt==VT_LPWSTR&&current->pwszVal&&*current->pwszVal) {
+                            resources.insert_or_assign(originalId,current->pwszVal);
+                            return PropVariantCopy(value,current);
+                        }
+                        if(const auto resource=resources.find(originalId);resource!=resources.end())
+                            return InitPropVariantFromString(resource->second.c_str(),value);
+                        // Some installed BML commands supply no public label
+                        // resource. Keep the existing authored fallback rather
+                        // than blanking a tab/button; its translation is a
+                        // separate host-resource requirement.
+                    }
+                    if(found!=owner_.metadata.end()&&!found->second.label.empty())
+                        return InitPropVariantFromString(found->second.label.c_str(),value);
                     return E_NOTIMPL;
                 }
                 if(IsEqualPropertyKey(key,UI_PKEY_TooltipDescription)){
@@ -671,7 +904,6 @@ struct NativeRibbon::Impl {
                 }
                 if(IsEqualPropertyKey(key,UI_PKEY_ItemsSource)||IsEqualPropertyKey(key,UI_PKEY_RecentItems)){
                     if(id==RibbonQuickAccess)return S_FALSE;
-                    if(IsEqualPropertyKey(key,UI_PKEY_ItemsSource))owner_.requestedCollections.insert(id);
                     if(id==RibbonFrequentPlaces){
                         const auto items=owner_.callbacks.items?owner_.callbacks.items(id):std::vector<RibbonItem>{};
                         if(items.size()>64)return E_INVALIDARG;
@@ -681,16 +913,24 @@ struct NativeRibbon::Impl {
                         const auto array=SafeArrayCreateVector(VT_UNKNOWN,0,static_cast<ULONG>(values.size()));
                         if(!array)return E_OUTOFMEMORY;
                         for(LONG i=0;i<static_cast<LONG>(values.size());++i){const auto hr=SafeArrayPutElement(array,&i,values[static_cast<std::size_t>(i)].Get());if(FAILED(hr)){SafeArrayDestroy(array);return hr;}}
-                        value->vt=VT_ARRAY|VT_UNKNOWN;value->parray=array;return S_OK;
+                        value->vt=VT_ARRAY|VT_UNKNOWN;value->parray=array;
+                        if(IsEqualPropertyKey(key,UI_PKEY_ItemsSource))owner_.requestedCollections.insert(id);
+                        return S_OK;
                     }
                     if(owner_.layout!=RibbonLayout::InstalledWindows10&&id!=RibbonNewMenu&&id!=RibbonExtractToGallery&&id!=RibbonLayoutGallery && id!=RibbonShareGallery&&id!=RecentSearches&&id!=SearchDateMenu&&id!=SearchKindMenu&&id!=SearchSizeMenu&&id!=RibbonSearchOtherProperties)return E_NOTIMPL;
                     if(!current||current->vt!=VT_UNKNOWN||!current->punkVal)return E_INVALIDARG;
                     ComPtr<IUICollection> collection;auto hr=current->punkVal->QueryInterface(IID_PPV_ARGS(&collection));if(FAILED(hr))return hr;
                     auto items=owner_.collectionItems(id);
                     if(items.size()>4096)return E_INVALIDARG;
-                    return owner_.replaceCollection(id,originalId,type!=owner_.commandTypes.end()?type->second:UI_COMMANDTYPE_COLLECTION,items,collection.Get());
+                    hr=owner_.replaceCollection(id,originalId,type!=owner_.commandTypes.end()?type->second:UI_COMMANDTYPE_COLLECTION,items,collection.Get());
+                    // The first provider callback already supplies the current
+                    // namespace. Mark the source refreshable after publishing it:
+                    // invalidating it during first popup construction leaves the
+                    // installed native gallery empty despite a populated source.
+                    if(SUCCEEDED(hr)&&IsEqualPropertyKey(key,UI_PKEY_ItemsSource))owner_.requestedCollections.insert(id);
+                    return hr;
                 }
-                (void)originalId;return E_NOTIMPL;
+                return E_NOTIMPL;
             }catch(...){return E_FAIL;}
         }
     private:
@@ -710,8 +950,11 @@ struct NativeRibbon::Impl {
     }
     HRESULT replaceCollection(UINT parent,UINT nativeParent,UI_COMMANDTYPE type,const std::vector<RibbonItem>& items,IUICollection* collection) {
         if(!collection)return E_POINTER;if(items.size()>4096)return E_INVALIDARG;
+        // Clear/Add can notify native listeners. Keep selection and invocation
+        // indexes unavailable until the complete replacement has succeeded.
+        collectionInvocationIndices[nativeParent].clear();
         auto hr=collection->Clear();if(FAILED(hr))return hr;
-        auto& indices=collectionInvocationIndices[nativeParent];indices.clear();
+        std::vector<UINT> indices;indices.reserve(items.size());
         if(layout==RibbonLayout::InstalledWindows10) {
             std::vector<UINT> oldParents{nativeParent};
             for(auto entry=dynamicCommands.begin();entry!=dynamicCommands.end();) {
@@ -753,10 +996,15 @@ struct NativeRibbon::Impl {
             }
             ++index;
         }
-        // Clear/Add resets an item gallery's native selection. Restore the
-        // actual folder-view index after this ItemsSource callback returns.
-        if(parent==RibbonLayoutGallery&&type==UI_COMMANDTYPE_COLLECTION)
-            return requestInvalidation(nativeParent,UI_INVALIDATIONS_PROPERTY,&UI_PKEY_SelectedItem);
+        collectionInvocationIndices[nativeParent]=std::move(indices);
+        // Clear/Add resets an item gallery's native selection. Restore its
+        // current View, Library or Search value after this callback returns.
+        // SelectedItem is the gallery's value: the framework queries it for
+        // UI_INVALIDATIONS_VALUE, which requires a null property key.
+        if(type==UI_COMMANDTYPE_COLLECTION&&(parent==RibbonLayoutGallery||parent==LibraryDefault||
+            parent==LibraryOptimize||parent==RibbonLibraryOptimizeMenu||parent==SearchDateMenu||
+            parent==SearchKindMenu||parent==SearchSizeMenu))
+            return requestInvalidation(nativeParent,UI_INVALIDATIONS_VALUE,nullptr);
         return S_OK;
     }
     HRESULT sameThread()const noexcept {return thread==GetCurrentThreadId()?S_OK:RPC_E_WRONG_THREAD;}
@@ -857,6 +1105,7 @@ HRESULT NativeRibbon::initialize(HWND window,HINSTANCE instance,RibbonCallbacks 
     if(FAILED(hr))return hr;if(apartment!=APTTYPE_STA&&apartment!=APTTYPE_MAINSTA)return RPC_E_WRONG_THREAD;
     try {
         auto impl=std::make_unique<Impl>();impl->window=window;impl->thread=GetCurrentThreadId();impl->callbacks=std::move(callbacks);
+        impl->englishPresentation=englishPresentationLanguage();
         impl->invalidationMessage=RegisterWindowMessageW(L"WindowsExplorer.NativeRibbon.DeferredInvalidations.v1");
         if(!impl->invalidationMessage)return HRESULT_FROM_WIN32(GetLastError());
         if(!SetWindowSubclass(window,Impl::subclassProcedure,reinterpret_cast<UINT_PTR>(impl.get()),reinterpret_cast<DWORD_PTR>(impl.get())))
@@ -872,7 +1121,8 @@ HRESULT NativeRibbon::initialize(HWND window,HINSTANCE instance,RibbonCallbacks 
         for(const auto& command:registryCommands) {
             NamespaceCommandMetadata metadata;
             namespaceCommandMetadata(command.key,&metadata);
-            impl->metadata.emplace(command.command,Impl::Metadata{metadata.label,metadata.description,metadata.icon});
+            impl->metadata.emplace(command.command,Impl::Metadata{metadata.label,metadata.description,metadata.icon,
+                metadata.label.empty()?Impl::LabelSource::AuthoredFallback:Impl::LabelSource::NativeProvider});
         }
         impl->metadata[RibbonShareGallery].icon=impl->metadata[RibbonSpecificPeople].icon;
         for(const auto& [group,command]:groupIcons){const auto found=impl->metadata.find(command);if(found!=impl->metadata.end())impl->metadata.emplace(group,Impl::Metadata{{},{},found->second.icon});}
@@ -880,12 +1130,22 @@ HRESULT NativeRibbon::initialize(HWND window,HINSTANCE instance,RibbonCallbacks 
             auto& metadata = impl->metadata[compiled.command];
             if (metadata.label.empty()) metadata.label = compiled.label;
         }
-        impl->metadata[RibbonEasyAccessMenu].label = L"Easy access";
-        impl->metadata[RibbonOptionsMenu].label = L"Options";
-        impl->metadata[RibbonFolderOptions].label=L"Options";
-        impl->metadata[RibbonAccessMedia].label=L"Access media";
-        impl->metadata[1527].label=L"Extract To";
+        if(impl->englishPresentation) {
+            // These English stock-Ribbon captions intentionally differ from
+            // the generic CommandStore title. Preserve that presentation on
+            // English systems without replacing another language's native text.
+            const auto correction=[&](UINT command,const wchar_t* label) {
+                auto& metadata=impl->metadata[command];metadata.label=label;
+                metadata.labelSource=Impl::LabelSource::EnglishPresentation;
+            };
+            correction(RibbonEasyAccessMenu,L"Easy access");
+            correction(RibbonOptionsMenu,L"Options");
+            correction(RibbonFolderOptions,L"Options");
+            correction(RibbonAccessMedia,L"Access media");
+            correction(1527,L"Extract To");
+        }
         impl->metadata[Delete].label=impl->metadata[RibbonDeleteMenu].label;
+        impl->metadata[Delete].labelSource=impl->metadata[RibbonDeleteMenu].labelSource;
         if(impl->metadata[Extract].label.empty())impl->metadata[Extract].label=L"Extract all";
         impl->metadata[RibbonOpenSettings].icon=L"shell32.dll,-16826";
         impl->metadata[RibbonEasyAccessMenu].icon=L"ExplorerFrame.dll:IMAGE:EasyAccess";
@@ -900,8 +1160,10 @@ HRESULT NativeRibbon::initialize(HWND window,HINSTANCE instance,RibbonCallbacks 
         std::vector<NamespaceSubcommandMetadata> nativeViews;
         const bool nativeViewMetadata = SUCCEEDED(namespaceCommandChildren(L"Windows.IconSize",nullptr,nullptr,&nativeViews)) && nativeViews.size()==8;
         for(UINT i=0;i<viewIcons.size();++i) {
-            impl->viewTitles[i] = nativeViewMetadata && PRIMARYLANGID(GetUserDefaultUILanguage())!=LANG_ENGLISH ? nativeViews[i].label : viewLabels[i];
-            impl->metadata[ViewFirst+i] = Impl::Metadata{impl->viewTitles[i],{},nativeViewMetadata ? nativeViews[i].icon : L"shell32.dll,-"+std::to_wstring(viewIcons[i])};
+            const bool nativeTitle=nativeViewMetadata&&!impl->englishPresentation&&!nativeViews[i].label.empty();
+            impl->viewTitles[i] = nativeTitle ? nativeViews[i].label : viewLabels[i];
+            impl->metadata[ViewFirst+i] = Impl::Metadata{impl->viewTitles[i],{},nativeViewMetadata ? nativeViews[i].icon : L"shell32.dll,-"+std::to_wstring(viewIcons[i]),
+                nativeTitle?Impl::LabelSource::NativeProvider:impl->englishPresentation?Impl::LabelSource::EnglishPresentation:Impl::LabelSource::AuthoredFallback};
         }
         for(const auto& [command,metadata]:impl->metadata)impl->defaultIcons.emplace(command,metadata.icon);
         impl->handler.Attach(new Impl::Handler(*impl));
@@ -957,7 +1219,13 @@ HRESULT NativeRibbon::invalidateItems(UINT command) {
 HRESULT NativeRibbon::collectionReadback(UINT command,RibbonCollectionReadback& output) const {
     if(!valid())return E_UNEXPECTED;const auto hr=impl_->sameThread();if(FAILED(hr))return hr;
     const auto found=impl_->collectionReads.find(command);if(found==impl_->collectionReads.end())return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
-    output=found->second;return S_OK;
+    output=found->second;
+    const auto native=impl_->nativeId(command);
+    if(const auto rows=impl_->collectionInvocationIndices.find(native);rows!=impl_->collectionInvocationIndices.end())
+        output.publishedItems=static_cast<UINT>(rows->second.size());
+    output.pendingInvalidations=static_cast<UINT>(std::count_if(impl_->deferredInvalidations.begin(),impl_->deferredInvalidations.end(),
+        [native](const auto& entry){return entry.command==native;}));
+    return S_OK;
 }
 HRESULT NativeRibbon::flush(){if(!valid())return E_UNEXPECTED;auto hr=impl_->sameThread();if(FAILED(hr))return hr;if(impl_->propertyDepth)return E_PENDING;hr=impl_->drainInvalidations();return FAILED(hr)?hr:impl_->framework->FlushPendingInvalidations();}
 HRESULT NativeRibbon::setContexts(RibbonContext contexts,bool activate){
@@ -1001,13 +1269,10 @@ HRESULT NativeRibbon::selectTab(UINT tab){
         Variant value;InitPropVariantFromUInt32(UI_CONTEXTAVAILABILITY_ACTIVE,&value.value);
         return framework()->SetUICommandProperty(tab==RibbonShortcutTab?RibbonShortcutContext:RibbonPictureContext+tab-RibbonPictureTab,UI_PKEY_ContextAvailable,value.value);
     }
-    const wchar_t* name=nullptr;
-    if(tab==RibbonHomeTab&&!impl_->computerMode&&!impl_->networkMode)name=L"Home";
-    else if(tab==RibbonShareTab&&!impl_->computerMode&&!impl_->networkMode)name=L"Share";
-    else if(tab==RibbonViewTab)name=L"View";
-    else if(tab==RibbonComputerTab&&impl_->computerMode)name=L"Computer";
-    else if(tab==RibbonNetworkTab&&impl_->networkMode)name=L"Network";
-    else return E_INVALIDARG;
+    const bool applicable=((tab==RibbonHomeTab||tab==RibbonShareTab)&&!impl_->computerMode&&!impl_->networkMode)||
+        tab==RibbonViewTab||(tab==RibbonComputerTab&&impl_->computerMode)||(tab==RibbonNetworkTab&&impl_->networkMode);
+    if(!applicable)return E_INVALIDARG;
+    std::wstring name;hr=commandLabel(tab,name);if(FAILED(hr))return hr;
     // Tab properties are invalidation-only. Its documented accessibility
     // SelectionItem pattern supplies programmatic selection without input
     // injection, activating a desktop, or opening an application command.
@@ -1017,9 +1282,47 @@ HRESULT NativeRibbon::selectTab(UINT tab){
         if(wcscmp(type,L"UIRibbonCommandBar")==0){*reinterpret_cast<HWND*>(data)=child;return FALSE;}
         return TRUE;
     },reinterpret_cast<LPARAM>(&bar));
-    try {return selectTabOnMta(bar?bar:impl_->window,name);}catch(...){return E_OUTOFMEMORY;}
+    try {return selectTabOnMta(bar?bar:impl_->window,name.c_str());}catch(...){return E_OUTOFMEMORY;}
 }
 HRESULT NativeRibbon::setMinimized(bool minimized){if(!valid())return E_UNEXPECTED;auto hr=impl_->sameThread();if(FAILED(hr))return hr;Variant value;InitPropVariantFromBoolean(minimized,&value.value);return impl_->setViewValue(UI_PKEY_Minimized,value.value);}
+HRESULT NativeRibbon::expandSearchDateMenu(std::span<const std::wstring> expectedRows,UINT& matchedRows,
+                                         NativePopupCapture* popup) {
+    matchedRows=0;if(!valid())return E_UNEXPECTED;
+    auto hr=impl_->sameThread();if(FAILED(hr))return hr;
+    const auto desktop=PrivateDesktop::current();
+    if(!desktop||FAILED(desktop->verifyIsolation()))return E_ACCESSDENIED;
+    if(expectedRows.size()!=8||std::any_of(expectedRows.begin(),expectedRows.end(),[](const auto& label){return label.empty();}))return E_INVALIDARG;
+    for(size_t index=0;index<expectedRows.size();++index)
+        if(std::find(expectedRows.begin(),expectedRows.begin()+static_cast<std::ptrdiff_t>(index),expectedRows[index])!=
+            expectedRows.begin()+static_cast<std::ptrdiff_t>(index))return E_INVALIDARG;
+    const auto type=impl_->commandTypes.find(SearchDateMenu);
+    if(type==impl_->commandTypes.end()||type->second!=UI_COMMANDTYPE_COLLECTION)return E_NOINTERFACE;
+    struct RibbonWindows {HWND window=nullptr;UINT count=0;} bars;
+    EnumChildWindows(impl_->window,[](HWND child,LPARAM value)->BOOL {
+        wchar_t className[64]{};GetClassNameW(child,className,static_cast<int>(std::size(className)));
+        if(wcscmp(className,L"UIRibbonCommandBar")==0) {
+            auto& found=*reinterpret_cast<RibbonWindows*>(value);found.window=child;++found.count;
+        }
+        return TRUE;
+    },reinterpret_cast<LPARAM>(&bars));
+    if(bars.count!=1||!IsWindowVisible(bars.window))return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+    if(impl_->readOnlyMenuExpansion)return E_UNEXPECTED;
+    std::wstring label;hr=commandLabel(SearchDateMenu,label);if(FAILED(hr))return hr;
+    struct ExpansionGuard {
+        Impl& owner;
+        explicit ExpansionGuard(Impl& value):owner(value){owner.readOnlyMenuExpansion=true;owner.menuExpansionExecutionAttempts=0;}
+        ~ExpansionGuard(){owner.readOnlyMenuExpansion=false;}
+    } guard(*impl_);
+    try {
+        NativePopupCapture observed;
+        hr=selectTabOnMta(impl_->window,label.c_str(),expectedRows,&matchedRows,&observed,bars.window,
+            impl_->nativeId(SearchDateMenu),type->second);
+        const auto attempts=impl_->menuExpansionExecutionAttempts;
+        observed.executionAttempts=attempts;
+        if(popup)*popup=std::move(observed);
+        return FAILED(hr)?hr:attempts?E_ACCESSDENIED:hr;
+    }catch(...){if(popup)popup->executionAttempts=impl_->menuExpansionExecutionAttempts;return E_OUTOFMEMORY;}
+}
 HRESULT NativeRibbon::minimized(bool& output)const{if(!valid())return E_UNEXPECTED;auto hr=impl_->sameThread();if(FAILED(hr))return hr;ComPtr<IPropertyStore>store;hr=impl_->viewStore(store);if(FAILED(hr))return hr;Variant value;hr=store->GetValue(UI_PKEY_Minimized,&value.value);if(FAILED(hr))return hr;BOOL flag=FALSE;hr=PropVariantToBoolean(value.value,&flag);if(SUCCEEDED(hr))output=flag!=FALSE;return hr;}
 HRESULT NativeRibbon::setQuickAccessBelow(bool below){if(!valid())return E_UNEXPECTED;auto hr=impl_->sameThread();if(FAILED(hr))return hr;Variant value;InitPropVariantFromUInt32(below?UI_CONTROLDOCK_BOTTOM:UI_CONTROLDOCK_TOP,&value.value);return impl_->setViewValue(UI_PKEY_QuickAccessToolbarDock,value.value);}
 HRESULT NativeRibbon::quickAccessBelow(bool& output)const{if(!valid())return E_UNEXPECTED;auto hr=impl_->sameThread();if(FAILED(hr))return hr;ComPtr<IPropertyStore>store;hr=impl_->viewStore(store);if(FAILED(hr))return hr;Variant value;hr=store->GetValue(UI_PKEY_QuickAccessToolbarDock,&value.value);ULONG dock=0;if(SUCCEEDED(hr))hr=PropVariantToUInt32(value.value,&dock);if(SUCCEEDED(hr))output=dock==UI_CONTROLDOCK_BOTTOM;return hr;}
@@ -1036,10 +1339,10 @@ HRESULT NativeRibbon::setQuickAccessCommands(std::span<const UINT> commands){
     if(!valid())return E_UNEXPECTED;auto hr=impl_->sameThread();if(FAILED(hr))return hr;if(commands.size()>20)return E_INVALIDARG;
     std::vector<ComPtr<IUnknown>>replacement;
     for(std::size_t i=0;i<commands.size();++i){if(std::find(commands.begin(),commands.begin()+static_cast<std::ptrdiff_t>(i),commands[i])!=commands.begin()+static_cast<std::ptrdiff_t>(i))return E_INVALIDARG;
-        if((commands[i]>=RibbonHomeTab&&commands[i]<=RibbonDiscImageTab)||commands[i]==FileMenu||commands[i]==RibbonQuickAccess||commands[i]==RibbonFrequentPlaces)return E_INVALIDARG;
+        if((commands[i]>=RibbonHomeTab&&commands[i]<=RibbonShortcutTab)||commands[i]==FileMenu||commands[i]==RibbonQuickAccess||commands[i]==RibbonFrequentPlaces)return E_INVALIDARG;
         const auto found=impl_->commandTypes.find(commands[i]);
         const auto declared=std::find_if(std::begin(compiledLabels),std::end(compiledLabels),[&](const auto& label){return label.command==commands[i];});
-        if(declared==std::end(compiledLabels)||(commands[i]>=1500&&commands[i]<2000)||(commands[i]>=RibbonPictureContext&&commands[i]<=RibbonDiscImageContext)||(found!=impl_->commandTypes.end()&&(found->second==UI_COMMANDTYPE_GROUP||found->second==UI_COMMANDTYPE_CONTEXT)))return E_INVALIDARG;
+        if(declared==std::end(compiledLabels)||(commands[i]>=1500&&commands[i]<2000)||(commands[i]>=RibbonPictureContext&&commands[i]<=RibbonShortcutContext)||(found!=impl_->commandTypes.end()&&(found->second==UI_COMMANDTYPE_GROUP||found->second==UI_COMMANDTYPE_CONTEXT)))return E_INVALIDARG;
         const auto id=impl_->nativeId(commands[i]);if(!id)return E_INVALIDARG;
         ComPtr<IUISimplePropertySet>properties;properties.Attach(new Item({id,{},false}));ComPtr<IUnknown>unknown;properties.As(&unknown);replacement.push_back(std::move(unknown));}
     ComPtr<IUICollection>collection;hr=impl_->quickCollection(collection);if(FAILED(hr))return hr;UINT count=0;hr=collection->GetCount(&count);if(FAILED(hr))return hr;
@@ -1049,10 +1352,11 @@ HRESULT NativeRibbon::setQuickAccessCommands(std::span<const UINT> commands){
     return hr;
 }
 HRESULT NativeRibbon::saveSettings(const std::filesystem::path& path)const{
-    if(!valid())return E_UNEXPECTED;auto hr=impl_->sameThread();if(FAILED(hr))return hr;ComPtr<IStream>stream;hr=CreateStreamOnHGlobal(nullptr,TRUE,&stream);if(FAILED(hr))return hr;
+    if(!valid())return E_UNEXPECTED;auto hr=impl_->sameThread();if(FAILED(hr))return hr;if(path.empty()||!path.is_absolute())return E_INVALIDARG;
+    ComPtr<IStream>stream;hr=CreateStreamOnHGlobal(nullptr,TRUE,&stream);if(FAILED(hr))return hr;
     hr=impl_->ribbon->SaveSettingsToStream(stream.Get());if(FAILED(hr))return hr;STATSTG stat{};hr=stream->Stat(&stat,STATFLAG_NONAME);if(FAILED(hr))return hr;if(!stat.cbSize.QuadPart||stat.cbSize.QuadPart>maximumSettingsBytes)return HRESULT_FROM_WIN32(ERROR_FILE_TOO_LARGE);
     HGLOBAL memory=nullptr;hr=GetHGlobalFromStream(stream.Get(),&memory);if(FAILED(hr))return hr;const auto bytes=static_cast<const BYTE*>(GlobalLock(memory));if(!bytes)return E_OUTOFMEMORY;
-    hr=writeAtomic(path,{bytes,static_cast<std::size_t>(stat.cbSize.QuadPart)});GlobalUnlock(memory);return hr;
+    hr=writeStateFileAtomic(path,{bytes,static_cast<std::size_t>(stat.cbSize.QuadPart)});GlobalUnlock(memory);return hr;
 }
 HRESULT NativeRibbon::loadSettings(const std::filesystem::path& path){
     if(!valid())return E_UNEXPECTED;auto hr=impl_->sameThread();if(FAILED(hr))return hr;if(path.empty()||!path.is_absolute())return E_INVALIDARG;
@@ -1068,6 +1372,14 @@ HRESULT NativeRibbon::commandImage(UINT command,bool large,IUIImage** output){
 HRESULT NativeRibbon::commandLabel(UINT command,std::wstring& output)const{
     if(!valid())return E_UNEXPECTED;const auto hr=impl_->sameThread();if(FAILED(hr))return hr;
     const auto found=impl_->metadata.find(command);if(found==impl_->metadata.end()||found->second.label.empty())return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+    if(impl_->layout==RibbonLayout::InstalledWindows10&&found->second.labelSource==Impl::LabelSource::AuthoredFallback) {
+        // This is an owned copy of the actual native currentValue, not a
+        // framework getter or a callback reentry. A missing native resource
+        // keeps its explicitly authored fallback and its original provenance.
+        if(const auto resource=impl_->nativeLabels.find(impl_->nativeId(command));resource!=impl_->nativeLabels.end()) {
+            output=resource->second;return S_OK;
+        }
+    }
     output=found->second.label;return S_OK;
 }
 HRESULT NativeRibbon::itemImage(const std::wstring& specification,bool large,IUIImage** output) {

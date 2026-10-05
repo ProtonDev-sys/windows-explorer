@@ -1,8 +1,13 @@
 #include "explorer/saved_search.hpp"
+#include "saved_search_internal.hpp"
+#include "search_scope_internal.hpp"
 #include <msxml6.h>
+#include <xmllite.h>
+#include <shlwapi.h>
 #include <structuredquery.h>
 #include <shlobj.h>
 #include <propvarutil.h>
+#include <propsys.h>
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -52,32 +57,12 @@ HRESULT property(IXMLDOMDocument2* document, const wchar_t* name, VARIANT value)
     return key.value ? document->setProperty(key.value, value) : E_OUTOFMEMORY;
 }
 
-HRESULT loadDocument(const std::filesystem::path& path, IXMLDOMDocument2** result) {
-    FileHandle file(CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
-                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
-    if (file.get() == INVALID_HANDLE_VALUE) return HRESULT_FROM_WIN32(GetLastError());
-    LARGE_INTEGER size{};
-    if (!GetFileSizeEx(file.get(), &size)) return HRESULT_FROM_WIN32(GetLastError());
-    if (size.QuadPart <= 0) return invalidData;
-    if (size.QuadPart > static_cast<LONGLONG>(maximumBytes)) return unsupported;
-    Variant source;
-    source.value.vt = VT_ARRAY | VT_UI1;
-    source.value.parray = SafeArrayCreateVector(VT_UI1, 0, static_cast<ULONG>(size.QuadPart));
-    if (!source.value.parray) return E_OUTOFMEMORY;
-    void* buffer = nullptr;
-    auto hr = SafeArrayAccessData(source.value.parray, &buffer);
-    if (FAILED(hr)) return hr;
-    DWORD received = 0;
-    const bool read = ReadFile(file.get(), buffer, static_cast<DWORD>(size.QuadPart), &received, nullptr) != FALSE;
-    const auto error = GetLastError();
-    SafeArrayUnaccessData(source.value.parray);
-    if (!read) return HRESULT_FROM_WIN32(error);
-    if (received != static_cast<DWORD>(size.QuadPart)) return invalidData;
-
+HRESULT parseDocument(VARIANT source, IXMLDOMDocument2** result) {
     ComPtr<IXMLDOMDocument2> document;
-    hr = CoCreateInstance(__uuidof(DOMDocument60), nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&document));
+    auto hr = CoCreateInstance(__uuidof(DOMDocument60), nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&document));
     if (FAILED(hr)) return hr;
     if (FAILED(hr = document->put_async(VARIANT_FALSE)) ||
+        FAILED(hr = document->put_preserveWhiteSpace(VARIANT_TRUE)) ||
         FAILED(hr = document->put_validateOnParse(VARIANT_FALSE)) ||
         FAILED(hr = document->put_resolveExternals(VARIANT_FALSE))) return hr;
     VARIANT option{}; option.vt = VT_BOOL; option.boolVal = VARIANT_TRUE;
@@ -87,10 +72,40 @@ HRESULT loadDocument(const std::filesystem::path& path, IXMLDOMDocument2** resul
     option.vt = VT_I4; option.lVal = maximumDepth;
     if (FAILED(hr = property(document.Get(), L"MaxElementDepth", option))) return hr;
     VARIANT_BOOL loaded = VARIANT_FALSE;
-    hr = document->load(source.value, &loaded);
+    hr = document->load(source, &loaded);
     if (FAILED(hr)) return hr;
     if (loaded != VARIANT_TRUE) return invalidData;
     return document.CopyTo(result);
+}
+
+HRESULT parseBytes(std::string_view bytes, IXMLDOMDocument2** result) {
+    Variant source;
+    source.value.vt = VT_ARRAY | VT_UI1;
+    source.value.parray = SafeArrayCreateVector(VT_UI1, 0, static_cast<ULONG>(bytes.size()));
+    if (!source.value.parray) return E_OUTOFMEMORY;
+    void* buffer = nullptr;
+    auto hr = SafeArrayAccessData(source.value.parray, &buffer);
+    if (FAILED(hr)) return hr;
+    std::copy(bytes.begin(), bytes.end(), static_cast<char*>(buffer));
+    if (FAILED(hr = SafeArrayUnaccessData(source.value.parray))) return hr;
+    return parseDocument(source.value, result);
+}
+
+HRESULT loadDocument(const std::filesystem::path& path, IXMLDOMDocument2** result, std::string& bytes) {
+    FileHandle file(CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
+    if (file.get() == INVALID_HANDLE_VALUE) return HRESULT_FROM_WIN32(GetLastError());
+    LARGE_INTEGER size{};
+    if (!GetFileSizeEx(file.get(), &size)) return HRESULT_FROM_WIN32(GetLastError());
+    if (size.QuadPart <= 0) return invalidData;
+    if (size.QuadPart > static_cast<LONGLONG>(maximumBytes)) return unsupported;
+    bytes.resize(static_cast<size_t>(size.QuadPart));
+    DWORD received = 0;
+    const bool read = ReadFile(file.get(), bytes.data(), static_cast<DWORD>(size.QuadPart), &received, nullptr) != FALSE;
+    const auto error = GetLastError();
+    if (!read) return HRESULT_FROM_WIN32(error);
+    if (received != static_cast<DWORD>(size.QuadPart)) return invalidData;
+    return parseBytes(bytes, result);
 }
 
 HRESULT nodeName(IXMLDOMNode* node, std::wstring& result) {
@@ -173,6 +188,99 @@ HRESULT emptyElement(IXMLDOMNode* node) {
     Elements children;
     const auto hr = elements(node, children);
     return FAILED(hr) ? hr : children.empty() ? S_OK : unsupported;
+}
+
+HRESULT filePropertyMetadata(IXMLDOMNode* node, SearchFileProperties& result) {
+    Attributes values;
+    auto hr = attributes(node, {}, values);
+    if (FAILED(hr)) return hr;
+    Elements fields;
+    if (FAILED(hr = elements(node, fields))) return hr;
+    if (fields.size() > 4) return unsupported;
+    for (const auto& field : fields) {
+        std::wstring name;
+        if (FAILED(hr = nodeName(field.Get(), name))) return hr;
+        auto* target = name == L"author" ? &result.author : name == L"kind" ? &result.kind :
+            name == L"description" ? &result.description : name == L"tags" ? &result.tags : nullptr;
+        if (!target || *target) return unsupported;
+        values.clear();
+        if (FAILED(hr = attributes(field.Get(), {}, values))) return hr;
+        ComPtr<IXMLDOMNodeList> children;
+        if (FAILED(hr = field->get_childNodes(&children))) return hr;
+        long length = 0;
+        if (FAILED(hr = children->get_length(&length))) return hr;
+        std::wstring text;
+        for (long index = 0; index < length; ++index) {
+            ComPtr<IXMLDOMNode> child;
+            if (FAILED(hr = children->get_item(index, &child))) return hr;
+            DOMNodeType type{};
+            if (FAILED(hr = child->get_nodeType(&type))) return hr;
+            if (type == NODE_COMMENT) continue;
+            if (type != NODE_TEXT && type != NODE_CDATA_SECTION) return unsupported;
+            // Bound simple text/CDATA shapes without MSXML's text-accessor
+            // trimming. Exact CR/LF character-reference values are recovered
+            // from the originally read bytes by XmlLite below.
+            Variant value;
+            if (FAILED(hr = child->get_nodeValue(&value.value))) return hr;
+            if (value.value.vt != VT_BSTR) return invalidData;
+            if (value.value.bstrVal) text.append(value.value.bstrVal, SysStringLen(value.value.bstrVal));
+            if (text.size() > maximumQueryLength) return unsupported;
+        }
+        *target = std::move(text);
+    }
+    return S_OK;
+}
+
+HRESULT exactFilePropertyText(std::string_view bytes, SearchFileProperties& result) {
+    // MSXML normalizes even adjacent CR/LF character references. XmlLite reads
+    // their literal values from the same bounded bytes whose complete shape
+    // was already checked above; there is no second file read or path race.
+    ComPtr<IXmlReader> reader;
+    auto hr = CreateXmlReader(__uuidof(IXmlReader), reinterpret_cast<void**>(reader.GetAddressOf()), nullptr);
+    if (FAILED(hr)) return hr;
+    if (FAILED(hr = reader->SetProperty(XmlReaderProperty_DtdProcessing, DtdProcessing_Prohibit)) ||
+        FAILED(hr = reader->SetProperty(XmlReaderProperty_XmlResolver, 0)) ||
+        FAILED(hr = reader->SetProperty(XmlReaderProperty_MaxElementDepth, maximumDepth))) return hr;
+    ComPtr<IStream> stream;
+    stream.Attach(SHCreateMemStream(reinterpret_cast<const BYTE*>(bytes.data()), static_cast<UINT>(bytes.size())));
+    if (!stream) return E_OUTOFMEMORY;
+    if (FAILED(hr = reader->SetInput(stream.Get()))) return hr;
+    bool inProperties = false;
+    std::optional<std::wstring>* field = nullptr;
+    unsigned count = 0;
+    XmlNodeType type{};
+    while ((hr = reader->Read(&type)) == S_OK) {
+        if (++count > maximumNodes * 2) return unsupported;
+        UINT depth = 0;
+        if (FAILED(hr = reader->GetDepth(&depth))) return hr;
+        if (type == XmlNodeType_Element) {
+            const wchar_t* name = nullptr; UINT length = 0;
+            if (FAILED(hr = reader->GetQualifiedName(&name, &length))) return hr;
+            const std::wstring_view tag(name, length);
+            if (depth == 1 && tag == L"properties") inProperties = !reader->IsEmptyElement();
+            else if (inProperties && depth == 2) {
+                field = tag == L"author" ? &result.author : tag == L"kind" ? &result.kind :
+                    tag == L"description" ? &result.description : tag == L"tags" ? &result.tags : nullptr;
+                if (!field || !*field) return unsupported;
+                field->emplace();
+                if (reader->IsEmptyElement()) field = nullptr;
+            }
+        } else if (type == XmlNodeType_EndElement) {
+            // XmlLite reports an end tag before decrementing its depth. All
+            // field shapes were validated as simple text, so their matching
+            // end tag closes the active field regardless of that depth value.
+            if (field) field = nullptr;
+            const wchar_t* name = nullptr; UINT length = 0;
+            if (FAILED(hr = reader->GetQualifiedName(&name, &length))) return hr;
+            if (std::wstring_view(name, length) == L"properties") inProperties = false;
+        } else if (field && (type == XmlNodeType_Text || type == XmlNodeType_CDATA || type == XmlNodeType_Whitespace)) {
+            const wchar_t* value = nullptr; UINT length = 0;
+            if (FAILED(hr = reader->GetValue(&value, &length))) return hr;
+            if (length > maximumQueryLength - field->value().size()) return unsupported;
+            if (length) field->value().append(value, length);
+        }
+    }
+    return hr == S_FALSE ? S_OK : hr;
 }
 
 HRESULT viewMetadata(IXMLDOMNode* node, SearchViewPresentation& result) {
@@ -264,10 +372,9 @@ HRESULT scopeItemMetadata(IXMLDOMNode* node, SavedSearchMetadata& result) {
         if (recursion->second == L"true") result.recursive = false;
         else if (recursion->second != L"false") return unsupported;
     }
-    // Legal external XML remains openable through the native Shell viewer.
-    // The documented shallow-exclude flag has provider-dependent behavior,
-    // so it cannot yet be restated as an equivalent editable scope rule.
-    if (excluded && !result.recursive) return unsupported;
+    // Provider-dependent physical exclusions are parsed losslessly here.
+    // Their exact protective condition guard is required before the reader
+    // publishes editable metadata; an unguarded external file stays native-only.
     if (path != values.end()) {
         // Environment expansion is part of the documented saved-scope format.
         if (path->second.empty() || path->second.find(L'\0') != std::wstring::npos) return invalidData;
@@ -308,7 +415,7 @@ HRESULT scopeItemMetadata(IXMLDOMNode* node, SavedSearchMetadata& result) {
     return S_OK;
 }
 
-HRESULT scopeMetadata(IXMLDOMNode* node, SavedSearchMetadata& result) {
+HRESULT scopeMetadata(IXMLDOMNode* node, SavedSearchMetadata& result, bool& needsGuard) {
     Attributes values;
     auto hr = attributes(node, {}, values);
     if (FAILED(hr)) return hr;
@@ -345,20 +452,12 @@ HRESULT scopeMetadata(IXMLDOMNode* node, SavedSearchMetadata& result) {
             hr = rule.folder->GetDisplayName(SIGDN_FILESYSPATH, &raw); TaskString path(raw);
             if (FAILED(hr) || !raw || !*raw) return unsupported;
         }
-        if (rule.excluded) for (const auto& included : result.scopeRules) {
-            if (included.excluded) continue;
-            int order = 0;
-            if (SUCCEEDED(rule.folder->Compare(included.folder.Get(), SICHINT_CANONICAL, &order)) && order == 0)
-                return unsupported;
-            if (!included.recursive) {
-                ComPtr<IShellItem> parent;
-                if (SUCCEEDED(rule.folder->GetParent(&parent)) &&
-                    SUCCEEDED(parent->Compare(included.folder.Get(), SICHINT_CANONICAL, &order)) && order == 0)
-                    return unsupported;
-            }
-        }
     }
-    return SHCreateShellItemArrayFromIDLists(static_cast<UINT>(pidls.size()), pidls.data(), &result.scopes);
+    bool required = false;
+    if (FAILED(hr = search_scope_internal::requiresProtectiveGuard(result.scopeRules, &required))) return hr;
+    if (FAILED(hr = SHCreateShellItemArrayFromIDLists(static_cast<UINT>(pidls.size()), pidls.data(), &result.scopes))) return hr;
+    needsGuard = required;
+    return S_OK;
 }
 
 bool operation(std::wstring_view name, CONDITION_OPERATION& result) {
@@ -374,7 +473,107 @@ bool operation(std::wstring_view name, CONDITION_OPERATION& result) {
     return false;
 }
 
-HRESULT condition(IXMLDOMNode* node, IConditionFactory2* factory, ICondition** result, unsigned depth = 0) {
+HRESULT sameBooleanLeaf(ICondition* expected, ICondition* actual, bool& same) {
+    same = false;
+    CONDITION_TYPE firstType{}, secondType{};
+    auto hr = expected->GetConditionType(&firstType);
+    if (SUCCEEDED(hr)) hr = actual->GetConditionType(&secondType);
+    if (FAILED(hr)) return hr;
+    if (firstType != CT_LEAF_CONDITION || secondType != CT_LEAF_CONDITION) return S_OK;
+    PWSTR firstProperty = nullptr, secondProperty = nullptr, firstSemantic = nullptr, secondSemantic = nullptr;
+    CONDITION_OPERATION firstOperation{}, secondOperation{};
+    PropertyVariant firstValue, secondValue;
+    hr = expected->GetComparisonInfo(&firstProperty, &firstOperation, &firstValue.value);
+    TaskString firstName(firstProperty);
+    if (FAILED(hr)) return hr;
+    hr = actual->GetComparisonInfo(&secondProperty, &secondOperation, &secondValue.value);
+    TaskString secondName(secondProperty);
+    if (FAILED(hr)) return hr;
+    hr = expected->GetValueType(&firstSemantic);
+    TaskString firstMeaning(firstSemantic);
+    if (FAILED(hr)) return hr;
+    hr = actual->GetValueType(&secondSemantic);
+    TaskString secondMeaning(secondSemantic);
+    if (FAILED(hr)) return hr;
+    same = firstProperty && secondProperty && _wcsicmp(firstProperty, secondProperty) == 0 &&
+        firstOperation == secondOperation && firstValue.value.vt == VT_BOOL && secondValue.value.vt == VT_BOOL &&
+        firstValue.value.boolVal == secondValue.value.boolVal &&
+        ((firstSemantic == nullptr && secondSemantic == nullptr) ||
+         (firstSemantic && secondSemantic && wcscmp(firstSemantic, secondSemantic) == 0));
+    return S_OK;
+}
+
+HRESULT inferredBooleanCondition(IConditionFactory2* factory, IQueryParser* queryParser,
+                                 const std::wstring& property, CONDITION_OPERATION comparison,
+                                 const std::wstring& text, ICondition** result) {
+    // The public format includes Boolean leaves with no propertyType. Infer
+    // only the installed schema's scalar Boolean, never another scalar type
+    // or an arbitrary string conversion.
+    if (comparison != COP_EQUAL && comparison != COP_NOTEQUAL) return unsupported;
+    const bool isTrue = CompareStringOrdinal(text.c_str(), static_cast<int>(text.size()), L"TRUE", 4, TRUE) == CSTR_EQUAL;
+    const bool isFalse = CompareStringOrdinal(text.c_str(), static_cast<int>(text.size()), L"FALSE", 5, TRUE) == CSTR_EQUAL;
+    if (!isTrue && !isFalse) return unsupported;
+    ComPtr<IPropertyDescription> description;
+    auto hr = PSGetPropertyDescriptionByName(property.c_str(), IID_PPV_ARGS(&description));
+    if (FAILED(hr)) return hr;
+    VARTYPE type = VT_EMPTY;
+    if (FAILED(hr = description->GetPropertyType(&type))) return hr;
+    if (type != VT_BOOL) return unsupported;
+    PROPERTYKEY key{};
+    if (FAILED(hr = description->GetPropertyKey(&key))) return hr;
+    ComPtr<ICondition> candidate;
+    hr = factory->CreateBooleanLeaf(key, comparison, isTrue ? TRUE : FALSE,
+                                    CONDITION_CREATION_DEFAULT, IID_PPV_ARGS(&candidate));
+    if (FAILED(hr)) return hr;
+    PWSTR raw = nullptr;
+    hr = queryParser->RestateToString(candidate.Get(), FALSE, &raw);
+    TaskString restated(raw);
+    if (FAILED(hr)) return hr;
+    if (!raw || !*raw || wcslen(raw) > maximumQueryLength) return unsupported;
+    ComPtr<IQuerySolution> solution;
+    if (FAILED(hr = queryParser->Parse(raw, nullptr, &solution))) return hr;
+    ComPtr<ICondition> reparsed, expected, actual;
+    if (FAILED(hr = solution->GetQuery(&reparsed, nullptr))) return hr;
+    SYSTEMTIME now{}; GetLocalTime(&now);
+    if (FAILED(hr = factory->Resolve(candidate.Get(), SQRO_DONT_SPLIT_WORDS, &now, &expected)) ||
+        FAILED(hr = solution->Resolve(reparsed.Get(), SQRO_DONT_SPLIT_WORDS, &now, &actual))) return hr;
+    if (!expected || !actual) return E_UNEXPECTED;
+    PWSTR rawExpectedMeaning = nullptr;
+    hr = expected->GetValueType(&rawExpectedMeaning);
+    TaskString expectedMeaning(rawExpectedMeaning);
+    if (FAILED(hr)) return hr;
+    if (!rawExpectedMeaning) {
+        // CreateBooleanLeaf supplies the schema-keyed VT_BOOL but leaves its
+        // semantic name absent. The native parser adds its registered Boolean
+        // semantic on restatement. Attach that observed name through the public
+        // factory, retaining every typed factory field, then require the same
+        // complete leaf comparison below. This never discards a differing type.
+        PWSTR rawMeaning = nullptr, rawProperty = nullptr;
+        hr = actual->GetValueType(&rawMeaning);
+        TaskString meaning(rawMeaning);
+        if (FAILED(hr)) return hr;
+        if (!rawMeaning || wcscmp(rawMeaning, L"System.StructuredQueryType.Boolean") != 0) return unsupported;
+        CONDITION_OPERATION operation{};
+        PropertyVariant scalar;
+        hr = expected->GetComparisonInfo(&rawProperty, &operation, &scalar.value);
+        TaskString canonicalProperty(rawProperty);
+        if (FAILED(hr)) return hr;
+        if (!rawProperty || scalar.value.vt != VT_BOOL) return unsupported;
+        ComPtr<ICondition> enriched;
+        hr = factory->MakeLeaf(rawProperty, operation, rawMeaning, &scalar.value,
+                               nullptr, nullptr, nullptr, FALSE, &enriched);
+        if (FAILED(hr)) return hr;
+        if (FAILED(hr = factory->Resolve(enriched.Get(), SQRO_DONT_SPLIT_WORDS, &now, &expected))) return hr;
+        if (!expected) return E_UNEXPECTED;
+        candidate = std::move(enriched);
+    }
+    bool same = false;
+    if (FAILED(hr = sameBooleanLeaf(expected.Get(), actual.Get(), same))) return hr;
+    return same ? candidate.CopyTo(result) : unsupported;
+}
+
+HRESULT condition(IXMLDOMNode* node, IConditionFactory2* factory, IQueryParser* queryParser,
+                  ICondition** result, unsigned depth = 0) {
     if (depth > 64) return unsupported;
     std::wstring name;
     auto hr = nodeName(node, name);
@@ -389,8 +588,8 @@ HRESULT condition(IXMLDOMNode* node, IConditionFactory2* factory, ICondition** r
     if (type->second == L"leafCondition") {
         if (!children.empty()) return unsupported;
         const auto propertyType = values.find(L"propertyType"), op = values.find(L"operator"), value = values.find(L"value");
-        if (propertyType == values.end() || op == values.end() || value == values.end()) return invalidData;
-        if (propertyType->second != L"wstr" && propertyType->second != L"string") return unsupported;
+        if (op == values.end() || value == values.end()) return invalidData;
+        if (propertyType != values.end() && propertyType->second != L"wstr" && propertyType->second != L"string") return unsupported;
         CONDITION_OPERATION comparison{};
         if (!operation(op->second, comparison)) return unsupported;
         const auto propertyName = values.find(L"property");
@@ -400,16 +599,12 @@ HRESULT condition(IXMLDOMNode* node, IConditionFactory2* factory, ICondition** r
         if (semantic != values.end() && otherCase != values.end()) return unsupported;
         if (semantic == values.end()) semantic = otherCase;
         if (semantic != values.end() && (semantic->second.empty() || semantic->second.size() > 1024)) return unsupported;
-        if (semantic != values.end()) {
-            constexpr std::array<std::wstring_view, 8> supportedTypes{
-                L"System.StructuredQueryType.String",
-                L"System.StructuredQueryType.Integer", L"System.StructuredQueryType.FloatingPoint",
-                L"System.StructuredQueryType.Boolean", L"System.StructuredQueryType.DateTime",
-                L"System.StructuredQueryType.FilePath", L"System.StructuredQueryType.Implicit.System.Kind",
-                L"System.StructuredQueryType.Implicit.System.Size"};
-            if (std::find(supportedTypes.begin(), supportedTypes.end(), semantic->second) == supportedTypes.end()) return unsupported;
-        }
+        if (semantic != values.end() && !saved_search_internal::supportedValueType(semantic->second)) return unsupported;
         if (value->second.size() > maximumQueryLength) return unsupported;
+        if (propertyType == values.end()) {
+            if (semantic != values.end() && semantic->second != L"System.StructuredQueryType.Boolean") return unsupported;
+            return inferredBooleanCondition(factory, queryParser, propertyName->second, comparison, value->second, result);
+        }
         PropertyVariant scalar;
         if (FAILED(hr = InitPropVariantFromString(value->second.c_str(), &scalar.value))) return hr;
         return factory->MakeLeaf(propertyName == values.end() ? nullptr : propertyName->second.c_str(), comparison,
@@ -420,7 +615,7 @@ HRESULT condition(IXMLDOMNode* node, IConditionFactory2* factory, ICondition** r
     if (type->second == L"notCondition") {
         if (children.size() != 1) return unsupported;
         ComPtr<ICondition> child;
-        if (FAILED(hr = condition(children[0].Get(), factory, &child, depth + 1))) return hr;
+        if (FAILED(hr = condition(children[0].Get(), factory, queryParser, &child, depth + 1))) return hr;
         return factory->MakeNot(child.Get(), FALSE, result);
     }
     CONDITION_TYPE connective{};
@@ -432,11 +627,44 @@ HRESULT condition(IXMLDOMNode* node, IConditionFactory2* factory, ICondition** r
     std::vector<ICondition*> raw;
     for (const auto& child : children) {
         ComPtr<ICondition> item;
-        if (FAILED(hr = condition(child.Get(), factory, &item, depth + 1))) return hr;
+        if (FAILED(hr = condition(child.Get(), factory, queryParser, &item, depth + 1))) return hr;
         raw.push_back(item.Get()); owned.push_back(item);
     }
     return factory->CreateCompoundFromArray(connective, raw.data(), static_cast<ULONG>(raw.size()),
                                            CONDITION_CREATION_DEFAULT, IID_PPV_ARGS(result));
+}
+
+HRESULT removeProtectiveScopeGuard(ICondition* original, const std::vector<SearchScopeRule>& rules,
+                                  ICondition** result) {
+    CONDITION_TYPE type{};
+    auto hr = original->GetConditionType(&type);
+    if (FAILED(hr)) return hr;
+    if (type != CT_AND_CONDITION) return unsupported;
+    ComPtr<IEnumUnknown> enumeration;
+    if (FAILED(hr = original->GetSubConditions(IID_PPV_ARGS(&enumeration)))) return hr;
+    std::vector<ComPtr<ICondition>> children;
+    for (;;) {
+        ComPtr<IUnknown> unknown;
+        hr = enumeration->Next(1, &unknown, nullptr);
+        if (hr == S_FALSE) break;
+        if (FAILED(hr)) return hr;
+        if (!unknown || children.size() == 2) return unsupported;
+        ComPtr<ICondition> child;
+        if (FAILED(hr = unknown.As(&child))) return hr;
+        children.push_back(std::move(child));
+    }
+    if (children.size() != 2) return unsupported;
+    ComPtr<ICondition> expected;
+    if (FAILED(hr = search_scope_internal::createScopeGuard(rules, &expected))) return hr;
+    if (!expected) return E_UNEXPECTED;
+    std::array<bool, 2> matches{};
+    for (size_t i = 0; i < children.size(); ++i)
+        if (FAILED(hr = search_scope_internal::sameScopeGuard(expected.Get(), children[i].Get(), &matches[i]))) return hr;
+    // One exact top-level guard can be removed because the returned scope rules
+    // reapply that same condition in live/save routes. Do not guess a guard in
+    // a user OR/NOT, accept a partial domain, or strip two ambiguous matches.
+    if (matches[0] == matches[1]) return unsupported;
+    return children[matches[0] ? 1 : 0].CopyTo(result);
 }
 
 HRESULT parser(IQueryParser** result) {
@@ -795,9 +1023,7 @@ HRESULT queryString(IQueryParser* parser, ICondition* item, std::wstring& result
             case COP_VALUE_NOTCONTAINS: symbol = L"~!"; break;
             case COP_DOSWILDCARDS: symbol = L"~"; break;
             case COP_WORD_EQUAL: symbol = L"$="; break;
-            case COP_WORD_STARTSWITH:
-                if (_wcsicmp(rawProperty, L"System.FileName") == 0) return unsupported;
-                symbol = L"$<"; break;
+            case COP_WORD_STARTSWITH: symbol = L"$<"; break;
             default: break;
             }
             if (symbol) {
@@ -901,7 +1127,8 @@ HRESULT queryMetadata(IXMLDOMNode* node, SavedSearchMetadata& result) {
         *slot = child;
     }
     if (!scope || !conditions || !kinds) return unsupported;
-    if (FAILED(hr = scopeMetadata(scope.Get(), result))) return hr;
+    bool needsGuard = false;
+    if (FAILED(hr = scopeMetadata(scope.Get(), result, needsGuard))) return hr;
     values.clear();
     if (FAILED(hr = attributes(kinds.Get(), {}, values))) return hr;
     Elements kindChildren;
@@ -935,10 +1162,15 @@ HRESULT queryMetadata(IXMLDOMNode* node, SavedSearchMetadata& result) {
     if (roots.size() != 1) return unsupported;
     ComPtr<IConditionFactory2> factory;
     if (FAILED(hr = CoCreateInstance(__uuidof(ConditionFactory), nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory)))) return hr;
-    ComPtr<ICondition> tree;
-    if (FAILED(hr = condition(roots[0].Get(), factory.Get(), &tree))) return hr;
     ComPtr<IQueryParser> queryParser;
     if (FAILED(hr = parser(&queryParser))) return hr;
+    ComPtr<ICondition> tree;
+    if (FAILED(hr = condition(roots[0].Get(), factory.Get(), queryParser.Get(), &tree))) return hr;
+    if (needsGuard) {
+        ComPtr<ICondition> query;
+        if (FAILED(hr = removeProtectiveScopeGuard(tree.Get(), result.scopeRules, &query))) return hr;
+        tree = std::move(query);
+    }
     if (std::any_of(kindNames.begin(), kindNames.end(), [](const std::wstring& kind) { return kind != L"item"; })) {
         // Keep System.Kind typed while constructing the union. A quoted
         // textual System.Kind value can be parsed as a generic search term;
@@ -977,13 +1209,34 @@ HRESULT queryMetadata(IXMLDOMNode* node, SavedSearchMetadata& result) {
 }
 } // namespace
 
+bool saved_search_internal::supportedValueType(std::wstring_view type) noexcept {
+    constexpr std::array<std::wstring_view, 8> supportedTypes{
+        L"System.StructuredQueryType.String",
+        L"System.StructuredQueryType.Integer", L"System.StructuredQueryType.FloatingPoint",
+        L"System.StructuredQueryType.Boolean", L"System.StructuredQueryType.DateTime",
+        L"System.StructuredQueryType.FilePath", L"System.StructuredQueryType.Implicit.System.Kind",
+        L"System.StructuredQueryType.Implicit.System.Size"};
+    return std::find(supportedTypes.begin(), supportedTypes.end(), type) != supportedTypes.end();
+}
+
+HRESULT saved_search_internal::validateSerializedLimits(std::string_view xml) {
+    if (xml.empty()) return invalidData;
+    if (xml.size() > maximumBytes) return unsupported;
+    ComPtr<IXMLDOMDocument2> document;
+    auto hr = parseBytes(xml, &document);
+    if (FAILED(hr)) return hr;
+    unsigned count = 0;
+    return boundedTree(document.Get(), 0, count);
+}
+
 HRESULT readSavedSearch(const std::filesystem::path& path, SavedSearchMetadata* result) {
     if (!result) return E_POINTER;
     try {
         if (path.empty() || path.native().find(L'\0') != std::wstring::npos || _wcsicmp(path.extension().c_str(), L".search-ms") != 0)
             return E_INVALIDARG;
         ComPtr<IXMLDOMDocument2> document;
-        auto hr = loadDocument(path, &document);
+        std::string bytes;
+        auto hr = loadDocument(path, &document, bytes);
         if (FAILED(hr)) return hr;
         unsigned count = 0;
         if (FAILED(hr = boundedTree(document.Get(), 0, count))) return hr;
@@ -998,17 +1251,23 @@ HRESULT readSavedSearch(const std::filesystem::path& path, SavedSearchMetadata* 
         if (values.size() != 1 || values[L"version"] != L"1.0") return unsupported;
         Elements children;
         if (FAILED(hr = elements(root.Get(), children))) return hr;
-        ComPtr<IXMLDOMNode> query, view;
-        bool properties = false;
+        ComPtr<IXMLDOMNode> query, view, properties;
         for (const auto& child : children) {
             if (FAILED(hr = nodeName(child.Get(), name))) return hr;
             if (name == L"query" && !query) query = child;
             else if (name == L"viewInfo" && !view) view = child;
-            else if (name == L"properties" && !properties) properties = true;
+            else if (name == L"properties" && !properties) {
+                properties = child;
+            }
             else return unsupported;
         }
         if (!query) return unsupported;
         SavedSearchMetadata candidate;
+        if (properties) {
+            candidate.fileProperties.emplace();
+            if (FAILED(hr = filePropertyMetadata(properties.Get(), *candidate.fileProperties))) return hr;
+            if (FAILED(hr = exactFilePropertyText(bytes, *candidate.fileProperties))) return hr;
+        }
         if (view) {
             candidate.presentation.emplace();
             if (FAILED(hr = viewMetadata(view.Get(), *candidate.presentation))) return hr;

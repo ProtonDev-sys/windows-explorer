@@ -1,7 +1,12 @@
 #include "explorer/context_menu.hpp"
+#include "explorer/headless_visual.hpp"
+#include "explorer/worker_sta.hpp"
 
 #include <shlobj.h>
 #include <wrl/implements.h>
+#include <array>
+#include <cstdlib>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -420,25 +425,154 @@ struct TemporaryDirectory {
 };
 
 struct HiddenOwner {
-    HWND window = CreateWindowExW(0, L"STATIC", L"Headless context menu owner",
-                                  WS_OVERLAPPED, 0, 0, 1, 1, nullptr, nullptr,
-                                  GetModuleHandleW(nullptr), nullptr);
+    HWND window = nullptr;
+    HiddenOwner() {
+        const auto desktop = explorer::PrivateDesktop::current();
+        require(desktop && desktop->ready() && SUCCEEDED(desktop->verifyIsolation()),
+            "Native menu owner requires the current owned private desktop");
+        window = CreateWindowExW(0, L"STATIC", L"Headless context menu owner",
+            WS_OVERLAPPED, 0, 0, 1, 1, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    }
     ~HiddenOwner() { if (window) DestroyWindow(window); }
 };
 
-bool processHasVisibleWindow() {
-    bool visible = false;
-    EnumWindows([](HWND window, LPARAM parameter) -> BOOL {
+struct MenuWindowObservation {
+    struct VisibleWindow {
+        HWND window = nullptr;
+        HWND owner = nullptr;
+        HWND rootOwner = nullptr;
+        DWORD thread = 0;
+        LONG_PTR style = 0, extendedStyle = 0;
+        RECT bounds{};
+        bool boundsRead = false;
+        std::array<wchar_t, 128> className{};
+        std::array<wchar_t, 256> caption{};
+        bool captionRead = false;
+    };
+    std::array<HWND, 256> processWindows{};
+    std::array<VisibleWindow, 16> visibleWindows{};
+    size_t totalVisited = 0, processCount = 0, visibleCount = 0;
+    DWORD error = ERROR_SUCCESS;
+    bool enumerated = false;
+    HRESULT status = E_ACCESSDENIED;
+    HWND topBefore = nullptr, topAfter = nullptr;
+    DWORD topBeforeError = ERROR_SUCCESS, topAfterError = ERROR_SUCCESS;
+    bool confirmedEmpty = false;
+
+    static BOOL CALLBACK observe(HWND window, LPARAM parameter) {
+        auto& result = *reinterpret_cast<MenuWindowObservation*>(parameter);
+        ++result.totalVisited;
         DWORD process = 0;
-        GetWindowThreadProcessId(window, &process);
-        if (process == GetCurrentProcessId() && IsWindowVisible(window)) {
-            *reinterpret_cast<bool*>(parameter) = true;
-            return FALSE;
-        }
+        const auto thread = GetWindowThreadProcessId(window, &process);
+        if (process != GetCurrentProcessId()) return TRUE;
+        if (result.processCount < result.processWindows.size()) result.processWindows[result.processCount] = window;
+        ++result.processCount;
+        if (!IsWindowVisible(window)) return TRUE;
+        const auto index = result.visibleCount++;
+        if (index >= result.visibleWindows.size()) return TRUE;
+        auto& entry = result.visibleWindows[index];
+        entry.window = window; entry.thread = thread;
+        entry.owner = GetWindow(window, GW_OWNER); entry.rootOwner = GetAncestor(window, GA_ROOTOWNER);
+        entry.style = GetWindowLongPtrW(window, GWL_STYLE);
+        entry.extendedStyle = GetWindowLongPtrW(window, GWL_EXSTYLE);
+        entry.boundsRead = GetWindowRect(window, &entry.bounds) != FALSE;
+        GetClassNameW(window, entry.className.data(), static_cast<int>(entry.className.size()));
+        DWORD_PTR copied = 0;
+        entry.captionRead = SendMessageTimeoutW(window, WM_GETTEXT, entry.caption.size(),
+            reinterpret_cast<LPARAM>(entry.caption.data()), SMTO_ABORTIFHUNG | SMTO_BLOCK, 50, &copied) != 0;
+        entry.caption.back() = L'\0';
         return TRUE;
-    }, reinterpret_cast<LPARAM>(&visible));
-    return visible;
-}
+    }
+
+    explicit MenuWindowObservation(HDESK desktop) {
+        if (!desktop) { error = ERROR_ACCESS_DENIED; return; }
+        SetLastError(ERROR_SUCCESS);
+        topBefore = GetTopWindow(nullptr);
+        topBeforeError = topBefore ? ERROR_SUCCESS : GetLastError();
+        SetLastError(ERROR_SUCCESS);
+        enumerated = EnumDesktopWindows(desktop, observe, reinterpret_cast<LPARAM>(this)) != FALSE;
+        if (enumerated) status = S_OK;
+        else {
+            error = GetLastError(); // Capture before the independent native empty-desktop reads.
+            if (error) status = HRESULT_FROM_WIN32(error);
+            else {
+                SetLastError(ERROR_SUCCESS);
+                topAfter = GetTopWindow(nullptr);
+                topAfterError = topAfter ? ERROR_SUCCESS : GetLastError();
+                const auto privateDesktop = explorer::PrivateDesktop::current();
+                bool unchanged = false;
+                confirmedEmpty = totalVisited == 0 && !topBefore && !topAfter && !topBeforeError && !topAfterError &&
+                    desktop == GetThreadDesktop(GetCurrentThreadId()) && privateDesktop &&
+                    SUCCEEDED(privateDesktop->verifyIsolation(&unchanged)) && unchanged;
+                status = confirmedEmpty ? S_FALSE : HRESULT_FROM_WIN32(ERROR_GEN_FAILURE);
+            }
+        }
+    }
+};
+
+struct MenuVisibilityGuard {
+    const explorer::PrivateDesktop* desktop = explorer::PrivateDesktop::current();
+    std::array<HWND, 256> baseline{};
+    size_t baselineCount = 0;
+
+    explicit MenuVisibilityGuard(const char* stage = "before-native-menu-fixture") {
+        require(desktop && desktop->ready() && SUCCEEDED(desktop->verifyIsolation()),
+            "Native menu fixture requires the current owned private desktop");
+        const auto observation = inspect(stage);
+        baseline = observation.processWindows; baselineCount = observation.processCount;
+    }
+
+    void report(const char* stage, const MenuWindowObservation& observation,
+                HRESULT isolation, HRESULT inputRead, bool inputVisible) const {
+        std::cout << "native-menu-visibility stage=" << stage << " privateDesktop=" << (SUCCEEDED(isolation))
+            << " isolationHRESULT=" << static_cast<ULONG>(isolation)
+            << " inputHRESULT=" << static_cast<ULONG>(inputRead) << " inputVisible=" << inputVisible
+            << " enumerated=" << observation.enumerated << " error=" << observation.error
+            << " enumerationHRESULT=" << static_cast<ULONG>(observation.status) << " confirmedEmpty=" << observation.confirmedEmpty
+            << " totalVisited=" << observation.totalVisited << " topBefore=" << reinterpret_cast<UINT_PTR>(observation.topBefore)
+            << " topAfter=" << reinterpret_cast<UINT_PTR>(observation.topAfter)
+            << " topReadErrors=" << observation.topBeforeError << '/' << observation.topAfterError
+            << " processWindows=" << observation.processCount << " baselineTruncated=" << (baselineCount > baseline.size())
+            << " visibleWindows=" << observation.visibleCount << '\n';
+        for (size_t index = 0; index < observation.visibleCount && index < observation.visibleWindows.size(); ++index) {
+            const auto& entry = observation.visibleWindows[index];
+            bool seenAtBaseline = false;
+            for (size_t prior = 0; prior < baselineCount && prior < baseline.size(); ++prior)
+                if (baseline[prior] == entry.window) seenAtBaseline = true;
+            std::cout << "  native-menu-window hwnd=" << reinterpret_cast<UINT_PTR>(entry.window)
+                << " thread=" << entry.thread << " currentSTA=" << (entry.thread == GetCurrentThreadId())
+                << " owner=" << reinterpret_cast<UINT_PTR>(entry.owner)
+                << " rootOwner=" << reinterpret_cast<UINT_PTR>(entry.rootOwner)
+                << " seenAtBaseline=" << seenAtBaseline << " style=" << entry.style << " exStyle=" << entry.extendedStyle
+                << " boundsRead=" << entry.boundsRead << " bounds=" << entry.bounds.left << ',' << entry.bounds.top << ','
+                << entry.bounds.right << ',' << entry.bounds.bottom << " captionRead=" << entry.captionRead << '\n';
+            std::wcout << L"    class=[" << entry.className.data() << L"] caption=[" << entry.caption.data() << L"]\n";
+        }
+    }
+
+    MenuWindowObservation inspect(const char* stage) const {
+        bool unchanged = false, inputVisible = true;
+        const auto isolation = desktop->verifyIsolation(&unchanged);
+        const auto inputRead = desktop->visibleWindowsOnInputDesktop(inputVisible);
+        const MenuWindowObservation observation(SUCCEEDED(isolation) && unchanged ? GetThreadDesktop(GetCurrentThreadId()) : nullptr);
+        report(stage, observation, isolation, inputRead, inputVisible);
+        ++assertions;
+        if (FAILED(isolation) || !unchanged || FAILED(inputRead) || inputVisible || FAILED(observation.status) ||
+            observation.visibleCount != 0)
+            throw std::runtime_error(std::string("Native menu visibility/isolation guard failed at ") + stage);
+        return observation;
+    }
+
+    void reportFailureTeardown() const noexcept {
+        try {
+            bool inputVisible = true;
+            const auto isolation = desktop->verifyIsolation();
+            const auto inputRead = desktop->visibleWindowsOnInputDesktop(inputVisible);
+            const MenuWindowObservation observation(SUCCEEDED(isolation) ? GetThreadDesktop(GetCurrentThreadId()) : nullptr);
+            report("after-failed-native-menu-reset", observation, isolation, inputRead, inputVisible);
+        } catch (...) { std::cerr << "native-menu-visibility failure teardown diagnostics unavailable\n"; }
+    }
+};
 
 unsigned enabledLeaves(const std::vector<ContextMenuEntry>& entries, UINT first, UINT count) {
     unsigned leaves = 0;
@@ -450,23 +584,28 @@ unsigned enabledLeaves(const std::vector<ContextMenuEntry>& entries, UINT first,
     return leaves;
 }
 
-void nativeMenusWithoutDisplayOrInvocation() {
+void nativeMenuFixture() {
     TemporaryDirectory temporary;
     HiddenOwner owner;
     require(owner.window != nullptr && !IsWindowVisible(owner.window), "Fixture owner must stay hidden");
-    require(!processHasVisibleWindow(), "Tests have a visible process window before Shell enumeration");
+    MenuVisibilityGuard visibility;
+    visibility.inspect("after-hidden-owner-create");
     ComPtr<IShellItem> folder;
+    NativeContextMenu background, newItems, itemMenu;
+    try {
     require(SUCCEEDED(SHCreateItemFromParsingName(temporary.path.c_str(), nullptr,
                                                  IID_PPV_ARGS(&folder))), "Cannot bind menu fixture folder");
-    NativeContextMenu background;
+    visibility.inspect("after-folder-bind");
     require(SUCCEEDED(background.createBackground(owner.window, folder.Get())),
             "Cannot obtain native folder-background context menu");
+    visibility.inspect("after-background-create");
     std::vector<ContextMenuEntry> entries;
     require(SUCCEEDED(background.enumerate(entries)) && !entries.empty(),
             "Native background capabilities could not be enumerated headlessly");
-    NativeContextMenu newItems;
+    visibility.inspect("after-background-populate");
     require(SUCCEEDED(newItems.createNewItems(owner.window, folder.Get())),
             "Cannot obtain native registered New item menu");
+    visibility.inspect("after-new-create");
     require(newItems.popup() != newItems.menu(), "New menu must expose its borrowed native cascade");
     require(SUCCEEDED(newItems.enumerate(entries)) &&
             enabledLeaves(entries, newItems.firstCommand(), newItems.commandCount()) >= 2,
@@ -474,7 +613,7 @@ void nativeMenusWithoutDisplayOrInvocation() {
     std::wcout << L"      Registered New item capabilities:";
     for (const auto& entry : entries) if (!entry.separator()) std::wcout << L" [" << entry.label << L"]";
     std::wcout << L'\n';
-    require(!processHasVisibleWindow(), "Shell enumeration showed a visible process window");
+    visibility.inspect("after-new-populate");
     require(std::filesystem::is_empty(temporary.path), "Enumeration mutated the owned fixture");
     // A valid ZIP can expose SFGAO_FOLDER while remaining a regular file. Reject
     // it before creating a filesystem ShellNew handler, without invoking one.
@@ -502,10 +641,12 @@ void nativeMenusWithoutDisplayOrInvocation() {
     require(!newItems.menu() && !newItems.popup() && newItems.commandCount() == 0 && !IsMenu(previousNewMenu),
             "Rejected ZIP destination retained the previous New menu");
     require(std::filesystem::file_size(archivePath) == 22, "ZIP destination validation mutated the fixture");
+    visibility.inspect("after-zip-destination-rejection");
     // No native InvokeCommand calls here: registered ShellNew Command handlers
     // may launch wizards/editors, and have no documented guaranteed-silent mode.
     newItems.reset();
     background.reset();
+    visibility.inspect("after-background-new-reset");
     const auto filePath = temporary.path / L"fixture.txt";
     { std::ofstream file(filePath); file << "owned menu fixture"; }
     ComPtr<IShellItem> file;
@@ -515,13 +656,97 @@ void nativeMenusWithoutDisplayOrInvocation() {
     ComPtr<IShellItemArray> selection;
     require(SUCCEEDED(SHCreateShellItemArrayFromShellItem(file.Get(), IID_PPV_ARGS(&selection))),
             "Cannot create native selection fixture");
-    NativeContextMenu itemMenu;
     require(SUCCEEDED(itemMenu.createSelection(owner.window, selection.Get())),
             "Cannot obtain native item menu");
+    visibility.inspect("after-selection-create");
     require(SUCCEEDED(itemMenu.enumerate(entries)) && !entries.empty(),
             "Native item/Open-with capabilities could not be enumerated headlessly");
-    require(!processHasVisibleWindow(), "Item enumeration showed a visible process window");
+    visibility.inspect("after-selection-populate");
     require(std::filesystem::file_size(filePath) == 18, "Item enumeration mutated the fixture");
+    itemMenu.reset();
+    visibility.inspect("after-selection-reset");
+    } catch (...) {
+        itemMenu.reset(); newItems.reset(); background.reset();
+        visibility.reportFailureTeardown();
+        throw;
+    }
+}
+
+void nativeMenusWithoutDisplayOrInvocation() {
+    // Native EDIT presentation earlier in this process can leave Windows'
+    // InputSwitch helpers on its desktop. Give this never-presented fixture its
+    // own desktop so its strict visibility guard measures its native calls.
+    const auto creatorDesktop = explorer::PrivateDesktop::current();
+    bool creatorUnchanged = false, creatorInputVisible = true;
+    require(creatorDesktop && SUCCEEDED(creatorDesktop->verifyIsolation(&creatorUnchanged)) && creatorUnchanged &&
+        SUCCEEDED(creatorDesktop->visibleWindowsOnInputDesktop(creatorInputVisible)) && !creatorInputVisible,
+        "Native menu creator must retain its private desktop/input isolation");
+    const auto creatorName = creatorDesktop->name();
+    std::exception_ptr failure;
+    std::thread worker([&] {
+        try {
+            explorer::PrivateDesktop desktop;
+            require(SUCCEEDED(desktop.initialize()) && desktop.name() != creatorName,
+                "Initialize distinct native menu private desktop before COM");
+            std::wcout << L"native-menu-isolated-desktops creator=[" << creatorName << L"] fixture=[" << desktop.name() << L"]\n";
+            {
+                const auto apartment = OleInitialize(nullptr);
+                require(SUCCEEDED(apartment), "Initialize isolated native menu STA");
+                struct Apartment { ~Apartment() { OleUninitialize(); } } apartmentOwner;
+                try { nativeMenuFixture(); }
+                catch (...) { failure = std::current_exception(); }
+                const auto drained = explorer::drainStaWorkers(5000);
+                if (FAILED(drained)) {
+                    std::cerr << "FAIL isolated native menu creator drain HRESULT=" << static_cast<ULONG>(drained) << '\n';
+                    // Native work cannot outlive this STA, its sites or desktop.
+                    if (!TerminateProcess(GetCurrentProcess(), 10)) std::_Exit(10);
+                    std::_Exit(10);
+                }
+                MenuVisibilityGuard afterFixture("after-native-menu-fixture-resources-release");
+                (void)afterFixture;
+            }
+            MenuVisibilityGuard afterApartment("after-native-menu-STA-release");
+            (void)afterApartment;
+        } catch (...) { failure = std::current_exception(); }
+    });
+    // Wait on the thread's actual exit, including COM/desktop/CRT teardown;
+    // a signal sent from its lambda would precede native thread termination.
+    HANDLE workerExit = worker.native_handle();
+    const auto deadline = GetTickCount64() + 20000;
+    HRESULT waitFailure = S_OK;
+    for (;;) {
+        const auto observed = WaitForSingleObject(workerExit, 0);
+        const auto observationError = observed == WAIT_FAILED ? GetLastError() : ERROR_SUCCESS;
+        if (observed == WAIT_OBJECT_0) break;
+        if (observed == WAIT_FAILED && SUCCEEDED(waitFailure)) {
+            waitFailure = HRESULT_FROM_WIN32(observationError ? observationError : ERROR_GEN_FAILURE);
+            std::cerr << "native-menu-isolated-join waitObservation=" << observed << " error=" << observationError
+                << " HRESULT=" << static_cast<ULONG>(waitFailure) << '\n';
+        } else if (observed != WAIT_TIMEOUT && SUCCEEDED(waitFailure))
+            waitFailure = HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+        if (GetTickCount64() >= deadline) {
+            std::cerr << "FAIL isolated native menu STA did not join within its bounded lifetime HRESULT="
+                << static_cast<ULONG>(HRESULT_FROM_WIN32(ERROR_TIMEOUT)) << " waitHRESULT=" << static_cast<ULONG>(waitFailure) << '\n';
+            // Keep the borrowed result storage and creator desktop alive.
+            // This is already a verified private headless test process.
+            if (!TerminateProcess(GetCurrentProcess(), 10)) std::_Exit(10);
+            std::_Exit(10);
+        }
+        DWORD index = 0;
+        const auto waited = CoWaitForMultipleHandles(COWAIT_DISPATCH_CALLS | COWAIT_DISPATCH_WINDOW_MESSAGES,
+            20, 1, &workerExit, &index);
+        if (FAILED(waited) && waited != RPC_S_CALLPENDING && SUCCEEDED(waitFailure)) {
+            waitFailure = waited;
+            std::cerr << "native-menu-isolated-join creatorPumpHRESULT=" << static_cast<ULONG>(waited) << '\n';
+        }
+    }
+    worker.join();
+    require(SUCCEEDED(waitFailure), "Pump native menu creator STA until the fixture genuinely joins");
+    creatorUnchanged = false; creatorInputVisible = true;
+    require(SUCCEEDED(creatorDesktop->verifyIsolation(&creatorUnchanged)) && creatorUnchanged &&
+        SUCCEEDED(creatorDesktop->visibleWindowsOnInputDesktop(creatorInputVisible)) && !creatorInputVisible,
+        "Native menu isolated STA changed the creator or input desktop");
+    if (failure) std::rethrow_exception(failure);
 }
 } // namespace
 
@@ -557,7 +782,3 @@ int runContextMenuTests() {
     std::cout << "Context menu assertions: " << assertions << '\n';
     return failures;
 }
-
-#ifdef EXPLORER_CONTEXT_MENU_TEST_STANDALONE
-int main() { return runContextMenuTests(); }
-#endif

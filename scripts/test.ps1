@@ -8,6 +8,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot 'windows-environment.ps1')
 if ([string]::IsNullOrWhiteSpace($BuildDirectory)) { $BuildDirectory = Join-Path $projectRoot 'build' }
 $BuildDirectory = [IO.Path]::GetFullPath($BuildDirectory)
 $artifactDirectory = Join-Path $projectRoot 'artifacts'
@@ -76,26 +77,32 @@ function Test-ConfiguredOptIn([string]$Name, [string]$Variable) {
 $historyStatus = Get-NativeTestStatus 'native_shell_history'
 $searchOptionsStatus = Get-NativeTestStatus 'native_search_options'
 $viewPersistenceStatus = Get-NativeTestStatus 'native_view_persistence'
+$transferStatus = Get-NativeTestStatus 'native_shell_transfer'
 $disposableRunner = $env:GITHUB_ACTIONS -ceq 'true'
 $historyOptIn = Test-ConfiguredOptIn 'native_shell_history' 'WINDOWSEXPLORER_NATIVE_HISTORY_TEST'
 $searchOptIn = Test-ConfiguredOptIn 'native_search_options' 'WINDOWSEXPLORER_SEARCH_OPTIONS_TEST'
 $viewPersistenceOptIn = Test-ConfiguredOptIn 'native_view_persistence' 'WINDOWSEXPLORER_VIEW_PERSISTENCE_TEST'
+$transferOptIn = $env:WINDOWSEXPLORER_NATIVE_TRANSFER_TEST -ceq '1'
 @{
     executableSha256 = (Get-FileHash -LiteralPath $executable -Algorithm SHA256).Hash.ToLowerInvariant()
     completedUtc = [DateTime]::UtcNow.ToString('o')
     os = [Environment]::OSVersion.VersionString
+    windows = Get-ExplorerWindowsEnvironment
     disposableHostedRunner = $disposableRunner
     nativeHistoryOptInConfigured = $historyOptIn
     nativeSearchOptionsOptInConfigured = $searchOptIn
     nativeViewPersistenceOptInConfigured = $viewPersistenceOptIn
+    nativeTransferOptInExplicit = $transferOptIn
     nativeHistoryMutationEnabled = $disposableRunner -and $historyOptIn -and $historyStatus -ne 'skipped' -and $historyStatus -ne 'not-run'
     nativeSearchOptionsMutationEnabled = $disposableRunner -and $searchOptIn -and $searchOptionsStatus -ne 'skipped' -and $searchOptionsStatus -ne 'not-run'
     nativeViewPersistenceMutationEnabled = $disposableRunner -and $viewPersistenceOptIn -and $viewPersistenceStatus -ne 'skipped' -and $viewPersistenceStatus -ne 'not-run'
+    nativeTransferMutationEnabled = $disposableRunner -and $transferOptIn -and $transferStatus -ne 'skipped' -and $transferStatus -ne 'not-run'
     nativeHistoryTestStatus = $historyStatus
     nativeSearchOptionsTestStatus = $searchOptionsStatus
     nativeViewPersistenceTestStatus = $viewPersistenceStatus
+    nativeTransferTestStatus = $transferStatus
     installedHostConfigured = $installedHostConfigured
-} | ConvertTo-Json | Set-Content -LiteralPath $environmentReport -Encoding utf8
+} | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $environmentReport -Encoding utf8
 foreach ($hostReport in $hostReports) {
     if (Test-Path -LiteralPath $hostReport.destination) {
         $reportSummary = Get-Content -LiteralPath $hostReport.destination -Raw | ConvertFrom-Json
@@ -105,6 +112,18 @@ foreach ($hostReport in $hostReports) {
     }
 }
 if ($testExit -ne 0) { throw "Headless checks failed: CTest=$testExit. Reports: $artifactDirectory" }
+if ($disposableRunner) {
+    foreach ($nativeGate in @(
+        @{ name = 'native_shell_history'; optedIn = $historyOptIn; status = $historyStatus },
+        @{ name = 'native_search_options'; optedIn = $searchOptIn; status = $searchOptionsStatus },
+        @{ name = 'native_view_persistence'; optedIn = $viewPersistenceOptIn; status = $viewPersistenceStatus },
+        @{ name = 'native_shell_transfer'; optedIn = $transferOptIn; status = $transferStatus }
+    )) {
+        if ($nativeGate.optedIn -and $nativeGate.status -ne 'passed') {
+            throw "Opted-in disposable-CI test must actually pass: $($nativeGate.name)=$($nativeGate.status)."
+        }
+    }
+}
 foreach ($hostReport in $hostReports) {
     if (-not (Test-Path -LiteralPath $hostReport.destination)) {
         throw "Smoke test did not create its report: $($hostReport.destination)"

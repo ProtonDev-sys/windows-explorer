@@ -18,6 +18,11 @@ public:
     StaWorkerLease(const StaWorkerLease&) = delete;
     StaWorkerLease& operator=(const StaWorkerLease&) = delete;
     HRESULT attach() noexcept;
+    // Move one retained value into preallocated creator-STA cleanup. The
+    // worker must finish/exit; the creator releases it while pumping COM.
+    // Validation failure preserves keepalive. Native bookkeeping failure
+    // consumes/retains it and makes the final drain fail. No allocation occurs.
+    HRESULT deferCreatorRelease(std::shared_ptr<void>& keepalive) noexcept;
     HRESULT finish() noexcept;
 private:
     struct Impl;

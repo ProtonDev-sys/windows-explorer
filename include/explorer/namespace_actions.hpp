@@ -8,6 +8,8 @@
 
 namespace explorer {
 
+struct NamespaceStateRegistration;
+
 enum class NamespaceAction {
     FormatDrive, OptimizeDrive, CleanUpDrive, EjectDrive, BitLocker,
     MountDiscImage, BurnDiscImage,
@@ -115,8 +117,8 @@ struct NamespaceCommandState {
     bool explorerCommand = false;
     bool initialized = false;
     bool siteAttached = false;
-    // Read-only full native selection-menu evidence for static association
-    // verbs that have no registered public command-state handler.
+    // Read-only native selection/background-menu evidence for commands that
+    // have no usable directly initialized public command-state handler.
     bool contextMenu = false;
     bool identitySnapshot = false;
     DWORD selectionCount = 0;
@@ -168,13 +170,16 @@ HRESULT namespaceSelectionKinds(IShellItemArray* selection,NamespaceSelectionKin
 HRESULT namespaceCommandState(std::wstring_view command, IShellItemArray* selection,
                               IUnknown* site, NamespaceCommandState* result);
 
-// Completes a native E_PENDING state query with GetState(TRUE) on a separate
+// Attempts a native E_PENDING state query with GetState(TRUE) on a separate
 // STA. Actual selection/site interfaces cross apartments through the standard
 // GIT; no provider interface is called from a foreign apartment. Poll/cancel and
 // destruction belong to the creating STA; none waits for provider completion.
 // Worker owns a handle to the exact creator desktop and attaches before COM.
 // Hosts drain their STA workers while sites/apartment remain alive at shutdown;
 // navigation cancellation and task destruction remain nonblocking.
+// Registrations survive cancellation until every worker has released its own
+// proxies. Initialized facades may reuse a registration for the same retained
+// selection/site objects; standalone start methods own independent ones.
 // The host must discard results after navigation/selection/clipboard changes.
 // Background Explorer commands receive null selection; state-only handlers
 // receive the actual current-folder item array required by their public API.
@@ -196,8 +201,14 @@ public:
                                            std::unique_ptr<NamespaceCommandStateTask>* result);
     // Ribbon-only static commands can be absent from the default item menu.
     // Reads their exact registered CommandStore leaf with the full selection.
+    // Background requires the one actual folder item and creates the native
+    // cidl=0 background menu with the original marshaled view site.
     static HRESULT startRegisteredMenu(std::wstring_view command,IShellItemArray* selection,IUnknown* site,
-                                       std::unique_ptr<NamespaceCommandStateTask>* result);
+                                       std::unique_ptr<NamespaceCommandStateTask>* result,
+                                       NamespaceMenuScope scope = NamespaceMenuScope::Selection);
+    // E_PENDING can mean unfinished work or a finished provider's actual
+    // result. Snapshot completed() before poll to distinguish those cases;
+    // completion does not establish a successful native state.
     HRESULT poll(NamespaceCommandState* result);
     HRESULT pollSelectionVerbBatch(std::vector<NamespaceSelectionVerbState>* result);
     // Read-only performance evidence after actual completion, including a
@@ -209,10 +220,12 @@ public:
     bool completed() const;
     void cancel() noexcept;
 private:
+    friend class NativeNamespaceActions;
     struct Impl;
     static HRESULT startImpl(std::wstring_view name,IShellItemArray* selection,IUnknown* site,
                              bool background,std::vector<std::wstring> selectionVerbs,
-                             std::unique_ptr<NamespaceCommandStateTask>* result,bool independentVerbs = false);
+                             std::unique_ptr<NamespaceCommandStateTask>* result,bool independentVerbs = false,
+                             std::shared_ptr<NamespaceStateRegistration> registration = {});
     explicit NamespaceCommandStateTask(std::unique_ptr<Impl> impl);
     std::unique_ptr<Impl> impl_;
 };
@@ -313,6 +326,8 @@ public:
     HRESULT invokeViewSelection(std::wstring_view command,IShellView* exactView,bool headless);
     // Fast capability query on this instance's actual selection/view site. Does
     // not load menus; Background supplies null selection to the view provider.
+    // The validated Recycle Bin Properties composite defers to its exact
+    // background-menu worker when its uninitialized direct provider fails.
     HRESULT queryCommandState(std::wstring_view command, NamespaceCommandState* result,
                               NamespaceMenuScope scope = NamespaceMenuScope::Selection);
     HRESULT startCommandStateTask(std::wstring_view command,std::unique_ptr<NamespaceCommandStateTask>* result,

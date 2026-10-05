@@ -3,15 +3,20 @@
 #include "explorer/worker_sta.hpp"
 
 #include <shlobj.h>
+#include <objbase.h>
 #include <wrl/implements.h>
 #include <array>
 #include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <new>
 #include <stdexcept>
 #include <thread>
+#include <utility>
 
 namespace {
 using Microsoft::WRL::ComPtr;
@@ -35,9 +40,22 @@ void succeeded(HRESULT value, const char* message) {
     }
 }
 
+[[noreturn]] void namespaceFatal(const char* phase,HRESULT status) noexcept {
+    std::fprintf(stderr,"FATAL: private namespace %s HRESULT=0x%08lX\n",phase,static_cast<unsigned long>(status));
+    TerminateProcess(GetCurrentProcess(),1);std::_Exit(1);
+}
+
+void drainNamespaceWorkers(const char* phase) noexcept {
+    const auto status=explorer::drainStaWorkers(10000);
+    if(FAILED(status))namespaceFatal(phase,status);
+}
+
+struct NamespaceDrainGuard {
+    ~NamespaceDrainGuard(){drainNamespaceWorkers("fixture worker drain before owned-resource teardown");}
+};
+
 void onPrivateNamespaceDesktop(const std::function<void()>& body) {
     std::exception_ptr failure;
-    std::atomic<bool> complete{false};
     std::thread worker([&] {
         explorer::PrivateDesktop desktop;bool initialized=false;
         try {
@@ -51,16 +69,33 @@ void onPrivateNamespaceDesktop(const std::function<void()>& body) {
             succeeded(desktop.verifyIsolation(),"Verify input desktop remains unchanged after namespace fixture");
         } catch(...) { failure=std::current_exception(); }
         if(initialized) {
-            try{succeeded(explorer::drainStaWorkers(10000),"Drain namespace fixture workers before apartment shutdown");}
-            catch(...){if(!failure)failure=std::current_exception();}
+            drainNamespaceWorkers("worker drain before apartment/private-desktop shutdown");
             OleUninitialize();
         }
-        complete.store(true);
     });
-    while(!complete.load()) {
-        MSG message{};while(PeekMessageW(&message,nullptr,0,0,PM_REMOVE)){TranslateMessage(&message);DispatchMessageW(&message);}
-        Sleep(1);
+    HANDLE kernel=nullptr;
+    if(!DuplicateHandle(GetCurrentProcess(),worker.native_handle(),GetCurrentProcess(),&kernel,SYNCHRONIZE,FALSE,0))
+        namespaceFatal("duplicate exact fixture thread",HRESULT_FROM_WIN32(GetLastError()));
+    const auto desktop=explorer::PrivateDesktop::current();
+    const auto deadline=GetTickCount64()+20000;
+    for(;;) {
+        if(desktop) {
+            const auto isolated=desktop->verifyIsolation();if(FAILED(isolated))namespaceFatal("parent isolation during native wait",isolated);
+        }
+        const auto signaled=WaitForSingleObject(kernel,0);
+        if(signaled==WAIT_OBJECT_0)break;
+        if(signaled!=WAIT_TIMEOUT)namespaceFatal("inspect exact fixture thread",HRESULT_FROM_WIN32(GetLastError()));
+        if(GetTickCount64()>=deadline)namespaceFatal("fixture kernel-exit deadline",HRESULT_FROM_WIN32(ERROR_TIMEOUT));
+        MSG message{};unsigned dispatched=0;
+        while(dispatched++<32&&PeekMessageW(&message,nullptr,0,0,PM_REMOVE)) {
+            if(message.message==WM_QUIT)namespaceFatal("unexpected parent quit",E_ABORT);
+            TranslateMessage(&message);DispatchMessageW(&message);
+        }
+        DWORD index=0;
+        const auto waited=CoWaitForMultipleHandles(COWAIT_DISPATCH_CALLS|COWAIT_DISPATCH_WINDOW_MESSAGES,10,1,&kernel,&index);
+        if(FAILED(waited)&&waited!=RPC_S_CALLPENDING)namespaceFatal("dispatch fixture kernel wait",waited);
     }
+    CloseHandle(kernel);
     worker.join();if(failure)std::rethrow_exception(failure);
 }
 
@@ -128,6 +163,366 @@ std::string read(const fs::path& path) {
     std::ifstream input(path, std::ios::binary);
     require(input.good(), "Read owned fixture for side-effect checks");
     return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+}
+
+bool pumpPrivateNamespaceUntil(const std::function<bool()>& complete,DWORD milliseconds) {
+    struct Event {HANDLE value=CreateEventW(nullptr,TRUE,FALSE,nullptr);~Event(){if(value)CloseHandle(value);}}event;
+    require(event.value!=nullptr,"Create owned namespace COM-dispatch event");
+    const auto desktop=explorer::PrivateDesktop::current();
+    require(desktop!=nullptr,"Native background fixture has no private desktop");
+    const auto deadline=GetTickCount64()+milliseconds;
+    do {
+        succeeded(desktop->verifyIsolation(),"Keep native background query on its private desktop");
+        if(complete())return true;
+        MSG message{};unsigned dispatched=0;
+        while(dispatched++<32&&PeekMessageW(&message,nullptr,0,0,PM_REMOVE)) {
+            if(message.message==WM_QUIT){PostQuitMessage(static_cast<int>(message.wParam));return false;}
+            TranslateMessage(&message);DispatchMessageW(&message);
+        }
+        DWORD index=0;
+        const auto waited=CoWaitForMultipleHandles(COWAIT_DISPATCH_CALLS|COWAIT_DISPATCH_WINDOW_MESSAGES,5,1,&event.value,&index);
+        if(waited!=RPC_S_CALLPENDING)succeeded(waited,"Dispatch native background provider's marshaled view calls");
+    }while(GetTickCount64()<deadline);
+    return complete();
+}
+
+struct LookupEvidence {
+    HANDLE entered=CreateEventW(nullptr,TRUE,FALSE,nullptr),release=CreateEventW(nullptr,TRUE,FALSE,nullptr);
+    std::atomic<bool> block{false};
+    std::atomic<unsigned> marshalClasses{0},registrationProbes{0},marshals{0},lookups{0},destroyed{0};
+    std::atomic<DWORD> lookupThread{0};
+    std::atomic<DWORD> classThread{0},classDestination{0},classFlags{0};
+    std::atomic<HRESULT> lookupWait{E_PENDING},classStatus{E_PENDING},destructionApartment{E_PENDING};
+    std::function<void()> onRegistration;
+    ~LookupEvidence(){if(entered)CloseHandle(entered);if(release)CloseHandle(release);}
+};
+
+// Own public COM object using the actual free-threaded marshaler. The gate is
+// inside the real standard GIT's foreign-apartment IUnknown lookup, rather
+// than a replacement GIT or a simulated worker-completion seam.
+class LookupSite final : public IServiceProvider,public IMarshal {
+public:
+    static HRESULT create(const std::shared_ptr<LookupEvidence>& evidence,ComPtr<IUnknown>* result) {
+        auto* value=new(std::nothrow) LookupSite(evidence);if(!value)return E_OUTOFMEMORY;
+        const auto status=CoCreateFreeThreadedMarshaler(static_cast<IServiceProvider*>(value),&value->marshaler_);
+        if(FAILED(status)){value->Release();return status;}
+        result->Attach(static_cast<IServiceProvider*>(value));return S_OK;
+    }
+    ULONG references() const noexcept{return references_.load();}
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid,void** result) override {
+        if(!result)return E_POINTER;*result=nullptr;
+        if(IsEqualIID(iid,IID_IUnknown)||IsEqualIID(iid,IID_IServiceProvider)) {
+            if(IsEqualIID(iid,IID_IUnknown)&&GetCurrentThreadId()!=creator_&&evidence_->block.exchange(false)) {
+                ++evidence_->lookups;evidence_->lookupThread=GetCurrentThreadId();SetEvent(evidence_->entered);
+                evidence_->lookupWait=WaitForSingleObject(evidence_->release,5000)==WAIT_OBJECT_0?S_OK:HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+                if(FAILED(evidence_->lookupWait.load()))return evidence_->lookupWait.load();
+            }
+            *result=static_cast<IServiceProvider*>(this);
+        } else if(IsEqualIID(iid,IID_IMarshal))*result=static_cast<IMarshal*>(this);
+        else return E_NOINTERFACE;
+        AddRef();return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override{return ++references_;}
+    ULONG STDMETHODCALLTYPE Release() override{const auto remaining=--references_;if(!remaining)delete this;return remaining;}
+    HRESULT STDMETHODCALLTYPE QueryService(REFGUID,REFIID,void** result) override {
+        if(!result)return E_POINTER;*result=nullptr;return E_NOINTERFACE;
+    }
+    HRESULT STDMETHODCALLTYPE GetUnmarshalClass(REFIID iid,void* object,DWORD destination,void* context,DWORD flags,CLSID* result) override {
+        ++evidence_->marshalClasses;evidence_->classThread=GetCurrentThreadId();
+        evidence_->classDestination=destination;evidence_->classFlags=flags;
+        if(GetCurrentThreadId()==creator_&&IsEqualIID(iid,IID_IUnknown)) {
+            // The standard GIT may recognize the real FTM class and retain an
+            // agile interface without calling MarshalInterface. Observe its
+            // actual creator-side IUnknown registration-class probe instead.
+            ++evidence_->registrationProbes;
+            auto callback=std::move(evidence_->onRegistration);if(callback)callback();
+        }
+        const auto status=marshal([&](IMarshal* value){return value->GetUnmarshalClass(iid,object,destination,context,flags,result);});
+        evidence_->classStatus=status;return status;
+    }
+    HRESULT STDMETHODCALLTYPE GetMarshalSizeMax(REFIID iid,void* object,DWORD destination,void* context,DWORD flags,DWORD* result) override {
+        return marshal([&](IMarshal* value){return value->GetMarshalSizeMax(iid,object,destination,context,flags,result);});
+    }
+    HRESULT STDMETHODCALLTYPE MarshalInterface(IStream* stream,REFIID iid,void* object,DWORD destination,void* context,DWORD flags) override {
+        ++evidence_->marshals;
+        return marshal([&](IMarshal* value){return value->MarshalInterface(stream,iid,object,destination,context,flags);});
+    }
+    HRESULT STDMETHODCALLTYPE UnmarshalInterface(IStream* stream,REFIID iid,void** result) override {
+        return marshal([&](IMarshal* value){return value->UnmarshalInterface(stream,iid,result);});
+    }
+    HRESULT STDMETHODCALLTYPE ReleaseMarshalData(IStream* stream) override {
+        return marshal([&](IMarshal* value){return value->ReleaseMarshalData(stream);});
+    }
+    HRESULT STDMETHODCALLTYPE DisconnectObject(DWORD reserved) override {
+        return marshal([&](IMarshal* value){return value->DisconnectObject(reserved);});
+    }
+private:
+    explicit LookupSite(std::shared_ptr<LookupEvidence> evidence):evidence_(std::move(evidence)){}
+    ~LookupSite(){APTTYPE type{};APTTYPEQUALIFIER qualifier{};evidence_->destructionApartment=CoGetApartmentType(&type,&qualifier);++evidence_->destroyed;}
+    template<class Callback> HRESULT marshal(const Callback& callback) {
+        ComPtr<IMarshal> value;const auto status=marshaler_.As(&value);return FAILED(status)?status:callback(value.Get());
+    }
+    std::atomic<ULONG> references_{1};
+    DWORD creator_=GetCurrentThreadId();
+    std::shared_ptr<LookupEvidence> evidence_;
+    ComPtr<IUnknown> marshaler_;
+};
+
+void traceLookupEvidence(const char* stage,const LookupEvidence& evidence) {
+    std::cerr<<"Native GIT stage="<<stage<<" classCalls="<<evidence.marshalClasses.load()
+        <<" creatorIUnknownProbes="<<evidence.registrationProbes.load()<<" MarshalInterface="<<evidence.marshals.load()
+        <<" foreignLookups="<<evidence.lookups.load()<<" lookupThread="<<evidence.lookupThread.load()
+        <<" creatorThread="<<GetCurrentThreadId()<<" classThread="<<evidence.classThread.load()
+        <<" destination="<<evidence.classDestination.load()<<" flags="<<evidence.classFlags.load()
+        <<" classHr=0x"<<std::hex<<static_cast<unsigned long>(evidence.classStatus.load())<<std::dec<<'\n';
+}
+
+void realGitLookupCancellationLifetime() {
+    Fixture fixture;const auto folder=item(fixture.root);const auto selected=array(folder.Get());
+    const auto before=read(fixture.text);const auto clipboard=GetClipboardSequenceNumber();
+    constexpr wchar_t command[]=L"Windows.WindowsExplorer_GIT_LifetimeFixture_8CF8E310";
+    constexpr wchar_t keyPath[]=L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\CommandStore\\shell\\Windows.WindowsExplorer_GIT_LifetimeFixture_8CF8E310";
+    HKEY missing=nullptr;const auto absent=RegOpenKeyExW(HKEY_LOCAL_MACHINE,keyPath,0,KEY_READ,&missing);
+    if(missing)RegCloseKey(missing);
+    require(absent==ERROR_FILE_NOT_FOUND||absent==ERROR_PATH_NOT_FOUND,
+            "Controlled GIT lookup command is not genuinely absent from the installed registry");
+    for(const bool facade:{false,true}) {
+        const auto evidence=std::make_shared<LookupEvidence>();
+        require(evidence->entered&&evidence->release,"Create owned actual-GIT lookup control events");
+        ComPtr<IUnknown> site;succeeded(LookupSite::create(evidence,&site),"Create real free-threaded COM lookup site");
+        auto* source=static_cast<LookupSite*>(static_cast<IServiceProvider*>(site.Get()));
+        explorer::NativeNamespaceActions actions;
+        if(facade)succeeded(actions.initialize(nullptr,{folder,selected,site}),"Initialize exact retained cancellation context");
+        std::unique_ptr<explorer::NamespaceCommandStateTask> task;
+        evidence->block=true;
+        try {
+            // No installed provider can perform a later QI: the only foreign
+            // lookup before the missing-key failure is the actual GIT call.
+            succeeded(facade?actions.startCommandStateTask(command,&task,explorer::NamespaceMenuScope::Background):
+                explorer::NamespaceCommandStateTask::start(command,selected.Get(),site.Get(),true,&task),
+                "Start actual standard-GIT lookup before cancellation");
+            require(pumpPrivateNamespaceUntil([&]{return WaitForSingleObject(evidence->entered,0)==WAIT_OBJECT_0;},3000),
+                    "Real standard-GIT foreign-apartment lookup did not enter the owned gate");
+            if(evidence->lookups!=1||evidence->lookupThread==GetCurrentThreadId()||!evidence->registrationProbes)
+                traceLookupEvidence("controlled-lookup",*evidence);
+            require(evidence->lookups==1&&evidence->lookupThread!=GetCurrentThreadId()&&evidence->registrationProbes>0,
+                    "Lookup control ran on the creator or bypassed real GIT free-threaded registration");
+            const auto references=source->references();
+            const auto started=GetTickCount64();task->cancel();
+            explorer::NamespaceCommandState sentinel;sentinel.state=ECS_CHECKED;sentinel.selectionCount=41;
+            require(task->poll(&sentinel)==HRESULT_FROM_WIN32(ERROR_CANCELLED)&&sentinel.state==ECS_CHECKED&&sentinel.selectionCount==41,
+                    "Lookup cancellation accepted a stale result or changed output");
+            task.reset();
+            require(GetTickCount64()-started<250&&source->references()==references,
+                    "Cancellation revoked a live GIT lookup or waited for the gated worker");
+            actions.reset();
+            // Keep a test anchor until the lookup has exited, so a broken
+            // retention implementation fails an assertion rather than freeing
+            // this owned COM object's method while it is executing.
+            SetEvent(evidence->release);
+            drainNamespaceWorkers("real canceled lookup and exact native worker exit");
+            require(evidence->lookupWait==S_OK&&source->references()==1,
+                    "Canceled lookup failed or left a registered/proxy site reference after worker exit");
+            site.Reset();
+            require(evidence->destroyed==1&&SUCCEEDED(evidence->destructionApartment.load()),
+                    "Final GIT site release escaped an initialized apartment or retained the canceled object");
+        } catch(...) {
+            SetEvent(evidence->release);
+            if(task)task->cancel();task.reset();actions.reset();
+            drainNamespaceWorkers("failed controlled COM lookup before owned fixture teardown");
+            throw;
+        }
+    }
+    require(read(fixture.text)==before&&GetClipboardSequenceNumber()==clipboard,
+            "Read-only GIT lifetime proof changed owned data or the clipboard");
+}
+
+void exactTargetRegistrationReuseAndReentry() {
+    Fixture fixture;const auto folder=item(fixture.root),text=item(fixture.text),image=item(fixture.image);
+    struct Identities {PIDLIST_ABSOLUTE first=nullptr,second=nullptr;~Identities(){CoTaskMemFree(first);CoTaskMemFree(second);}} identities;
+    succeeded(SHGetIDListFromObject(text.Get(),&identities.first),"Capture first owned native registration target");
+    succeeded(SHGetIDListFromObject(image.Get(),&identities.second),"Capture second owned native registration target");
+    std::array<PCIDLIST_ABSOLUTE,2> ids{identities.first,identities.second};
+    ComPtr<IShellItemArray> selected;succeeded(SHCreateShellItemArrayFromIDLists(static_cast<UINT>(ids.size()),ids.data(),&selected),
+                                             "Construct complete native registration-reuse selection");
+    const auto evidence=std::make_shared<LookupEvidence>();ComPtr<IUnknown> site;
+    succeeded(LookupSite::create(evidence,&site),"Create actual COM marshal-count provenance site");
+    const auto replacement=std::make_shared<LookupEvidence>();ComPtr<IUnknown> replacementSite;
+    succeeded(LookupSite::create(replacement,&replacementSite),"Create distinct replacement native context site");
+    const auto replacementSelection=array(image.Get());
+    HRESULT reinitialized=E_PENDING;
+    const auto before=read(fixture.text);const auto clipboard=GetClipboardSequenceNumber();
+    explorer::NativeNamespaceActions actions;succeeded(actions.initialize(nullptr,{folder,selected,site}),"Initialize exact full-array native context");
+    NamespaceDrainGuard cleanup;
+    const auto properties=[&](bool standalone=false) {
+        std::unique_ptr<explorer::NamespaceCommandStateTask> task;
+        succeeded(standalone?explorer::NamespaceCommandStateTask::startSelectionVerb(L"properties",selected.Get(),site.Get(),&task):
+                            actions.startStaticVerbStateTask(L"properties",&task),"Start complete actual native properties state");
+        require(pumpPrivateNamespaceUntil([&]{return task->completed();},5000),"Actual native registered context exceeded bounded wait");
+        explorer::NamespaceCommandState state;succeeded(task->poll(&state),"Read actual complete-selection native properties state");
+        require(state.contextMenu&&state.identitySnapshot&&state.selectionCount==2&&state.siteAttached,
+                "Registration reuse replaced the full native selection, CIDA snapshot or original site");
+        return state.state;
+    };
+    const auto expected=properties();const auto initial=evidence->registrationProbes.load();
+    const auto repeated=properties();
+    if(!initial||repeated!=expected||evidence->registrationProbes!=initial)traceLookupEvidence("same-object-reuse",*evidence);
+    require(initial>0&&repeated==expected&&evidence->registrationProbes==initial,
+            "Repeated same-object state created another GIT registration or changed native state");
+    succeeded(actions.refresh(),"Refresh capabilities while exact full-array/site objects remain unchanged");
+    require(properties()==expected&&evidence->registrationProbes==initial,"Menu refresh discarded an unchanged registration context");
+    properties(true);
+    const auto standaloneProbes=evidence->registrationProbes.load();
+    require(standaloneProbes>initial,"Standalone public task reused a facade registration instead of owning its own");
+    succeeded(actions.initialize(nullptr,{folder,selected,site}),"Advance native target generation with identical retained objects");
+    require(properties()==expected&&evidence->registrationProbes>standaloneProbes,
+            "Target generation replacement reused retired registrations or changed native membership state");
+    const auto background=[&] {
+        std::unique_ptr<explorer::NamespaceCommandStateTask> task;
+        succeeded(actions.startCommandStateTask(L"Windows.undo",&task,explorer::NamespaceMenuScope::Background),
+                  "Start read-only native background provider with exact current folder");
+        require(pumpPrivateNamespaceUntil([&]{return task->completed();},5000),"Native background provider did not finish");
+        explorer::NamespaceCommandState state;return std::pair{task->poll(&state),state.state};
+    };
+    const auto beforeBackground=evidence->registrationProbes.load();
+    const auto backgroundState=background();const auto backgroundProbes=evidence->registrationProbes.load();
+    require(backgroundProbes>beforeBackground&&background()==backgroundState&&evidence->registrationProbes==backgroundProbes,
+            "Background jobs rebuilt/re-registered an unchanged folder context or merged selection targets");
+
+    succeeded(actions.initialize(nullptr,{folder,selected,site}),"Prepare actual registration callback generation fence");
+    evidence->onRegistration=[&]{reinitialized=actions.initialize(nullptr,{folder,replacementSelection,replacementSite});};
+    std::unique_ptr<explorer::NamespaceCommandStateTask> untouched;
+    require(actions.startStaticVerbStateTask(L"properties",&untouched)==HRESULT_FROM_WIN32(ERROR_BUSY)&&!untouched&&SUCCEEDED(reinitialized),
+            "Native marshal reentry published an old-generation task or failed to preserve output");
+    succeeded(actions.startStaticVerbStateTask(L"properties",&untouched),"Start only the actual replacement target generation");
+    require(pumpPrivateNamespaceUntil([&]{return untouched->completed();},5000),"Replacement native provider did not complete");
+    explorer::NamespaceCommandState actual;succeeded(untouched->poll(&actual),"Read genuine replacement-array native state");
+    require(actual.contextMenu&&actual.identitySnapshot&&actual.selectionCount==1&&actual.siteAttached&&replacement->registrationProbes>0,
+            "Reentrant replacement retained the old selection, site or stale registration");
+    untouched.reset();actions.reset();
+    drainNamespaceWorkers("every registration-reuse worker before owned data teardown");
+    require(read(fixture.text)==before&&GetClipboardSequenceNumber()==clipboard,
+            "Registration reuse/state reads changed owned contents or shared clipboard");
+}
+
+class BackgroundNavigationEvents final : public Microsoft::WRL::RuntimeClass<
+    Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::ClassicCom>,IExplorerBrowserEvents> {
+public:
+    bool complete=false;
+    HRESULT status=E_PENDING;
+    HRESULT STDMETHODCALLTYPE OnNavigationPending(PCIDLIST_ABSOLUTE) override{return S_OK;}
+    HRESULT STDMETHODCALLTYPE OnViewCreated(IShellView*) override{return S_OK;}
+    HRESULT STDMETHODCALLTYPE OnNavigationComplete(PCIDLIST_ABSOLUTE) override{complete=true;status=S_OK;return S_OK;}
+    HRESULT STDMETHODCALLTYPE OnNavigationFailed(PCIDLIST_ABSOLUTE) override{complete=true;status=E_FAIL;return S_OK;}
+};
+
+struct NativeBackgroundView {
+    HWND owner=nullptr;
+    DWORD cookie=0;
+    ComPtr<IExplorerBrowser> browser;
+    ComPtr<IShellView> view;
+    ComPtr<BackgroundNavigationEvents> events;
+    void initialize(IShellItem* folder) {
+        const auto desktop=explorer::PrivateDesktop::current();
+        require(desktop&&SUCCEEDED(desktop->verifyIsolation()),"Create native background view only on the owned private desktop");
+        owner=CreateWindowExW(0,L"STATIC",L"owned read-only native background fixture",WS_POPUP,
+            0,0,800,600,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
+        require(owner&&!IsWindowVisible(owner),"Create exclusively hidden native background owner");
+        succeeded(CoCreateInstance(CLSID_ExplorerBrowser,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&browser)),
+                  "Create read-only native background browser");
+        succeeded(browser->SetOptions(EBO_NOPERSISTVIEWSTATE|EBO_NOTRAVELLOG),"Prohibit native background fixture view/history persistence");
+        RECT bounds{0,0,800,600};FOLDERSETTINGS settings{FVM_DETAILS,0};
+        succeeded(browser->Initialize(owner,&bounds,&settings),"Initialize native background browser without displaying it");
+        events=Microsoft::WRL::Make<BackgroundNavigationEvents>();require(events!=nullptr,"Create native background navigation observer");
+        succeeded(browser->Advise(events.Get(),&cookie),"Observe native background navigation completion");
+        succeeded(browser->BrowseToObject(folder,SBSP_ABSOLUTE),"Browse native background namespace without invoking a command");
+        require(pumpPrivateNamespaceUntil([&]{return events->complete;},5000),"Native background navigation exceeded bounded wait");
+        succeeded(events->status,"Read actual native background navigation result");
+        succeeded(browser->GetCurrentView(IID_PPV_ARGS(&view)),"Read actual native background view site");
+        require(!IsWindowVisible(owner),"Native background browser displayed its owner");
+    }
+    ~NativeBackgroundView() {
+        // Keep the native view/HWND alive through exact canceled-worker exit;
+        // failed draining must stop this private process before teardown.
+        drainNamespaceWorkers("native browser/view drain before teardown");
+        view.Reset();
+        if(browser){if(cookie)browser->Unadvise(cookie);browser->Destroy();browser.Reset();}
+        events.Reset();if(owner)DestroyWindow(owner);
+    }
+};
+
+void nativeRecyclePropertiesBackgroundState() {
+    const auto clipboard=GetClipboardSequenceNumber();
+    Fixture fixture;const auto before=read(fixture.text);
+    ComPtr<IShellItem> bin;
+    succeeded(SHGetKnownFolderItem(FOLDERID_RecycleBinFolder,KF_FLAG_DONT_VERIFY,nullptr,IID_PPV_ARGS(&bin)),
+              "Get actual Recycle Bin namespace without deleting or restoring anything");
+    NativeBackgroundView host;host.initialize(bin.Get());
+    explorer::NativeNamespaceActions actions;
+    succeeded(actions.initialize(host.owner,{bin,{},host.view}),"Retain actual Bin folder and original native view site");
+    require(actions.facts().recycleBin&&actions.facts().selectionCount==0,"Native background fixture lost its Bin/no-selection context");
+    constexpr auto command=L"Windows.RecycleBin.properties";
+    explorer::NamespaceCommandState sentinel;sentinel.state=ECS_CHECKED;sentinel.delegatedCommand=L"unchanged";
+    auto fast=sentinel;
+    const auto status=actions.queryCommandState(command,&fast,explorer::NamespaceMenuScope::Background);
+    require(status==E_PENDING&&fast.state==sentinel.state&&fast.delegatedCommand==sentinel.delegatedCommand,
+            "Composite Bin fast query invented availability or changed output instead of deferring native menu work");
+    std::unique_ptr<explorer::NamespaceCommandStateTask> task;
+    const auto notFolder=item(fixture.text);const auto invalidBackground=array(notFolder.Get());
+    succeeded(explorer::NamespaceCommandStateTask::startRegisteredMenu(command,invalidBackground.Get(),host.view.Get(),&task,
+              explorer::NamespaceMenuScope::Background),"Start invalid owned file background to verify native folder validation");
+    require(pumpPrivateNamespaceUntil([&]{return task->completed();},5000),"Invalid background folder validation exceeded bounded wait");
+    auto invalidOutput=sentinel;
+    require(task->poll(&invalidOutput)==E_INVALIDARG&&invalidOutput.state==sentinel.state&&
+            invalidOutput.delegatedCommand==sentinel.delegatedCommand,
+            "Nonfolder background was accepted or changed the caller's preserved state");
+    task.reset();
+    HRESULT started=HRESULT_FROM_WIN32(ERROR_BUSY);
+    require(pumpPrivateNamespaceUntil([&]{
+        if(started==HRESULT_FROM_WIN32(ERROR_BUSY))started=actions.startCommandStateTask(command,&task,explorer::NamespaceMenuScope::Background);
+        return started!=HRESULT_FROM_WIN32(ERROR_BUSY);
+    },5000),"Native Bin background worker could not reserve its own menu slot");
+    succeeded(started,"Start exact native Bin background-menu state worker");
+    require(task!=nullptr,"Native Bin background worker was not retained");
+    require(pumpPrivateNamespaceUntil([&]{return task->completed();},10000),"Native Bin background-menu state worker exceeded bounded wait");
+    explorer::NamespaceCommandState state;
+    succeeded(task->poll(&state),"Read actual native Bin Properties background-menu state");
+    require(state.contextMenu&&state.siteAttached&&!state.identitySnapshot&&state.selectionCount==0&&
+            state.delegatedCommand==command&&state.enabled(),"Native Bin Properties did not resolve its enabled sited background leaf");
+    explorer::NamespaceCommandStateTimings timing;
+    succeeded(task->pollTimings(&timing),"Read completed native Bin menu-worker timings");
+    task.reset();
+
+    // Independently build the real public cidl=0 menu on the owner STA, with
+    // the same original folder/site. No delayed submenus or verbs are invoked.
+    ComPtr<IShellFolder> folder;succeeded(bin->BindToHandler(nullptr,BHID_SFObject,IID_PPV_ARGS(&folder)),"Bind actual native Bin background folder");
+    struct Pidl {PIDLIST_ABSOLUTE value=nullptr;~Pidl(){CoTaskMemFree(value);}}pidl;
+    succeeded(SHGetIDListFromObject(bin.Get(),&pidl.value),"Retain native Bin background identity");
+    struct Key {HKEY value=nullptr;~Key(){if(value)RegCloseKey(value);}}key;
+    succeeded(HRESULT_FROM_WIN32(RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+        L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\CommandStore",0,KEY_READ,&key.value)),
+        "Open native background CommandStore read-only");
+    DEFCONTEXTMENU definition{};definition.hwnd=host.owner;definition.pidlFolder=pidl.value;
+    definition.psf=folder.Get();definition.cKeys=1;definition.aKeys=&key.value;
+    ComPtr<IContextMenu> context;succeeded(SHCreateDefaultContextMenu(&definition,IID_PPV_ARGS(&context)),"Create independent native Bin background menu");
+    explorer::NativeContextMenu menu;succeeded(menu.create(host.owner,context.Get(),host.view.Get(),CMF_EXTENDEDVERBS),"Attach original Bin view site to independent native menu");
+    std::vector<explorer::ContextMenuEntry> entries;succeeded(menu.enumerate(entries,false),"Read native Bin Properties without opening or populating a submenu");
+    unsigned matches=0;UINT ordinal=0;
+    for(const auto& entry:entries)if(!entry.separator()&&!entry.submenu&&_wcsicmp(entry.canonicalVerb.c_str(),command)==0) {
+        ++matches;ordinal=entry.id;
+        require(state.enabled()==entry.enabled()&&state.checked()==((entry.state&MFS_CHECKED)!=0),
+                "Deferred Bin Properties state differs from independent native background-menu authority");
+    }
+    require(matches==1&&ordinal!=0,"Independent native Bin menu has no exact unique Properties ordinal");
+    require(actions.invokeCommandStore(command,true,{},explorer::NamespaceMenuScope::Background)==E_ACCESSDENIED&&
+            actions.invokeCommandStore(command,false,{},explorer::NamespaceMenuScope::Background)==E_ACCESSDENIED,
+            "Read-only Bin fixture weakened headless or hidden-owner invocation guards");
+    bool visible=true;const auto desktop=explorer::PrivateDesktop::current();
+    succeeded(desktop->visibleWindowsOnInputDesktop(visible),"Observe actual input-desktop windows after native Bin state readback");
+    require(!visible&&!IsWindowVisible(host.owner)&&GetClipboardSequenceNumber()==clipboard&&read(fixture.text)==before,
+            "Native Bin state fixture displayed UI or changed owned content/clipboard");
+    std::cout<<"Bin Properties nativeBackground=1 enabled="<<state.enabled()<<" matchedOrdinals="<<matches
+        <<" workerMicroseconds="<<timing.workerMicroseconds<<'\n';
 }
 
 NamespaceFacts selectedFile(const wchar_t* path) {
@@ -641,6 +1036,9 @@ int runNamespaceActionTests() {
         {"native fixture capabilities, STA lifetime and headless activation guard",nativeFixtureCapabilitiesAndHeadlessGuard},
         {"Windows command resources and read-only drive enumeration",metadataAndReadOnlyDriveEnumeration},
         {"all eight native localized View gallery titles and icon resources",nativeViewGalleryResources},
+        {"actual Recycle Bin Properties native background-menu state and invocation guards",[]{onPrivateNamespaceDesktop(nativeRecyclePropertiesBackgroundState);}},
+        {"actual standard-GIT lookup cancellation and initialized final release",[]{onPrivateNamespaceDesktop(realGitLookupCancellationLifetime);}},
+        {"exact target registration reuse, standalone ownership and native marshal reentry",[]{onPrivateNamespaceDesktop(exactTargetRegistrationReuseAndReentry);}},
         {"full 100001-item aggregate attributes, provider site and activation guards",[]{onPrivateNamespaceDesktop(aggregateLargeSelectionAndProviderGuards);}},
         {"real native 100001-item arrays with final file, link and virtual counterexamples",[]{onPrivateNamespaceDesktop(nativeLargeArrayTailCounterexamples);}}
     };

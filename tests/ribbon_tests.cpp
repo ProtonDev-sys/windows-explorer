@@ -1,14 +1,19 @@
 #include "explorer/ribbon.hpp"
 #include "explorer/commands.hpp"
+#include "explorer/namespace_actions.hpp"
 #include "explorer/headless_visual.hpp"
+#include "state_file_security_fixture.hpp"
 #include <UIRibbonPropertyHelpers.h>
 #include <propvarutil.h>
 #include <commctrl.h>
 #include <wrl/client.h>
+#include <algorithm>
 #include <array>
+#include <atomic>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <stdexcept>
 #include <thread>
 #include <uiautomation.h>
@@ -23,6 +28,92 @@ void succeeded(HRESULT result,const char* message){if(FAILED(result))throw std::
 void pump(){const auto end=GetTickCount64()+150;do{MSG message{};while(PeekMessageW(&message,nullptr,0,0,PM_REMOVE)){TranslateMessage(&message);DispatchMessageW(&message);}MsgWaitForMultipleObjectsEx(0,nullptr,5,QS_ALLINPUT,MWMO_INPUTAVAILABLE);}while(GetTickCount64()<end);}
 struct Window{HWND handle=nullptr;~Window(){if(handle)DestroyWindow(handle);}};
 struct Variant{PROPVARIANT value{};~Variant(){PropVariantClear(&value);}};
+class LabelReferenceHandler final : public IUIApplication, public IUICommandHandler {
+public:
+    std::map<UINT,std::wstring> labels,tooltips;
+    std::map<UINT,UINT> labelRequests;
+    std::map<UINT,UI_COMMANDTYPE> commandTypes;
+    std::map<UINT,VARTYPE> firstLabelTypes;
+    std::map<UINT,std::wstring> firstLabels;
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id,void** output) override {
+        if(!output)return E_POINTER;*output=nullptr;
+        if(id==IID_IUnknown||id==__uuidof(IUIApplication))*output=static_cast<IUIApplication*>(this);
+        else if(id==__uuidof(IUICommandHandler))*output=static_cast<IUICommandHandler*>(this);
+        else return E_NOINTERFACE;
+        AddRef();return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override {return ++references_;}
+    ULONG STDMETHODCALLTYPE Release() override {const auto count=--references_;if(!count)delete this;return count;}
+    HRESULT STDMETHODCALLTYPE OnViewChanged(UINT32,UI_VIEWTYPE,IUnknown*,UI_VIEWVERB verb,INT32 reason) override {
+        return verb==UI_VIEWVERB_ERROR?reason:S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE OnCreateUICommand(UINT32 command,UI_COMMANDTYPE type,IUICommandHandler** output) override {
+        if(!output)return E_POINTER;*output=nullptr;
+        try {commandTypes.insert_or_assign(command,type);}catch(...){return E_OUTOFMEMORY;}
+        *output=static_cast<IUICommandHandler*>(this);AddRef();return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE OnDestroyUICommand(UINT32,UI_COMMANDTYPE,IUICommandHandler*) override {return S_OK;}
+    HRESULT STDMETHODCALLTYPE Execute(UINT32,UI_EXECUTIONVERB,const PROPERTYKEY*,const PROPVARIANT*,IUISimplePropertySet*) override {
+        return E_ACCESSDENIED;
+    }
+    HRESULT STDMETHODCALLTYPE UpdateProperty(UINT32 command,REFPROPERTYKEY key,const PROPVARIANT* current,PROPVARIANT* output) override {
+        if(!output)return E_POINTER;PropVariantInit(output);
+        try {
+            if(IsEqualPropertyKey(key,UI_PKEY_Label)||IsEqualPropertyKey(key,UI_PKEY_TooltipTitle)) {
+                const bool label=IsEqualPropertyKey(key,UI_PKEY_Label);
+                if(label) {
+                    ++labelRequests[command];
+                    const auto first=firstLabelTypes.try_emplace(command,current?current->vt:static_cast<VARTYPE>(VT_EMPTY)).second;
+                    if(first&&current&&current->vt==VT_LPWSTR&&current->pwszVal)
+                        firstLabels.emplace(command,current->pwszVal);
+                }
+                if(current&&current->vt==VT_LPWSTR&&current->pwszVal&&*current->pwszVal) {
+                    (label?labels:tooltips).try_emplace(command,current->pwszVal);
+                    return PropVariantCopy(output,current);
+                }
+            }
+        }catch(...){return E_OUTOFMEMORY;}
+        return E_NOTIMPL;
+    }
+private:
+    std::atomic<ULONG> references_{1};
+};
+struct InstalledLabelReference {
+    Window window;
+    HMODULE module=nullptr;
+    Microsoft::WRL::ComPtr<LabelReferenceHandler> handler;
+    Microsoft::WRL::ComPtr<IUIFramework> framework;
+    ~InstalledLabelReference() {
+        if(framework)framework->Destroy();framework.Reset();handler.Reset();
+        if(module)FreeLibrary(module);
+    }
+    void initialize(const wchar_t* windowClass,const explorer::RibbonFeatures& features) {
+        window.handle=CreateWindowExW(0,windowClass,L"Owned native Ribbon label reference",WS_OVERLAPPEDWINDOW,
+            0,0,1000,700,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
+        require(window.handle!=nullptr,"Create private native label-reference host");
+        module=LoadLibraryExW(L"ExplorerFrame.dll",nullptr,
+            LOAD_LIBRARY_SEARCH_SYSTEM32|LOAD_LIBRARY_AS_DATAFILE|LOAD_LIBRARY_AS_IMAGE_RESOURCE);
+        require(module!=nullptr,"Load actual installed Ribbon resource module");
+        handler.Attach(new LabelReferenceHandler());
+        succeeded(CoCreateInstance(CLSID_UIRibbonFramework,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&framework)),
+            "Create independent native label-reference framework");
+        succeeded(framework->Initialize(window.handle,handler.Get()),"Initialize independent native label reference");
+        succeeded(framework->LoadUI(module,L"EXPLORER_RIBBON"),"Load unmodified installed BML label resources");
+        succeeded(framework->SetModes(0xa1|(features.discBurning?0x20000:0x40000)),"Select actual native Home reference mode");
+        require(!IsWindowVisible(window.handle),"Native label-reference host became visible");
+    }
+};
+struct OwnedRefineControl {
+    std::wstring name;
+    CONTROLTYPEID type=0;
+    RECT bounds{};
+};
+struct OwnedRefineLabels {
+    std::wstring selectedTab,toolbar;
+    CONTROLTYPEID parentType=0;
+    std::vector<OwnedRefineControl> controls;
+    std::vector<std::wstring> groupLabels;
+};
 HRESULT ownedAutomation(HWND window,std::function<HRESULT(IUIAutomation*)> action) {
     DWORD process=0;
     if(!window||GetWindowThreadProcessId(window,&process)!=GetCurrentThreadId()||process!=GetCurrentProcessId())return E_INVALIDARG;
@@ -56,6 +147,453 @@ HRESULT namedElement(IUIAutomation* automation,HWND window,const wchar_t* name,I
     if(SUCCEEDED(hr))hr=automation->CreatePropertyCondition(UIA_NamePropertyId,caption,&condition);VariantClear(&caption);
     if(SUCCEEDED(hr))hr=root->FindFirst(TreeScope_Descendants,condition.Get(),output);
     return SUCCEEDED(hr)&&!*output?HRESULT_FROM_WIN32(ERROR_NOT_FOUND):hr;
+}
+std::string diagnosticCaption(std::wstring_view caption) {
+    if(caption.empty())return {};
+    const auto characters=static_cast<int>(caption.size());
+    const auto bytes=WideCharToMultiByte(CP_UTF8,WC_ERR_INVALID_CHARS,caption.data(),characters,nullptr,0,nullptr,nullptr);
+    if(!bytes)return "<invalid UTF-16>";
+    std::string result(static_cast<size_t>(bytes),'\0');
+    if(!WideCharToMultiByte(CP_UTF8,WC_ERR_INVALID_CHARS,caption.data(),characters,result.data(),bytes,nullptr,nullptr))
+        return "<invalid UTF-16>";
+    return result;
+}
+void diagnoseOwnedLabel(IUIAutomation* automation,HWND window,const std::wstring& expected,HRESULT lookup) {
+    Microsoft::WRL::ComPtr<IUIAutomationElement> root;
+    Microsoft::WRL::ComPtr<IUIAutomationCondition> condition;
+    Microsoft::WRL::ComPtr<IUIAutomationElementArray> matches;
+    auto hr=automation->ElementFromHandle(window,&root);
+    VARIANT caption{};caption.vt=VT_BSTR;caption.bstrVal=SysAllocString(expected.c_str());
+    if(SUCCEEDED(hr))hr=automation->CreatePropertyCondition(UIA_NamePropertyId,caption,&condition);
+    VariantClear(&caption);
+    if(SUCCEEDED(hr))hr=root->FindAll(TreeScope_Descendants,condition.Get(),&matches);
+    int count=-1;if(SUCCEEDED(hr))hr=matches->get_Length(&count);
+    std::cout<<"Owned UIA label: expected=\""<<diagnosticCaption(expected)<<"\" count="<<count
+        <<" lookup="<<static_cast<ULONG>(lookup)<<" enumeration="<<static_cast<ULONG>(hr)<<'\n';
+    for(int index=0;SUCCEEDED(hr)&&index<count;++index) {
+        Microsoft::WRL::ComPtr<IUIAutomationElement> match;
+        const auto item=matches->GetElement(index,&match);
+        if(FAILED(item)){std::cout<<"  match="<<index<<" HRESULT="<<static_cast<ULONG>(item)<<'\n';continue;}
+        CONTROLTYPEID type=0;BOOL offscreen=TRUE,enabled=FALSE;RECT bounds{};
+        const auto typeRead=match->get_CurrentControlType(&type);
+        const auto offscreenRead=match->get_CurrentIsOffscreen(&offscreen);
+        const auto enabledRead=match->get_CurrentIsEnabled(&enabled);
+        const auto boundsRead=match->get_CurrentBoundingRectangle(&bounds);
+        std::cout<<"  match="<<index<<" type="<<type<<" offscreen="<<offscreen<<" enabled="<<enabled
+            <<" bounds="<<bounds.left<<','<<bounds.top<<','<<bounds.right<<','<<bounds.bottom
+            <<" propertyStatus="<<static_cast<ULONG>(typeRead)<<','<<static_cast<ULONG>(offscreenRead)<<','
+            <<static_cast<ULONG>(enabledRead)<<','<<static_cast<ULONG>(boundsRead)<<'\n';
+    }
+}
+void diagnoseOwnedRibbonTabs(IUIAutomation* automation,HWND window) {
+    Microsoft::WRL::ComPtr<IUIAutomationElement> root;
+    Microsoft::WRL::ComPtr<IUIAutomationCondition> condition;
+    Microsoft::WRL::ComPtr<IUIAutomationElementArray> descendants;
+    auto hr=automation->ElementFromHandle(window,&root);
+    if(SUCCEEDED(hr))hr=automation->CreateTrueCondition(&condition);
+    if(SUCCEEDED(hr))hr=root->FindAll(TreeScope_Descendants,condition.Get(),&descendants);
+    int count=-1;if(SUCCEEDED(hr))hr=descendants->get_Length(&count);
+    std::cout<<"Owned UIA Ribbon tree: descendants="<<count<<" HRESULT="<<static_cast<ULONG>(hr)<<'\n';
+    int printed=0;
+    for(int index=0;SUCCEEDED(hr)&&index<count&&printed<80;++index) {
+        Microsoft::WRL::ComPtr<IUIAutomationElement> item;
+        CONTROLTYPEID type=0;
+        if(FAILED(descendants->GetElement(index,&item))||FAILED(item->get_CurrentControlType(&type)))continue;
+        if(type!=UIA_TabControlTypeId&&type!=UIA_TabItemControlTypeId&&type!=UIA_GroupControlTypeId&&
+           type!=UIA_ToolBarControlTypeId)continue;
+        ++printed;BSTR name=nullptr;BOOL offscreen=TRUE;RECT bounds{};
+        const auto nameRead=item->get_CurrentName(&name);
+        const auto offscreenRead=item->get_CurrentIsOffscreen(&offscreen);
+        const auto boundsRead=item->get_CurrentBoundingRectangle(&bounds);
+        Microsoft::WRL::ComPtr<IUIAutomationSelectionItemPattern> selection;
+        auto selectedRead=item->GetCurrentPatternAs(UIA_SelectionItemPatternId,IID_PPV_ARGS(&selection));
+        BOOL selected=FALSE;if(SUCCEEDED(selectedRead)&&selection)selectedRead=selection->get_CurrentIsSelected(&selected);
+        std::cout<<"  caption=\""<<diagnosticCaption(name?std::wstring_view(name):std::wstring_view{})
+            <<"\" type="<<type<<" offscreen="<<offscreen<<" selected="<<selected
+            <<" bounds="<<bounds.left<<','<<bounds.top<<','<<bounds.right<<','<<bounds.bottom
+            <<" propertyStatus="<<static_cast<ULONG>(nameRead)<<','<<static_cast<ULONG>(offscreenRead)<<','
+            <<static_cast<ULONG>(boundsRead)<<','<<static_cast<ULONG>(selectedRead)<<'\n';
+        SysFreeString(name);
+    }
+}
+void diagnoseOwnedSearchToolbars(IUIAutomation* automation,HWND window) {
+    using Microsoft::WRL::ComPtr;
+    ComPtr<IUIAutomationElement> root;
+    ComPtr<IUIAutomationCondition> condition;
+    ComPtr<IUIAutomationElementArray> toolbars;
+    ComPtr<IUIAutomationTreeWalker> walker;
+    auto status=automation->ElementFromHandle(window,&root);
+    VARIANT type{};type.vt=VT_I4;type.lVal=UIA_ToolBarControlTypeId;
+    if(SUCCEEDED(status))status=automation->CreatePropertyCondition(UIA_ControlTypePropertyId,type,&condition);
+    if(SUCCEEDED(status))status=root->FindAll(TreeScope_Descendants,condition.Get(),&toolbars);
+    if(SUCCEEDED(status))status=automation->get_ControlViewWalker(&walker);
+    int count=-1;if(SUCCEEDED(status))status=toolbars->get_Length(&count);
+    std::cout<<"Owned raw Search toolbars: count="<<count<<" HRESULT="<<static_cast<ULONG>(status)<<'\n';
+    for(int index=0;SUCCEEDED(status)&&index<count&&index<24;++index) {
+        ComPtr<IUIAutomationElement> toolbar,parent;
+        auto item=toolbars->GetElement(index,&toolbar);
+        if(SUCCEEDED(item))item=walker->GetParentElement(toolbar.Get(),&parent);
+        BSTR name=nullptr,parentName=nullptr;RECT bounds{},parentBounds{};BOOL offscreen=TRUE;CONTROLTYPEID parentType=0;
+        const auto nameRead=toolbar?toolbar->get_CurrentName(&name):E_POINTER;
+        const auto offscreenRead=toolbar?toolbar->get_CurrentIsOffscreen(&offscreen):E_POINTER;
+        const auto boundsRead=toolbar?toolbar->get_CurrentBoundingRectangle(&bounds):E_POINTER;
+        const auto parentNameRead=parent?parent->get_CurrentName(&parentName):E_POINTER;
+        const auto parentTypeRead=parent?parent->get_CurrentControlType(&parentType):E_POINTER;
+        const auto parentBoundsRead=parent?parent->get_CurrentBoundingRectangle(&parentBounds):E_POINTER;
+        std::cout<<"  toolbar="<<index<<" caption=\""<<diagnosticCaption(name?std::wstring_view(name):std::wstring_view{})
+            <<"\" type="<<UIA_ToolBarControlTypeId<<" offscreen="<<offscreen<<" bounds="<<bounds.left<<','<<bounds.top<<','<<bounds.right<<','<<bounds.bottom
+            <<" parent=\""<<diagnosticCaption(parentName?std::wstring_view(parentName):std::wstring_view{})<<"\" parentType="<<parentType
+            <<" parentBounds="<<parentBounds.left<<','<<parentBounds.top<<','<<parentBounds.right<<','<<parentBounds.bottom
+            <<" propertyStatus="<<static_cast<ULONG>(item)<<','<<static_cast<ULONG>(nameRead)<<','<<static_cast<ULONG>(offscreenRead)<<','
+            <<static_cast<ULONG>(boundsRead)<<','<<static_cast<ULONG>(parentNameRead)<<','<<static_cast<ULONG>(parentTypeRead)<<','
+            <<static_cast<ULONG>(parentBoundsRead)<<'\n';
+        SysFreeString(name);SysFreeString(parentName);
+        if(FAILED(item)||!toolbar)continue;
+        ComPtr<IUIAutomationElement> child;item=walker->GetFirstChildElement(toolbar.Get(),&child);
+        for(int childIndex=0;SUCCEEDED(item)&&child&&childIndex<24;++childIndex) {
+            BSTR childName=nullptr;RECT childBounds{};BOOL childOffscreen=TRUE;CONTROLTYPEID childType=0;
+            const auto childNameRead=child->get_CurrentName(&childName);
+            const auto childTypeRead=child->get_CurrentControlType(&childType);
+            const auto childOffscreenRead=child->get_CurrentIsOffscreen(&childOffscreen);
+            const auto childBoundsRead=child->get_CurrentBoundingRectangle(&childBounds);
+            std::cout<<"    child="<<childIndex<<" caption=\""<<diagnosticCaption(childName?std::wstring_view(childName):std::wstring_view{})
+                <<"\" type="<<childType<<" offscreen="<<childOffscreen<<" bounds="<<childBounds.left<<','<<childBounds.top<<','
+                <<childBounds.right<<','<<childBounds.bottom<<" propertyStatus="<<static_cast<ULONG>(childNameRead)<<','
+                <<static_cast<ULONG>(childTypeRead)<<','<<static_cast<ULONG>(childOffscreenRead)<<','<<static_cast<ULONG>(childBoundsRead)<<'\n';
+            SysFreeString(childName);ComPtr<IUIAutomationElement> next;
+            item=walker->GetNextSiblingElement(child.Get(),&next);child=std::move(next);
+        }
+    }
+}
+HRESULT ownedHomeGroupLabels(HWND window,std::vector<std::wstring>& output) {
+    auto result=std::make_shared<std::vector<std::wstring>>();
+    const auto hr=ownedAutomation(window,[window,result](IUIAutomation* automation) {
+        Microsoft::WRL::ComPtr<IUIAutomationElement> root;
+        Microsoft::WRL::ComPtr<IUIAutomationCondition> condition,tabCondition;
+        Microsoft::WRL::ComPtr<IUIAutomationTreeWalker> walker;
+        auto status=automation->ElementFromHandle(window,&root);
+        VARIANT type{};type.vt=VT_I4;type.lVal=UIA_ToolBarControlTypeId;
+        if(SUCCEEDED(status))status=automation->CreatePropertyCondition(UIA_ControlTypePropertyId,type,&condition);
+        type.lVal=UIA_TabItemControlTypeId;
+        if(SUCCEEDED(status))status=automation->CreatePropertyCondition(UIA_ControlTypePropertyId,type,&tabCondition);
+        if(SUCCEEDED(status))status=automation->get_ControlViewWalker(&walker);
+        if(FAILED(status))return status;
+        const auto deadline=GetTickCount64()+2000;
+        int lastToolbarCount=0;size_t lastGroupCount=0;bool lastReady=false;
+        do {
+            Microsoft::WRL::ComPtr<IUIAutomationElementArray> matches;
+            status=root->FindAll(TreeScope_Descendants,condition.Get(),&matches);
+            int count=0;if(SUCCEEDED(status))status=matches->get_Length(&count);
+            Microsoft::WRL::ComPtr<IUIAutomationElementArray> tabs;
+            if(SUCCEEDED(status))status=root->FindAll(TreeScope_Descendants,tabCondition.Get(),&tabs);
+            int tabCount=0;if(SUCCEEDED(status))status=tabs->get_Length(&tabCount);
+            std::wstring selectedName;RECT selectedBounds{};int selectedCount=0;
+            for(int index=0;SUCCEEDED(status)&&index<tabCount;++index) {
+                Microsoft::WRL::ComPtr<IUIAutomationElement> tab;
+                Microsoft::WRL::ComPtr<IUIAutomationSelectionItemPattern> selection;
+                status=tabs->GetElement(index,&tab);
+                if(SUCCEEDED(status))status=tab->GetCurrentPatternAs(UIA_SelectionItemPatternId,IID_PPV_ARGS(&selection));
+                if(SUCCEEDED(status)&&!selection)status=E_NOINTERFACE;
+                BOOL selected=FALSE;if(SUCCEEDED(status))status=selection->get_CurrentIsSelected(&selected);
+                if(FAILED(status)||!selected)continue;
+                ++selectedCount;BSTR name=nullptr;
+                status=tab->get_CurrentName(&name);
+                if(SUCCEEDED(status))status=tab->get_CurrentBoundingRectangle(&selectedBounds);
+                if(SUCCEEDED(status))selectedName=name?name:L"";
+                SysFreeString(name);
+            }
+            std::vector<std::pair<LONG,std::wstring>> groups;
+            Microsoft::WRL::ComPtr<IUIAutomationElement> content;
+            bool ready=selectedCount==1&&!selectedName.empty()&&selectedBounds.right>selectedBounds.left&&selectedBounds.bottom>selectedBounds.top;
+            for(int index=0;SUCCEEDED(status)&&index<count;++index) {
+                Microsoft::WRL::ComPtr<IUIAutomationElement> group,parent;
+                status=matches->GetElement(index,&group);
+                if(SUCCEEDED(status))status=walker->GetParentElement(group.Get(),&parent);
+                CONTROLTYPEID parentType=0;
+                if(SUCCEEDED(status)&&!parent)status=E_UNEXPECTED;
+                if(SUCCEEDED(status))status=parent->get_CurrentControlType(&parentType);
+                if(FAILED(status))break;
+                // Native Ribbon groups are toolbars in the selected Custom
+                // content panel. The Quick Access toolbar has a Pane parent and
+                // must not be mistaken for a Home group.
+                if(parentType!=UIA_CustomControlTypeId)continue;
+                if(!content)content=parent;
+                BOOL samePane=FALSE;
+                status=automation->CompareElements(content.Get(),parent.Get(),&samePane);
+                if(SUCCEEDED(status)&&!samePane)status=E_UNEXPECTED;
+                BSTR name=nullptr,parentName=nullptr;BOOL offscreen=TRUE;RECT bounds{},parentBounds{};
+                if(SUCCEEDED(status))status=group->get_CurrentName(&name);
+                if(SUCCEEDED(status))status=group->get_CurrentIsOffscreen(&offscreen);
+                if(SUCCEEDED(status))status=group->get_CurrentBoundingRectangle(&bounds);
+                if(SUCCEEDED(status))status=parent->get_CurrentName(&parentName);
+                if(SUCCEEDED(status))status=parent->get_CurrentBoundingRectangle(&parentBounds);
+                if(SUCCEEDED(status)) {
+                    ready=ready&&name&&*name&&!offscreen&&bounds.right>bounds.left&&bounds.bottom>bounds.top&&
+                        parentName&&std::wstring_view(parentName)==selectedName&&parentBounds.top>=selectedBounds.bottom&&
+                        bounds.left>=parentBounds.left&&bounds.right<=parentBounds.right&&
+                        bounds.top>=parentBounds.top&&bounds.bottom<=parentBounds.bottom;
+                    groups.emplace_back(bounds.left,name?name:L"");
+                }
+                SysFreeString(name);SysFreeString(parentName);
+            }
+            if(FAILED(status))return status;
+            lastToolbarCount=count;lastGroupCount=groups.size();lastReady=ready;
+            if(groups.size()>5)return E_UNEXPECTED;
+            if(groups.size()==5&&ready) {
+                std::sort(groups.begin(),groups.end(),[](const auto& left,const auto& right){return left.first<right.first;});
+                result->clear();for(auto& group:groups)result->push_back(std::move(group.second));
+                return S_OK;
+            }
+            // Realization can follow ShowWindow asynchronously. Observe the
+            // same owned native pane while its owning STA pumps, until all
+            // five Home groups have actual visible native bounds and names.
+            Sleep(10);
+        }while(GetTickCount64()<deadline);
+        std::cout<<"Owned native Home realization timeout: toolbars="<<lastToolbarCount
+            <<" paneGroups="<<lastGroupCount<<" ready="<<lastReady<<'\n';
+        Microsoft::WRL::ComPtr<IUIAutomationElementArray> remaining;
+        const auto enumeration=root->FindAll(TreeScope_Descendants,condition.Get(),&remaining);
+        int count=0;
+        if(SUCCEEDED(enumeration)&&SUCCEEDED(remaining->get_Length(&count)))for(int index=0;index<count&&index<20;++index) {
+            Microsoft::WRL::ComPtr<IUIAutomationElement> toolbar,parent;
+            if(FAILED(remaining->GetElement(index,&toolbar)))continue;
+            BSTR name=nullptr,parentName=nullptr;BOOL offscreen=TRUE;RECT bounds{},parentBounds{};
+            CONTROLTYPEID parentType=0;
+            const auto nameRead=toolbar->get_CurrentName(&name);
+            const auto offscreenRead=toolbar->get_CurrentIsOffscreen(&offscreen);
+            const auto boundsRead=toolbar->get_CurrentBoundingRectangle(&bounds);
+            auto parentRead=walker->GetParentElement(toolbar.Get(),&parent);
+            if(SUCCEEDED(parentRead)&&parent) {
+                parentRead=parent->get_CurrentControlType(&parentType);
+                if(SUCCEEDED(parentRead))parentRead=parent->get_CurrentName(&parentName);
+                if(SUCCEEDED(parentRead))parentRead=parent->get_CurrentBoundingRectangle(&parentBounds);
+            }
+            std::cout<<"  toolbar=\""<<diagnosticCaption(name?std::wstring_view(name):std::wstring_view{})
+                <<"\" offscreen="<<offscreen<<" bounds="<<bounds.left<<','<<bounds.top<<','<<bounds.right<<','<<bounds.bottom
+                <<" parentType="<<parentType<<" parent=\""<<diagnosticCaption(parentName?std::wstring_view(parentName):std::wstring_view{})
+                <<"\" parentBounds="<<parentBounds.left<<','<<parentBounds.top<<','<<parentBounds.right<<','<<parentBounds.bottom
+                <<" propertyStatus="<<static_cast<ULONG>(nameRead)<<','<<static_cast<ULONG>(offscreenRead)<<','
+                <<static_cast<ULONG>(boundsRead)<<','<<static_cast<ULONG>(parentRead)<<'\n';
+            SysFreeString(name);SysFreeString(parentName);
+        }
+        diagnoseOwnedRibbonTabs(automation,window);
+        return HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+    });
+    if(SUCCEEDED(hr))output=std::move(*result);
+    return hr;
+}
+HRESULT ownedSearchRefineLabels(HWND window,OwnedRefineLabels& output) {
+    struct RibbonWindow {HWND handle=nullptr;bool duplicate=false;} ribbon;
+    EnumChildWindows(window,[](HWND child,LPARAM parameter)->BOOL {
+        wchar_t name[64]{};
+        if(GetClassNameW(child,name,static_cast<int>(std::size(name)))&&lstrcmpW(name,L"UIRibbonCommandBar")==0) {
+            auto& found=*reinterpret_cast<RibbonWindow*>(parameter);
+            if(found.handle)found.duplicate=true;else found.handle=child;
+        }
+        return TRUE;
+    },reinterpret_cast<LPARAM>(&ribbon));
+    DWORD process=0;
+    if(!ribbon.handle||ribbon.duplicate||GetWindowThreadProcessId(ribbon.handle,&process)!=GetCurrentThreadId()||
+       process!=GetCurrentProcessId())return E_UNEXPECTED;
+    auto result=std::make_shared<OwnedRefineLabels>();
+    const auto hr=ownedAutomation(window,[handle=ribbon.handle,result](IUIAutomation* automation) {
+        using Microsoft::WRL::ComPtr;
+        ComPtr<IUIAutomationElement> root;
+        ComPtr<IUIAutomationCondition> toolbarCondition,tabCondition;
+        ComPtr<IUIAutomationTreeWalker> walker;
+        auto status=automation->ElementFromHandle(handle,&root);
+        VARIANT type{};type.vt=VT_I4;type.lVal=UIA_ToolBarControlTypeId;
+        if(SUCCEEDED(status))status=automation->CreatePropertyCondition(UIA_ControlTypePropertyId,type,&toolbarCondition);
+        type.lVal=UIA_TabItemControlTypeId;
+        if(SUCCEEDED(status))status=automation->CreatePropertyCondition(UIA_ControlTypePropertyId,type,&tabCondition);
+        if(SUCCEEDED(status))status=automation->get_ControlViewWalker(&walker);
+        if(FAILED(status))return status;
+        const auto deadline=GetTickCount64()+2000;
+        int lastGroups=0,lastSelectedCount=0;size_t lastControls=0;
+        std::wstring lastSelectedName;RECT lastSelectedBounds{};
+        do {
+            ComPtr<IUIAutomationElementArray> tabs,toolbars;
+            status=root->FindAll(TreeScope_Descendants,tabCondition.Get(),&tabs);
+            int tabCount=0;if(SUCCEEDED(status))status=tabs->get_Length(&tabCount);
+            std::wstring selectedName;RECT selectedBounds{};int selectedCount=0;
+            for(int index=0;SUCCEEDED(status)&&index<tabCount;++index) {
+                ComPtr<IUIAutomationElement> tab;ComPtr<IUIAutomationSelectionItemPattern> selection;
+                status=tabs->GetElement(index,&tab);
+                if(SUCCEEDED(status))status=tab->GetCurrentPatternAs(UIA_SelectionItemPatternId,IID_PPV_ARGS(&selection));
+                if(SUCCEEDED(status)&&!selection)status=E_NOINTERFACE;
+                BOOL selected=FALSE;if(SUCCEEDED(status))status=selection->get_CurrentIsSelected(&selected);
+                if(FAILED(status)||!selected)continue;
+                ++selectedCount;BSTR name=nullptr;status=tab->get_CurrentName(&name);
+                if(SUCCEEDED(status))status=tab->get_CurrentBoundingRectangle(&selectedBounds);
+                if(SUCCEEDED(status))selectedName=name?name:L"";SysFreeString(name);
+            }
+            if(FAILED(status))return status;
+            lastSelectedCount=selectedCount;lastSelectedName=selectedName;lastSelectedBounds=selectedBounds;
+            status=root->FindAll(TreeScope_Descendants,toolbarCondition.Get(),&toolbars);
+            int count=0;if(SUCCEEDED(status))status=toolbars->get_Length(&count);
+            struct Group {ComPtr<IUIAutomationElement> element;std::wstring name;RECT bounds{};CONTROLTYPEID parentType=0;};
+            std::vector<Group> groups;ComPtr<IUIAutomationElement> content;
+            for(int index=0;SUCCEEDED(status)&&index<count;++index) {
+                ComPtr<IUIAutomationElement> toolbar,parent;
+                status=toolbars->GetElement(index,&toolbar);
+                BOOL offscreen=TRUE;if(SUCCEEDED(status))status=toolbar->get_CurrentIsOffscreen(&offscreen);
+                if(FAILED(status)||offscreen)continue;
+                status=walker->GetParentElement(toolbar.Get(),&parent);
+                if(SUCCEEDED(status)&&!parent)status=E_UNEXPECTED;
+                if(FAILED(status))break;
+                BSTR name=nullptr,parentName=nullptr;RECT bounds{},parentBounds{};CONTROLTYPEID parentType=0;
+                status=toolbar->get_CurrentName(&name);
+                if(SUCCEEDED(status))status=toolbar->get_CurrentBoundingRectangle(&bounds);
+                if(SUCCEEDED(status))status=parent->get_CurrentName(&parentName);
+                if(SUCCEEDED(status))status=parent->get_CurrentBoundingRectangle(&parentBounds);
+                if(SUCCEEDED(status))status=parent->get_CurrentControlType(&parentType);
+                // Discover the selected Search pane's actual parent identity
+                // and type. Do not assume Home's Custom parent type or mistake
+                // the caption QAT for a content group.
+                const bool current=SUCCEEDED(status)&&selectedCount==1&&!selectedName.empty()&&parentName&&
+                    std::wstring_view(parentName)==selectedName&&
+                    bounds.right>bounds.left&&bounds.bottom>bounds.top&&parentBounds.top>=selectedBounds.bottom&&
+                    bounds.left>=parentBounds.left&&bounds.top>=parentBounds.top&&
+                    bounds.right<=parentBounds.right&&bounds.bottom<=parentBounds.bottom;
+                if(current) {
+                    if(!content)content=parent;
+                    BOOL same=FALSE;status=automation->CompareElements(content.Get(),parent.Get(),&same);
+                    if(SUCCEEDED(status)&&!same)status=E_UNEXPECTED;
+                    if(SUCCEEDED(status))groups.push_back({toolbar,name?name:L"",bounds,parentType});
+                }
+                SysFreeString(name);SysFreeString(parentName);
+            }
+            if(FAILED(status))return status;
+            lastGroups=static_cast<int>(groups.size());
+            // The actual native template has four groups, including the empty
+            // Close caption. Native raw readback proved its second group is
+            // Refine and that all four whole galleries can have empty captions.
+            if(groups.size()==4) {
+                std::sort(groups.begin(),groups.end(),[](const auto& left,const auto& right){return left.bounds.left<right.bounds.left;});
+                auto& refine=groups[1];std::vector<OwnedRefineControl> controls;
+                ComPtr<IUIAutomationElement> child;status=walker->GetFirstChildElement(refine.element.Get(),&child);
+                while(SUCCEEDED(status)&&child) {
+                    BSTR name=nullptr;BOOL offscreen=TRUE;RECT bounds{};CONTROLTYPEID controlType=0;
+                    status=child->get_CurrentName(&name);
+                    if(SUCCEEDED(status))status=child->get_CurrentIsOffscreen(&offscreen);
+                    if(SUCCEEDED(status))status=child->get_CurrentBoundingRectangle(&bounds);
+                    if(SUCCEEDED(status))status=child->get_CurrentControlType(&controlType);
+                    if(SUCCEEDED(status)&&!offscreen&&bounds.right>bounds.left&&bounds.bottom>bounds.top&&
+                       bounds.left>=refine.bounds.left&&bounds.top>=refine.bounds.top&&
+                       bounds.right<=refine.bounds.right&&bounds.bottom<=refine.bounds.bottom)
+                        controls.push_back({name?name:L"",controlType,bounds});
+                    SysFreeString(name);
+                    ComPtr<IUIAutomationElement> next;
+                    if(SUCCEEDED(status))status=walker->GetNextSiblingElement(child.Get(),&next);
+                    child=std::move(next);
+                }
+                if(FAILED(status))return status;
+                lastControls=controls.size();
+                if(controls.size()==4) {
+                    result->selectedTab=selectedName;result->toolbar=refine.name;result->parentType=refine.parentType;
+                    result->controls=std::move(controls);result->groupLabels.clear();
+                    for(const auto& group:groups)result->groupLabels.push_back(group.name);
+                    return S_OK;
+                }
+            }
+            Sleep(10);
+        }while(GetTickCount64()<deadline);
+        std::cout<<"Owned Search Refine realization timeout: groups="<<lastGroups<<" controls="<<lastControls
+            <<" selectedCount="<<lastSelectedCount<<" selectedTab=\""<<diagnosticCaption(lastSelectedName)<<"\" selectedBounds="
+            <<lastSelectedBounds.left<<','<<lastSelectedBounds.top<<','<<lastSelectedBounds.right<<','<<lastSelectedBounds.bottom<<'\n';
+        diagnoseOwnedRibbonTabs(automation,handle);
+        diagnoseOwnedSearchToolbars(automation,handle);
+        return HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+    });
+    if(SUCCEEDED(hr))output=std::move(*result);
+    return hr;
+}
+void diagnoseRefineLabels(const char* source,const OwnedRefineLabels& labels) {
+    std::cout<<"Owned Search Refine "<<source<<": selectedTab=\""<<diagnosticCaption(labels.selectedTab)
+        <<"\" toolbar=\""<<diagnosticCaption(labels.toolbar)<<"\" parentType="<<labels.parentType
+        <<" controls="<<labels.controls.size()<<'\n';
+    std::cout<<"  ordered native group captions:";
+    for(const auto& caption:labels.groupLabels)std::cout<<" ["<<diagnosticCaption(caption)<<']';
+    std::cout<<'\n';
+    for(const auto& control:labels.controls)
+        std::cout<<"  caption=\""<<diagnosticCaption(control.name)<<"\" type="<<control.type
+            <<" parentType="<<UIA_ToolBarControlTypeId<<" bounds="<<control.bounds.left<<','<<control.bounds.top<<','
+            <<control.bounds.right<<','<<control.bounds.bottom<<'\n';
+}
+struct OwnedSingleGroupLabel {
+    std::wstring selectedTab,caption;
+    RECT bounds{};
+};
+HRESULT ownedSingleGroupLabel(HWND window,OwnedSingleGroupLabel& output) {
+    auto result=std::make_shared<OwnedSingleGroupLabel>();
+    const auto hr=ownedAutomation(window,[window,result](IUIAutomation* automation) {
+        using Microsoft::WRL::ComPtr;
+        ComPtr<IUIAutomationElement> root;
+        ComPtr<IUIAutomationCondition> toolbarCondition,tabCondition;
+        ComPtr<IUIAutomationTreeWalker> walker;
+        auto status=automation->ElementFromHandle(window,&root);
+        VARIANT type{};type.vt=VT_I4;type.lVal=UIA_ToolBarControlTypeId;
+        if(SUCCEEDED(status))status=automation->CreatePropertyCondition(UIA_ControlTypePropertyId,type,&toolbarCondition);
+        type.lVal=UIA_TabItemControlTypeId;
+        if(SUCCEEDED(status))status=automation->CreatePropertyCondition(UIA_ControlTypePropertyId,type,&tabCondition);
+        if(SUCCEEDED(status))status=automation->get_ControlViewWalker(&walker);
+        if(FAILED(status))return status;
+        const auto deadline=GetTickCount64()+2000;
+        do {
+            ComPtr<IUIAutomationElementArray> tabs,toolbars;
+            status=root->FindAll(TreeScope_Descendants,tabCondition.Get(),&tabs);
+            int tabCount=0;if(SUCCEEDED(status))status=tabs->get_Length(&tabCount);
+            std::wstring selectedName;RECT selectedBounds{};int selectedCount=0;
+            for(int index=0;SUCCEEDED(status)&&index<tabCount;++index) {
+                ComPtr<IUIAutomationElement> tab;ComPtr<IUIAutomationSelectionItemPattern> selection;
+                status=tabs->GetElement(index,&tab);
+                if(SUCCEEDED(status))status=tab->GetCurrentPatternAs(UIA_SelectionItemPatternId,IID_PPV_ARGS(&selection));
+                if(SUCCEEDED(status)&&!selection)status=E_NOINTERFACE;
+                BOOL selected=FALSE;if(SUCCEEDED(status))status=selection->get_CurrentIsSelected(&selected);
+                if(FAILED(status)||!selected)continue;
+                ++selectedCount;BSTR rawName=nullptr;status=tab->get_CurrentName(&rawName);
+                const std::unique_ptr<OLECHAR,decltype(&SysFreeString)> name(rawName,SysFreeString);
+                if(SUCCEEDED(status))status=tab->get_CurrentBoundingRectangle(&selectedBounds);
+                if(SUCCEEDED(status))selectedName=name?name.get():L"";
+            }
+            if(SUCCEEDED(status))status=root->FindAll(TreeScope_Descendants,toolbarCondition.Get(),&toolbars);
+            int toolbarCount=0;if(SUCCEEDED(status))status=toolbars->get_Length(&toolbarCount);
+            UINT groupCount=0;OwnedSingleGroupLabel observed;
+            for(int index=0;SUCCEEDED(status)&&index<toolbarCount;++index) {
+                ComPtr<IUIAutomationElement> toolbar,parent;
+                status=toolbars->GetElement(index,&toolbar);
+                BOOL offscreen=TRUE;if(SUCCEEDED(status))status=toolbar->get_CurrentIsOffscreen(&offscreen);
+                if(FAILED(status)||offscreen)continue;
+                status=walker->GetParentElement(toolbar.Get(),&parent);
+                if(SUCCEEDED(status)&&!parent)status=E_UNEXPECTED;
+                BSTR rawName=nullptr,rawParentName=nullptr;RECT bounds{},parentBounds{};
+                if(SUCCEEDED(status))status=toolbar->get_CurrentName(&rawName);
+                const std::unique_ptr<OLECHAR,decltype(&SysFreeString)> name(rawName,SysFreeString);
+                if(SUCCEEDED(status))status=toolbar->get_CurrentBoundingRectangle(&bounds);
+                if(SUCCEEDED(status))status=parent->get_CurrentName(&rawParentName);
+                const std::unique_ptr<OLECHAR,decltype(&SysFreeString)> parentName(rawParentName,SysFreeString);
+                if(SUCCEEDED(status))status=parent->get_CurrentBoundingRectangle(&parentBounds);
+                // Actual selected content-pane identity and visible geometry
+                // distinguish its group from the caption's Quick Access bar.
+                // Empty is a valid native group caption, not missing evidence.
+                const bool current=SUCCEEDED(status)&&selectedCount==1&&!selectedName.empty()&&parentName&&
+                    std::wstring_view(parentName.get())==selectedName&&
+                    bounds.right>bounds.left&&bounds.bottom>bounds.top&&parentBounds.top>=selectedBounds.bottom&&
+                    bounds.left>=parentBounds.left&&bounds.top>=parentBounds.top&&
+                    bounds.right<=parentBounds.right&&bounds.bottom<=parentBounds.bottom;
+                if(current) {
+                    ++groupCount;observed={selectedName,name?name.get():L"",bounds};
+                }
+            }
+            if(FAILED(status))return status;
+            if(groupCount>1)return E_UNEXPECTED;
+            if(groupCount==1) {*result=std::move(observed);return S_OK;}
+            Sleep(10);
+        }while(GetTickCount64()<deadline);
+        return HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+    });
+    if(SUCCEEDED(hr))output=std::move(*result);
+    return hr;
 }
 HRESULT namedGallery(IUIAutomation* automation,HWND window,const wchar_t* name,IUIAutomationElement** output) {
     if(!output)return E_POINTER;*output=nullptr;
@@ -189,12 +727,25 @@ int main(int argc,char** argv){
         explorer::NativeRibbon ribbon;
         require(ribbon.initialize(nullptr,GetModuleHandleW(nullptr),{})==E_INVALIDARG,"Invalid host accepted");
         bool copyEnabled=false,destinationEnabled=true,copySourceReady=false,callbackChangePending=false;
+        bool labelCallbackRequested=false;
+        HRESULT labelCallbackStatus=E_UNEXPECTED;
+        std::wstring labelCallbackOutput=L"unchanged label output";
         HRESULT callbackInvalidation=E_UNEXPECTED,callbackFlush=S_OK;
         unsigned executions=0;UINT lastCommand=0;unsigned heightEvents=0;unsigned copyItemsQueries=0;unsigned itemExecutions=0;UINT lastItemCommand=0,lastItem=0;
+        UINT librarySelectedIndex=UI_COLLECTION_INVALIDINDEX;
+        bool replacementLibraryLocations=false;
+        bool firstLibrarySourceRefresh=false;
+        HRESULT firstLibraryInvalidation=E_UNEXPECTED,firstLibraryFlush=S_OK;
         explorer::RibbonCallbacks callbacks;
         callbacks.execute=[&](UINT id){++executions;lastCommand=id;return S_OK;};
         callbacks.executeItem=[&](UINT id,UINT index){++itemExecutions;lastItemCommand=id;lastItem=index;return S_OK;};
-        callbacks.query=[&](UINT id){explorer::RibbonCommandState state;state.enabled=id==explorer::Paste?false:id!=explorer::Copy||copyEnabled;state.checked=id==explorer::HiddenItems;state.selectedIndex=id==explorer::RibbonLayoutGallery?5:UI_COLLECTION_INVALIDINDEX;return state;};
+        callbacks.query=[&](UINT id){
+            if(labelCallbackRequested&&id==explorer::Copy) {
+                labelCallbackRequested=false;
+                labelCallbackStatus=ribbon.commandLabel(explorer::RibbonHomeTab,labelCallbackOutput);
+            }
+            explorer::RibbonCommandState state;state.enabled=id==explorer::Paste?false:id!=explorer::Copy||copyEnabled;state.checked=id==explorer::HiddenItems;state.selectedIndex=id==explorer::RibbonLayoutGallery?5:id==explorer::LibraryDefault?librarySelectedIndex:UI_COLLECTION_INVALIDINDEX;return state;
+        };
         callbacks.items=[&](UINT id){
             std::vector<explorer::RibbonItem> items;
             if(id==explorer::RibbonExtractToGallery)for(UINT i=0;i<54;++i)
@@ -218,6 +769,17 @@ int main(int argc,char** argv){
                 items.push_back({0,L"Owned application one",false,L"imageres.dll,-3"});
                 items.push_back({1,L"Owned application two",false,L"imageres.dll,-3"});
             }
+            if(id==explorer::LibraryDefault) {
+                explorer::RibbonCollectionReadback demand;
+                succeeded(ribbon.collectionReadback(id,demand),"Native Library source callback phase");
+                if(!firstLibrarySourceRefresh&&demand.sourceRequests) {
+                    firstLibrarySourceRefresh=true;
+                    firstLibraryInvalidation=ribbon.invalidateItems(id);
+                    firstLibraryFlush=ribbon.flush();
+                }
+                for(UINT index=0;index<3;++index)
+                    items.push_back({index,std::wstring(replacementLibraryLocations?L"Owned replacement library location ":L"Owned library location ")+std::to_wstring(index),false,L"imageres.dll,-3"});
+            }
             return items;
         };
         callbacks.heightChanged=[&](UINT){++heightEvents;};
@@ -233,7 +795,270 @@ int main(int argc,char** argv){
         // a window on the user's desktop and supplies normal native paint/layout.
         ShowWindow(window.handle,SW_SHOWNOACTIVATE);UpdateWindow(window.handle);pump();
         succeeded(ribbon.invalidateState(),"All state properties preserve compiled labels");succeeded(ribbon.flush(),"Flush state labels");pump();
-        std::wstring tabLabel;succeeded(ribbon.commandLabel(explorer::RibbonHomeTab,tabLabel),"Compiled Home label survives state invalidation");require(tabLabel==L"Home","Home label disappeared");
+        std::wstring tabLabel;succeeded(ribbon.commandLabel(explorer::RibbonHomeTab,tabLabel),"Home label survives state invalidation");
+        std::vector<std::wstring> visibleLabels;
+        if(stock) {
+            InstalledLabelReference reference;reference.initialize(hostClass.lpszClassName,ribbon.features());
+            // Group labels come directly from the installed BML even when its
+            // Label callback supplies no currentValue. Compare all five actual
+            // native Home toolbars with an independent unmodified framework;
+            // an authored fallback such as Organize is not that provenance.
+            ShowWindow(reference.window.handle,SW_SHOWNOACTIVATE);UpdateWindow(reference.window.handle);pump();
+            std::vector<std::wstring> referenceGroups,actualGroups;
+            succeeded(ownedHomeGroupLabels(reference.window.handle,referenceGroups),"Read independently realized native Home group captions");
+            succeeded(ownedHomeGroupLabels(window.handle,actualGroups),"Read actual owned installed Home group captions");
+            require(referenceGroups.size()==5&&actualGroups==referenceGroups,"Installed native Home group captions changed from their compiled BML");
+            std::cout<<"PASS: all five installed Home group captions match independent native BML UIA:";
+            for(const auto& caption:referenceGroups)std::cout<<" ["<<diagnosticCaption(caption)<<']';
+            std::cout<<'\n';
+            ULONG languageCount=0,languageCharacters=0;
+            constexpr DWORD languageFlags=MUI_LANGUAGE_NAME|MUI_UI_FALLBACK;
+            require(GetThreadPreferredUILanguages(languageFlags,&languageCount,nullptr,&languageCharacters)&&languageCharacters>1,
+                "Read actual UI resource fallback languages");
+            std::vector<wchar_t> languageNames(languageCharacters,L'\0');
+            require(GetThreadPreferredUILanguages(languageFlags,&languageCount,languageNames.data(),&languageCharacters)&&languageCount,
+                "Read actual UI resource language names");
+            const auto effectiveLanguage=LocaleNameToLCID(languageNames.data(),LOCALE_ALLOW_NEUTRAL_NAMES);
+            require(effectiveLanguage!=0,"Resolve actual preferred UI language");
+            if(PRIMARYLANGID(effectiveLanguage)==LANG_ENGLISH) {
+                for(const auto& expected:std::array{
+                    std::pair{static_cast<UINT>(explorer::RibbonEasyAccessMenu),L"Easy access"},
+                    std::pair{static_cast<UINT>(explorer::RibbonOptionsMenu),L"Options"},
+                    std::pair{static_cast<UINT>(explorer::RibbonFolderOptions),L"Options"},
+                    std::pair{static_cast<UINT>(explorer::RibbonAccessMedia),L"Access media"},
+                    std::pair{1527U,L"Extract To"}}) {
+                    std::wstring current;succeeded(ribbon.commandLabel(expected.first,current),"Read English stock presentation correction");
+                    require(current==expected.second,"Existing English stock presentation correction was lost");
+                }
+            }
+            UINT nativeResourceLabels=0;
+            for(const UINT command:{static_cast<UINT>(explorer::RibbonHomeTab),static_cast<UINT>(explorer::RibbonShareTab),static_cast<UINT>(explorer::RibbonViewTab),1506U,1507U}) {
+                const auto nativeCommand=ribbon.nativeCommandId(command);
+                succeeded(reference.framework->InvalidateUICommand(nativeCommand,UI_INVALIDATIONS_PROPERTY,&UI_PKEY_Label),
+                    "Request actual installed Label callback currentValue");
+                succeeded(reference.framework->FlushPendingInvalidations(),"Materialize actual installed Label callback");
+                require(reference.handler->labelRequests[nativeCommand]>0,"Installed reference did not reach its native Label callback");
+                std::wstring current;succeeded(ribbon.commandLabel(command,current),"Read installed fallback label outside property callback");
+                require(!current.empty(),"A missing installed resource blanked an existing host tab/group");
+                if(const auto resource=reference.handler->labels.find(nativeCommand);resource!=reference.handler->labels.end()) {
+                    ++nativeResourceLabels;
+                    require(current==resource->second,"Native callback currentValue lost its installed text");
+                }
+                if(command!=1506U&&command!=1507U)visibleLabels.push_back(std::move(current));
+            }
+            labelCallbackRequested=true;
+            succeeded(ribbon.invalidateState(explorer::Copy),"Request real callback-boundary label read");
+            succeeded(ribbon.flush(),"Commit callback-boundary label request");pump();
+            require(!labelCallbackRequested&&labelCallbackStatus==S_OK&&labelCallbackOutput==tabLabel,
+                "Owned label snapshot could not be read without entering the framework from UpdateProperty");
+            succeeded(ribbon.commandLabel(explorer::RibbonHomeTab,labelCallbackOutput),"Read native fallback after property callback returned");
+            require(labelCallbackOutput==tabLabel,"Native fallback label changed across property callback boundary");
+            std::cout<<"PASS: native Label callback boundary; installed nonempty resource labels="<<nativeResourceLabels
+                <<"; explicit authored fallbacks="<<5-nativeResourceLabels<<'\n';
+        } else require(tabLabel==L"Home","Authored Home resource label disappeared");
+        for(const UINT command:{static_cast<UINT>(explorer::Copy),static_cast<UINT>(explorer::Cut),static_cast<UINT>(explorer::Properties),static_cast<UINT>(explorer::NewFolder)}) {
+            explorer::NamespaceCommandMetadata native;
+            succeeded(explorer::namespaceCommandMetadata(explorer::ribbonCommandStoreName(command),&native),"Independently read installed native command title");
+            std::wstring current;succeeded(ribbon.commandLabel(command,current),"Read retained native-provider title");
+            require(!native.label.empty()&&current==native.label,"Native provider title lost its localized text");
+            visibleLabels.push_back(native.label);
+        }
+        std::cout<<"Owned label host: visible="<<IsWindowVisible(window.handle)<<" ribbonHeight="<<ribbon.height()<<'\n';
+        succeeded(ownedAutomation(window.handle,[handle=window.handle,labels=visibleLabels](IUIAutomation* automation) {
+            HRESULT firstFailure=S_OK;
+            for(const auto& expected:labels) {
+                Microsoft::WRL::ComPtr<IUIAutomationElement> control;
+                auto status=namedElement(automation,handle,expected.c_str(),&control);
+                if(SUCCEEDED(status)) {
+                    BSTR actual=nullptr;status=control->get_CurrentName(&actual);
+                    const bool exact=SUCCEEDED(status)&&actual&&std::wstring_view(actual)==expected;
+                    SysFreeString(actual);if(SUCCEEDED(status)&&!exact)status=E_UNEXPECTED;
+                }
+                diagnoseOwnedLabel(automation,handle,expected,status);
+                if(FAILED(status)&&SUCCEEDED(firstFailure))firstFailure=status;
+            }
+            if(FAILED(firstFailure))diagnoseOwnedRibbonTabs(automation,handle);
+            return firstFailure;
+        }),"Actual owned UIA retained every host/native-provider control name");
+        std::wstring unchangedLabel=L"unchanged invalid label";
+        require(ribbon.commandLabel(0xffffffffU,unchangedLabel)==HRESULT_FROM_WIN32(ERROR_NOT_FOUND)&&unchangedLabel==L"unchanged invalid label",
+            "Invalid label request changed output");
+        if(stock) {
+            InstalledLabelReference reference;reference.initialize(hostClass.lpszClassName,ribbon.features());
+            const auto nativeContext=ribbon.nativeCommandId(explorer::RibbonSearchContext);
+            const auto nativeKind=ribbon.nativeCommandId(explorer::SearchKindMenu);
+            require(reference.handler->commandTypes.contains(nativeContext)&&
+                reference.handler->commandTypes.at(nativeContext)==UI_COMMANDTYPE_CONTEXT,
+                "Independent BML did not register the actual Search context");
+            Variant active;succeeded(InitPropVariantFromUInt32(UI_CONTEXTAVAILABILITY_ACTIVE,&active.value),"Native Search reference context value");
+            succeeded(reference.framework->SetUICommandProperty(nativeContext,UI_PKEY_ContextAvailable,active.value),
+                "Activate independently realized native Search reference");
+            ShowWindow(reference.window.handle,SW_SHOWNOACTIVATE);UpdateWindow(reference.window.handle);pump();
+            Variant contextValue;
+            const auto contextRead=reference.framework->GetUICommandProperty(nativeContext,UI_PKEY_ContextAvailable,&contextValue.value);
+            ULONG contextState=UI_CONTEXTAVAILABILITY_NOTAVAILABLE;
+            const auto contextStateRead=SUCCEEDED(contextRead)?PropVariantToUInt32(contextValue.value,&contextState):contextRead;
+            const auto kindType=reference.handler->commandTypes.find(nativeKind);
+            const auto kindFirstType=reference.handler->firstLabelTypes.find(nativeKind);
+            const auto kindFirstLabel=reference.handler->firstLabels.find(nativeKind);
+            std::cout<<"Owned independent Search context: nativeContext="<<nativeContext<<" read="<<static_cast<ULONG>(contextRead)
+                <<" valueType="<<contextValue.value.vt<<" stateRead="<<static_cast<ULONG>(contextStateRead)<<" availability="<<contextState
+                <<" nativeKind="<<nativeKind<<" kindRegistered="<<(kindType!=reference.handler->commandTypes.end())
+                <<" kindType="<<(kindType==reference.handler->commandTypes.end()?UI_COMMANDTYPE_UNKNOWN:kindType->second)
+                <<" kindLabelRequests="<<reference.handler->labelRequests[nativeKind]<<" firstCurrentType="
+                <<(kindFirstType==reference.handler->firstLabelTypes.end()?static_cast<VARTYPE>(VT_EMPTY):kindFirstType->second)
+                <<" firstCurrent=\""<<(kindFirstLabel==reference.handler->firstLabels.end()?"<absent>":diagnosticCaption(kindFirstLabel->second))<<"\"\n";
+            succeeded(contextStateRead,"Read actual independent Search contextual availability");
+            require(contextState==UI_CONTEXTAVAILABILITY_ACTIVE,"Independent Search context is not natively active");
+            OwnedRefineLabels nativeLabels,actualLabels;
+            const auto referenceRead=ownedSearchRefineLabels(reference.window.handle,nativeLabels);
+            diagnoseRefineLabels("independent BML",nativeLabels);
+            succeeded(referenceRead,"Read independent native Search Refine parent captions");
+            require(reference.handler->commandTypes.contains(nativeKind)&&
+                reference.handler->commandTypes.at(nativeKind)==UI_COMMANDTYPE_COLLECTION,
+                "Independent BML did not register realized Kind as a native collection");
+            succeeded(reference.framework->InvalidateUICommand(nativeKind,UI_INVALIDATIONS_PROPERTY,&UI_PKEY_Label),
+                "Request independent native Kind callback value");
+            succeeded(reference.framework->FlushPendingInvalidations(),"Materialize independent native Kind label");
+            succeeded(ribbon.setContexts(explorer::RibbonContext::Search,true),"Activate actual production Search label fixture");
+            succeeded(ribbon.flush(),"Materialize actual production Search labels");pump();
+            const auto actualRead=ownedSearchRefineLabels(window.handle,actualLabels);
+            diagnoseRefineLabels("production",actualLabels);
+            std::wstring retained;succeeded(ribbon.commandLabel(explorer::SearchKindMenu,retained),"Read retained production Kind label outside callback");
+            const auto first=reference.handler->firstLabels.find(nativeKind);
+            const auto firstType=reference.handler->firstLabelTypes.find(nativeKind);
+            std::cout<<"Owned native Kind label: nativeCommand="<<nativeKind<<" commandType="<<reference.handler->commandTypes.at(nativeKind)
+                <<" requests="<<reference.handler->labelRequests[nativeKind]<<" firstCurrentType="
+                <<(firstType==reference.handler->firstLabelTypes.end()?static_cast<VARTYPE>(VT_EMPTY):firstType->second)
+                <<" firstCurrent=\""<<(first==reference.handler->firstLabels.end()?"<absent>":diagnosticCaption(first->second))
+                <<"\" production=\""<<diagnosticCaption(retained)<<"\" referenceRead="<<static_cast<ULONG>(referenceRead)
+                <<" actualRead="<<static_cast<ULONG>(actualRead)<<'\n';
+            succeeded(actualRead,"Read actual production Search Refine parent captions");
+            require(reference.handler->labelRequests[nativeKind]>0,"Independent native Kind Label callback was never reached");
+            require(nativeLabels.selectedTab==actualLabels.selectedTab&&nativeLabels.toolbar==actualLabels.toolbar&&
+                nativeLabels.parentType==actualLabels.parentType&&nativeLabels.groupLabels.size()==4&&
+                nativeLabels.groupLabels==actualLabels.groupLabels,
+                "Production Search group captions differ from independent native BML, including its empty Close group");
+            require(nativeLabels.controls.size()==4&&actualLabels.controls.size()==4,
+                "Native Refine whole-gallery structure changed");
+            for(size_t index=0;index<nativeLabels.controls.size();++index)
+                require(nativeLabels.controls[index].type==UIA_SplitButtonControlTypeId&&
+                    actualLabels.controls[index].type==nativeLabels.controls[index].type,
+                    "Native Refine whole-gallery control type changed");
+            bool bmlKindAvailable=false;
+            const auto requireNativeKind=[&](std::wstring_view caption) {
+                if(caption.empty())return;
+                bmlKindAvailable=true;
+                require(retained==caption&&actualLabels.controls[1].name==caption,
+                    "Production Kind label replaced an independently observed installed BML caption");
+            };
+            if(first!=reference.handler->firstLabels.end())requireNativeKind(first->second);
+            if(const auto observed=reference.handler->labels.find(nativeKind);observed!=reference.handler->labels.end())
+                requireNativeKind(observed->second);
+            requireNativeKind(nativeLabels.controls[1].name);
+            if(!bmlKindAvailable) {
+                explorer::NamespaceCommandMetadata provider;
+                const auto providerRead=explorer::namespaceCommandMetadata(explorer::ribbonCommandStoreName(explorer::SearchKindMenu),&provider);
+                std::cout<<"Owned Kind caption provenance: BMLUnavailable firstCurrentType="
+                    <<(firstType==reference.handler->firstLabelTypes.end()?static_cast<VARTYPE>(VT_EMPTY):firstType->second)
+                    <<" providerRead="<<static_cast<ULONG>(providerRead)<<" providerTitle=\""<<diagnosticCaption(provider.label)
+                    <<"\" actualParentUiName=\""<<diagnosticCaption(actualLabels.controls[1].name)<<"\" KindCaptionParity=false\n";
+                succeeded(providerRead,"Independently read native Kind CommandStore/provider title");
+                require(!provider.label.empty()&&retained==provider.label&&actualLabels.controls[1].name==provider.label,
+                    "Actual Kind parent lost its independently read native provider title");
+            } else std::cout<<"Owned Kind caption provenance: BMLAvailable KindCaptionParity=true\n";
+            std::cout<<"PASS: all four actual Search group captions match independent native BML, including empty captions\n";
+            explorer::NamespaceCommandMetadata closeProvider;
+            succeeded(explorer::namespaceCommandMetadata(explorer::ribbonCommandStoreName(explorer::CloseSearch),&closeProvider),
+                "Independently read Close search leaf title");
+            require(!closeProvider.label.empty(),"Native Close search leaf title is unavailable");
+            succeeded(ownedAutomation(window.handle,[handle=window.handle,label=closeProvider.label](IUIAutomation* automation) {
+                Microsoft::WRL::ComPtr<IUIAutomationElement> leaf;
+                auto status=namedElement(automation,handle,label.c_str(),&leaf);
+                CONTROLTYPEID type=0;BOOL offscreen=TRUE;RECT bounds{};
+                if(SUCCEEDED(status))status=leaf->get_CurrentControlType(&type);
+                if(SUCCEEDED(status))status=leaf->get_CurrentIsOffscreen(&offscreen);
+                if(SUCCEEDED(status))status=leaf->get_CurrentBoundingRectangle(&bounds);
+                if(SUCCEEDED(status)&&(type!=UIA_ButtonControlTypeId||offscreen||bounds.right<=bounds.left||bounds.bottom<=bounds.top))
+                    status=E_UNEXPECTED;
+                return status;
+            }),"Empty native Close group preserves its actual visible Close search leaf title");
+            succeeded(ribbon.setContexts(explorer::RibbonContext::None),"Independent Search label fixture cleanup");
+            succeeded(ribbon.selectTab(explorer::RibbonHomeTab),"Restore Home after independent Search label fixture");pump();
+        }
+        if(stock) {
+            InstalledLabelReference reference;reference.initialize(hostClass.lpszClassName,ribbon.features());
+            ShowWindow(reference.window.handle,SW_SHOWNOACTIVATE);UpdateWindow(reference.window.handle);pump();
+            struct VideoVariant {UINT context,group;};
+            constexpr std::array videoVariants{VideoVariant{0x702,0x2c20},VideoVariant{0x70a,0x2c21}};
+            std::array<OwnedSingleGroupLabel,videoVariants.size()> nativeVideoGroups;
+            for(size_t index=0;index<videoVariants.size();++index) {
+                const auto variant=videoVariants[index];
+                require(reference.handler->commandTypes.contains(variant.context)&&
+                    reference.handler->commandTypes.at(variant.context)==UI_COMMANDTYPE_CONTEXT,
+                    "Independent BML did not register the requested Video context variant");
+                Variant active;succeeded(InitPropVariantFromUInt32(UI_CONTEXTAVAILABILITY_ACTIVE,&active.value),
+                    "Native Video reference availability value");
+                succeeded(reference.framework->SetUICommandProperty(variant.context,UI_PKEY_ContextAvailable,active.value),
+                    "Activate unmodified native Video context variant");
+                succeeded(reference.framework->FlushPendingInvalidations(),"Realize independent Video BML");pump();
+                require(reference.handler->commandTypes.contains(variant.group)&&
+                    reference.handler->commandTypes.at(variant.group)==UI_COMMANDTYPE_GROUP,
+                    "Independent BML did not realize the exact Video group command");
+                succeeded(reference.framework->InvalidateUICommand(variant.group,UI_INVALIDATIONS_PROPERTY,&UI_PKEY_Label),
+                    "Request independent native Video group label callback");
+                succeeded(reference.framework->FlushPendingInvalidations(),"Commit independent Video group label read");pump();
+                Variant property;
+                const auto propertyRead=reference.framework->GetUICommandProperty(variant.group,UI_PKEY_Label,&property.value);
+                succeeded(ownedSingleGroupLabel(reference.window.handle,nativeVideoGroups[index]),
+                    "Read real selected Video content group's native UIA Name property");
+                const auto firstType=reference.handler->firstLabelTypes.find(variant.group);
+                const auto firstLabel=reference.handler->firstLabels.find(variant.group);
+                std::cout<<"Owned independent Video group: context="<<variant.context<<" nativeGroup="<<variant.group
+                    <<" propertyRead="<<static_cast<ULONG>(propertyRead)<<" propertyType="<<property.value.vt
+                    <<" labelRequests="<<reference.handler->labelRequests[variant.group]<<" firstCurrentType="
+                    <<(firstType==reference.handler->firstLabelTypes.end()?static_cast<VARTYPE>(VT_EMPTY):firstType->second)
+                    <<" firstCurrent=\""<<(firstLabel==reference.handler->firstLabels.end()?"<absent>":diagnosticCaption(firstLabel->second))
+                    <<"\" selectedTab=\""<<diagnosticCaption(nativeVideoGroups[index].selectedTab)
+                    <<"\" actualUiCaption=\""<<diagnosticCaption(nativeVideoGroups[index].caption)
+                    <<"\" bounds="<<nativeVideoGroups[index].bounds.left<<','<<nativeVideoGroups[index].bounds.top<<','
+                    <<nativeVideoGroups[index].bounds.right<<','<<nativeVideoGroups[index].bounds.bottom<<'\n';
+                require(reference.handler->labelRequests[variant.group]>0,
+                    "Independent native Video group Label callback was never reached");
+                if(SUCCEEDED(propertyRead))require(property.value.vt==VT_LPWSTR&&
+                    std::wstring_view(property.value.pwszVal?property.value.pwszVal:L"")==nativeVideoGroups[index].caption,
+                    "Independent native Video UIProperty and actual UIA group caption disagree");
+                Variant unavailable;
+                succeeded(InitPropVariantFromUInt32(UI_CONTEXTAVAILABILITY_NOTAVAILABLE,&unavailable.value),
+                    "Native Video reference cleanup value");
+                succeeded(reference.framework->SetUICommandProperty(variant.context,UI_PKEY_ContextAvailable,unavailable.value),
+                    "Clear the independently tested native Video context variant");pump();
+            }
+            const size_t selectedVariant=ribbon.features().mediaFoundation?0:1;
+            const auto expectedVariant=videoVariants[selectedVariant];
+            succeeded(ribbon.setContexts(explorer::RibbonContext::Video,true),"Activate actual feature-selected Video production context");
+            succeeded(ribbon.flush(),"Materialize actual production Video group caption");pump();
+            UINT nativeContext=0,availability=0;
+            succeeded(ribbon.contextAvailable(explorer::RibbonContext::Video,nativeContext,availability),
+                "Read production Video context variant from native framework");
+            require(nativeContext==expectedVariant.context&&availability==UI_CONTEXTAVAILABILITY_ACTIVE,
+                "Production Video group did not use the actual native feature-selected variant");
+            OwnedSingleGroupLabel actualVideoGroup;
+            succeeded(ownedSingleGroupLabel(window.handle,actualVideoGroup),"Read actual production Video group's visible native UIA Name");
+            Variant actualProperty;
+            const auto actualPropertyRead=ribbon.nativeFramework()->GetUICommandProperty(expectedVariant.group,UI_PKEY_Label,&actualProperty.value);
+            std::cout<<"Owned production Video group: nativeContext="<<nativeContext<<" nativeGroup="<<expectedVariant.group
+                <<" propertyRead="<<static_cast<ULONG>(actualPropertyRead)<<" propertyType="<<actualProperty.value.vt
+                <<" selectedTab=\""<<diagnosticCaption(actualVideoGroup.selectedTab)<<"\" actualUiCaption=\""
+                <<diagnosticCaption(actualVideoGroup.caption)<<"\" referenceUiCaption=\""
+                <<diagnosticCaption(nativeVideoGroups[selectedVariant].caption)<<"\"\n";
+            require(actualVideoGroup.selectedTab==nativeVideoGroups[selectedVariant].selectedTab&&
+                actualVideoGroup.caption==nativeVideoGroups[selectedVariant].caption,
+                "Production Video group caption differs from independently loaded native BML, including an empty caption");
+            succeeded(ribbon.setContexts(explorer::RibbonContext::None),"Independent Video label fixture cleanup");
+            succeeded(ribbon.selectTab(explorer::RibbonHomeTab),"Restore Home after independent Video label fixture");pump();
+            std::cout<<"PASS: actual feature-selected Video group caption matches independent native BML\n";
+        }
         const auto capturePath=std::filesystem::current_path()/L"artifacts"/(L"ribbon-native-home-"+std::to_wstring(GetCurrentProcessId())+L".png");
         std::filesystem::create_directories(capturePath.parent_path());
         MoveWindow(window.handle,0,0,749,510,TRUE);pump();
@@ -270,6 +1095,95 @@ int main(int argc,char** argv){
             verifyContext(explorer::RibbonContext::Music,features.mediaFoundation?0x701:0x70b);
             verifyContext(explorer::RibbonContext::Video,features.mediaFoundation?0x702:0x70a);
             verifyContext(explorer::RibbonContext::DiscImage,features.discBurning?0x704:0x70d);
+            succeeded(ribbon.setContexts(explorer::RibbonContext::Library,true),"Select native Library item gallery");pump();
+            std::wstring libraryLabel;succeeded(ribbon.commandLabel(explorer::LibraryDefault,libraryLabel),"Native Library save-location label");
+            succeeded(expandOwnedGallery(window.handle,libraryLabel.c_str()),"Expand actual Library item gallery");pump();
+            Variant librarySource;
+            succeeded(ribbon.nativeFramework()->GetUICommandProperty(ribbon.nativeCommandId(explorer::LibraryDefault),
+                UI_PKEY_ItemsSource,&librarySource.value),"Actual materialized Library source");
+            Microsoft::WRL::ComPtr<IUICollection> libraryCollection;UINT libraryCount=0;
+            require(librarySource.value.vt==VT_UNKNOWN&&librarySource.value.punkVal,"Native Library source type");
+            succeeded(librarySource.value.punkVal->QueryInterface(IID_PPV_ARGS(&libraryCollection)),"Native Library source collection");
+            succeeded(libraryCollection->GetCount(&libraryCount),"Actual materialized Library row count");
+            require(libraryCount==3,"Native Library fixture rows were not materialized");
+            require(firstLibrarySourceRefresh&&firstLibraryInvalidation==S_OK&&firstLibraryFlush==E_PENDING,
+                "Initial Library callback did not exercise its owner refresh boundary");
+            for(UINT row=0;row<libraryCount;++row) {
+                const auto label=L"Owned library location "+std::to_wstring(row);
+                succeeded(checkOwnedGalleryRow(window.handle,label.c_str(),true,false),"First native Library popup kept every location after owner refresh");
+            }
+            // Initial Home has no Library item collection. Publish a valid
+            // mock index only after the real three-row source has materialized;
+            // no native property query runs from inside a property callback.
+            librarySelectedIndex=2;
+            succeeded(ribbon.invalidateState(explorer::LibraryDefault),"Publish actual Library fixture selection");
+            succeeded(ribbon.flush(),"Materialized Library selection flush");pump();
+            const auto selectedLibrary=[&] {
+                Variant selected;ULONG index=UI_COLLECTION_INVALIDINDEX;
+                succeeded(ribbon.nativeFramework()->GetUICommandProperty(ribbon.nativeCommandId(explorer::LibraryDefault),UI_PKEY_SelectedItem,&selected.value),"Native selected Library location readback");
+                succeeded(PropVariantToUInt32(selected.value,&index),"Native selected Library location type");return index;
+            };
+            require(selectedLibrary()==2,"First Library source materialization lost the selected location");
+            librarySelectedIndex=3;
+            succeeded(ribbon.invalidateState(explorer::LibraryDefault),"Reject out-of-range Library selection");
+            succeeded(ribbon.flush(),"Out-of-range Library selection flush");pump();
+            require(selectedLibrary()==UI_COLLECTION_INVALIDINDEX,"Native gallery received an out-of-range selection");
+            librarySelectedIndex=2;
+            succeeded(ribbon.invalidateState(explorer::LibraryDefault),"Restore valid Library selection");
+            succeeded(ribbon.flush(),"Valid Library selection flush");pump();
+            require(selectedLibrary()==2,"Valid Library selection was not restored");
+            succeeded(expandOwnedGallery(window.handle,libraryLabel.c_str()),"Present retained native Library popup");pump();
+            explorer::RibbonCollectionReadback libraryBeforeReplacement;
+            succeeded(ribbon.collectionReadback(explorer::LibraryDefault,libraryBeforeReplacement),"Retained Library popup source generation");
+            const auto verifyLibraryRows=[&](bool replacement,bool visible=true) {
+                UINT actualCount=0;succeeded(libraryCollection->GetCount(&actualCount),"Actual replacement Library row count");
+                require(actualCount==3,"Library source replacement lost a location");
+                for(UINT row=0;row<actualCount;++row) {
+                    Microsoft::WRL::ComPtr<IUnknown> raw;Microsoft::WRL::ComPtr<IUISimplePropertySet> properties;
+                    succeeded(libraryCollection->GetItem(row,&raw),"Actual replacement Library item");
+                    succeeded(raw.As(&properties),"Actual replacement Library properties");
+                    Variant title;succeeded(properties->GetValue(UI_PKEY_Label,&title.value),"Actual replacement Library title");
+                    const auto expected=std::wstring(replacement?L"Owned replacement library location ":L"Owned library location ")+std::to_wstring(row);
+                    require(title.value.vt==VT_LPWSTR&&title.value.pwszVal&&expected==title.value.pwszVal,"Library source retained a stale title");
+                    if(visible)succeeded(checkOwnedGalleryRow(window.handle,expected.c_str(),true,false),"Actual visible native Library location row");
+                }
+            };
+            verifyLibraryRows(false);
+            librarySelectedIndex=1;
+            replacementLibraryLocations=true;
+            succeeded(ribbon.invalidateItems(explorer::LibraryDefault),"Refresh changed Library locations");
+            const auto libraryDiagnostic=[&](const char* phase) {
+                explorer::RibbonCollectionReadback read;
+                succeeded(ribbon.collectionReadback(explorer::LibraryDefault,read),"Library selected callback diagnostics");
+                std::cout<<"Native Library "<<phase<<": sources="<<read.sourceRequests<<" selectedRequests="<<read.selectedRequests
+                    <<" lastSelectedIndex="<<read.lastSelectedIndex<<" publishedItems="<<read.publishedItems
+                    <<" pendingInvalidations="<<read.pendingInvalidations<<std::endl;
+            };
+            libraryDiagnostic("before-source-flush");
+            succeeded(ribbon.flush(),"Changed Library source flush");libraryDiagnostic("after-source-flush");pump();
+            libraryDiagnostic("after-owner-dispatch");
+            explorer::RibbonCollectionReadback openLibrarySnapshot;
+            succeeded(ribbon.collectionReadback(explorer::LibraryDefault,openLibrarySnapshot),"Open native Library popup snapshot");
+            require(openLibrarySnapshot.sourceRequests==libraryBeforeReplacement.sourceRequests&&selectedLibrary()==2,
+                "The open native Library popup did not retain its original source snapshot");
+            ExpandCollapseState libraryExpansion=ExpandCollapseState_LeafNode;
+            succeeded(galleryExpansionState(window.handle,libraryLabel.c_str(),libraryExpansion),"Actual Library popup state after source invalidation");
+            std::cout<<"Native Library expansion after source invalidation="<<libraryExpansion<<std::endl;
+            verifyLibraryRows(false,false);
+            succeeded(galleryExpansionState(window.handle,libraryLabel.c_str(),libraryExpansion,true),"Close retained native Library popup");pump();
+            require(libraryExpansion==ExpandCollapseState_Collapsed,"Retained Library popup did not close");
+            succeeded(expandOwnedGallery(window.handle,libraryLabel.c_str()),"Reopen actual native Library source");pump();
+            succeeded(ribbon.flush(),"Commit actual replacement Library value");pump();
+            libraryDiagnostic("after-native-source-reopen");
+            explorer::RibbonCollectionReadback reloadedLibrarySnapshot;
+            succeeded(ribbon.collectionReadback(explorer::LibraryDefault,reloadedLibrarySnapshot),"Reloaded native Library popup source");
+            require(reloadedLibrarySnapshot.sourceRequests>libraryBeforeReplacement.sourceRequests,
+                "Reopening Library locations did not reload their actual native source");
+            verifyLibraryRows(true);
+            std::cout<<"Native replaced Library selected index="<<selectedLibrary()<<std::endl;
+            require(selectedLibrary()==1,"Replacing Library locations lost their selected index");
+            succeeded(galleryExpansionState(window.handle,libraryLabel.c_str(),libraryExpansion,true),"Collapse native Library item gallery");
+            require(libraryExpansion==ExpandCollapseState_Collapsed,"Library gallery remained expanded");
             UINT unchangedId=77,unchangedAvailability=88;
             require(ribbon.contextAvailable(explorer::RibbonContext::Drive|explorer::RibbonContext::Music,unchangedId,unchangedAvailability)==E_INVALIDARG&&unchangedId==77&&unchangedAvailability==88,"Invalid context query changed output");
             require(ribbon.setDriveType(DRIVE_RAMDISK+1)==E_INVALIDARG,"Invalid drive type accepted");
@@ -406,7 +1320,16 @@ int main(int argc,char** argv){
         const std::array<UINT,3> custom{explorer::Copy,explorer::Properties,explorer::NewFolder};succeeded(ribbon.setQuickAccessCommands(custom),"Custom native QAT");
         succeeded(ribbon.quickAccessCommands(qat),"Custom QAT readback");require(qat==std::vector<UINT>(custom.begin(),custom.end()),"QAT order changed");
         const std::array<UINT,2> duplicate{explorer::Copy,explorer::Copy};require(ribbon.setQuickAccessCommands(duplicate)==E_INVALIDARG,"Duplicate QAT accepted");
-        const std::array<UINT,1> group{explorer::RibbonHomeTab};require(ribbon.setQuickAccessCommands(group)==E_INVALIDARG,"Structural QAT command accepted");
+        for (UINT tab = explorer::RibbonHomeTab; tab <= explorer::RibbonShortcutTab; ++tab) {
+            const std::array<UINT,1> structural{tab};
+            require(ribbon.setQuickAccessCommands(structural)==E_INVALIDARG,"Structural QAT tab accepted");
+        }
+        for (UINT context = explorer::RibbonPictureContext; context <= explorer::RibbonShortcutContext; ++context) {
+            const std::array<UINT,1> structural{context};
+            require(ribbon.setQuickAccessCommands(structural)==E_INVALIDARG,"Structural QAT context accepted");
+        }
+        succeeded(ribbon.quickAccessCommands(qat),"QAT after rejected structural commands");
+        require(qat==std::vector<UINT>(custom.begin(),custom.end()),"Rejected structural commands changed the QAT");
         bool below=false;succeeded(ribbon.setQuickAccessBelow(true),"Native QAT below");succeeded(ribbon.quickAccessBelow(below),"QAT placement readback");require(below,"Below-ribbon QAT ignored");
         succeeded(ribbon.setContexts(explorer::RibbonContext::Search|explorer::RibbonContext::Picture),"Multiple native contextual pages");
         Variant context;succeeded(ribbon.framework()->GetUICommandProperty(explorer::RibbonSearchContext,UI_PKEY_ContextAvailable,&context.value),"Search availability");ULONG available=0;succeeded(PropVariantToUInt32(context.value,&available),"Context type");require(available==UI_CONTEXTAVAILABILITY_AVAILABLE,"Search context missing");
@@ -423,6 +1346,8 @@ int main(int argc,char** argv){
         const auto expanded=ribbon.height();succeeded(ribbon.setMinimized(true),"Native collapse");pump();bool minimized=false;succeeded(ribbon.minimized(minimized),"Collapse property readback");require(minimized&&ribbon.height()<expanded,"Collapse did not reclaim host space");
         const auto temporary=std::filesystem::temp_directory_path()/(L"WindowsExplorer-Ribbon-"+std::to_wstring(GetCurrentProcessId())+L"-"+std::to_wstring(GetTickCount64()));
         const auto settings=temporary/L"\u8a2d\u5b9a.bin";
+        require(ribbon.saveSettings({})==E_INVALIDARG&&ribbon.saveSettings(L"relative-ribbon-settings.bin")==E_INVALIDARG,
+            "Native Ribbon settings accepted an empty or relative destination");
         succeeded(ribbon.saveSettings(settings),"Atomic Unicode native settings save");
         succeeded(ribbon.setMinimized(false),"Native expand");succeeded(ribbon.setQuickAccessBelow(false),"QAT restore top");
         const std::array<UINT,1> reset{explorer::NewFolder};succeeded(ribbon.setQuickAccessCommands(reset),"QAT reset");
@@ -430,6 +1355,28 @@ int main(int argc,char** argv){
         succeeded(ribbon.minimized(minimized),"Restored collapse");succeeded(ribbon.quickAccessBelow(below),"Restored QAT placement");succeeded(ribbon.quickAccessCommands(qat),"Restored QAT commands");
         if(!(minimized&&below&&qat==std::vector<UINT>(custom.begin(),custom.end())))std::cerr<<"Settings readback minimized="<<minimized<<" below="<<below<<" commands="<<qat.size()<<'\n';
         require(minimized&&below&&qat==std::vector<UINT>(custom.begin(),custom.end()),"Native persisted state lost");
+        const auto selectPersistedState=[&](bool replacement)->HRESULT {
+            auto status=ribbon.setMinimized(!replacement);
+            if(SUCCEEDED(status))status=ribbon.setQuickAccessBelow(!replacement);
+            if(SUCCEEDED(status))status=replacement?ribbon.setQuickAccessCommands(reset):ribbon.setQuickAccessCommands(custom);
+            return status;
+        };
+        explorer::test::stateFileSecurityProfiles(temporary,L"native-ribbon",
+            [&](const std::filesystem::path& path,bool replacement)->HRESULT {
+                const auto status=selectPersistedState(replacement);
+                return SUCCEEDED(status)?ribbon.saveSettings(path):status;
+            },
+            [&](const std::filesystem::path& path,bool replacement) {
+                succeeded(selectPersistedState(!replacement),"Disturb actual native state before security readback");
+                succeeded(ribbon.loadSettings(path),"Load actual native codec under preserved security profile");
+                succeeded(ribbon.minimized(minimized),"Security profile collapse readback");
+                succeeded(ribbon.quickAccessBelow(below),"Security profile QAT placement readback");
+                succeeded(ribbon.quickAccessCommands(qat),"Security profile QAT command readback");
+                const auto expected=replacement?std::vector<UINT>(reset.begin(),reset.end()):std::vector<UINT>(custom.begin(),custom.end());
+                require(minimized==!replacement&&below==!replacement&&qat==expected,
+                    "Actual native Ribbon codec changed complete state under a security profile");
+            });
+        succeeded(ribbon.loadSettings(settings),"Restore original native state after security profiles");
         const auto invalid=temporary/L"invalid.bin";{std::ofstream stream(invalid,std::ios::binary);stream<<"not Ribbon settings";}
         require(FAILED(ribbon.loadSettings(invalid)),"Malformed native settings accepted");succeeded(ribbon.quickAccessCommands(qat),"Failed settings preserved QAT");require(qat==std::vector<UINT>(custom.begin(),custom.end()),"Failed load changed QAT");
         HRESULT wrongThread=S_OK;std::thread wrong([&]{wrongThread=ribbon.invalidate();});wrong.join();require(wrongThread==RPC_E_WRONG_THREAD,"Cross-thread framework call accepted");

@@ -21,19 +21,17 @@ struct ChromeDrawReadback {
 HRESULT chromeToolbarDrawReadback(HWND toolbar, UINT command, ChromeDrawReadback* output) noexcept;
 HRESULT drawNavigationButton(HWND owner, HDC dc, const RECT& bounds, UINT command,
                              const ChromeButtonState& state, UINT dpi = 96);
-HRESULT drawStatusViewButton(HWND owner, HDC dc, const RECT& bounds, UINT command,
-                             const ChromeButtonState& state, UINT dpi = 96);
 void drawSearchGlyph(HDC dc, const RECT& bounds, bool enabled, UINT dpi = 96);
 // The installed Ribbon omits a host-owned minimize affordance. Keep a native
 // accessible button and draw its current public UI_PKEY_Minimized state.
 HRESULT applyRibbonCollapseButton(HWND button);
 bool drawRibbonCollapseButton(const DRAWITEMSTRUCT& draw, bool minimized, UINT dpi = 96);
-// Parent NM_CUSTOMDRAW handler for only the Navigation / View shortcuts
+// Parent NM_CUSTOMDRAW handler for the Navigation and Refresh
 // toolbars. Native text/tooltip/accessibility identities stay on each button.
-LRESULT chromeToolbarCustomDraw(NMTBCUSTOMDRAW& draw, bool status, UINT dpi = 96);
+LRESULT chromeToolbarCustomDraw(NMTBCUSTOMDRAW& draw, UINT dpi = 96);
 // Keeps native toolbar buttons, text, tooltips and accessibility while drawing
 // the address breadcrumb's Shell icon and horizontal expansion chevrons.
 LRESULT chromeBreadcrumbCustomDraw(NMTBCUSTOMDRAW& draw, UINT dpi = 96);
 HRESULT applyChrome(HWND navigation, HWND breadcrumbs, HWND address, HWND search,
-                    HWND statusViews, HWND addressActions = nullptr);
+                    HWND addressActions = nullptr);
 }

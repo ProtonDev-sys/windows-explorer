@@ -7,6 +7,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot 'windows-environment.ps1')
 if ([string]::IsNullOrWhiteSpace($BuildDirectory)) { $BuildDirectory = Join-Path $projectRoot 'build' }
 $executable = Join-Path ([IO.Path]::GetFullPath($BuildDirectory)) ($Configuration + '/WindowsExplorer.exe')
 if (-not (Test-Path -LiteralPath $executable)) { throw 'Build the native application before benchmarking.' }
@@ -22,8 +23,9 @@ if ($copiedSha256 -ne $builtSha256) { throw 'The executable changed while its im
     executableSha256 = $copiedSha256
     startedUtc = [DateTime]::UtcNow.ToString('o')
     os = [Environment]::OSVersion.VersionString
+    windows = Get-ExplorerWindowsEnvironment
     logicalProcessors = [Environment]::ProcessorCount
-} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $directory 'environment.json') -Encoding utf8
+} | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $directory 'environment.json') -Encoding utf8
 $report = Join-Path $directory 'native-navigation.json'
 $benchmarkArguments = @('--headless-benchmark', '--report', ('"' + $report + '"'))
 if ($InstalledRibbon) { $benchmarkArguments += '--installed-ribbon' }
@@ -55,6 +57,19 @@ function Assert-NonnegativeFiniteNumber($Value, [string]$Description) {
         [double]::IsNaN([double]$Value) -or [double]::IsInfinity([double]$Value)) {
         throw "Invalid $Description in native benchmark: $report"
     }
+}
+if ($null -eq $result.startup -or $result.startup.nativeTargetMatched -ne $true) {
+    throw "Initial native view did not match the retained startup target: $report"
+}
+$previousStartupPhase = 0.0
+foreach ($phase in @('privateDesktopReadyMs', 'platformReadyMs', 'createReturnedMs', 'nativeViewReadyMs')) {
+    $observation = $result.startup.PSObject.Properties[$phase]
+    if ($null -eq $observation) { throw "Missing startup phase $phase`: $report" }
+    Assert-NonnegativeFiniteNumber $observation.Value "startup.$phase"
+    if ([double]$observation.Value + 0.002 -lt $previousStartupPhase) {
+        throw "Startup observations differ from their actual phase order: $report"
+    }
+    $previousStartupPhase = [double]$observation.Value
 }
 $expectedCounts = @(10, 1000, 10000)
 $metrics = @{ navigation = 'navigationMs'; nativeNavigationCallback = 'nativeNavigationCallbackMs'; firstItem = 'firstItemMs'; fullyPopulated = 'fullyPopulatedMs' }
@@ -102,7 +117,8 @@ for ($index = 0; $index -lt $expectedSelections.Count; $index++) {
     }
     Assert-NonnegativeFiniteNumber $measured.durationMs 'selection duration'
     foreach ($phase in @('commandMs', 'deferredWorkMs', 'countReadbackMs',
-            'commandStateReadyAfterReadbackMs', 'commandStateReadyTotalMs')) {
+            'commandStateReadyAfterReadbackMs', 'commandStateReadyTotalMs',
+            'immediateCountReadAtMs', 'immediateCountReadCostMs')) {
         $phaseProperty = $measured.PSObject.Properties[$phase]
         if ($null -eq $phaseProperty) {
             throw "Incomplete native selection phase timing: $report"
@@ -127,7 +143,31 @@ for ($index = 0; $index -lt $expectedSelections.Count; $index++) {
         if ($null -eq $phaseProperty) { throw "Missing creator STA phase $phase`: $report" }
         Assert-NonnegativeFiniteNumber $phaseProperty.Value $phase
     }
-    Write-Host "10,000 items: $($measured.action) $($measured.durationMs) ms; selected $($measured.selected)"
+    foreach ($counter in @('generationChanges', 'equivalentSelectionRefreshes', 'uncertainSelectionRefreshes')) {
+        Assert-NonnegativeFiniteNumber $measured.$counter $counter
+        if ($measured.$counter -ne [Math]::Floor($measured.$counter)) { throw "Noninteger selection counter: $report" }
+    }
+    Assert-NonnegativeFiniteNumber $measured.immediateSelectedCount 'immediate selected count'
+    if ($measured.immediateSelectedCount -ne [Math]::Floor($measured.immediateSelectedCount) -or
+        $measured.immediateSelectedCount -gt 10000 -or
+        $measured.immediateCountReadAtMs -gt $measured.durationMs + 0.002 -or
+        $measured.immediateCountReadCostMs -gt $measured.immediateCountReadAtMs + 0.002) {
+        throw "Invalid immediate native selection observation: $report"
+    }
+    if ($null -eq $measured.hostWork.PSObject.Properties['completedStateWorkers']) {
+        throw "Missing completed native worker profiling: $report"
+    }
+    foreach ($worker in $measured.hostWork.completedStateWorkers) {
+        if ($worker.timingStatus -ne 0 -or $worker.selectionBatch -isnot [bool] -or $null -eq $worker.status) {
+            throw "Unestablished completed native worker profiling: $report"
+        }
+        Assert-NonnegativeFiniteNumber $worker.command 'profiled command identifier'
+        foreach ($phase in @('workerMs', 'dataObjectExportMs', 'identityConstructionMs', 'contextBindMs',
+                'menuQueryMs', 'menuEnumerationMs', 'stateReductionMs')) {
+            Assert-NonnegativeFiniteNumber $worker.$phase "native worker $phase"
+        }
+    }
+    Write-Host "10,000 items: $($measured.action); immediate count $($measured.immediateSelectedCount) at $($measured.immediateCountReadAtMs) ms; creator queue drained $($measured.durationMs) ms; native command states ready $($measured.commandStateReadyTotalMs) ms; selected $($measured.selected)"
 }
 foreach ($case in $result.cases) {
     Write-Host "$($case.items) items: navigation p95 $($case.navigation.p95Ms) ms; first item p95 $($case.firstItem.p95Ms) ms; populated p95 $($case.fullyPopulated.p95Ms) ms"

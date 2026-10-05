@@ -80,7 +80,6 @@ constexpr std::array catalog{
     native(RibbonLibraryChangeIcon,L"Windows.LibraryChangeIcon",writableLibrary),
     host(RibbonLibraryShowInNavigation,L"Windows.LibraryShowInNavPane",writableLibrary,Scope::Background),
     native(RibbonResetLibrary,L"Windows.LibraryRestoreDefaults",writableLibrary),
-    host(RibbonRemoveLibraryFolder,{},writableLibrary),
     host(RibbonNewLibraryMenu,{},RequireNone),
     host(ExpandAncestors),host(RibbonExpandToCurrent,L"Windows.NavPaneExpandToCurrentFolder"),
     host(RibbonShowAllFolders,L"Windows.NavPaneShowAllFolders"),host(RibbonShowLibraries,L"Windows.NavPaneShowLibraries"),

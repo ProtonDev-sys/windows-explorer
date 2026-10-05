@@ -48,8 +48,14 @@ public:
     // enumerate(..., false) reads only metadata already supplied by the handler.
     // Invoke and menu-message/delayed population are rejected for this instance.
     // Normal popup and invocation paths must continue to use create().
+    // omitResourceVerbs may be used only when none of the requested canonical
+    // leaves is cut/copy/paste/link/delete/rename/properties or an alias thereof.
+    // Dynamic handlers remain enabled; an unsupported restriction interface
+    // retains the ordinary native query, while supported failures propagate.
+    // Any added restriction is restored after this query, including its error
+    // path, so a retained provider remains suitable for a later normal menu.
     HRESULT createLeafState(IContextMenu* context, IUnknown* site = nullptr,
-                            UINT flags = CMF_NORMAL);
+                            UINT flags = CMF_NORMAL, bool omitResourceVerbs = false);
     void reset() noexcept;
 
     HMENU menu() const noexcept { return menu_; }
@@ -74,7 +80,7 @@ public:
 
 private:
     HRESULT createImpl(HWND owner, IContextMenu* context, IUnknown* site, UINT flags,
-                       bool leafStateOnly);
+                       bool leafStateOnly, bool omitResourceVerbs = false);
     HRESULT enumerateMenu(HMENU menu, UINT position, unsigned depth, unsigned& budget,
                           std::vector<ContextMenuEntry>& entries, bool populate);
     std::wstring canonicalVerb(UINT id) const;

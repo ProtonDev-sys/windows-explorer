@@ -40,8 +40,6 @@ Preferences loadPreferences(const std::filesystem::path& path);
 bool savePreferences(const std::filesystem::path& path, const Preferences& preferences);
 std::wstring trim(const std::wstring& text);
 std::wstring expandEnvironment(const std::wstring& text);
-std::wstring searchUri(const std::wstring& query, const std::wstring& scope);
-std::wstring formatBytes(std::uint64_t bytes);
 bool validLeafName(const std::wstring& name);
 std::wstring hresultMessage(HRESULT result);
 

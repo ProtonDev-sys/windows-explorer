@@ -1,10 +1,10 @@
 #include "explorer/address_history.hpp"
-#include <aclapi.h>
+#include "state_file.hpp"
 #include <shlobj.h>
 #include <algorithm>
 #include <cstring>
-#include <limits>
-#include <memory>
+#include <new>
+#include <utility>
 
 namespace explorer {
 namespace {
@@ -85,108 +85,6 @@ struct File {
 HRESULT pathError(const std::filesystem::filesystem_error& error) {
     return HRESULT_FROM_WIN32(static_cast<DWORD>(error.code().value()));
 }
-HRESULT writeAtomic(const std::filesystem::path& path, const std::string& bytes) {
-    File original;
-    original.handle = CreateFileW(path.c_str(), READ_CONTROL | FILE_READ_ATTRIBUTES | DELETE,
-        FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
-        FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
-    FILE_BASIC_INFO basic{};
-    FILE_ID_INFO identity{};
-    std::unique_ptr<void, decltype(&LocalFree)> security(nullptr, &LocalFree);
-    PACL dacl = nullptr;
-    SECURITY_DESCRIPTOR_CONTROL control{};
-    if (original.handle != INVALID_HANDLE_VALUE) {
-        if (!GetFileInformationByHandleEx(original.handle, FileBasicInfo, &basic, sizeof(basic)) ||
-            !GetFileInformationByHandleEx(original.handle, FileIdInfo, &identity, sizeof(identity)))
-            return HRESULT_FROM_WIN32(GetLastError());
-        if (basic.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_REPARSE_POINT))
-            return HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED);
-        if (basic.FileAttributes & FILE_ATTRIBUTE_ENCRYPTED) return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
-        PSECURITY_DESCRIPTOR raw = nullptr;
-        const auto status = GetSecurityInfo(original.handle, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
-                                            nullptr, nullptr, &dacl, nullptr, &raw);
-        security.reset(raw);
-        if (status) return HRESULT_FROM_WIN32(status);
-        DWORD revision = 0;
-        if (!GetSecurityDescriptorControl(raw, &control, &revision)) return HRESULT_FROM_WIN32(GetLastError());
-    } else {
-        const auto error = GetLastError();
-        if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND) return HRESULT_FROM_WIN32(error);
-    }
-    std::error_code error;
-    std::filesystem::create_directories(path.parent_path(), error);
-    if (error) return HRESULT_FROM_WIN32(static_cast<DWORD>(error.value()));
-    File temporary;
-    temporary.remove = true;
-    for (unsigned attempt = 0; attempt < 16; ++attempt) {
-        GUID id{}; wchar_t text[40]{};
-        const auto hr = CoCreateGuid(&id);
-        if (FAILED(hr)) return hr;
-        if (!StringFromGUID2(id, text, ARRAYSIZE(text))) return E_FAIL;
-        const auto name = path.parent_path() / (std::wstring(L"address-history-") + text + L".tmp");
-        temporary.handle = CreateFileW(name.c_str(), GENERIC_WRITE | DELETE | WRITE_DAC,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (temporary.handle != INVALID_HANDLE_VALUE) break;
-        const auto failure = GetLastError();
-        if (failure != ERROR_FILE_EXISTS && failure != ERROR_ALREADY_EXISTS) return HRESULT_FROM_WIN32(failure);
-    }
-    if (temporary.handle == INVALID_HANDLE_VALUE) return HRESULT_FROM_WIN32(ERROR_TOO_MANY_NAMES);
-    size_t offset = 0;
-    while (offset < bytes.size()) {
-        DWORD written = 0;
-        if (!WriteFile(temporary.handle, bytes.data() + offset, static_cast<DWORD>(bytes.size() - offset), &written, nullptr))
-            return HRESULT_FROM_WIN32(GetLastError());
-        if (!written) return HRESULT_FROM_WIN32(ERROR_WRITE_FAULT);
-        offset += written;
-    }
-    if (security) {
-        const auto protection = control & SE_DACL_PROTECTED ? PROTECTED_DACL_SECURITY_INFORMATION : UNPROTECTED_DACL_SECURITY_INFORMATION;
-        const auto status = SetSecurityInfo(temporary.handle, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION | protection,
-                                            nullptr, nullptr, dacl, nullptr);
-        if (status) return HRESULT_FROM_WIN32(status);
-        FILE_BASIC_INFO retained{};
-        retained.CreationTime = basic.CreationTime;
-        retained.FileAttributes = basic.FileAttributes & (FILE_ATTRIBUTE_ARCHIVE | FILE_ATTRIBUTE_HIDDEN |
-                                                        FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED);
-        if (!retained.FileAttributes) retained.FileAttributes = FILE_ATTRIBUTE_NORMAL;
-        if (!SetFileInformationByHandle(temporary.handle, FileBasicInfo, &retained, sizeof(retained)))
-            return HRESULT_FROM_WIN32(GetLastError());
-    }
-    if (!FlushFileBuffers(temporary.handle)) return HRESULT_FROM_WIN32(GetLastError());
-    if (original.handle != INVALID_HANDLE_VALUE) {
-        File current;
-        current.handle = CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_DELETE,
-            nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
-        FILE_ID_INFO now{};
-        if (current.handle == INVALID_HANDLE_VALUE ||
-            !GetFileInformationByHandleEx(current.handle, FileIdInfo, &now, sizeof(now)))
-            return HRESULT_FROM_WIN32(GetLastError());
-        if (now.VolumeSerialNumber != identity.VolumeSerialNumber ||
-            std::memcmp(now.FileId.Identifier, identity.FileId.Identifier, sizeof(identity.FileId.Identifier)))
-            return HRESULT_FROM_WIN32(ERROR_RETRY);
-    }
-    const auto& name = path.native();
-    const auto renameBytes = name.size() * sizeof(wchar_t);
-    if (renameBytes > (std::numeric_limits<DWORD>::max)() - offsetof(FILE_RENAME_INFO, FileName) - sizeof(wchar_t)) return E_INVALIDARG;
-    // The length excludes the explicit terminator used by Win32 translation.
-    std::vector<BYTE> storage(offsetof(FILE_RENAME_INFO, FileName) + renameBytes + sizeof(wchar_t));
-    auto* rename = reinterpret_cast<FILE_RENAME_INFO*>(storage.data());
-    const bool replace = original.handle != INVALID_HANDLE_VALUE;
-    rename->ReplaceIfExists = replace ? TRUE : FALSE;
-    rename->FileNameLength = static_cast<DWORD>(renameBytes);
-    std::memcpy(rename->FileName, name.data(), renameBytes);
-    if (replace) {
-        // The small per-app codec has no retained native-folder read handles.
-        // Close its validation handle before ordinary atomic replacement;
-        // readers denying deletion were already rejected by the preflight.
-        CloseHandle(original.handle);
-        original.handle = INVALID_HANDLE_VALUE;
-    }
-    if (!SetFileInformationByHandle(temporary.handle, FileRenameInfo, rename, static_cast<DWORD>(storage.size())))
-        return HRESULT_FROM_WIN32(GetLastError());
-    temporary.remove = false;
-    return S_OK;
-}
 bool registryOrdinal(std::wstring_view name, unsigned& ordinal) {
     if (name.size() < 4 || CompareStringOrdinal(name.data(), 3, L"url", 3, TRUE) != CSTR_EQUAL || name[3] == L'0') return false;
     unsigned result = 0;
@@ -263,7 +161,7 @@ HRESULT saveAddressHistory(const std::filesystem::path& path, std::span<const st
     try {
         std::string data(magic, sizeof(magic) - 1); append32(data, addresses.size());
         for (const auto& value : addresses) { const auto bytes = encode(value); append32(data, bytes.size()); data += bytes; }
-        return writeAtomic(path, data);
+        return writeStateFileAtomic(path, std::string_view(data));
     } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
       catch (const std::filesystem::filesystem_error& error) { return pathError(error); }
 }

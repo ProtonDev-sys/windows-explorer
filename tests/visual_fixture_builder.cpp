@@ -1,5 +1,7 @@
 #include "explorer/library.hpp"
 #include "explorer/search.hpp"
+#include "explorer/saved_search.hpp"
+#include "explorer/headless_visual.hpp"
 
 #include <windows.h>
 #include <shlobj.h>
@@ -10,10 +12,13 @@
 #include <imapi2fs.h>
 #include <shlwapi.h>
 #include <array>
+#include <algorithm>
+#include <compare>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -224,6 +229,87 @@ ComPtr<IShellItem> item(const fs::path& path) {
     auto nativePath = path; nativePath.make_preferred();
     ComPtr<IShellItem> value; check(SHCreateItemFromParsingName(nativePath.c_str(),nullptr,IID_PPV_ARGS(&value)),"Read owned native item"); return value;
 }
+struct FileIdentity {
+    ULONGLONG volume = 0;
+    std::array<BYTE,16> id{};
+    auto operator<=>(const FileIdentity&) const = default;
+};
+FileIdentity fileIdentity(const fs::path& path) {
+    const auto handle=CreateFileW(path.c_str(),FILE_READ_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
+        nullptr,OPEN_EXISTING,FILE_FLAG_BACKUP_SEMANTICS,nullptr);
+    require(handle!=INVALID_HANDLE_VALUE,"Open owned search file identity");
+    FILE_ID_INFO value{};const auto read=GetFileInformationByHandleEx(handle,FileIdInfo,&value,sizeof(value));
+    const auto status=read?S_OK:HRESULT_FROM_WIN32(GetLastError());CloseHandle(handle);check(status,"Read owned native file identity");
+    FileIdentity result{value.VolumeSerialNumber};std::copy_n(value.FileId.Identifier,result.id.size(),result.id.begin());return result;
+}
+void modified(const fs::path& path,const FILETIME& value) {
+    const auto handle=CreateFileW(path.c_str(),FILE_WRITE_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
+        nullptr,OPEN_EXISTING,FILE_FLAG_BACKUP_SEMANTICS,nullptr);
+    require(handle!=INVALID_HANDLE_VALUE,"Open owned search date fixture");
+    const auto written=SetFileTime(handle,nullptr,nullptr,&value);
+    const auto status=written?S_OK:HRESULT_FROM_WIN32(GetLastError());CloseHandle(handle);check(status,"Set owned search fixture date");
+}
+void createTodaySearch(const fs::path& root) {
+    const auto scope=root/L"Search scope",child=scope/L"Child";
+    require(fs::create_directory(scope)&&fs::create_directory(child),"Exclusively create owned search scope");
+    FILETIME today{},earlier{};GetSystemTimeAsFileTime(&today);
+    SYSTEMTIME old{};old.wYear=2020;old.wMonth=1;old.wDay=2;
+    require(SystemTimeToFileTime(&old,&earlier),"Create old search fixture date");
+    const std::array<fs::path,5> files{scope/L"Today.txt",scope/L"Earlier.txt",child/L"Today child.txt",
+        child/L"Earlier child.txt",root/L"Outside today.txt"};
+    for(size_t index=0;index<files.size();++index) {
+        createBytes(files[index],std::vector<std::uint8_t>{'O','w','n','e','d','\n'});
+        modified(files[index],index==1||index==3?earlier:today);
+    }
+    modified(child,earlier); // The recursive folder itself is not a Today result.
+    constexpr auto query=L"System.DateModified:System.StructuredQueryType.DateTime#Today";
+    for(const auto* rejected:{L"System.DateModified:System.StructuredQueryType.DateTime#Yesterday",
+            L"System.DateModified:=2026-10-05T00:00:00Z",
+            L"System.DateModified:System.StructuredQueryType.DateTime#Today AND System.Size:>0"})
+        require(explorer::validateRelativeTodayQuery(rejected)==E_INVALIDARG,
+            "Today persistence proof accepted a different relative date, absolute date or extra condition");
+    const auto saved=root/L"Owned search.search-ms";
+    const auto scoped=item(scope);
+    check(explorer::saveSearch(query,scoped.Get(),true,saved),"Save genuine unresolved Today search fixture");
+    explorer::SavedSearchMetadata metadata;check(explorer::readSavedSearch(saved,&metadata),"Reload actual saved Today search metadata");
+    check(explorer::validateRelativeTodayQuery(metadata.query),"Saved Today condition was frozen, omitted or replaced");
+    require(metadata.scope&&metadata.recursive&&metadata.scopeRules.size()==1&&metadata.scopeRules[0].recursive&&
+        metadata.scopeRules[0].folder&&!metadata.scopeRules[0].excluded,"Saved Today search scope is not the exact recursive include");
+    int comparison=1;check(scoped->Compare(metadata.scope.Get(),SICHINT_CANONICAL,&comparison),"Compare native saved Today scope");
+    require(comparison==0,"Saved Today search scope escaped the owned scope");
+    comparison=1;check(scoped->Compare(metadata.scopeRules[0].folder.Get(),SICHINT_CANONICAL,&comparison),"Compare native saved Today scope rule");
+    require(comparison==0,"Saved Today search rule escaped the owned scope");
+    const std::array<ComPtr<IShellItem>,2> expectedItems{item(files[0]),item(files[2])};
+    const std::set<FileIdentity> expected{fileIdentity(files[0]),fileIdentity(files[2])};
+    require(expected.size()==2,"Owned Today fixtures must have distinct native file identities");
+    const auto deadline=GetTickCount64()+5000;
+    for(;;) {
+        ComPtr<IShellFolder> folder;check(item(saved)->BindToHandler(nullptr,BHID_SFObject,IID_PPV_ARGS(&folder)),"Bind actual saved Today native folder");
+        ComPtr<IEnumIDList> enumerator;check(folder->EnumObjects(nullptr,static_cast<SHCONTF>(SHCONTF_FOLDERS|SHCONTF_NONFOLDERS),&enumerator),"Enumerate actual saved Today native results");
+        std::set<FileIdentity> actual;size_t count=0;
+        while(enumerator) {
+            PITEMID_CHILD pidl=nullptr;const auto next=enumerator->Next(1,&pidl,nullptr);if(next==S_FALSE)break;
+            check(next,"Read actual saved Today result");require(pidl!=nullptr,"Today result lacks native identity");
+            ComPtr<IShellItem> result;const auto created=SHCreateItemWithParent(nullptr,folder.Get(),pidl,IID_PPV_ARGS(&result));
+            CoTaskMemFree(pidl);check(created,"Resolve actual saved Today result");
+            PWSTR rawPath=nullptr;const auto named=result->GetDisplayName(SIGDN_FILESYSPATH,&rawPath);
+            const fs::path resultPath=rawPath?rawPath:L"";CoTaskMemFree(rawPath);check(named,"Read actual Today filesystem identity");
+            require(!resultPath.empty(),"Actual Today result lacks a filesystem identity");
+            const auto resultFile=item(resultPath); // Unwrap the native search PIDL before canonical comparison.
+            size_t expectedIndex=expectedItems.size();
+            for(size_t index=0;index<expectedItems.size();++index) {
+                int equal=1;check(expectedItems[index]->Compare(resultFile.Get(),SICHINT_CANONICAL,&equal),"Compare owned Today result identity");
+                if(equal==0)expectedIndex=index;
+            }
+            require(expectedIndex<expectedItems.size(),"Today native search included an earlier, outside-scope or unexpected item");
+            require(actual.insert(fileIdentity(resultPath)).second,"Today native search returned a duplicate identity");++count;
+        }
+        if(count==2&&actual==expected)break;
+        require(GetTickCount64()<deadline,"Actual saved Today query did not return both exact recursive owned identities");
+        MSG message{};while(PeekMessageW(&message,nullptr,0,0,PM_REMOVE)){TranslateMessage(&message);DispatchMessageW(&message);}
+        MsgWaitForMultipleObjectsEx(0,nullptr,50,QS_ALLINPUT,MWMO_INPUTAVAILABLE);
+    }
+}
 std::string ascii(const std::wstring& value) {
     std::string result;
     for (const auto character : value) { require(character >= 0x20 && character < 0x7f,"Native fixture metadata must be printable ASCII"); result.push_back(static_cast<char>(character)); }
@@ -286,7 +372,7 @@ int wmain(int count, wchar_t** arguments) {
         check(link->SetWorkingDirectory(root.c_str()),"Set owned shortcut working directory");
         ComPtr<IPersistFile> persist; check(link.As(&persist),"Query owned shortcut writer");
         check(persist->Save((root/L"Application shortcut.lnk").c_str(),TRUE),"Save owned shortcut");
-        check(explorer::saveSearch(L"System.FileName:=\"Read me.txt\"",item(root).Get(),true,root/L"Owned search.search-ms"),"Save genuine native search fixture");
+        createTodaySearch(root);
         explorer::ShellLibrary library; check(explorer::ShellLibrary::create(library),"Create owned native library");
         check(library.addFolder(root/L"Documents"),"Include owned Documents in library");
         check(library.addFolder(root/L"Pictures"),"Include owned Pictures in library");
@@ -310,7 +396,7 @@ int wmain(int count, wchar_t** arguments) {
         validateMedia(root/L"Music/Owned audio.wav",streamtypeAUDIO,44100,2);
         validateMedia(root/L"Videos/Owned video.avi",streamtypeVIDEO,1,16);
         createDiscImage(root);
-        std::string json = "{\"headless\":true,\"privateDesktop\":true,\"inputDesktopUnchanged\":true,\"visibleInputDesktopWindows\":false,\"passed\":true,\"executedFixture\":false,\"created\":7,\"isoBuilder\":\"IMAPI2FS\",\"isoBuilderStatus\":0,\"isoVolumeVerified\":true,\"libraryLocations\":3,\"libraryDefault\":\"Documents\",\"libraryTemplate\":\"Documents\",\"fixtureFiles\":[";
+        std::string json = "{\"headless\":true,\"privateDesktop\":true,\"inputDesktopUnchanged\":true,\"visibleInputDesktopWindows\":false,\"passed\":true,\"executedFixture\":false,\"created\":7,\"isoBuilder\":\"IMAPI2FS\",\"isoBuilderStatus\":0,\"isoVolumeVerified\":true,\"libraryLocations\":3,\"libraryDefault\":\"Documents\",\"libraryTemplate\":\"Documents\",\"searchScope\":\"Search scope\",\"searchRelativeToday\":true,\"searchRecursive\":true,\"searchResultCount\":2,\"searchExactIdentities\":true,\"searchEarlierExcluded\":true,\"searchOutsideScopeExcluded\":true,\"fixtureFiles\":[";
         const std::array<const wchar_t*,7> types{L".search-ms",L".library-ms",L".exe",L".lnk",L".wav",L".avi",L".iso"};
         for (std::size_t index = 0; index < outputs.size(); ++index) {
             if (index) json += ',';

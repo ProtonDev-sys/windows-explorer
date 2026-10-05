@@ -29,6 +29,16 @@ struct SearchViewPresentation {
     std::optional<SearchViewOrder> groupBy;
     std::optional<std::vector<SearchViewOrder>> sort;
 };
+// The public file format identifies these file metadata elements as internal
+// fields. Preserve imported simple text values without interpreting them or
+// inventing additional native properties. Unknown shapes remain native-only.
+struct SearchFileProperties {
+    std::optional<std::wstring> author;
+    std::optional<std::wstring> kind;
+    std::optional<std::wstring> description;
+    std::optional<std::wstring> tags;
+    bool operator==(const SearchFileProperties&) const = default;
+};
 HRESULT validateSearchViewPresentation(const SearchViewPresentation& presentation);
 HRESULT captureSearchViewPresentation(IFolderView2* view, SearchViewPresentation* result);
 HRESULT applySearchViewPresentation(IFolderView2* view, const SearchViewPresentation& presentation);
@@ -40,19 +50,17 @@ HRESULT nativeSearchViewPresentation(const SearchViewPresentation& actual, Searc
 // Creates an in-memory native Shell search folder. The caller must initialize
 // COM and owns the returned interface. A null scope searches This PC; a supplied
 // folder searches that location and its descendants. Non-recursive searches
-// require a filesystem folder. Explicit filename word-prefix ($<) conditions
-// return ERROR_NOT_SUPPORTED for a Windows 10 native handler compatibility
-// issue. No UI is created here.
+// require a filesystem folder. No UI is created here.
 HRESULT createSearchFolder(const std::wstring& query, IShellItem* scope, IShellItem** result,
                            bool recursive = true);
 // Native union scope, with up to 256 folder locations. Library scopes expand
 // to their included folders. Non-recursive scope applies to each location.
 HRESULT createSearchFolderForScopes(const std::wstring& query, IShellItemArray* scopes,
                                     IShellItem** result, bool recursive = true);
-// Preserves individual include recursion and recursive child exclusions.
-// Provider-dependent exclusions (shallow, same as an included root, or an
-// immediate child of a shallow include) return ERROR_NOT_SUPPORTED. Mixed
-// shallow scopes/exclusions require filesystem locations for path conditions.
+// Preserves individual include recursion and exclusions. Physical shallow,
+// equal-root and excluded direct-child-of-shallow combinations use an exact
+// native path predicate. Mixed shallow scopes/exclusions require filesystem
+// locations; unsupported virtual combinations return ERROR_NOT_SUPPORTED.
 HRESULT createSearchFolderForScopeRules(const std::wstring& query,
                                        const std::vector<SearchScopeRule>& scopes, IShellItem** result);
 
@@ -70,12 +78,15 @@ HRESULT createSearchFolderForScopeRules(const std::wstring& query,
 enum class SearchSaveMode { CreateNew, UserConfirmed };
 HRESULT saveSearch(const std::wstring& query, IShellItem* scope, bool recursive,
                    const std::filesystem::path& path, SearchSaveMode mode = SearchSaveMode::CreateNew,
-                   const SearchViewPresentation* presentation = nullptr);
+                   const SearchViewPresentation* presentation = nullptr,
+                   const SearchFileProperties* fileProperties = nullptr);
 HRESULT saveSearchForScopes(const std::wstring& query, IShellItemArray* scopes, bool recursive,
                             const std::filesystem::path& path, SearchSaveMode mode = SearchSaveMode::CreateNew,
-                            const SearchViewPresentation* presentation = nullptr);
+                            const SearchViewPresentation* presentation = nullptr,
+                            const SearchFileProperties* fileProperties = nullptr);
 HRESULT saveSearchForScopeRules(const std::wstring& query, const std::vector<SearchScopeRule>& scopes,
                                const std::filesystem::path& path, SearchSaveMode mode = SearchSaveMode::CreateNew,
-                               const SearchViewPresentation* presentation = nullptr);
+                               const SearchViewPresentation* presentation = nullptr,
+                               const SearchFileProperties* fileProperties = nullptr);
 
 } // namespace explorer

@@ -4,10 +4,15 @@
 #include "explorer/ribbon_features.hpp"
 #include "explorer/chrome.hpp"
 #include <filesystem>
+#include <cstdint>
+#include <optional>
+#include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 struct IUIFramework;
+struct IShellItem;
 
 namespace explorer {
 
@@ -37,6 +42,96 @@ private:
     std::wstring inputName_;
 };
 
+// Verifies one complete unresolved native DateModified Today leaf. Equivalent
+// native restatement is accepted; absolute dates, other presets and compound
+// filters are rejected. Requires caller-initialized COM; no HWND or output.
+HRESULT validateRelativeTodayQuery(std::wstring_view query) noexcept;
+
+// A noninheritable read lease for an existing local source descriptor. It
+// atomically refuses competing data-write/delete handles and does not recall
+// offline data or follow reparses. Attribute-only access is not excluded;
+// callers must retain their independent byte/metadata preservation checks.
+class VisualSourceReadLease final {
+public:
+    VisualSourceReadLease() noexcept = default;
+    ~VisualSourceReadLease();
+    VisualSourceReadLease(const VisualSourceReadLease&) = delete;
+    VisualSourceReadLease& operator=(const VisualSourceReadLease&) = delete;
+    HRESULT acquire(const PrivateDesktop& desktop, const std::filesystem::path& path);
+    bool held() const noexcept { return file_ != INVALID_HANDLE_VALUE; }
+private:
+    HANDLE file_ = INVALID_HANDLE_VALUE;
+};
+
+struct DocumentsLibrarySourceReadback {
+    bool requested = false;
+    bool unavailable = false;
+    bool unsupported = false;
+    bool displayUnsupported = false;
+    bool writeProtected = false;
+    HRESULT leaseRead = E_NOTIMPL;
+    HRESULT resolveRead = E_NOTIMPL;
+    HRESULT knownFolderRead = E_NOTIMPL;
+    HRESULT itemRead = E_NOTIMPL;
+    HRESULT pathRead = E_NOTIMPL;
+    HRESULT parsingNameRead = E_NOTIMPL;
+    HRESULT parsingItemRead = E_NOTIMPL;
+    HRESULT parsingIdentityRead = E_NOTIMPL;
+    HRESULT loadRead = E_NOTIMPL;
+    HRESULT fileRead = E_NOTIMPL;
+    HRESULT verifyRead = E_NOTIMPL;
+    bool currentMatches = false;
+    bool backingFileUnchanged = false;
+    bool metadataUnchanged = false;
+    HRESULT optionsRead = E_NOTIMPL;
+    DWORD options = 0;
+    HRESULT typeRead = E_NOTIMPL;
+    bool documentsType = false;
+    HRESULT foldersRead = E_NOTIMPL;
+    DWORD folderCount = 0;
+    HRESULT privateSaveRead = E_NOTIMPL;
+    HRESULT publicSaveRead = E_NOTIMPL;
+    struct Verification {
+        UINT stage = 0;
+        HRESULT currentRead = E_NOTIMPL;
+        HRESULT knownFolderRead = E_NOTIMPL;
+        HRESULT knownItemRead = E_NOTIMPL;
+        HRESULT knownIdentityRead = E_NOTIMPL;
+        HRESULT pathRead = E_NOTIMPL;
+        HRESULT metadataRead = E_NOTIMPL;
+        HRESULT privateSaveRead = E_NOTIMPL;
+        HRESULT publicSaveRead = E_NOTIMPL;
+        bool knownMatches = false, pathMatches = false;
+        bool optionsUnchanged = false, typeUnchanged = false, folderCountUnchanged = false;
+        bool privateSaveStatusUnchanged = false, publicSaveStatusUnchanged = false;
+        bool privateSaveMatches = false, publicSaveMatches = false;
+        bool fileIdentityUnchanged = false, fileSizeUnchanged = false;
+        bool fileCreationUnchanged = false, fileWriteUnchanged = false, fileChangeUnchanged = false;
+        bool fileAttributesUnchanged = false, fileBytesUnchanged = false;
+    } verification;
+};
+std::string documentsLibrarySourceJson(const DocumentsLibrarySourceReadback& source);
+
+// A protected current-profile metadata snapshot. It never creates a content
+// view: native browsing can rewrite a library descriptor even without Commit.
+// Retain the lease through all native interfaces. File bytes/PIDLs/paths remain
+// in memory and are never serialized into the numeric provenance report.
+class DocumentsLibraryVisualSource final {
+public:
+    DocumentsLibraryVisualSource() noexcept;
+    ~DocumentsLibraryVisualSource();
+    DocumentsLibraryVisualSource(const DocumentsLibraryVisualSource&) = delete;
+    DocumentsLibraryVisualSource& operator=(const DocumentsLibraryVisualSource&) = delete;
+    HRESULT resolve(const PrivateDesktop& desktop, std::wstring& location,
+                    DocumentsLibrarySourceReadback& readback);
+    HRESULT verify(const PrivateDesktop& desktop, IShellItem* current,
+                   DocumentsLibrarySourceReadback& readback) const;
+    HRESULT verifyMetadata(const PrivateDesktop& desktop, DocumentsLibrarySourceReadback& readback) const;
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
 struct VisualWidget {
     unsigned depth = 0;
     int id = 0;
@@ -47,7 +142,95 @@ struct VisualWidget {
     bool enabled = false;
 };
 
+// Exact native popup observed by UI Automation; all bounds are screen pixels.
+// Capture accepts only the same owned private HWND and unchanged geometry.
+struct NativePopupCapture {
+    struct ParentReadback {
+        int type = 0;
+        bool enabled = false;
+        bool offscreen = true;
+        RECT bounds{};
+        HRESULT elementRead = E_NOTIMPL;
+        HRESULT typeRead = E_NOTIMPL;
+        HRESULT enabledRead = E_NOTIMPL;
+        HRESULT offscreenRead = E_NOTIMPL;
+        HRESULT boundsRead = E_NOTIMPL;
+        HRESULT patternRead = E_NOTIMPL;
+        HRESULT stateRead = E_NOTIMPL;
+        int expandState = 3; // ExpandCollapseState_LeafNode; no UIA dependency here
+        HRESULT parentRead = E_NOTIMPL;
+        int parentType = 0;
+        RECT parentBounds{};
+        bool parentSameName = false;
+        HRESULT ribbonAncestorRead = E_NOTIMPL;
+        bool ribbonAncestor = false;
+        bool ribbonBoundsContain = false;
+        bool toolbarBoundsContain = false;
+        bool accepted = false;
+        HRESULT automationIdRead = E_NOTIMPL;
+        std::wstring automationId;
+    };
+    UINT stage = 0;
+    UINT candidateCount = 0;
+    std::vector<ParentReadback> parents;
+    UINT_PTR ribbonWindow = 0;
+    RECT ribbonBounds{};
+    UINT nativeCommand = 0;
+    UINT commandType = 0;
+    UINT executionAttempts = 0;
+    HWND window = nullptr;
+    RECT bounds{};
+    std::vector<RECT> rowBounds;
+};
+// Numeric-only readback; does not inspect or operate the window.
+std::string nativePopupExpansionJson(const NativePopupCapture& popup);
+
 struct VisualCaptureOptions {
+    struct CommandReadinessReadback {
+        bool requested = false;
+        bool ready = false;
+        HRESULT read = E_NOTIMPL;
+        ULONGLONG waitMs = 0;
+        ULONGLONG namespaceGeneration = 0;
+        UINT pendingCapabilities = 0;
+        UINT workerTasks = 0;
+        UINT statePolls = 0;
+        bool selectionBatchPending = false;
+    };
+    CommandReadinessReadback commandReadiness;
+    struct SearchDateMenuReadback {
+        bool requested = false;
+        HRESULT read = E_NOTIMPL;
+        bool expanded = false;
+        UINT expectedRows = 0;
+        UINT matchedRows = 0;
+        bool relativeToday = false;
+        HRESULT scopeRead = E_NOTIMPL;
+        HRESULT resultRead = E_NOTIMPL;
+        UINT resultCount = 0;
+        UINT expectedResults = 0;
+        UINT matchedIdentities = 0;
+        UINT unexpectedPaths = 0;
+        UINT duplicateIdentities = 0;
+        HRESULT submitRead = E_NOTIMPL;
+        UINT submitCount = 0;
+        UINT recentCount = 0;
+        bool recentMatchesQuery = false;
+        HRESULT scopeNavigationRead = E_NOTIMPL;
+        bool physicalScopeReady = false;
+        bool savedInputUnchanged = false;
+        bool nativeViewChanged = false;
+        bool scopePreserved = false;
+        bool historyCommitted = false;
+        bool factoryRetained = false;
+        UINT retainedFactoriesBefore = 0;
+        UINT retainedFactoriesAfter = 0;
+        UINT navigationDelta = 0;
+        HRESULT recentEnabledRead = E_NOTIMPL;
+        bool recentEnabled = false;
+    };
+    SearchDateMenuReadback searchDateMenu;
+    NativePopupCapture searchDatePopup;
     struct ContextReadback {
         UINT logicalContext = 0;
         UINT nativeIdentifier = 0;
@@ -59,6 +242,10 @@ struct VisualCaptureOptions {
         UINT selectedCount = 0;
         HRESULT cachedRead = E_NOTIMPL;
         bool cachedEnabled = false;
+        bool cachedChecked = false;
+        UINT cachedNativeState = 0;
+        bool pending = false;
+        bool slowStateCompleted = false;
         HRESULT nativeRead = E_NOTIMPL;
         UINT nativeState = 0;
     };
@@ -72,6 +259,17 @@ struct VisualCaptureOptions {
     std::vector<ContextReadback> ribbonContexts;
     std::vector<ProviderReadback> ribbonProviders;
     bool includeFrame = true;
+    // Uses documented PW_CLIENTONLY without the compositor full-content flag.
+    // For an owned native control fixture; includeFrame must be false.
+    bool nativeClientPrint = false;
+    // Authentic client pixels cropped from this verified owned root's print.
+    // The full source PNG is retained; no scaling or synthetic paint is used.
+    HWND nativeClientCropSource = nullptr;
+    std::filesystem::path nativeClientCropSourceImage;
+    // Diagnostic DC layout for this owned-root crop only; ordinary captures
+    // retain their existing native printing policy.
+    std::optional<DWORD> nativeClientCropPrintLayout;
+    std::optional<UINT> nativeClientCropPrintFlags;
     bool trimInvisibleFrame = false;
     unsigned layoutDpi = 96;
     unsigned minimumUniqueColors = 12;
@@ -79,9 +277,28 @@ struct VisualCaptureOptions {
     double maximumUnpaintedFraction = 0.001;
     bool requireVisibleChildren = true;
     RECT pixelInspectionBounds{}; // optional read-only region, in output pixels
+    std::optional<COLORREF> pixelInspectionBackground;
 };
 
 struct VisualCaptureReport {
+    DocumentsLibrarySourceReadback documentsLibrarySource;
+    VisualCaptureOptions::CommandReadinessReadback commandReadiness;
+    VisualCaptureOptions::SearchDateMenuReadback searchDateMenu;
+    NativePopupCapture searchDateExpansion;
+    struct PopupReadback {
+        UINT_PTR window = 0;
+        RECT bounds{}; // output pixels
+        HRESULT read = E_NOTIMPL;
+        bool ownedPrivate = false;
+        bool printed = false;
+        UINT physicalRows = 0;
+        unsigned uniqueColors = 0;
+        double inkFraction = 0;
+        double unpaintedFraction = 0;
+        unsigned minimumRowUniqueColors = 0;
+        double minimumRowInkFraction = 0;
+    };
+    PopupReadback searchDatePopup;
     struct ToolbarButtonReadback {
         int index = 0;
         int command = 0;
@@ -128,6 +345,21 @@ struct VisualCaptureReport {
     bool inputDesktopUnchanged = false;
     bool visibleInputDesktopWindows = false;
     bool printWindowSucceeded = false;
+    UINT printWindowFlags = 0;
+    bool nativeClientCropped = false;
+    UINT_PTR printSourceWindow = 0;
+    UINT_PTR printTargetWindow = 0;
+    RECT printSourceBounds{}, printTargetClientBounds{}; // physical screen pixels
+    std::filesystem::path nativeClientCropSourceImage;
+    std::optional<DWORD> nativeClientCropPrintLayout;
+    DWORD printSourceDcLayout = GDI_ERROR;
+    int printSourceDcMapMode = 0;
+    DWORD printMemoryDcInitialLayout = GDI_ERROR;
+    DWORD printMemoryDcBeforeLayout = GDI_ERROR;
+    DWORD printMemoryDcAfterLayout = GDI_ERROR;
+    int printMemoryDcInitialMapMode = 0;
+    int printMemoryDcBeforeMapMode = 0;
+    int printMemoryDcAfterMapMode = 0;
     bool invisibleFrameTrimmed = false;
     unsigned uniqueColors = 0;
     double inkFraction = 0;
@@ -135,6 +367,8 @@ struct VisualCaptureReport {
     RECT pixelInspectionBounds{};
     unsigned inspectionUniqueColors = 0;
     double inspectionInkFraction = 0;
+    std::optional<COLORREF> pixelInspectionBackground;
+    uint64_t inspectionPixelHash = 0;
     HRESULT layoutGallerySelectedRead = E_NOTIMPL;
     UINT layoutGallerySelected = 0xffffffffu;
     UINT layoutGalleryNativeCommand = 0;

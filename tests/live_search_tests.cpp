@@ -205,6 +205,22 @@ void busyRetryPreservesOnlyCurrentIntent() {
     const auto bounded=ready(policy,maximum-20);
     require(policy.retry(bounded,maximum-10)&&policy.deadline()==maximum&&!policy.takeReady(maximum-1)&&
             ready(policy,maximum)==bounded, "Busy retry deadline overflowed or changed intent");
+    LiveSearchPolicy repeatedlyBusy;
+    succeeded(repeatedlyBusy.submit(literal,0), "Schedule explicit intent across repeated native backpressure");
+    auto repeated=ready(repeatedlyBusy,0);
+    const auto original=repeated;
+    for(std::uint64_t attempt=0;attempt<20;++attempt) {
+        const auto now=attempt*100;
+        require(repeatedlyBusy.retry(repeated,now)&&repeatedlyBusy.waiting()&&
+                repeatedlyBusy.committedLiteral().empty()&&!repeatedlyBusy.finish(repeated,S_OK)&&
+                !repeatedlyBusy.takeReady(now+99), "Repeated busy response lost or prematurely completed Enter intent");
+        repeated=ready(repeatedlyBusy,now+100);
+        require(repeated==original, "Repeated retry changed the original native query intent");
+    }
+    native=query(repeated,fixture);
+    require(nativeResults(native.Get(),fixture)==fixture.identities({L"beta.bin"})&&
+            repeatedlyBusy.finish(repeated,S_OK)&&repeatedlyBusy.committedLiteral()==literal&&
+            !repeatedlyBusy.retry(repeated,2001), "Repeatedly deferred exact native query did not commit once");
     fixture.unchanged();
 }
 void clearEscapeProgrammaticAndNavigationCancellation() {

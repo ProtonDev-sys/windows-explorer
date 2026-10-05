@@ -74,8 +74,8 @@ std::optional<FocusRegion> cycleFocusRegion(std::optional<FocusRegion> current,
                                            const FocusAvailability& available) noexcept {
     constexpr int regionCount = 5;
     const std::array<bool, regionCount> enabled{
-        available.address, available.search, available.folderView,
-        available.commandBand, available.navigation};
+        available.folderView, available.sorting, available.status,
+        available.toolbar, available.navigation};
     int index = backwards ? 0 : regionCount - 1;
     if (current) {
         const int candidate = static_cast<int>(*current);

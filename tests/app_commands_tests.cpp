@@ -12,10 +12,12 @@
 #include <atomic>
 #include <cwctype>
 #include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <set>
 #include <stdexcept>
@@ -124,15 +126,30 @@ struct HiddenView {
     }
 };
 
-void onPrivateDesktop(const std::function<void()>& body) {
+void onPrivateDesktop(const std::function<void()>& body, bool registerGuard = true) {
+    const auto borrowedDesktop = GetThreadDesktop(GetCurrentThreadId());
+    if (!registerGuard) {
+        const auto creator = explorer::PrivateDesktop::current();
+        require(creator && creator->ready() && SUCCEEDED(creator->verifyIsolation()),
+                "Unguarded negative control requires an already isolated creator desktop");
+    }
     std::exception_ptr failure;
     std::atomic<bool> complete{false};
     std::thread worker([&] {
         explorer::PrivateDesktop desktop;
         bool initialized=false;
         try {
-            succeeded(desktop.initialize(),"Attach guarded private provider desktop before native initialization");
-            succeeded(desktop.verifyIsolation(),"Verify private provider desktop isolation");
+            if (registerGuard) {
+                succeeded(desktop.initialize(),"Attach guarded private provider desktop before native initialization");
+                succeeded(desktop.verifyIsolation(),"Verify private provider desktop isolation");
+            } else {
+                // Use the creator's non-input desktop without registering a
+                // thread-local guard. Native headless invocation must refuse.
+                require(SetThreadDesktop(borrowedDesktop) != FALSE,
+                        "Attach unguarded control to the creator's private desktop before COM");
+                require(explorer::PrivateDesktop::current() == nullptr,
+                        "Negative-control thread unexpectedly registered a guard");
+            }
             succeeded(OleInitialize(nullptr),"Initialize private provider STA");initialized=true;
             body();
         } catch (...) { failure=std::current_exception(); }
@@ -501,9 +518,16 @@ void actualViewFastStateAndNativePopups() {
     HiddenView host(folder.Get());
     NativeNamespaceActions actions;
     succeeded(actions.initialize(host.owner,{folder,{},host.view}),"Attach actual hidden IShellView command site");
-    require(explorer::PrivateDesktop::current()==nullptr &&
-            actions.invokeViewSelection(L"Windows.selectall",host.view.Get(),true)==E_ACCESSDENIED,
-            "Selection-only surface accepted an unguarded headless desktop");
+    onPrivateDesktop([path = fixture.root] {
+        const auto unguardedFolder = item(path);
+        HiddenView unguardedHost(unguardedFolder.Get());
+        NativeNamespaceActions unguarded;
+        succeeded(unguarded.initialize(unguardedHost.owner, {unguardedFolder, {}, unguardedHost.view}),
+                  "Attach actual unguarded negative-control view on a non-input desktop");
+        require(explorer::PrivateDesktop::current() == nullptr &&
+                unguarded.invokeViewSelection(L"Windows.selectall", unguardedHost.view.Get(), true) == E_ACCESSDENIED,
+                "Selection-only surface accepted an unguarded headless desktop");
+    }, false);
     HRESULT foreignThread=S_OK;
     std::thread selectionWorker([&]{
         const auto com=CoInitializeEx(nullptr,COINIT_MULTITHREADED);
@@ -1197,7 +1221,7 @@ void nativeLeafStateMenuEquivalence() {
         succeeded(SHBindToParent(identities.text,IID_PPV_ARGS(&parent),&unused),"Bind exact native registered-menu parent");
         struct Registry {HKEY key=nullptr;~Registry(){if(key)RegCloseKey(key);}} registry;
         succeeded(HRESULT_FROM_WIN32(RegOpenKeyExW(HKEY_LOCAL_MACHINE,
-            L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\CommandStore\\shell",0,KEY_READ,&registry.key)),
+            L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\CommandStore",0,KEY_READ,&registry.key)),
             "Read native CommandStore without writing registration");
         const auto leaves=[](const std::vector<ContextMenuEntry>& entries) {
             std::multimap<std::wstring,UINT> states;
@@ -1227,20 +1251,23 @@ void nativeLeafStateMenuEquivalence() {
                 };
                 ComPtr<IContextMenu> full;succeeded(createContext(&full),"Create original full-array native comparison menu");
                 const auto normalStarted=std::chrono::steady_clock::now();
-                NativeContextMenu normal;succeeded(normal.create(nullptr,full.Get(),host.view.Get(),CMF_ITEMMENU|CMF_EXTENDEDVERBS),
+                const UINT nativeFlags=CMF_EXTENDEDVERBS|(registered?0:CMF_ITEMMENU);
+                NativeContextMenu normal;succeeded(normal.create(nullptr,full.Get(),host.view.Get(),nativeFlags),
                     "Read native synchronous-cascade comparison truth without invocation");
                 const auto normalMicros=std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-normalStarted).count();
                 std::vector<ContextMenuEntry> original;succeeded(normal.enumerate(original,false),"Read original actual native leaf states");
                 normal.reset();full.Reset();
                 ComPtr<IContextMenu> stateContext;succeeded(createContext(&stateContext),"Create fresh original-target native leaf-state menu");
                 const auto stateStarted=std::chrono::steady_clock::now();
-                NativeContextMenu state;succeeded(state.createLeafState(stateContext.Get(),host.view.Get(),CMF_ITEMMENU|CMF_EXTENDEDVERBS),
+                NativeContextMenu state;succeeded(state.createLeafState(stateContext.Get(),host.view.Get(),nativeFlags),
                     "Read same native target/site without forcing cascade population");
                 const auto stateMicros=std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-stateStarted).count();
                 std::vector<ContextMenuEntry> snapshot;succeeded(state.enumerate(snapshot,false),"Read unpopulated actual native leaf states");
                 if(registered) {
                     const auto all=leaves(original),lazy=leaves(snapshot);
                     const auto range=all.equal_range(L"windows.removeproperties"),other=lazy.equal_range(L"windows.removeproperties");
+                    if(count==1)require(range.first!=range.second&&other.first!=other.second,
+                        "Registered single-file comparison did not contain the actual RemoveProperties leaf");
                     require(std::vector(range.first,range.second)==std::vector(other.first,other.second),
                         "Registered RemoveProperties state differs without synchronous cascades");
                 } else require(leaves(original)==leaves(snapshot),
@@ -1250,6 +1277,70 @@ void nativeLeafStateMenuEquivalence() {
                 require(state.invoke(state.firstCommand())==E_ACCESSDENIED,
                     "Read-only root state comparison could activate a native command");
                 state.reset();stateContext.Reset();
+                ComPtr<IContextMenu> restrictedContext;succeeded(createContext(&restrictedContext),
+                    "Retain the same full native array/site for the no-resource state comparison");
+                NativeContextMenu restricted;succeeded(restricted.createLeafState(restrictedContext.Get(),host.view.Get(),nativeFlags,true),
+                    "Read native association/dynamic leaf truth without unrelated built-in operations");
+                std::vector<ContextMenuEntry> restrictedEntries;succeeded(restricted.enumerate(restrictedEntries,false),
+                    "Read actual restricted native leaves without invoking or populating cascades");
+                const auto nonResource=[&](const std::vector<ContextMenuEntry>& values) {
+                    auto result=leaves(values);
+                    std::erase_if(result,[](const auto& entry) {
+                        auto verb=std::wstring_view(entry.first);
+                        if(verb.starts_with(L"windows."))verb.remove_prefix(8);
+                        return verb==L"cut"||verb==L"copy"||verb==L"paste"||verb==L"link"||verb==L"delete"||
+                            verb==L"rename"||verb==L"properties"||verb==L"pastelink"||verb==L"pasteshortcut"||
+                            verb==L"recycle"||verb==L"permanentdelete"||verb==L"ribbondelete"||verb==L"copyaspath"||
+                            verb.ends_with(L".properties");
+                    });
+                    return result;
+                };
+                require(nonResource(original)==nonResource(restrictedEntries),
+                    "Native no-resource restriction changed a non-resource canonical leaf's presence, multiplicity, disabled or checked state");
+                require(restricted.invoke(restricted.firstCommand())==E_ACCESSDENIED,
+                    "Restricted leaf-state query permitted native invocation");
+                restricted.reset();
+                if(count==1||count==10000) {
+                    NativeContextMenu followup;succeeded(followup.create(nullptr,restrictedContext.Get(),host.view.Get(),nativeFlags),
+                        "Reuse the exact restricted native provider for an ordinary complete menu");
+                    std::vector<ContextMenuEntry> restored;succeeded(followup.enumerate(restored,false),
+                        "Read canonical IDs and resource leaves after native restriction restoration");
+                    require(leaves(original)==leaves(restored),
+                        "Retained provider normal-menu followup lost native resource or non-resource canonical states");
+                    followup.reset();
+                }
+                restrictedContext.Reset();
+                if(!registered) {
+                    // Exercise the real worker, full CIDA and actual site for
+                    // every catalog static fallback (including absent aliases),
+                    // rather than accepting only a creator-STA menu comparison.
+                    const std::array<std::wstring_view,10> requested{L"open",L"edit",L"print",L"pintohome",L"runasuser",
+                        L"runas",L"enqueue",L"manage",L"remotedesktop",L"pintostartscreen"};
+                    std::unique_ptr<NamespaceCommandStateTask> task;
+                    succeeded(NamespaceCommandStateTask::startSelectionVerbBatch(requested,selected.Get(),host.view.Get(),&task),
+                        "Read every catalog static leaf from one genuine optimized full-selection worker menu");
+                    std::vector<NamespaceSelectionVerbState> actual;
+                    succeeded(finishStateBatch(*task,&actual),"Complete native restricted state worker on the original full selection/site");
+                    require(actual.size()==requested.size(),"Restricted native worker dropped a catalog canonical request");
+                    const auto expected=leaves(original);
+                    for(size_t index=0;index<requested.size();++index) {
+                        const auto range=expected.equal_range(std::wstring(requested[index]));
+                        const auto matches=std::distance(range.first,range.second);
+                        const auto& result=actual[index];
+                        require(result.verb==requested[index],"Restricted worker reordered catalog aliases");
+                        if(!matches)require(result.status==HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED),
+                            "Restricted worker invented an absent native catalog leaf");
+                        else if(matches>1)require(result.status==E_UNEXPECTED,"Restricted worker erased native canonical ambiguity");
+                        else {
+                            succeeded(result.status,"Restricted worker lost an actual native catalog leaf");
+                            const UINT flags=range.first->second;
+                            require(result.native.contextMenu&&result.native.identitySnapshot&&result.native.siteAttached&&
+                                result.native.selectionCount==count&&result.native.enabled()==!(flags&(MFS_DISABLED|MFS_GRAYED))&&
+                                result.native.checked()==!!(flags&MFS_CHECKED),
+                                "Restricted worker changed full-selection native catalog presence, disabled or checked state");
+                        }
+                    }
+                }
             }
             ComPtr<IShellItem> tail;succeeded(selected->GetItemAt(count-1,&tail),"Read untouched original full-array tail");
             int comparison=1;succeeded(tail->Compare(mixed?directory.Get():text.Get(),SICHINT_CANONICAL,&comparison),
@@ -1344,6 +1435,7 @@ public:
     DWORD fullCount=100001;
     bool tailSupports=true,omit=false,duplicate=false,cascade=false;
     bool checked=false;
+    std::wstring canonicalVerb=L"edit";
     HRESULT queryStatus=S_OK;
     IUnknown* expectedSite=nullptr;
     std::atomic<unsigned> queries{0},invocations{0},attachments{0},detachments{0};
@@ -1372,7 +1464,7 @@ public:
     }
     HRESULT STDMETHODCALLTYPE GetCommandString(UINT_PTR ordinal,UINT flags,UINT*,LPSTR output,UINT capacity) override {
         if((ordinal!=2&&(!duplicate||ordinal!=3))||flags!=GCS_VERBW)return E_NOTIMPL;
-        return wcscpy_s(reinterpret_cast<wchar_t*>(output),capacity,L"edit")?E_FAIL:S_OK;
+        return wcscpy_s(reinterpret_cast<wchar_t*>(output),capacity,canonicalVerb.c_str())?E_FAIL:S_OK;
     }
     HRESULT STDMETHODCALLTYPE InvokeCommand(CMINVOKECOMMANDINFO*) override {++invocations;return E_ACCESSDENIED;}
     HRESULT STDMETHODCALLTYPE SetSite(IUnknown* site) override {
@@ -1389,11 +1481,15 @@ class StaticStateSelection final : public Microsoft::WRL::RuntimeClass<
     Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::ClassicCom>,IShellItemArray> {
 public:
     ComPtr<StaticStateMenu> menu=Microsoft::WRL::Make<StaticStateMenu>();
-    std::atomic<unsigned> itemReads{0},binds{0};
+    ComPtr<IContextMenu> configuredMenu;
+    ComPtr<IDataObject> exportedData;
+    std::atomic<unsigned> itemReads{0},binds{0},menuBinds{0},dataBinds{0};
     HRESULT STDMETHODCALLTYPE GetCount(DWORD* output) override {if(!output)return E_POINTER;*output=menu->fullCount;return S_OK;}
     HRESULT STDMETHODCALLTYPE BindToHandler(IBindCtx*,REFGUID handler,REFIID iid,void** output) override {
         if(!output)return E_POINTER;*output=nullptr;++binds;
-        return handler==BHID_SFUIObject?menu->QueryInterface(iid,output):E_NOTIMPL;
+        if(handler==BHID_DataObject){++dataBinds;return exportedData?exportedData->QueryInterface(iid,output):E_NOTIMPL;}
+        if(handler==BHID_SFUIObject){++menuBinds;return (configuredMenu?configuredMenu.Get():menu.Get())->QueryInterface(iid,output);}
+        return E_NOTIMPL;
     }
     HRESULT STDMETHODCALLTYPE GetItemAt(DWORD,IShellItem** output) override {
         ++itemReads;if(!output)return E_POINTER;*output=nullptr;return E_UNEXPECTED;
@@ -1407,6 +1503,240 @@ public:
     HRESULT STDMETHODCALLTYPE GetAttributes(SIATTRIBFLAGS,SFGAOF,SFGAOF*) override {return E_NOTIMPL;}
     HRESULT STDMETHODCALLTYPE EnumItems(IEnumShellItems** output) override {if(!output)return E_POINTER;*output=nullptr;return E_NOTIMPL;}
 };
+
+class MalformedCidaData final : public Microsoft::WRL::RuntimeClass<
+    Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::ClassicCom>,IDataObject,Microsoft::WRL::FtmBase> {
+public:
+    explicit MalformedCidaData(std::vector<BYTE> bytes):bytes_(std::move(bytes)),format_(RegisterClipboardFormatW(CFSTR_SHELLIDLIST)) {}
+    std::atomic<unsigned> exports{0};
+    std::atomic<SIZE_T> exportedBytes{0};
+    HRESULT STDMETHODCALLTYPE GetData(FORMATETC* format,STGMEDIUM* output) override {
+        if(!output)return E_POINTER;
+        const auto status=QueryGetData(format);if(FAILED(status))return status;
+        HGLOBAL memory=GlobalAlloc(GMEM_MOVEABLE,bytes_.size());if(!memory)return E_OUTOFMEMORY;
+        const SIZE_T size=GlobalSize(memory);
+        auto* data=static_cast<BYTE*>(GlobalLock(memory));
+        if(!data){const auto error=HRESULT_FROM_WIN32(GetLastError());GlobalFree(memory);return error;}
+        // Poison allocation padding too: no implicit zero may terminate a
+        // deliberately unterminated PIDL after the supplied payload.
+        std::memset(data,0xff,size);std::memcpy(data,bytes_.data(),bytes_.size());GlobalUnlock(memory);
+        *output={};output->tymed=TYMED_HGLOBAL;output->hGlobal=memory;
+        exportedBytes=size;++exports;return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE QueryGetData(FORMATETC* format) override {
+        if(!format)return E_POINTER;
+        return format_&&format->cfFormat==format_&&format->dwAspect==DVASPECT_CONTENT&&format->lindex==-1&&
+            !format->ptd&&(format->tymed&TYMED_HGLOBAL)?S_OK:DV_E_FORMATETC;
+    }
+    HRESULT STDMETHODCALLTYPE GetDataHere(FORMATETC*,STGMEDIUM*) override {return E_NOTIMPL;}
+    HRESULT STDMETHODCALLTYPE GetCanonicalFormatEtc(FORMATETC*,FORMATETC* output) override {
+        if(!output)return E_POINTER;output->ptd=nullptr;return DATA_S_SAMEFORMATETC;
+    }
+    HRESULT STDMETHODCALLTYPE SetData(FORMATETC*,STGMEDIUM*,BOOL) override {return E_ACCESSDENIED;}
+    HRESULT STDMETHODCALLTYPE EnumFormatEtc(DWORD,IEnumFORMATETC** output) override {
+        if(!output)return E_POINTER;*output=nullptr;return E_NOTIMPL;
+    }
+    HRESULT STDMETHODCALLTYPE DAdvise(FORMATETC*,DWORD,IAdviseSink*,DWORD*) override {return OLE_E_ADVISENOTSUPPORTED;}
+    HRESULT STDMETHODCALLTYPE DUnadvise(DWORD) override {return OLE_E_ADVISENOTSUPPORTED;}
+    HRESULT STDMETHODCALLTYPE EnumDAdvise(IEnumSTATDATA** output) override {
+        if(!output)return E_POINTER;*output=nullptr;return OLE_E_ADVISENOTSUPPORTED;
+    }
+private:
+    std::vector<BYTE> bytes_;
+    UINT format_=0;
+};
+
+void malformedExportedSelectionIdentity() {
+    onPrivateDesktop([] {
+        const auto site=Microsoft::WRL::Make<StaticStateSite>();
+        ComPtr<IUnknown> identity;succeeded(site.As(&identity),"Retain exact malformed-selection worker site");
+        const auto clipboard=GetClipboardSequenceNumber();
+        struct Export {DWORD count;std::vector<BYTE> bytes;};
+        const auto words=[](std::initializer_list<UINT> values) {
+            std::vector<BYTE> bytes(values.size()*sizeof(UINT));
+            std::memcpy(bytes.data(),values.begin(),bytes.size());return bytes;
+        };
+        // These are malformed exported wire payloads, not a second CIDA parser.
+        // The two last payloads respectively omit parent and child termination.
+        auto parent=words({1,12,12,4});
+        auto child=words({1,12,14,0x00020000});
+        const std::array<Export,6> payloads{{
+            {std::numeric_limits<UINT>::max(),words({std::numeric_limits<UINT>::max()})},
+            {8,words({8,0})},
+            {1,words({1,std::numeric_limits<UINT>::max(),12,0})},
+            {1,words({1,0,12,0})},
+            {1,std::move(parent)},
+            {1,std::move(child)}
+        }};
+        NamespaceCommandState sentinel;sentinel.handler=CLSID_ShellDesktop;sentinel.state=ECS_CHECKED;
+        sentinel.explorerCommand=sentinel.initialized=sentinel.siteAttached=sentinel.contextMenu=sentinel.identitySnapshot=true;
+        sentinel.selectionCount=23;sentinel.delegatedCommand=L"untouched native state";
+        const auto unchanged=[&](const NamespaceCommandState& value) {
+            return IsEqualCLSID(value.handler,sentinel.handler)&&value.state==sentinel.state&&
+                value.explorerCommand==sentinel.explorerCommand&&value.initialized==sentinel.initialized&&
+                value.siteAttached==sentinel.siteAttached&&value.contextMenu==sentinel.contextMenu&&
+                value.identitySnapshot==sentinel.identitySnapshot&&value.selectionCount==sentinel.selectionCount&&
+                value.delegatedCommand==sentinel.delegatedCommand;
+        };
+        const std::array<std::wstring_view,2> verbs{L"edit",L"print"};
+        for(size_t index=0;index<payloads.size();++index) {
+            const auto selected=Microsoft::WRL::Make<StaticStateSelection>();selected->menu->fullCount=payloads[index].count;
+            const auto data=Microsoft::WRL::Make<MalformedCidaData>(payloads[index].bytes);
+            succeeded(data.As(&selected->exportedData),"Expose real exported HGLOBAL CIDA data object");
+            std::unique_ptr<NamespaceCommandStateTask> task;
+            succeeded(NamespaceCommandStateTask::startSelectionVerb(L"edit",selected.Get(),identity.Get(),&task),
+                "Start public full-selection native worker with malformed exported data");
+            auto state=sentinel;
+            require(finishStateTask(*task,&state)==HRESULT_FROM_WIN32(ERROR_INVALID_DATA)&&unchanged(state),
+                "Malformed CIDA changed single-state output or escaped exact invalid-data rejection");
+            task.reset();
+            succeeded(NamespaceCommandStateTask::startSelectionVerbBatch(verbs,selected.Get(),identity.Get(),&task),
+                "Start public full-selection native batch with malformed exported data");
+            std::vector<NamespaceSelectionVerbState> states{{L"untouched batch",E_ABORT,sentinel}};
+            require(finishStateBatch(*task,&states)==HRESULT_FROM_WIN32(ERROR_INVALID_DATA)&&states.size()==1&&
+                states.front().verb==L"untouched batch"&&states.front().status==E_ABORT&&unchanged(states.front().native),
+                "Malformed CIDA changed batch output or invented per-leaf state");
+            require(data->exports==2&&selected->dataBinds==2&&selected->binds==2&&selected->menuBinds==0&&
+                selected->itemReads==0&&selected->menu->queries==0&&selected->menu->attachments==0&&selected->menu->invocations==0,
+                "Malformed full-selection export fell back to native menu binding, per-item reads, site attachment or invocation");
+            if(index==0)require(data->exportedBytes<40,"Overflow-count payload unexpectedly became a large allocation");
+            if(index==1)require(data->exportedBytes<40,"Missing-offset payload unexpectedly acquired its entire CIDA header");
+        }
+        require(GetClipboardSequenceNumber()==clipboard,"Malformed exported-selection worker published clipboard data");
+    });
+}
+
+class RestrictedStateMenu final : public Microsoft::WRL::RuntimeClass<
+    Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::ClassicCom>,
+    IContextMenu,IObjectWithSite,IDefaultFolderMenuInitialize,Microsoft::WRL::FtmBase> {
+public:
+    explicit RestrictedStateMenu(StaticStateMenu* native):native_(native) {}
+    DEFAULT_FOLDER_MENU_RESTRICTIONS restrictions=DFMR_NO_ASYNC_VERBS;
+    HRESULT getStatus=S_OK,setStatus=S_OK,restoreStatus=S_OK;
+    DEFAULT_FOLDER_MENU_RESTRICTIONS queriedRestrictions=DFMR_DEFAULT;
+    std::atomic<unsigned> gets{0},sets{0};
+    std::atomic<bool> setterHasSite{false};
+    HRESULT STDMETHODCALLTYPE QueryContextMenu(HMENU menu,UINT position,UINT first,UINT last,UINT flags) override {
+        queriedRestrictions=restrictions;
+        return native_->QueryContextMenu(menu,position,first,last,flags);
+    }
+    HRESULT STDMETHODCALLTYPE GetCommandString(UINT_PTR ordinal,UINT flags,UINT* reserved,LPSTR output,UINT capacity) override {
+        return native_->GetCommandString(ordinal,flags,reserved,output,capacity);
+    }
+    HRESULT STDMETHODCALLTYPE InvokeCommand(CMINVOKECOMMANDINFO* command) override {return native_->InvokeCommand(command);}
+    HRESULT STDMETHODCALLTYPE SetSite(IUnknown* site) override {return native_->SetSite(site);}
+    HRESULT STDMETHODCALLTYPE GetSite(REFIID iid,void** output) override {return native_->GetSite(iid,output);}
+    HRESULT STDMETHODCALLTYPE Initialize(HWND,IContextMenuCB*,PCIDLIST_ABSOLUTE,IShellFolder*,UINT,
+                                         PCUITEMID_CHILD_ARRAY,IUnknown*,UINT,const HKEY*) override {return E_NOTIMPL;}
+    HRESULT STDMETHODCALLTYPE SetMenuRestrictions(DEFAULT_FOLDER_MENU_RESTRICTIONS values) override {
+        const auto attempt=++sets;ComPtr<IUnknown> site;setterHasSite=SUCCEEDED(native_->GetSite(IID_PPV_ARGS(&site)))&&site.Get()==native_->expectedSite;
+        if(FAILED(setStatus))return setStatus;if(attempt==2&&FAILED(restoreStatus))return restoreStatus;
+        restrictions=values;return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetMenuRestrictions(DEFAULT_FOLDER_MENU_RESTRICTIONS mask,
+                                                   DEFAULT_FOLDER_MENU_RESTRICTIONS* output) override {
+        ++gets;if(!output)return E_POINTER;if(FAILED(getStatus))return getStatus;
+        *output=static_cast<DEFAULT_FOLDER_MENU_RESTRICTIONS>(restrictions&mask);return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE SetHandlerClsid(REFCLSID) override {return E_NOTIMPL;}
+private:
+    ComPtr<StaticStateMenu> native_;
+};
+
+void resourceVerbStateRestrictions() {
+    onPrivateDesktop([] {
+        const auto site=Microsoft::WRL::Make<StaticStateSite>();
+        ComPtr<IUnknown> identity;succeeded(site.As(&identity),"Retain original restriction-test view site");
+        const auto clipboard=GetClipboardSequenceNumber();
+        for(unsigned variant=0;variant<11;++variant) {
+            const auto selected=Microsoft::WRL::Make<StaticStateSelection>();
+            selected->menu->expectedSite=identity.Get();selected->menu->checked=true;
+            selected->menu->tailSupports=variant!=1;selected->menu->omit=variant==2;
+            selected->menu->duplicate=variant==3;selected->menu->cascade=variant==4;
+            selected->menu->queryStatus=variant==5||variant==10?E_ACCESSDENIED:S_OK;
+            const auto configured=Microsoft::WRL::Make<RestrictedStateMenu>(selected->menu.Get());
+            configured->setStatus=variant==6?E_ACCESSDENIED:S_OK;configured->getStatus=variant==7?E_FAIL:S_OK;
+            configured->restoreStatus=variant==9||variant==10?E_ABORT:S_OK;
+            if(variant==8)configured->restrictions=static_cast<DEFAULT_FOLDER_MENU_RESTRICTIONS>(DFMR_NO_ASYNC_VERBS|DFMR_NO_RESOURCE_VERBS);
+            succeeded(configured.As(&selected->configuredMenu),"Expose actual supported restriction interface");
+            std::unique_ptr<NamespaceCommandStateTask> task;
+            succeeded(NamespaceCommandStateTask::startSelectionVerb(L"edit",selected.Get(),identity.Get(),&task),
+                "Read complete custom native selection state through documented no-resource restriction");
+            NamespaceCommandState state;state.state=ECS_CHECKED;state.selectionCount=23;
+            const auto status=finishStateTask(*task,&state);
+            if(variant<2||variant==8) {
+                succeeded(status,"Restricted native leaf lost its actual enabled/disabled/checked state");
+                require(state.contextMenu&&state.siteAttached&&state.selectionCount==100001&&state.checked()&&state.enabled()==(variant!=1),
+                    "Restricted native state changed the original full-array tail or view site");
+            } else {
+                const auto expected=variant==3?E_UNEXPECTED:(variant==5||variant==6||variant==10)?E_ACCESSDENIED:
+                    variant==7?E_FAIL:variant==9?E_ABORT:HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+                require(status==expected&&state.state==ECS_CHECKED&&state.selectionCount==23,
+                    "Restriction/leaf failure was erased or changed capability failure output");
+            }
+            const bool prepared=variant!=6&&variant!=7;
+            require(configured->gets==1&&configured->sets==(variant==7||variant==8?0u:variant==6?1u:2u)&&
+                selected->menu->queries==(prepared?1u:0u),"Restriction failure queried a menu or skipped native preparation");
+            if(prepared) {
+                require(configured->queriedRestrictions==static_cast<DEFAULT_FOLDER_MENU_RESTRICTIONS>(DFMR_NO_ASYNC_VERBS|DFMR_NO_RESOURCE_VERBS),
+                    "State-only preparation replaced an existing native restriction or skipped the optimized query");
+                require(configured->restrictions==(variant==8||variant==9||variant==10?
+                    static_cast<DEFAULT_FOLDER_MENU_RESTRICTIONS>(DFMR_NO_ASYNC_VERBS|DFMR_NO_RESOURCE_VERBS):DFMR_NO_ASYNC_VERBS),
+                    "State-only query failed to restore the retained provider's original native restrictions");
+            }
+            if(variant!=7&&variant!=8)require(configured->setterHasSite,"Restriction was set before attaching the original native view site");
+            require(selected->menu->attachments==selected->menu->detachments&&selected->menu->invocations==0&&selected->itemReads==0,
+                "Restricted state leaked its site, invoked a native command or truncated the original array");
+            if(variant==0) {
+                selected->menu->canonicalVerb=L"copy";
+                NativeContextMenu followup;succeeded(followup.create(nullptr,configured.Get(),identity.Get(),CMF_EXTENDEDVERBS),
+                    "Retained provider exposes its genuine resource verb in a normal-menu followup");
+                std::vector<ContextMenuEntry> entries;succeeded(followup.enumerate(entries,false),"Read retained normal resource leaf");
+                require(configured->gets==1&&configured->sets==2&&configured->queriedRestrictions==DFMR_NO_ASYNC_VERBS&&
+                    entries.size()==1&&entries.front().canonicalVerb==L"copy"&&entries.front().enabled(),
+                    "Worker-only optimization suppressed a later normal menu on the same provider");followup.reset();
+            }
+        }
+        for(const auto resource:{L"cut",L"copy",L"paste",L"link",L"delete",L"rename",L"properties",L"pastelink",
+                                  L"pasteshortcut",L"recycle",L"PermanentDelete",L"RibbonDelete",L"copyaspath",L"RecycleBin.properties"}) {
+            for(const bool registeredAlias:{false,true}) {
+                const auto selected=Microsoft::WRL::Make<StaticStateSelection>();
+                selected->menu->expectedSite=identity.Get();
+                selected->menu->canonicalVerb=(registeredAlias?L"Windows.":L"")+std::wstring(resource);
+                const auto configured=Microsoft::WRL::Make<RestrictedStateMenu>(selected->menu.Get());
+                succeeded(configured.As(&selected->configuredMenu),"Retain resource-request restriction spy");
+                const std::array<std::wstring_view,2> verbs{L"edit",selected->menu->canonicalVerb};
+                std::unique_ptr<NamespaceCommandStateTask> task;
+                succeeded(NamespaceCommandStateTask::startSelectionVerbBatch(verbs,selected.Get(),identity.Get(),&task),
+                    "Resource aliases keep the actual unrestricted complete-selection menu");
+                std::vector<NamespaceSelectionVerbState> states;succeeded(finishStateBatch(*task,&states),"Read real resource leaf in a mixed batch");
+                require(configured->gets==0&&configured->sets==0&&states.size()==2&&states[1].status==S_OK&&
+                    states[1].native.selectionCount==100001&&states[1].native.enabled()&&selected->menu->queries==1&&selected->menu->exactSite,
+                    "Resource request was restricted or lost its real native full-array state");
+            }
+        }
+        {
+            const auto native=Microsoft::WRL::Make<StaticStateMenu>();native->expectedSite=identity.Get();
+            const auto configured=Microsoft::WRL::Make<RestrictedStateMenu>(native.Get());
+            NativeContextMenu normal;succeeded(normal.create(nullptr,configured.Get(),identity.Get(),CMF_EXTENDEDVERBS),
+                "Normal menus preserve their native resource and invocation preparation");
+            require(configured->gets==0&&configured->sets==0&&native->queries==1&&native->queryFlags==(CMF_EXTENDEDVERBS|CMF_SYNCCASCADEMENU),
+                "Worker-only restriction changed normal popup/invocation preparation");normal.reset();
+        }
+        {
+            const auto selected=Microsoft::WRL::Make<StaticStateSelection>();selected->menu->expectedSite=identity.Get();
+            ComPtr<IDefaultFolderMenuInitialize> unsupported;
+            require(selected->menu.As(&unsupported)==E_NOINTERFACE,"Unsupported-interface control unexpectedly supports native restrictions");
+            std::unique_ptr<NamespaceCommandStateTask> task;
+            succeeded(NamespaceCommandStateTask::startSelectionVerb(L"edit",selected.Get(),identity.Get(),&task),
+                "Unsupported native restriction interface retains the ordinary menu query");
+            NamespaceCommandState state;succeeded(finishStateTask(*task,&state),"Read unchanged fallback native leaf");
+            require(state.selectionCount==100001&&state.enabled()&&selected->menu->queries==1&&selected->menu->exactSite,
+                "Unsupported restriction interface erased genuine native leaf state");
+        }
+        require(GetClipboardSequenceNumber()==clipboard,"Restriction tests published clipboard data");
+    });
+}
 
 void defaultMenuWorkerSlotSurvivesCancellation() {
     onPrivateDesktop([] {
@@ -1438,16 +1768,19 @@ void defaultMenuWorkerSlotSurvivesCancellation() {
         require(selected->menu->queries==1&&selected->menu->invocations==0,
             "Canceled generations constructed concurrent default menus or invoked a command");
         std::unique_ptr<NamespaceCommandStateTask> registered;
-        succeeded(NamespaceCommandStateTask::startRegisteredMenu(L"Windows.removeproperties",selected.Get(),identity.Get(),&registered),
-            "Registered-menu work must remain independent of the default-menu slot");
-        NamespaceCommandState preserved;preserved.selectionCount=91;
-        require(finishStateTask(*registered,&preserved)==E_UNEXPECTED&&preserved.selectionCount==91,
-            "Separate registered menu changed actual unsupported mock output or remained blocked");
-        require(selected->menu->queries==1,"Registered-only preparation used the wrong default menu");
+        require(NamespaceCommandStateTask::startRegisteredMenu(L"Windows.removeproperties",selected.Get(),identity.Get(),&registered)==busy&&!registered,
+            "Registered selection menu overlapped an in-flight native default menu");
         SetEvent(selected->menu->release);
         succeeded(drainStaWorkers(10000),"Wait for canceled native provider references/COM and exact worker termination");
         require(selected->menu->attachments==selected->menu->detachments,
             "Canceled heavy-menu ownership leaked its native view site");
+        succeeded(NamespaceCommandStateTask::startRegisteredMenu(L"Windows.removeproperties",selected.Get(),identity.Get(),&registered),
+            "Registered selection menu did not acquire the released native menu slot");
+        NamespaceCommandState preserved;preserved.selectionCount=91;
+        require(finishStateTask(*registered,&preserved)==E_UNEXPECTED&&preserved.selectionCount==91,
+            "Registered menu changed unsupported mock output after serialized preparation");
+        require(selected->menu->queries==1,"Registered-only preparation used the wrong default menu");
+        succeeded(drainStaWorkers(10000),"Release exact serialized registered-menu worker lifetime");
         selected->menu->block=false;
         succeeded(NamespaceCommandStateTask::startSelectionVerbBatch(verbs,selected.Get(),identity.Get(),&untouched),
             "Latest generation did not acquire native work slot after actual cleanup");
@@ -1662,15 +1995,15 @@ void actualLargeStaticMenuStateEquivalence() {
             }
             auto context=folderContext();context.selectionCount=5001;
             std::vector<AppCommandCapability> pendingCapabilities;
-            for(const auto id:std::array<UINT,5>{Open,RibbonOpenMenu,Edit,Print,RibbonRunAsAnotherUser}) {
-                AppCommandCapability capability;succeeded(queryAppCommand(actions,id,context,&capability),"Read exact catalog batch route");
-                if(capability.status==E_PENDING&&!capability.selectionVerb.empty())pendingCapabilities.push_back(capability);
+            for(const auto& binding:appCommandCatalog()) {
+                AppCommandCapability capability;succeeded(queryAppCommand(actions,binding.command,context,&capability),"Read every applicable catalog batch route and alias");
+                if(capability.status==E_PENDING&&!capability.selectionVerbs.empty())pendingCapabilities.push_back(capability);
             }
             std::vector<AppSelectionStateBinding> mapping;
             succeeded(startAppSelectionStateBatch(actions,pendingCapabilities,&batch,&mapping),"Batch cached compatible command capabilities and aliases");
             succeeded(finishStateBatch(*batch,&states),"Complete catalog native batch");
             std::set<std::wstring_view> uniqueVerbs;
-            for(const auto& capability:pendingCapabilities)uniqueVerbs.insert(capability.selectionVerb);
+            for(const auto& capability:pendingCapabilities)for(const auto verb:capability.selectionVerbs)uniqueVerbs.insert(verb);
             require(mapping.size()==pendingCapabilities.size()&&states.size()==uniqueVerbs.size(),
                     "Catalog batch omitted states or repeated the same canonical leaf");
             for(const auto& binding:mapping)require(std::any_of(states.begin(),states.end(),[&](const auto& state){return state.verb==binding.verb;}),
@@ -1805,8 +2138,9 @@ int runAppCommandTests() {
         {"actual associations, compressed handlers and unchanged owned payloads",realAssociationsAndZipCapabilities},
         {"strict isolated native view selection whitelist and exact counts",nativeViewSelectionWhitelist},
         {"static native menu worker full arrays, exact leaf failures and cancellation",staticMenuWorkerContractsAndCancellation},
+        {"malformed exported full-selection CIDA rejection and unchanged public outputs",malformedExportedSelectionIdentity},
+        {"worker-only native resource restrictions, exact failures and unrestricted resource aliases",resourceVerbStateRestrictions},
         {"default-menu native work reservation survives cancellation and task destruction",defaultMenuWorkerSlotSurvivesCancellation},
-        {"native root-leaf state versus synchronous cascades on full 1/2/16/5001/10000 targets",nativeLeafStateMenuEquivalence},
         {"actual native 5001-item static menu worker/direct state equivalence",actualLargeStaticMenuStateEquivalence},
         {"native registered Ribbon-only states and application-shortcut redirection",nativeRegisteredStaticAndShortcutState},
         {"real native Share artwork and universal headless activation guard",handlerPresentationAndActivationGuards}
@@ -1821,4 +2155,18 @@ int runAppCommandTests() {
     try{succeeded(drainStaWorkers(10000),"Drain catalog suite native workers while creator COM remains initialized");}
     catch(const std::exception& error){++failures;std::cerr<<"FAIL: App commands: final STA drain: "<<error.what()<<'\n';}
     return static_cast<int>(failures);
+}
+
+int runNativeMenuStateTests() {
+    try {
+        nativeLeafStateMenuEquivalence();
+        std::cout << "PASS: native root-leaf state versus synchronous cascades on full 1/2/16/5001/10000 targets\n";
+        return 0;
+    } catch(const std::exception& error) {
+        std::cerr << "FAIL: native root-leaf state equivalence: " << error.what() << '\n';
+        return 1;
+    } catch(...) {
+        std::cerr << "FAIL: native root-leaf state equivalence: unknown exception\n";
+        return 1;
+    }
 }

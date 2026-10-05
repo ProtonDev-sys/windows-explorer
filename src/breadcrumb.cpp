@@ -1,4 +1,5 @@
 #include "explorer/breadcrumb.hpp"
+#include "explorer/ui_direction.hpp"
 #include "explorer/worker_sta.hpp"
 
 #include <shlobj.h>
@@ -231,7 +232,8 @@ HRESULT expandNativeTreeItem(INameSpaceTreeControl* tree, IShellItem* item, HWND
     // coordinates. Keeping them distinct also handles a pane below the Ribbon
     // and a host positioned anywhere on any monitor.
     POINT nativePoint = point;
-    if (!ScreenToClient(nativeWindow,&nativePoint)) return HRESULT_FROM_WIN32(GetLastError());
+    hr = mapUiPoint(nullptr, nativeWindow, nativePoint, &nativePoint);
+    if (FAILED(hr)) return hr;
     ComPtr<IShellItem> hit;
     hr = tree->HitTest(&nativePoint,&hit);
     if (FAILED(hr)) return hr;
@@ -248,8 +250,9 @@ HRESULT expandNativeTreeItem(INameSpaceTreeControl* tree, IShellItem* item, HWND
     for (const auto control : controls.windows) {
         POINT mappedPoint = point;
         RECT mappedBounds = bounds;
-        MapWindowPoints(HWND_DESKTOP,control,&mappedPoint,1);
-        MapWindowPoints(HWND_DESKTOP,control,reinterpret_cast<POINT*>(&mappedBounds),2);
+        hr = mapUiPoint(nullptr, control, mappedPoint, &mappedPoint);
+        if (SUCCEEDED(hr)) hr = mapUiRect(nullptr, control, mappedBounds, &mappedBounds);
+        if (FAILED(hr)) return hr;
         TVHITTESTINFO info{};
         info.pt = mappedPoint;
         const auto node = TreeView_HitTest(control,&info);

@@ -3,7 +3,6 @@
 
 #include <shlobj.h>
 #include <shellapi.h>
-#include <aclapi.h>
 #include <wrl/client.h>
 #include <wrl/implements.h>
 #include <sherrors.h>
@@ -16,7 +15,6 @@
 #include <cstring>
 #include <vector>
 #include <thread>
-#include <exception>
 
 namespace {
 using Microsoft::WRL::ComPtr;
@@ -74,7 +72,6 @@ struct Fixture {
         require(fs::create_directories(root / L"destination"), "create fixture destination");
     }
     ~Fixture() {
-        ShellOperations::clearHistory();
         std::error_code error;
         fs::remove_all(root, error);
     }
@@ -109,280 +106,6 @@ ComPtr<IShellItemArray> selection(const std::vector<fs::path>& paths) {
     for (auto pidl : pidls) CoTaskMemFree(pidl);
     succeeded(hr, "create batch selection");
     return result;
-}
-void journalCopyAndCollision() {
-    Fixture fixture;
-    const auto source = fixture.root / L"source" / L"copy-\u03bb.txt";
-    const auto destination = fixture.root / L"destination";
-    write(source, "copy contents");
-    auto selected = selection(source);
-    auto target = item(destination);
-    succeeded(ShellOperations::copyOrMove(nullptr, selected.Get(), target.Get(), false, true, true), "record isolated copy");
-    require(ShellOperations::canUndo() && !ShellOperations::canRedo(), "record enables only Undo");
-    const auto copy = destination / source.filename();
-    const auto id = identity(copy);
-    succeeded(ShellOperations::undo(nullptr, true), "undo isolated copy");
-    require(!fs::exists(copy) && read(source) == "copy contents", "copy undo preserves source and removes output");
-    require(!ShellOperations::canUndo() && ShellOperations::canRedo(), "undo moves one record to Redo");
-    write(source, "source changed after undo");
-    succeeded(ShellOperations::redo(nullptr, true), "redo independent of changed source");
-    require(read(copy) == "copy contents" && sameIdentity(id, identity(copy)), "redo restores exact created object");
-    ShellOperations::clearHistory();
-    require(!ShellOperations::canUndo() && !ShellOperations::canRedo(), "clear removes capabilities");
-    succeeded(ShellOperations::copyOrMove(nullptr, selected.Get(), target.Get(), false, true, true), "record native collision name");
-    fs::path collision;
-    for (const auto& entry : fs::directory_iterator(destination))
-        if (entry.is_regular_file() && entry.path() != copy) collision = entry.path();
-    require(!collision.empty(), "native collision generated another file");
-    succeeded(ShellOperations::undo(nullptr, true), "undo actual collision target");
-    require(!fs::exists(collision) && read(copy) == "copy contents", "collision undo preserves preexisting object");
-    succeeded(ShellOperations::redo(nullptr, true), "redo actual collision target");
-    require(read(collision) == "source changed after undo" && read(copy) == "copy contents", "collision redo restores native name and content");
-}
-void journalMoveRename() {
-    Fixture fixture;
-    const auto source = fixture.root / L"source" / L"move-\u732b.txt";
-    const auto destination = fixture.root / L"destination";
-    write(source, "move contents");
-    const auto original = identity(source);
-    auto selected = selection(source);
-    auto target = item(destination);
-    succeeded(ShellOperations::copyOrMove(nullptr, selected.Get(), target.Get(), true, true, true), "record isolated move");
-    succeeded(ShellOperations::undo(nullptr, true), "undo isolated move");
-    require(read(source) == "move contents" && sameIdentity(original, identity(source)), "move undo restores original identity");
-    succeeded(ShellOperations::redo(nullptr, true), "redo isolated move");
-    const auto moved = destination / source.filename();
-    require(!fs::exists(source) && sameIdentity(original, identity(moved)), "move redo preserves identity");
-    auto movedItem = item(moved);
-    succeeded(ShellOperations::rename(nullptr, movedItem.Get(), L"renamed-\u03bb.txt", true, true), "record Unicode rename");
-    const auto renamed = destination / L"renamed-\u03bb.txt";
-    succeeded(ShellOperations::undo(nullptr, true), "undo Unicode rename");
-    require(fs::exists(moved) && !fs::exists(renamed), "rename undo restores old name");
-    succeeded(ShellOperations::redo(nullptr, true), "redo Unicode rename");
-    require(sameIdentity(original, identity(renamed)), "rename redo keeps original file");
-}
-void journalFolderAndMembership() {
-    Fixture fixture;
-    auto target = item(fixture.root / L"destination");
-    const auto folder = fixture.root / L"destination" / L"New folder \u03bb";
-    succeeded(ShellOperations::newFolder(nullptr, target.Get(), folder.filename().wstring(), true, true), "record new folder");
-    const auto id = identity(folder);
-    succeeded(ShellOperations::undo(nullptr, true), "undo empty new folder");
-    require(!fs::exists(folder), "new folder removed by undo");
-    succeeded(ShellOperations::redo(nullptr, true), "redo new folder");
-    require(fs::is_directory(folder) && sameIdentity(id, identity(folder)), "new folder redo preserves identity");
-    write(folder / L"unrelated.txt", "user data");
-    require(FAILED(ShellOperations::undo(nullptr, true)), "undo refuses folder changed by user");
-    require(read(folder / L"unrelated.txt") == "user data", "refused undo preserves new user data");
-
-    ShellOperations::clearHistory();
-    const auto tree = fixture.root / L"source" / L"Tree";
-    require(fs::create_directories(tree / L"child"), "create directory fixture");
-    write(tree / L"child" / L"nested.txt", "nested contents");
-    auto selected = selection(tree);
-    succeeded(ShellOperations::copyOrMove(nullptr, selected.Get(), target.Get(), false, true, true), "record directory copy");
-    const auto copied = fixture.root / L"destination" / L"Tree";
-    succeeded(ShellOperations::undo(nullptr, true), "undo complete directory tree");
-    require(!fs::exists(copied) && fs::exists(tree), "directory undo preserves original tree");
-    succeeded(ShellOperations::redo(nullptr, true), "redo complete directory tree");
-    require(read(copied / L"child" / L"nested.txt") == "nested contents", "directory redo preserves descendants");
-    write(copied / L"child" / L"new.txt", "foreign membership");
-    require(FAILED(ShellOperations::undo(nullptr, true)), "directory undo refuses changed membership");
-    require(read(copied / L"child" / L"new.txt") == "foreign membership", "changed membership preserved");
-}
-void journalStaleObjects() {
-    Fixture fixture;
-    const auto source = fixture.root / L"source" / L"stale.txt";
-    const auto copy = fixture.root / L"destination" / L"stale.txt";
-    write(source, "original contents");
-    auto selected = selection(source);
-    auto target = item(fixture.root / L"destination");
-    succeeded(ShellOperations::copyOrMove(nullptr, selected.Get(), target.Get(), false, true, true), "record stale fixture");
-    const HANDLE file = CreateFileW(copy.c_str(), GENERIC_READ | GENERIC_WRITE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
-    require(file != INVALID_HANDLE_VALUE, "open stale file");
-    FILETIME oldWrite{};
-    require(GetFileTime(file, nullptr, nullptr, &oldWrite) != FALSE, "read stale timestamp");
-    DWORD bytes = 0;
-    require(WriteFile(file, "changed! contents", 17, &bytes, nullptr) != FALSE && bytes == 17, "modify stale content");
-    require(SetFileTime(file, nullptr, nullptr, &oldWrite) != FALSE, "restore LastWriteTime");
-    CloseHandle(file);
-    require(FAILED(ShellOperations::undo(nullptr, true)), "ChangeTime rejects content changed with restored LastWriteTime");
-    require(read(copy) == "changed! contents", "stale copied data remains");
-    ShellOperations::clearHistory();
-    fs::remove(copy);
-    succeeded(ShellOperations::copyOrMove(nullptr, selected.Get(), target.Get(), false, true, true), "record replacement fixture");
-    fs::rename(copy, fixture.root / L"saved-copy.txt");
-    write(copy, "original contents");
-    require(FAILED(ShellOperations::undo(nullptr, true)), "identity rejects same-name same-content replacement");
-    require(read(copy) == "original contents" && fs::exists(fixture.root / L"saved-copy.txt"), "replacement and original both preserved");
-}
-void journalLocksAndCollisions() {
-    Fixture fixture;
-    const auto source = fixture.root / L"source" / L"lock.txt";
-    const auto copy = fixture.root / L"destination" / L"lock.txt";
-    write(source, "locked contents");
-    auto selected = selection(source);
-    auto target = item(fixture.root / L"destination");
-    succeeded(ShellOperations::copyOrMove(nullptr, selected.Get(), target.Get(), false, true, true), "record locked fixture");
-    HANDLE writer = CreateFileW(copy.c_str(), GENERIC_WRITE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
-    require(writer != INVALID_HANDLE_VALUE, "hold writer open");
-    require(FAILED(ShellOperations::undo(nullptr, true)), "undo refuses active writer");
-    CloseHandle(writer);
-    succeeded(ShellOperations::undo(nullptr, true), "undo after writer released without changes");
-    write(copy, "foreign redo collision");
-    require(FAILED(ShellOperations::redo(nullptr, true)), "redo never overwrites unrelated collision");
-    require(read(copy) == "foreign redo collision", "redo collision preserved");
-    fs::remove(copy);
-    succeeded(ShellOperations::redo(nullptr, true), "retry redo after collision removed");
-    require(read(copy) == "locked contents", "retry restores retained contents");
-    ShellOperations::clearHistory();
-    selected = selection(source);
-    succeeded(ShellOperations::copyOrMove(nullptr, selected.Get(), target.Get(), true, true, true), "record move with generated collision target");
-    write(source, "foreign original-path collision");
-    require(FAILED(ShellOperations::undo(nullptr, true)), "move undo never overwrites original-path collision");
-    require(read(source) == "foreign original-path collision", "move collision preserved");
-}
-void journalBatchAndRecovery() {
-    Fixture fixture;
-    const auto destination = fixture.root / L"destination";
-    const std::vector<fs::path> sources{fixture.root / L"source" / L"a.txt", fixture.root / L"source" / L"b.txt"};
-    write(sources[0], "first");
-    write(sources[1], "second");
-    auto selected = selection(sources);
-    auto target = item(destination);
-    succeeded(ShellOperations::copyOrMove(nullptr, selected.Get(), target.Get(), false, true, true), "record batch copy");
-    write(destination / L"b.txt", "changed second");
-    require(FAILED(ShellOperations::undo(nullptr, true)), "batch validates every object before first inverse mutation");
-    require(read(destination / L"a.txt") == "first" && read(destination / L"b.txt") == "changed second", "batch preflight failure leaves complete original state");
-    ShellOperations::clearHistory();
-    fs::remove(destination / L"a.txt");
-    fs::remove(destination / L"b.txt");
-    succeeded(ShellOperations::copyOrMove(nullptr, selected.Get(), target.Get(), false, true, true), "record successful batch copy");
-    succeeded(ShellOperations::undo(nullptr, true), "undo whole batch copy");
-    require(!fs::exists(destination / L"a.txt") && !fs::exists(destination / L"b.txt"), "undo removes exactly both batch outputs");
-    succeeded(ShellOperations::redo(nullptr, true), "redo whole batch copy");
-    require(read(destination / L"a.txt") == "first" && read(destination / L"b.txt") == "second", "redo restores both batch outputs");
-    succeeded(ShellOperations::undo(nullptr, true), "undo before clearing retained data");
-    ShellOperations::clearHistory();
-    const auto recovery = ShellOperations::recoveryPaths();
-    bool preserved = false;
-    for (const auto& directory : recovery) {
-        if (!fs::exists(directory) || !sameIdentity(identity(fs::path(directory).parent_path()), identity(destination))) continue;
-        for (const auto& entry : fs::directory_iterator(directory))
-            if (entry.is_regular_file() && (read(entry.path()) == "first" || read(entry.path()) == "second")) preserved = true;
-    }
-    require(preserved, "history cleanup preserves retained data in owned recovery directories");
-    require(!ShellOperations::canRedo(), "clearing retained history removes redo capability");
-}
-
-class DenySubdirectoryCreation final {
-public:
-    explicit DenySubdirectoryCreation(fs::path path) : path_(std::move(path)) {
-        HANDLE token = nullptr;
-        require(OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token) != FALSE, "open fixture access token");
-        DWORD bytes = 0;
-        GetTokenInformation(token, TokenUser, nullptr, 0, &bytes);
-        std::vector<BYTE> user(bytes);
-        const BOOL ok = GetTokenInformation(token, TokenUser, user.data(), bytes, &bytes);
-        CloseHandle(token);
-        require(ok != FALSE, "read fixture user SID");
-        DWORD error = GetNamedSecurityInfoW(path_.data(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
-            nullptr, nullptr, &originalDacl_, nullptr, &originalDescriptor_);
-        require(error == ERROR_SUCCESS, "read fixture original DACL");
-        EXPLICIT_ACCESSW access{};
-        access.grfAccessPermissions = FILE_ADD_SUBDIRECTORY;
-        access.grfAccessMode = DENY_ACCESS;
-        access.grfInheritance = NO_INHERITANCE;
-        BuildTrusteeWithSidW(&access.Trustee, reinterpret_cast<TOKEN_USER*>(user.data())->User.Sid);
-        PACL denied = nullptr;
-        error = SetEntriesInAclW(1, &access, originalDacl_, &denied);
-        if (error == ERROR_SUCCESS) error = SetNamedSecurityInfoW(path_.data(), SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION, nullptr, nullptr, denied, nullptr);
-        if (denied) LocalFree(denied);
-        if (error != ERROR_SUCCESS) {
-            LocalFree(originalDescriptor_);
-            originalDescriptor_ = nullptr;
-        }
-        require(error == ERROR_SUCCESS, "deny fixture subdirectory creation");
-    }
-    ~DenySubdirectoryCreation() {
-        if (originalDescriptor_) {
-            SetNamedSecurityInfoW(path_.data(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
-                nullptr, nullptr, originalDacl_, nullptr);
-            LocalFree(originalDescriptor_);
-        }
-    }
-private:
-    std::wstring path_;
-    PACL originalDacl_ = nullptr;
-    PSECURITY_DESCRIPTOR originalDescriptor_ = nullptr;
-};
-void journalBatchRollback() {
-    Fixture fixture;
-    const auto source = fixture.root / L"source";
-    const auto destination = fixture.root / L"destination";
-    const auto first = source / L"a-file.txt";
-    const auto second = source / L"z-directory";
-    write(first, "first contents");
-    require(fs::create_directory(second), "create rollback directory fixture");
-    write(second / L"nested.txt", "second contents");
-    const auto firstId = identity(first);
-    const auto secondId = identity(second);
-    auto selected = selection(std::vector<fs::path>{first, second});
-    auto target = item(destination);
-    succeeded(ShellOperations::copyOrMove(nullptr, selected.Get(), target.Get(), true, true, true), "record rollback move batch");
-    require(!fs::exists(first) && !fs::exists(second), "move batch leaves source empty");
-    {
-        // Adding files remains allowed, so the first inverse succeeds. Adding a
-        // directory is denied, making the second inverse fail after that move.
-        DenySubdirectoryCreation deny(source);
-        const HRESULT result = ShellOperations::undo(nullptr, true);
-        require(FAILED(result) && result != HRESULT_FROM_WIN32(ERROR_RECOVERY_FAILURE), "mid-batch failure rolls back without poisoning history");
-        require(!fs::exists(first) && !fs::exists(second), "rollback restores original source item count");
-        require(read(destination / first.filename()) == "first contents" &&
-            read(destination / second.filename() / L"nested.txt") == "second contents", "rollback restores complete destination contents");
-        require(sameIdentity(firstId, identity(destination / first.filename())) &&
-            sameIdentity(secondId, identity(destination / second.filename())), "rollback retains both file identities");
-        require(ShellOperations::canUndo() && !ShellOperations::canRedo(), "rolled-back record remains on Undo stack");
-    }
-    succeeded(ShellOperations::undo(nullptr, true), "retry batch after permission restored");
-    require(read(first) == "first contents" && read(second / L"nested.txt") == "second contents", "retry restores both original locations");
-    succeeded(ShellOperations::redo(nullptr, true), "redo batch after rollback recovery");
-    require(!fs::exists(first) && !fs::exists(second), "redo restores batch forward locations");
-}
-void journalFailureAndForeignHolding() {
-    Fixture fixture;
-    const auto source = fixture.root / L"source";
-    const auto destination = fixture.root / L"destination";
-    const auto first = source / L"a.txt";
-    const auto second = source / L"b.txt";
-    write(first, "first contents");
-    write(second, "second contents");
-    auto selected = selection(std::vector<fs::path>{first, second});
-    auto target = item(destination);
-    fs::remove(second);
-    require(FAILED(ShellOperations::copyOrMove(nullptr, selected.Get(), target.Get(), false, true, true)), "failed or partial operation reports failure");
-    require(!ShellOperations::canUndo() && !ShellOperations::canRedo(), "failed or partial operation creates no undo record");
-    fs::remove(destination / first.filename());
-    selected = selection(first);
-    succeeded(ShellOperations::copyOrMove(nullptr, selected.Get(), target.Get(), false, true, true), "record holding fixture");
-    succeeded(ShellOperations::undo(nullptr, true), "undo before holding ownership checks");
-    fs::path holding;
-    for (const auto& entry : fs::directory_iterator(destination))
-        if (entry.is_directory() && fs::exists(entry.path() / first.filename())) holding = entry.path();
-    require(!holding.empty(), "find owned holding directory in fixture");
-    write(holding / L"foreign.txt", "foreign holding data");
-    require(FAILED(ShellOperations::redo(nullptr, true)), "redo refuses foreign holding-directory contents");
-    require(read(holding / L"foreign.txt") == "foreign holding data" &&
-        read(holding / first.filename()) == "first contents", "foreign and owned held data both preserved");
-    fs::remove(holding / L"foreign.txt");
-    succeeded(ShellOperations::newFolder(nullptr, target.Get(), L"Another operation", true, true), "record operation after Undo");
-    require(!ShellOperations::canRedo() && ShellOperations::canUndo(), "new operation invalidates Redo only after success");
-    require(read(holding / first.filename()) == "first contents", "redo invalidation preserves retained object");
-    succeeded(ShellOperations::undo(nullptr, true), "undo new operation after invalidation");
-    require(!fs::exists(destination / L"Another operation"), "new undo targets only newly recorded operation");
 }
 enum class CancelPoint { None, BeforeCopy, AfterCopy, BeforeMove, BeforeRename, BeforeNew, BeforeDelete };
 
@@ -470,7 +193,7 @@ void operationProgressAndTargets() {
     auto target = item(destination);
     auto selected = selection(source);
     auto copied = Microsoft::WRL::Make<ProgressProbe>();
-    succeeded(ShellOperations::copyOrMove(nullptr, selected.Get(), target.Get(), false, true, false, copied.Get()),
+    succeeded(ShellOperations::copyOrMove(nullptr, selected.Get(), target.Get(), false, true, copied.Get()),
               "native copy with caller progress sink");
     requireProbe(copied.Get());
     require(copied->outputs.size() == 1 && fs::equivalent(copied->outputs[0].created.parent_path(), destination) &&
@@ -488,20 +211,20 @@ void operationProgressAndTargets() {
     const auto movedId = identity(moving);
     selected = selection(moving);
     auto moved = Microsoft::WRL::Make<ProgressProbe>();
-    succeeded(ShellOperations::copyOrMove(nullptr, selected.Get(), target.Get(), true, true, false, moved.Get()), "native move progress");
+    succeeded(ShellOperations::copyOrMove(nullptr, selected.Get(), target.Get(), true, true, moved.Get()), "native move progress");
     requireProbe(moved.Get());
     require(moved->outputs.size() == 1 && fs::equivalent(moved->outputs[0].created, destination / moving.filename()) &&
         sameIdentity(movedId, moved->outputs[0].id) && !fs::exists(moving), "native move reports original filesystem identity at actual target");
 
     auto movingItem = item(destination / moving.filename());
     auto renamed = Microsoft::WRL::Make<ProgressProbe>();
-    succeeded(ShellOperations::rename(nullptr, movingItem.Get(), L"renamed-\u03bb.txt", true, false, renamed.Get()), "native rename progress");
+    succeeded(ShellOperations::rename(nullptr, movingItem.Get(), L"renamed-\u03bb.txt", true, renamed.Get()), "native rename progress");
     requireProbe(renamed.Get());
     require(renamed->outputs.size() == 1 && fs::equivalent(renamed->outputs[0].created, destination / L"renamed-\u03bb.txt") &&
         sameIdentity(movedId, renamed->outputs[0].id), "native rename reports exact Unicode target and original identity");
 
     auto folder = Microsoft::WRL::Make<ProgressProbe>();
-    succeeded(ShellOperations::newFolder(nullptr, target.Get(), L"created-\u03bb", true, false, folder.Get()), "native new-folder progress");
+    succeeded(ShellOperations::newFolder(nullptr, target.Get(), L"created-\u03bb", true, folder.Get()), "native new-folder progress");
     requireProbe(folder.Get());
     require(folder->outputs.size() == 1 && fs::equivalent(folder->outputs[0].created, destination / L"created-\u03bb") &&
         fs::is_directory(folder->outputs[0].created), "native new-folder sink reports actual folder identity");
@@ -513,7 +236,6 @@ void operationProgressAndTargets() {
     require(deleted->preCalls == 1 && deleted->postCalls == 1 && deleted->outputs.empty() &&
         !fs::exists(renamed->outputs[0].created), "owned permanent deletion reports completion without a recycle target");
     require(read(source) == "copy content" && read(destination / source.filename()) == "existing collision", "completion preserves unrelated files");
-    require(!ShellOperations::canUndo() && !ShellOperations::canRedo(), "ordinary silent progress fixtures create no journal history");
     std::cout << "Native file-operation progress callbacks: " << copied->progressCalls + moved->progressCalls +
         renamed->progressCalls + folder->progressCalls + deleted->progressCalls << " updates; five native operation completions checked\n";
 }
@@ -536,21 +258,20 @@ void operationCancellation() {
     for (const auto point : {CancelPoint::BeforeCopy, CancelPoint::BeforeMove}) {
         auto cancelled = Microsoft::WRL::Make<ProgressProbe>(point);
         const HRESULT result = ShellOperations::copyOrMove(nullptr, selected.Get(), target.Get(),
-            point == CancelPoint::BeforeMove, true, true, cancelled.Get());
+            point == CancelPoint::BeforeMove, true, cancelled.Get());
         requireProbe(cancelled.Get());
         require(explorer::isShellOperationCancelled(result), "native pre-transfer cancellation retains a user cancellation result");
         require(fs::is_empty(destination) && read(first) == "first content" && read(second) == "second content" &&
             sameIdentity(firstId, identity(first)) && sameIdentity(secondId, identity(second)), "pre-transfer cancellation preserves every original and creates no output");
-        require(!ShellOperations::canUndo() && !ShellOperations::canRedo(), "cancelled native batch creates no fixture history");
     }
     auto failed = Microsoft::WRL::Make<ProgressProbe>(CancelPoint::BeforeCopy, E_ACCESSDENIED);
-    const auto failure = ShellOperations::copyOrMove(nullptr, selected.Get(), target.Get(), false, true, true, failed.Get());
+    const auto failure = ShellOperations::copyOrMove(nullptr, selected.Get(), target.Get(), false, true, failed.Get());
     requireProbe(failed.Get());
     require(FAILED(failure) && !explorer::isShellOperationCancelled(failure) && fs::is_empty(destination),
         "native callback failure remains an operation error with no output");
 
     auto partial = Microsoft::WRL::Make<ProgressProbe>(CancelPoint::AfterCopy);
-    const auto result = ShellOperations::copyOrMove(nullptr, selected.Get(), target.Get(), false, true, true, partial.Get());
+    const auto result = ShellOperations::copyOrMove(nullptr, selected.Get(), target.Get(), false, true, partial.Get());
     requireProbe(partial.Get());
     require(explorer::isShellOperationCancelled(result) && partial->outputs.size() == 1 &&
         std::distance(fs::directory_iterator(destination), fs::directory_iterator{}) == 1,
@@ -558,7 +279,6 @@ void operationCancellation() {
     require(read(partial->outputs[0].source) == read(partial->outputs[0].created) &&
         sameIdentity(partial->outputs[0].id, identity(partial->outputs[0].created)) &&
         sameIdentity(firstId, identity(first)) && sameIdentity(secondId, identity(second)), "partial cancellation preserves the actual completed copy and both originals");
-    require(!ShellOperations::canUndo() && !ShellOperations::canRedo(), "partial cancellation never records a complete fixture transaction");
 }
 
 void operationCancelledMutations() {
@@ -573,15 +293,14 @@ void operationCancelledMutations() {
     for (const auto point : {CancelPoint::BeforeRename, CancelPoint::BeforeNew, CancelPoint::BeforeDelete}) {
         auto cancelled = Microsoft::WRL::Make<ProgressProbe>(point);
         const auto result = point == CancelPoint::BeforeRename
-            ? ShellOperations::rename(nullptr, current.Get(), L"cancelled.txt", true, true, cancelled.Get())
+            ? ShellOperations::rename(nullptr, current.Get(), L"cancelled.txt", true, cancelled.Get())
             : point == CancelPoint::BeforeNew
-            ? ShellOperations::newFolder(nullptr, target.Get(), L"cancelled folder", true, true, cancelled.Get())
+            ? ShellOperations::newFolder(nullptr, target.Get(), L"cancelled folder", true, cancelled.Get())
             : ShellOperations::remove(nullptr, selected.Get(), true, true, cancelled.Get());
         requireProbe(cancelled.Get());
         require(explorer::isShellOperationCancelled(result) && fs::is_empty(destination) &&
             !fs::exists(source.parent_path() / L"cancelled.txt") && read(source) == "cancel preserves me" &&
             sameIdentity(original, identity(source)), "native cancellation precedes rename, folder creation and owned permanent deletion");
-        require(!ShellOperations::canUndo() && !ShellOperations::canRedo(), "cancelled mutation produces no fixture record");
     }
 }
 
@@ -728,7 +447,6 @@ int operationProgressTests() {
             clipboard != GetClipboardSequenceNumber()) {
             ++failures; std::cerr << "FAIL: Native file-operation fixtures changed desktop or clipboard\n";
         }
-        ShellOperations::clearHistory();
         OleUninitialize();
     });
     worker.join();
@@ -754,11 +472,6 @@ int runShellOperationTests() {
                 "clipboard rejects null selection");
         require(ShellOperations::copyPaths(nullptr, nullptr) == E_INVALIDARG,
                 "paths reject null selection");
-        ShellOperations::clearHistory();
-        require(ShellOperations::undo(nullptr, true) == HRESULT_FROM_WIN32(ERROR_NO_MORE_ITEMS) && !ShellOperations::canUndo(),
-                "empty isolated Undo reports no history");
-        require(ShellOperations::redo(nullptr, true) == HRESULT_FROM_WIN32(ERROR_NO_MORE_ITEMS) && !ShellOperations::canRedo(),
-                "empty isolated Redo reports no history");
 
         Fixture fixture;
         const fs::path source = fixture.root / L"source";
@@ -819,21 +532,6 @@ int runShellOperationTests() {
         std::cerr << "Shell operations failed: " << error.what() << '\n';
         ++failures;
     }
-    const std::vector<std::pair<const char*, std::function<void()>>> journalTests{
-        {"copy, native collision name and retained identity", journalCopyAndCollision},
-        {"Unicode move and rename", journalMoveRename},
-        {"new-folder and directory membership", journalFolderAndMembership},
-        {"ChangeTime and replaced object guards", journalStaleObjects},
-        {"active writer and inverse collisions", journalLocksAndCollisions},
-        {"atomic batch preflight and retained recovery", journalBatchAndRecovery},
-        {"mid-batch failure and rollback", journalBatchRollback},
-        {"partial failure, foreign holding data and redo invalidation", journalFailureAndForeignHolding}
-    };
-    for (const auto& [name, test] : journalTests) {
-        try { test(); std::cout << "PASS: isolated Undo/Redo " << name << '\n'; }
-        catch (const std::exception& error) { ++failures; std::cerr << "FAIL: isolated Undo/Redo " << name << ": " << error.what() << '\n'; }
-    }
-    ShellOperations::clearHistory();
     ShellOperations::flushClipboardIfOwned();
     OleUninitialize();
     failures += operationProgressTests();

@@ -2,6 +2,7 @@
 #include "explorer/commands.hpp"
 #include "explorer/theme.hpp"
 #include "explorer/headless_visual.hpp"
+#include "explorer/ui_direction.hpp"
 #include <uxtheme.h>
 #include <vsstyle.h>
 #include <vssym32.h>
@@ -44,6 +45,24 @@ void recordPrivateDraw(const NMTBCUSTOMDRAW& draw, const ChromeButtonState& stat
     }
 }
 int px(int value, UINT dpi) { return MulDiv(value, static_cast<int>(dpi), 96); }
+bool rightToLeft(HWND owner) noexcept {
+    bool mirrored=false;
+    return SUCCEEDED(windowUiDirection(owner,&mirrored))&&mirrored;
+}
+bool mirroredDc(HDC dc) noexcept {
+    const auto layout=GetLayout(dc);
+    return layout!=GDI_ERROR&&(layout&LAYOUT_RTL)!=0;
+}
+struct BitmapOrientation {
+    HDC dc;
+    DWORD previous=GDI_ERROR;
+    explicit BitmapOrientation(HDC target) : dc(target) {
+        const auto layout=GetLayout(dc);
+        if(layout!=GDI_ERROR&&(layout&LAYOUT_RTL)&&!(layout&LAYOUT_BITMAPORIENTATIONPRESERVED))
+            previous=SetLayout(dc,layout|LAYOUT_BITMAPORIENTATIONPRESERVED);
+    }
+    ~BitmapOrientation() {if(previous!=GDI_ERROR)SetLayout(dc,previous);}
+};
 struct ThemeHandle {
     HTHEME value;
     ThemeHandle(HWND owner, const wchar_t* name) : value(OpenThemeData(owner, name)) {}
@@ -118,6 +137,7 @@ struct BitmapStrips {
         if (!source) return false;
         const auto previous = SelectObject(source, bitmap);
         const BLENDFUNCTION alpha{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+        const BitmapOrientation orientation(dc);
         // The cache preserves native colors and converts their original alpha
         // representation for this native GDI compositing operation.
         const bool drawn = AlphaBlend(dc, (bounds.left + bounds.right - size) / 2,
@@ -157,9 +177,11 @@ bool fontGlyph(HDC dc, const RECT& bounds, wchar_t glyph, int size, COLORREF col
     if (available) {
         const auto oldColor = SetTextColor(dc, color);
         const auto oldMode = SetBkMode(dc, TRANSPARENT);
+        const auto oldAlignment=mirroredDc(dc)?SetTextAlign(dc,TA_LEFT|TA_TOP|TA_NOUPDATECP):GDI_ERROR;
         auto rectangle = bounds;
         drawn = DrawTextW(dc, &glyph, 1, &rectangle,
             DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX) != 0;
+        if(oldAlignment!=GDI_ERROR)SetTextAlign(dc,oldAlignment);
         SetBkMode(dc, oldMode);
         SetTextColor(dc, oldColor);
     }
@@ -177,7 +199,7 @@ bool nativeAddressGlyph(HDC dc, const RECT& bounds, int cell, UINT dpi) {
     return strips().draw(dc, bounds, dark ? white[index] : normal[index], cell, 4, size);
 }
 bool nativeNavigationGlyph(HDC dc, const RECT& bounds, UINT command,
-                           const ChromeButtonState& state, UINT dpi) {
+                           const ChromeButtonState& state, UINT dpi, bool rtl) {
     const auto size = px(16, dpi);
     const auto theme = themeState();
     const auto color = theme.actual == ThemeMode::Dark ?
@@ -189,8 +211,9 @@ bool nativeNavigationGlyph(HDC dc, const RECT& bounds, UINT command,
         auto glyphBounds = bounds;
         OffsetRect(&glyphBounds, px(command == Forward ? 1 : 2, dpi),
                    command == HistoryMenu ? -px(1, dpi) : 0);
-        return fontGlyph(dc, glyphBounds, command == Back ? L'\xe72b' :
-            command == Forward ? L'\xe72a' : L'\xe70d',
+        const auto glyphCommand=rtl?(command==Back?Forward:command==Forward?Back:command):command;
+        return fontGlyph(dc, glyphBounds, glyphCommand == Back ? L'\xe72b' :
+            glyphCommand == Forward ? L'\xe72a' : L'\xe70d',
             px(command == HistoryMenu ? 6 : 12, dpi), color, FW_SEMIBOLD, ANTIALIASED_QUALITY);
     }
     if (command == Up) {
@@ -198,7 +221,8 @@ bool nativeNavigationGlyph(HDC dc, const RECT& bounds, UINT command,
             return fontGlyph(dc, bounds, L'\xe74a', px(12, dpi), color);
         const auto icon = icons().get(state.enabled ? 16817 : 16818, static_cast<UINT>(size));
         return icon && DrawIconEx(dc, (bounds.left + bounds.right - size) / 2 + px(2, dpi),
-            (bounds.top + bounds.bottom - size) / 2 + px(1, dpi), icon, size, size, 0, nullptr, DI_NORMAL);
+            (bounds.top + bounds.bottom - size) / 2 + px(1, dpi), icon, size, size, 0, nullptr,
+            DI_NORMAL|(rtl?DI_NOMIRROR:0));
     }
     if (command == Refresh) {
         // Four-cell Go / Stop / Refresh / Down strip used by the address bar.
@@ -223,7 +247,7 @@ void background(HWND owner, HDC dc, const RECT& bounds, const ChromeButtonState&
         if (brush) { FillRect(dc, &bounds, brush); DeleteObject(brush); }
     }
 }
-void lineGlyph(HDC dc, const RECT& bounds, UINT command, const ChromeButtonState& state, UINT dpi) {
+void lineGlyph(HDC dc, const RECT& bounds, UINT command, const ChromeButtonState& state, UINT dpi, bool rtl) {
     const int centerX = (bounds.left + bounds.right) / 2;
     const int centerY = (bounds.top + bounds.bottom) / 2;
     const int radius = std::max(3, px(4, dpi));
@@ -248,7 +272,9 @@ void lineGlyph(HDC dc, const RECT& bounds, UINT command, const ChromeButtonState
         LineTo(dc, centerX, centerY - radius);
         LineTo(dc, centerX + radius + 1, centerY + 1);
     } else {
-        const int direction = command == Back ? -1 : 1;
+        // GDI primitives already mirror with their DC. Reverse only the
+        // remaining difference between actual window and DC direction.
+        const int direction = (command == Back ? -1 : 1)*(rtl&&!mirroredDc(dc)?-1:1);
         MoveToEx(dc, centerX - direction * radius, centerY, nullptr);
         LineTo(dc, centerX + direction * radius, centerY);
         MoveToEx(dc, centerX, centerY - radius, nullptr);
@@ -267,7 +293,13 @@ LRESULT CALLBACK searchProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         if (dc) {
             const UINT dpi = GetDpiForWindow(window);
             RECT bounds{}; GetClientRect(window, &bounds);
-            bounds.right = bounds.left + px(40, dpi);
+            // Classic EDIT consumes inherited mirroring into right alignment
+            // and RTL reading while retaining an unmirrored client DC. Use
+            // the actual host direction and this paint DC's coordinates.
+            const auto leadingWidth = std::min<LONG>(px(40, dpi), bounds.right - bounds.left);
+            if (rightToLeft(GetAncestor(window, GA_ROOT)) && !mirroredDc(dc))
+                bounds.left = bounds.right - leadingWidth;
+            else bounds.right = bounds.left + leadingWidth;
             FillRect(dc, &bounds, themeBrush(ThemeSurface::Address));
             drawSearchGlyph(dc, bounds, IsWindowEnabled(window) != FALSE, dpi);
             if (message == WM_PAINT) ReleaseDC(window, dc);
@@ -395,29 +427,26 @@ HRESULT drawNavigationButton(HWND owner, HDC dc, const RECT& bounds, UINT comman
                              const ChromeButtonState& state, UINT dpi) {
     if (!dc || !dpi) return E_INVALIDARG;
     if (command != Back && command != Forward && command != HistoryMenu && command != Up && command != Refresh) return E_INVALIDARG;
+    const auto rtl=rightToLeft(owner);
     background(owner, dc, bounds, state);
-    if (!themeState().highContrast && nativeNavigationGlyph(dc, bounds, command, state, dpi)) return S_OK;
+    if (!themeState().highContrast && nativeNavigationGlyph(dc, bounds, command, state, dpi, rtl)) return S_OK;
     if (command != Up && command != Refresh) {
         ThemeHandle theme(owner, L"Navigation");
         const int part = command == Back ? NAV_BACKBUTTON : command == Forward ? NAV_FORWARDBUTTON : NAV_MENUBUTTON;
         const int nativeState = !state.enabled ? NAV_BB_DISABLED : state.pressed ? NAV_BB_PRESSED : state.hot ? NAV_BB_HOT : NAV_BB_NORMAL;
-        if (theme.value && IsThemePartDefined(theme.value, part, nativeState) &&
-            SUCCEEDED(DrawThemeBackground(theme.value, dc, part, nativeState, &bounds, nullptr))) return S_OK;
+        if (theme.value && IsThemePartDefined(theme.value, part, nativeState)) {
+            if(!rtl&&SUCCEEDED(DrawThemeBackground(theme.value,dc,part,nativeState,&bounds,nullptr)))return S_OK;
+            if(rtl) {
+                const auto dcMirrored=mirroredDc(dc);
+                const int rtlPart=dcMirrored?part:command==Back?NAV_FORWARDBUTTON:command==Forward?NAV_BACKBUTTON:part;
+                DTBGOPTS options{sizeof(options),static_cast<DWORD>(dcMirrored?DTBG_MIRRORDC:DTBG_NOMIRROR),{}};
+                if(SUCCEEDED(DrawThemeBackgroundEx(theme.value,dc,rtlPart,nativeState,&bounds,&options)))return S_OK;
+            }
+        }
     }
-    lineGlyph(dc, bounds, command, state, dpi);
+    if(rtl&&command==Refresh&&fontGlyph(dc,bounds,L'\xe72c',px(12,dpi),glyphColor(state)))return S_OK;
+    lineGlyph(dc, bounds, command, state, dpi, rtl);
     return S_OK;
-}
-HRESULT drawStatusViewButton(HWND owner, HDC dc, const RECT& bounds, UINT command,
-                             const ChromeButtonState& state, UINT dpi) {
-    if (!dc || !dpi || (command != ViewFirst + 5 && command != ViewFirst + 1)) return E_INVALIDARG;
-    background(owner, dc, bounds, state, ThemeSurface::Status);
-    const int size = px(16, dpi);
-    // These are the installed Windows.IconSize Detailed/Large gallery resources.
-    // Artwork is resolved from Windows at runtime, never copied into the app.
-    const auto icon = icons().get(command == ViewFirst + 5 ? 62998 : 63008, static_cast<UINT>(size));
-    if (!icon) return HRESULT_FROM_WIN32(ERROR_RESOURCE_NAME_NOT_FOUND);
-    return DrawIconEx(dc, (bounds.left + bounds.right - size) / 2, (bounds.top + bounds.bottom - size) / 2,
-        icon, size, size, 0, nullptr, DI_NORMAL) ? S_OK : HRESULT_FROM_WIN32(GetLastError());
 }
 void drawSearchGlyph(HDC dc, const RECT& bounds, bool enabled, UINT dpi) {
     if (!dc || !dpi) return;
@@ -438,7 +467,7 @@ void drawSearchGlyph(HDC dc, const RECT& bounds, bool enabled, UINT dpi) {
     LineTo(dc, left - px(3, dpi), top + px(11, dpi));
     SelectObject(dc, oldPen); SelectObject(dc, oldBrush); DeleteObject(pen);
 }
-LRESULT chromeToolbarCustomDraw(NMTBCUSTOMDRAW& draw, bool status, UINT dpi) {
+LRESULT chromeToolbarCustomDraw(NMTBCUSTOMDRAW& draw, UINT dpi) {
     const bool addressAction = GetPropW(draw.nmcd.hdr.hwndFrom, addressActionBorder) != nullptr;
     if (draw.nmcd.dwDrawStage == CDDS_PREPAINT)
         return CDRF_NOTIFYITEMDRAW | (addressAction ? CDRF_NOTIFYPOSTPAINT : 0);
@@ -466,9 +495,8 @@ LRESULT chromeToolbarCustomDraw(NMTBCUSTOMDRAW& draw, bool status, UINT dpi) {
     state.pressed = (flags & CDIS_SELECTED) != 0;
     state.checked = (flags & CDIS_CHECKED) != 0;
     const auto command = static_cast<UINT>(draw.nmcd.dwItemSpec);
-    if (!status) recordPrivateDraw(draw, state, dpi);
-    const auto hr = status ? drawStatusViewButton(draw.nmcd.hdr.hwndFrom, draw.nmcd.hdc,
-        draw.nmcd.rc, command, state, dpi) : drawNavigationButton(draw.nmcd.hdr.hwndFrom,
+    recordPrivateDraw(draw, state, dpi);
+    const auto hr = drawNavigationButton(draw.nmcd.hdr.hwndFrom,
         draw.nmcd.hdc, draw.nmcd.rc, command, state, dpi);
     return SUCCEEDED(hr) ? CDRF_SKIPDEFAULT : CDRF_DODEFAULT;
 }
@@ -477,6 +505,7 @@ LRESULT chromeBreadcrumbCustomDraw(NMTBCUSTOMDRAW& draw, UINT dpi) {
     if (draw.nmcd.dwDrawStage != CDDS_ITEMPREPAINT || !draw.nmcd.hdc || !dpi)
         return CDRF_DODEFAULT;
     const auto owner = draw.nmcd.hdr.hwndFrom;
+    const auto rtl=rightToLeft(owner);
     const auto command = static_cast<UINT>(draw.nmcd.dwItemSpec);
     TBBUTTONINFOW button{sizeof(button)};
     button.dwMask = TBIF_STYLE | TBIF_IMAGE | TBIF_LPARAM;
@@ -491,6 +520,40 @@ LRESULT chromeBreadcrumbCustomDraw(NMTBCUSTOMDRAW& draw, UINT dpi) {
     if (command == Address || command == AddressList) recordPrivateDraw(draw, state, dpi);
     background(owner, draw.nmcd.hdc, draw.nmcd.rc, state);
     if (button.fsStyle & BTNS_SEP) return CDRF_SKIPDEFAULT;
+    if (command == BreadcrumbOverflow) {
+        const auto font = reinterpret_cast<HFONT>(SendMessageW(owner, WM_GETFONT, 0, 0));
+        const auto previousFont = font ? SelectObject(draw.nmcd.hdc, font) : nullptr;
+        const auto previousColor = SetTextColor(draw.nmcd.hdc, glyphColor(state));
+        const auto previousMode = SetBkMode(draw.nmcd.hdc, TRANSPARENT);
+        auto content = draw.nmcd.rc;
+        if(!rtl)DrawTextW(draw.nmcd.hdc,L"\u00bb",1,&content,DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_NOPREFIX);
+        else {
+            // The Latin guillemet is bidirectionally mirrored by text layout.
+            // Draw the two breadcrumb-direction chevrons once in the native DC
+            // rather than combining character and window reflection.
+            const auto pen=CreatePen(PS_SOLID,std::max(1,px(1,dpi)),glyphColor(state));
+            if(pen) {
+                const auto oldPen=SelectObject(draw.nmcd.hdc,pen);
+                const int direction=mirroredDc(draw.nmcd.hdc)?1:-1;
+                const int centerX=(content.left+content.right)/2,centerY=(content.top+content.bottom)/2;
+                for(const int offset:{-px(2,dpi),px(2,dpi)}) {
+                    MoveToEx(draw.nmcd.hdc,centerX+offset-direction*px(2,dpi),centerY-px(3,dpi),nullptr);
+                    LineTo(draw.nmcd.hdc,centerX+offset+direction*px(2,dpi),centerY);
+                    LineTo(draw.nmcd.hdc,centerX+offset-direction*px(2,dpi),centerY+px(3,dpi));
+                }
+                SelectObject(draw.nmcd.hdc,oldPen);DeleteObject(pen);
+            }
+        }
+        SetBkMode(draw.nmcd.hdc, previousMode);
+        SetTextColor(draw.nmcd.hdc, previousColor);
+        if (previousFont) SelectObject(draw.nmcd.hdc, previousFont);
+        if (flags & CDIS_FOCUS) {
+            auto focus = draw.nmcd.rc;
+            InflateRect(&focus, -px(1, dpi), -px(2, dpi));
+            DrawFocusRect(draw.nmcd.hdc, &focus);
+        }
+        return CDRF_SKIPDEFAULT;
+    }
     auto content = draw.nmcd.rc;
     content.left += px(4, dpi);
     content.right -= px(14, dpi);
@@ -500,6 +563,7 @@ LRESULT chromeBreadcrumbCustomDraw(NMTBCUSTOMDRAW& draw, UINT dpi) {
         const auto images = reinterpret_cast<HIMAGELIST>(SendMessageW(owner, TB_GETIMAGELIST, 0, 0));
         int width = 0, height = 0;
         if (images && ImageList_GetIconSize(images, &width, &height)) {
+            const BitmapOrientation orientation(draw.nmcd.hdc);
             ImageList_Draw(images, button.iImage, draw.nmcd.hdc, content.left,
                 (content.top + content.bottom - height) / 2, ILD_TRANSPARENT);
             content.left += width + px(4, dpi);
@@ -515,8 +579,10 @@ LRESULT chromeBreadcrumbCustomDraw(NMTBCUSTOMDRAW& draw, UINT dpi) {
                 const auto previousFont = font ? SelectObject(draw.nmcd.hdc, font) : nullptr;
                 const auto previousColor = SetTextColor(draw.nmcd.hdc, glyphColor(state));
                 const auto previousMode = SetBkMode(draw.nmcd.hdc, TRANSPARENT);
+                const auto previousAlignment=rtl?SetTextAlign(draw.nmcd.hdc,TA_LEFT|TA_TOP|TA_NOUPDATECP):GDI_ERROR;
                 DrawTextW(draw.nmcd.hdc, label.c_str(), static_cast<int>(length), &content,
-                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS | (rtl?DT_RTLREADING:0));
+                if(previousAlignment!=GDI_ERROR)SetTextAlign(draw.nmcd.hdc,previousAlignment);
                 SetBkMode(draw.nmcd.hdc, previousMode);
                 SetTextColor(draw.nmcd.hdc, previousColor);
                 if (previousFont) SelectObject(draw.nmcd.hdc, previousFont);
@@ -532,12 +598,11 @@ LRESULT chromeBreadcrumbCustomDraw(NMTBCUSTOMDRAW& draw, UINT dpi) {
             state.enabled ? RGB(128, 128, 128) : themePalette().disabledText;
         if (command == Address || command == AddressList) arrow = draw.nmcd.rc;
         auto nativeArrow = arrow;
-        POINT clientOrigin{};
-        RECT toolbarWindow{};
+        RECT toolbarWindow{},toolbarOuterClient{};
         int borderX = 0, borderY = 0;
-        if (ClientToScreen(owner, &clientOrigin) && GetWindowRect(owner, &toolbarWindow)) {
-            borderX = clientOrigin.x - toolbarWindow.left;
-            borderY = clientOrigin.y - toolbarWindow.top;
+        if (GetWindowRect(owner, &toolbarWindow)&&SUCCEEDED(mapUiRect(nullptr,owner,toolbarWindow,&toolbarOuterClient))) {
+            borderX = -toolbarOuterClient.left;
+            borderY = -toolbarOuterClient.top;
         }
         // The bordered toolbar's client origin differs from the outer address
         // row. Preserve the installed strip's alignment in that outer row.
@@ -545,7 +610,7 @@ LRESULT chromeBreadcrumbCustomDraw(NMTBCUSTOMDRAW& draw, UINT dpi) {
         const bool nativeDown = (command == Address || command == AddressList) &&
             !theme.highContrast && nativeAddressGlyph(draw.nmcd.hdc, nativeArrow, 3, dpi);
         if (!nativeDown && !fontGlyph(draw.nmcd.hdc, arrow,
-                       (command == Address || command == AddressList) ? L'\xe70d' : L'\xe76c', px(8, dpi), color))
+                       (command == Address || command == AddressList) ? L'\xe70d' : rtl?L'\xe76b':L'\xe76c', px(8, dpi), color))
             return CDRF_DODEFAULT;
     }
     if (flags & CDIS_FOCUS) {
@@ -555,17 +620,17 @@ LRESULT chromeBreadcrumbCustomDraw(NMTBCUSTOMDRAW& draw, UINT dpi) {
     }
     return CDRF_SKIPDEFAULT;
 }
-HRESULT applyChrome(HWND navigation, HWND breadcrumbs, HWND address, HWND search, HWND statusViews, HWND addressActions) {
-    if (!IsWindow(navigation) || !IsWindow(breadcrumbs) || !IsWindow(address) || !IsWindow(search) || !IsWindow(statusViews))
+HRESULT applyChrome(HWND navigation, HWND breadcrumbs, HWND address, HWND search, HWND addressActions) {
+    if (!IsWindow(navigation) || !IsWindow(breadcrumbs) || !IsWindow(address) || !IsWindow(search))
         return E_INVALIDARG;
-    for (const auto window : {navigation, breadcrumbs, address, search, statusViews, addressActions}) {
+    for (const auto window : {navigation, breadcrumbs, address, search, addressActions}) {
         if (!window) continue;
         if (!IsWindow(window)) return E_INVALIDARG;
         DWORD process = 0;
         const auto thread = GetWindowThreadProcessId(window, &process);
         if (process != GetCurrentProcessId() || thread != GetCurrentThreadId()) return E_ACCESSDENIED;
     }
-    for (const auto window : {navigation, breadcrumbs, address, search, statusViews, addressActions}) if (window) applyWindowTheme(window);
+    for (const auto window : {navigation, breadcrumbs, address, search, addressActions}) if (window) applyWindowTheme(window);
     const UINT dpi = GetDpiForWindow(navigation);
     SendMessageW(navigation, TB_SETBUTTONSIZE, 0, MAKELPARAM(px(28, dpi), px(30, dpi)));
     // Stock navigation has a narrow history rail. Four uniform 28px buttons
@@ -578,11 +643,16 @@ HRESULT applyChrome(HWND navigation, HWND breadcrumbs, HWND address, HWND search
         button.cx = static_cast<WORD>(px(navigationWidths[index], dpi));
         SendMessageW(navigation, TB_SETBUTTONINFOW, navigationCommands[index], reinterpret_cast<LPARAM>(&button));
     }
-    SendMessageW(statusViews, TB_SETBUTTONSIZE, 0, MAKELPARAM(px(24, dpi), px(22, dpi)));
     if (addressActions) SendMessageW(addressActions, TB_SETBUTTONSIZE, 0, MAKELPARAM(px(24, dpi), px(30, dpi)));
     if (addressActions && !SetPropW(addressActions, addressActionBorder, reinterpret_cast<HANDLE>(1)))
         return HRESULT_FROM_WIN32(GetLastError());
-    SendMessageW(search, EM_SETMARGINS, EC_LEFTMARGIN, MAKELPARAM(px(40, dpi), 0));
+    // Classic RTL EDIT has physical client coordinates after converting its
+    // inherited layout style. Reserve the actual right edge and restore the
+    // opposite native font margin instead of retaining an old icon margin.
+    if (rightToLeft(GetAncestor(search, GA_ROOT)))
+        SendMessageW(search, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN,
+            MAKELPARAM(EC_USEFONTINFO, px(40, dpi)));
+    else SendMessageW(search, EM_SETMARGINS, EC_LEFTMARGIN, MAKELPARAM(px(40, dpi), 0));
     for (const auto window : {breadcrumbs, address, search}) {
         const auto style = GetWindowLongPtrW(window, GWL_STYLE);
         if (!(style & WS_BORDER)) {

@@ -1,3 +1,4 @@
+#include "state_file.hpp"
 #include "explorer/search_history.hpp"
 #include <shlobj.h>
 #include <wrl/client.h>
@@ -101,27 +102,7 @@ HRESULT saveSearchHistory(const std::filesystem::path& path, std::span<const std
             std::find(queries.begin(), queries.begin() + index, query) != queries.begin() + index) return E_INVALIDARG;
         const auto bytes = encoded(query); append32(data, bytes.size()); data += bytes;
     }
-    std::error_code error;
-    std::filesystem::create_directories(path.parent_path(), error);
-    if (error) return HRESULT_FROM_WIN32(static_cast<DWORD>(error.value()));
-    GUID identity{}; wchar_t name[40]{};
-    auto hr = CoCreateGuid(&identity);
-    if (FAILED(hr)) return hr;
-    if (!StringFromGUID2(identity, name, ARRAYSIZE(name))) return E_FAIL;
-    const auto temporary = path.parent_path() / (std::wstring(L"search-history-") + name + L".tmp");
-    const auto file = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file == INVALID_HANDLE_VALUE) return HRESULT_FROM_WIN32(GetLastError());
-    DWORD written = 0;
-    DWORD failure = ERROR_SUCCESS;
-    if (!WriteFile(file, data.data(), static_cast<DWORD>(data.size()), &written, nullptr)) failure = GetLastError();
-    else if (written != data.size()) failure = ERROR_WRITE_FAULT;
-    else if (!FlushFileBuffers(file)) failure = GetLastError();
-    CloseHandle(file);
-    if (failure) { DeleteFileW(temporary.c_str()); return HRESULT_FROM_WIN32(failure); }
-    if (!MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-        const auto moveFailure = GetLastError(); DeleteFileW(temporary.c_str()); return HRESULT_FROM_WIN32(moveFailure);
-    }
-    return S_OK;
+    return writeStateFileAtomic(path, std::string_view(data));
 }
 HRESULT SearchSuggestionList::replace(std::span<const std::wstring> queries) {
     if (queries.size() > maximumRecentSearches) return E_INVALIDARG;

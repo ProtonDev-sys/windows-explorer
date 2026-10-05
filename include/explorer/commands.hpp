@@ -20,6 +20,6 @@ enum Command : UINT {
     SharingProperties,
     NewLibrary, IncludeLibraryFolder, LibraryLocations, LibraryDefault, LibraryOptimize,
     ExpandAncestors, AddressList,
-    ViewFirst = 500, ViewLast = ViewFirst + 7, BreadcrumbFirst = 3000
+    ViewFirst = 500, ViewLast = ViewFirst + 7, BreadcrumbOverflow = 2999, BreadcrumbFirst = 3000
 };
 }

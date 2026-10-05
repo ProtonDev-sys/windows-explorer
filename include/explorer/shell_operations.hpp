@@ -3,7 +3,6 @@
 #include <windows.h>
 #include <shobjidl.h>
 #include <string>
-#include <vector>
 
 namespace explorer {
 
@@ -20,11 +19,18 @@ public:
     // navigation/default-association services; it is detached after the call.
     static HRESULT invoke(HWND owner, IShellItemArray* selection, const wchar_t* verb,
                           IUnknown* site = nullptr);
-    static HRESULT copyToClipboard(HWND owner, IShellItemArray* selection, bool cut);
+    // Optional output is the exact producer supplied to OleSetClipboard, not
+    // OleGetClipboard's consumer wrapper; unchanged when publication fails.
+    static HRESULT copyToClipboard(HWND owner, IShellItemArray* selection, bool cut,
+                                   IDataObject** published = nullptr);
+    // Explicit producer-owned cleanup only, on its publishing STA. The exact
+    // retained producer and current OLE ownership are checked while the Win32
+    // clipboard is locked; unrelated/replaced clipboard data is never emptied.
+    // S_FALSE means this producer no longer owns the clipboard.
+    static HRESULT clearClipboardIfOwned(IDataObject* published, HWND owner);
     // Call on the publishing STA before OleUninitialize. Never flush another
     // application's clipboard, and release retained COM data before STA exit.
     static void flushClipboardIfOwned();
-    static HRESULT paste(HWND owner, IShellItem* destination);
     // Silent operations suppress Shell UI, preserve collisions under new names,
     // and do not add fixture operations to the user's Shell undo history.
     // An optional public progress sink is advised only for this call; its native
@@ -32,34 +38,19 @@ public:
     // The native progress dialog remains available when silent is false.
     static HRESULT copyOrMove(HWND owner, IShellItemArray* selection,
                               IShellItem* destination, bool move, bool silent = false,
-                              bool recordUndo = false,
                               IFileOperationProgressSink* progress = nullptr);
     static HRESULT remove(HWND owner, IShellItemArray* selection,
                           bool permanent = false, bool silent = false,
                           IFileOperationProgressSink* progress = nullptr);
     static HRESULT rename(HWND owner, IShellItem* item, const std::wstring& name,
-                          bool silent = false, bool recordUndo = false,
+                          bool silent = false,
                           IFileOperationProgressSink* progress = nullptr);
     static HRESULT newFolder(HWND owner, IShellItem* destination, const std::wstring& name,
-                             bool silent = false, bool recordUndo = false,
+                             bool silent = false,
                              IFileOperationProgressSink* progress = nullptr);
-    // The isolated journal belongs to the calling STA. Production Undo/Redo use
-    // the registered Windows.undo/redo handlers and their native Shell records.
-    // Silent fixture operations enter this journal only with recordUndo=true.
-    // Inverses refuse replacements, stale identity/metadata, active writers and
-    // foreign holding-folder contents. Directory relocation releases descendant
-    // locks and verifies its resulting metadata; races preserve recovery data.
-    static HRESULT undo(HWND owner, bool silent = false);
-    static HRESULT redo(HWND owner, bool silent = false);
-    static bool canUndo();
-    static bool canRedo();
-    // Normal operations always keep native Shell history. recordUndo is accepted
-    // only with silent=true so fixture and production histories cannot mix.
-    // Removes only empty, identity-checked holding folders and releases history.
-    // Retained objects are preserved; recoveryPaths identifies their directories.
-    static void clearHistory();
-    static std::vector<std::wstring> recoveryPaths();
     static HRESULT copyPaths(HWND owner, IShellItemArray* selection);
+    // Explicit normal interaction only; callers must reject headless use.
+    static HRESULT copyText(HWND owner, const std::wstring& text);
 };
 
 } // namespace explorer

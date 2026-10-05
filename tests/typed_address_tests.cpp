@@ -13,6 +13,12 @@ void splitting() {
         {L"  \"C:\\Owned Folder\\日本語.exe\"  /x \"quoted value\" ",L"C:\\Owned Folder\\日本語.exe",L"/x \"quoted value\" "},
         {L"C:\\Owned Folder\\Tool.EXE /arg:\"two words\"",L"C:\\Owned Folder\\Tool.EXE",L"/arg:\"two words\""},
         {L"%WINDIR%\\system32\\cmd.exe /k",L"%WINDIR%\\system32\\cmd.exe",L"/k"},
+        {L"cmd /c C:\\Owned\\tool.exe",L"cmd",L"/c C:\\Owned\\tool.exe"},
+        {L"notepad \"C:\\Owned Folder\\report.exe\"",L"notepad",L"\"C:\\Owned Folder\\report.exe\""},
+        {L"tool -source owned.bat",L"tool",L"-source owned.bat"},
+        {L"cmd.exe /c owned.cmd",L"cmd.exe",L"/c owned.cmd"},
+        {L".\\Owned Folder\\tool.exe /arg",L".\\Owned Folder\\tool.exe",L"/arg"},
+        {L"\"Owned Tool.exe\" /arg",L"Owned Tool.exe",L"/arg"},
         {L"https://example.invalid/owned?q=%20value",L"https://example.invalid/owned?q=%20value",L""},
         {L"ms-settings:display",L"ms-settings:display",L""},
         {L"mailto:owned@example.invalid?subject=two words",L"mailto:owned@example.invalid?subject=two words",L""},
@@ -41,6 +47,10 @@ void routing() {
     require(explorer::launchTypedAddress(nullptr,L"\"unterminated",false,mock)==E_INVALIDARG&&calls==0,"Malformed normal input reached mock");
     require(explorer::launchTypedAddress(reinterpret_cast<HWND>(static_cast<UINT_PTR>(7)),L"cmd /c \"owned only\"",false,mock,L"C:\\Owned Unicode 日本語")==HRESULT_FROM_WIN32(ERROR_CANCELLED)&&calls==1,
         "Explicit mock dispatch changed native result");
+    for(const auto& invalid: {std::wstring(L"x\0y",3),std::wstring(1,static_cast<wchar_t>(0xd800)),
+                             std::wstring(1,static_cast<wchar_t>(0xdc00)),std::wstring(32768,L'a')})
+        require(explorer::launchTypedAddress(nullptr,L"cmd",false,mock,invalid)==E_INVALIDARG&&calls==1,
+            "Malformed working directory reached a launcher");
 }
 }
 int runTypedAddressTests() {

@@ -1,18 +1,16 @@
+#include "state_file.hpp"
 #include "explorer/core.hpp"
 
 #include <shlobj.h>
 #include <algorithm>
-#include <array>
 #include <charconv>
 #include <cwctype>
 #include <fstream>
 #include <iomanip>
 #include <iterator>
 #include <limits>
-#include <locale>
 #include <sstream>
 #include <string_view>
-#include <vector>
 
 namespace explorer {
 namespace {
@@ -91,20 +89,6 @@ bool booleanOr(std::string_view text, bool fallback) {
     return fallback;
 }
 
-std::wstring urlEncode(const std::wstring& text) {
-    constexpr char hex[] = "0123456789ABCDEF";
-    std::wstring result;
-    for (const unsigned char ch : utf8(text)) {
-        if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '-' || ch == '_' || ch == '.' || ch == '~') {
-            result += static_cast<wchar_t>(ch);
-        } else {
-            result += L'%';
-            result += static_cast<wchar_t>(hex[ch >> 4]);
-            result += static_cast<wchar_t>(hex[ch & 15]);
-        }
-    }
-    return result;
-}
 } // namespace
 
 std::filesystem::path preferencesPath() {
@@ -208,29 +192,7 @@ bool savePreferences(const std::filesystem::path& path, const Preferences& prefe
         << "windowHeight=" << (preferences.windowHeight >= 480 && preferences.windowHeight <= 4320 ? preferences.windowHeight : defaults.windowHeight) << '\n'
         << "startupLocation=" << escapeLocation(encodedLocation) << '\n';
     const auto contents = output.str();
-    std::error_code error;
-    if (!path.parent_path().empty()) {
-        std::filesystem::create_directories(path.parent_path(), error);
-        if (error) return false;
-    }
-    std::filesystem::path temporary;
-    HANDLE file = INVALID_HANDLE_VALUE;
-    for (unsigned attempt = 0; attempt < 8; ++attempt) {
-        temporary = path;
-        temporary += L".tmp-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetCurrentThreadId()) + L"-" + std::to_wstring(GetTickCount64()) + L"-" + std::to_wstring(attempt);
-        file = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (file != INVALID_HANDLE_VALUE) break;
-        if (GetLastError() != ERROR_FILE_EXISTS && GetLastError() != ERROR_ALREADY_EXISTS) return false;
-    }
-    if (file == INVALID_HANDLE_VALUE) return false;
-    DWORD written = 0;
-    const bool wrote = WriteFile(file, contents.data(), static_cast<DWORD>(contents.size()), &written, nullptr) && written == contents.size() && FlushFileBuffers(file);
-    const bool closed = CloseHandle(file) != FALSE;
-    if (!wrote || !closed || !MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-        DeleteFileW(temporary.c_str());
-        return false;
-    }
-    return true;
+    return SUCCEEDED(writeStateFileAtomic(path, std::string_view(contents)));
 }
 
 std::wstring trim(const std::wstring& text) {
@@ -252,26 +214,6 @@ std::wstring expandEnvironment(const std::wstring& text) {
         return result;
     }
     return text;
-}
-
-std::wstring searchUri(const std::wstring& query, const std::wstring& scope) {
-    // Microsoft search-ms protocol: query is AQS by default; location supports local and UNC scopes.
-    // https://learn.microsoft.com/windows/win32/search/-search-3x-wds-qryidx-crumb
-    std::wstring result = L"search-ms:query=" + urlEncode(query);
-    if (!scope.empty()) result += L"&crumb=location:" + urlEncode(scope);
-    return result;
-}
-
-std::wstring formatBytes(std::uint64_t bytes) {
-    if (bytes < 1024) return std::to_wstring(bytes) + (bytes == 1 ? L" byte" : L" bytes");
-    constexpr std::array<const wchar_t*, 6> units{ L"KB", L"MB", L"GB", L"TB", L"PB", L"EB" };
-    long double value = static_cast<long double>(bytes) / 1024.0L;
-    std::size_t unit = 0;
-    while (value >= 1024.0L && unit + 1 < units.size()) { value /= 1024.0L; ++unit; }
-    std::wostringstream output;
-    output.imbue(std::locale::classic());
-    output << std::fixed << std::setprecision(2) << value << L' ' << units[unit];
-    return output.str();
 }
 
 bool validLeafName(const std::wstring& name) {

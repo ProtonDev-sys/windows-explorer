@@ -33,6 +33,8 @@ struct DeferredDesktop {
     HDESK desktop = nullptr;
     HANDLE thread = nullptr, wait = nullptr;
     std::shared_ptr<WorkerGroup> group;
+    std::shared_ptr<void> creatorRelease;
+    bool retainOnFailure = false;
     DeferredDesktop* next = nullptr;
 };
 void CALLBACK releaseTerminatedDesktop(void* context, BOOLEAN) {
@@ -61,6 +63,15 @@ HRESULT reapCompleted(const std::shared_ptr<WorkerGroup>& group) noexcept {
         std::unique_ptr<DeferredDesktop> owned(completed);
         completed = owned->next;
         owned->next = nullptr;
+        if (owned->retainOnFailure) {
+            std::lock_guard lock(groupsMutex);
+            owned->next = group->completed;
+            group->completed = owned.release();
+            continue;
+        }
+        // Release native values on this initialized creator STA, outside the
+        // group mutex: their destructors may reenter COM or worker bookkeeping.
+        owned->creatorRelease.reset();
         const auto closed = CloseDesktop(owned->desktop) ? S_OK : lastFailure();
         std::lock_guard lock(groupsMutex);
         if (SUCCEEDED(closed)) {
@@ -81,6 +92,7 @@ HRESULT reapCompleted(const std::shared_ptr<WorkerGroup>& group) noexcept {
 }
 
 struct StaWorkerLease::Impl {
+    DWORD creatorThread = GetCurrentThreadId();
     HDESK desktop = nullptr;
     HDESK creatorConnection = nullptr; // Borrowed; creator retains it through drain.
     HDESK previous = nullptr;
@@ -98,6 +110,16 @@ struct StaWorkerLease::Impl {
             // and creator connection, and expose the failure to the final drain.
             std::lock_guard lock(groupsMutex);
             if (SUCCEEDED(group->cleanup)) group->cleanup = E_UNEXPECTED;
+            if (completion && completion->creatorRelease) {
+                completion->retainOnFailure = true;
+                completion->desktop = desktop;
+                completion->thread = thread;
+                completion->group = group;
+                completion->next = group->completed;
+                group->completed = completion.release();
+                desktop = nullptr;
+                thread = nullptr;
+            }
             counted = false;
         }
         if (desktop && !terminationRequired && !retainOnFailure) CloseDesktop(desktop);
@@ -176,8 +198,34 @@ HRESULT StaWorkerLease::attach() noexcept {
     return S_OK;
 }
 
+HRESULT StaWorkerLease::deferCreatorRelease(std::shared_ptr<void>& keepalive) noexcept {
+    if (!impl_ || !impl_->completion || !keepalive) return E_INVALIDARG;
+    if (GetCurrentThreadId() == impl_->creatorThread ||
+        (impl_->attachedThread && impl_->attachedThread != GetCurrentThreadId())) return RPC_E_WRONG_THREAD;
+    if (impl_->completion->creatorRelease) return HRESULT_FROM_WIN32(ERROR_ALREADY_INITIALIZED);
+    // Reserve ownership before any fallible kernel operation. A failure must
+    // retain this value, never destroy native registrations on a non-COM worker.
+    impl_->completion->creatorRelease = std::move(keepalive);
+    if (!impl_->thread && !DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(),
+        &impl_->thread, SYNCHRONIZE, FALSE, 0)) {
+        const auto failed = lastFailure();
+        impl_->retainOnFailure = true;
+        std::lock_guard lock(groupsMutex);
+        if (SUCCEEDED(impl_->group->cleanup)) impl_->group->cleanup = failed;
+        return failed;
+    }
+    impl_->terminationRequired = true;
+    return S_OK;
+}
+
 HRESULT StaWorkerLease::finish() noexcept {
     if (!impl_) return S_FALSE;
+    if (impl_->retainOnFailure && impl_->completion && impl_->completion->creatorRelease) {
+        HRESULT failed;
+        { std::lock_guard lock(groupsMutex); failed = impl_->group->cleanup; }
+        impl_.reset(); // Retains the complete payload in the failed creator group.
+        return FAILED(failed) ? failed : E_UNEXPECTED;
+    }
     const auto deferUntilThreadExit = [&](HRESULT cause) noexcept -> HRESULT {
         auto deferred = std::move(impl_->completion);
         if (!deferred) return E_UNEXPECTED;

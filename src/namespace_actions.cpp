@@ -1,6 +1,7 @@
 #include "explorer/namespace_actions.hpp"
 #include "explorer/headless_visual.hpp"
 #include "explorer/worker_sta.hpp"
+#include "explorer/ui_direction.hpp"
 
 #include <shlobj.h>
 #include <shlwapi.h>
@@ -27,9 +28,10 @@ constexpr wchar_t commandStorePath[] = L"SOFTWARE\\Microsoft\\Windows\\CurrentVe
 constexpr DWORD detailedTargetBudget = 100000;
 constexpr unsigned maximumMenuDepth = 16;
 constexpr unsigned maximumMenuEntries = 4096;
-// A cancelled worker can remain inside a native menu query. Synchronous
-// view-selection menus use this same slot, including during pumped callbacks.
-std::atomic<unsigned> defaultMenuWorkers{0};
+// A cancelled worker can remain inside a native menu query. Registered and
+// default selection menus share the same view/site and must not overlap.
+// Synchronous view-selection menus also use this slot during pumped callbacks.
+std::atomic<unsigned> selectionMenuWorkers{0};
 
 struct ActionDescription { std::wstring_view command; std::wstring_view label; };
 constexpr std::array<ActionDescription, static_cast<size_t>(NamespaceAction::Count)> actions{{
@@ -249,6 +251,44 @@ struct RegisteredProvider {
     bool siteAttached = false;
     ~RegisteredProvider() { if (siteAttached && withSite) withSite->SetSite(nullptr); }
 };
+
+HRESULT recyclePropertiesMenuComposite(std::wstring_view command) {
+    if (!equal(command,L"Windows.RecycleBin.properties")) return S_FALSE;
+    const std::wstring path=std::wstring(commandStorePath)+L"\\shell\\"+std::wstring(command);
+    RegistryKey key;
+    auto hr=HRESULT_FROM_WIN32(RegOpenKeyExW(HKEY_LOCAL_MACHINE,path.c_str(),0,KEY_READ,&key.value));
+    if(FAILED(hr))return hr;
+    std::wstring handler,canonical;
+    hr=readRegistryText(key.value,L"ExplorerCommandHandler",handler);
+    if(SUCCEEDED(hr))hr=readRegistryText(key.value,L"CanonicalName",canonical);
+    if(FAILED(hr))return hr;
+    // This composite lacks a public initializer. Its static leaves cannot be
+    // queried as IExplorerCommands; only the native menu can arbitrate them.
+    if(!equal(handler,L"{AFA470FE-371D-4F98-9592-39E3C7227E5C}")||
+       !equal(canonical,L"{CB32A163-F6AE-4883-8FEF-C762490EBA1F}"))
+        return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+    DWORD type=0,bytes=0;
+    auto error=RegQueryValueExW(key.value,L"VerbList",nullptr,&type,nullptr,&bytes);
+    if(error!=ERROR_SUCCESS)return HRESULT_FROM_WIN32(error);
+    if(type!=REG_MULTI_SZ||bytes<2*sizeof(wchar_t)||bytes>65536||bytes%sizeof(wchar_t))
+        return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+    std::vector<wchar_t> names(bytes/sizeof(wchar_t));
+    error=RegQueryValueExW(key.value,L"VerbList",nullptr,&type,reinterpret_cast<BYTE*>(names.data()),&bytes);
+    if(error!=ERROR_SUCCESS)return HRESULT_FROM_WIN32(error);
+    if(type!=REG_MULTI_SZ||bytes!=names.size()*sizeof(wchar_t)||names.back()!=L'\0'||
+       names[names.size()-2]!=L'\0')return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+    constexpr std::array leaves{L"Windows.RecycleBin.Selection.properties",L"Windows.RecycleBin.Location.properties"};
+    size_t offset=0;
+    for(const auto leaf:leaves) {
+        if(offset+1>=names.size()||!names[offset])return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+        const auto length=wcsnlen_s(names.data()+offset,names.size()-offset);
+        if(length==names.size()-offset||!equal(std::wstring_view(names.data()+offset,length),leaf))
+            return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+        offset+=length+1;
+    }
+    if(offset+1!=names.size()||names[offset]!=L'\0')return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+    return S_OK;
+}
 
 HRESULT loadRegisteredProvider(std::wstring_view command,IUnknown* site,bool allowStateHandler,
                                RegisteredProvider& result) {
@@ -832,6 +872,38 @@ HRESULT namespaceCommandState(std::wstring_view command, IShellItemArray* select
       catch (...) { return E_FAIL; }
 }
 
+struct NamespaceStateRegistration {
+    ComPtr<IGlobalInterfaceTable> git;
+    DWORD selection = 0, site = 0;
+    IShellItemArray* selectionSource = nullptr;
+    IUnknown* siteSource = nullptr;
+    DWORD creator = GetCurrentThreadId();
+
+    ~NamespaceStateRegistration() {
+        if (git) {
+            if (selection) git->RevokeInterfaceFromGlobal(selection);
+            if (site) git->RevokeInterfaceFromGlobal(site);
+        }
+    }
+    bool matches(IShellItemArray* items,IUnknown* view) const noexcept {
+        return creator == GetCurrentThreadId() && selectionSource == items && siteSource == view;
+    }
+    static HRESULT create(IShellItemArray* items,IUnknown* view,
+                          std::shared_ptr<NamespaceStateRegistration>* result) {
+        try {
+            auto value = std::make_shared<NamespaceStateRegistration>();
+            auto hr = CoCreateInstance(CLSID_StdGlobalInterfaceTable,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&value->git));
+            if (SUCCEEDED(hr) && items) hr = value->git->RegisterInterfaceInGlobal(items,__uuidof(IShellItemArray),&value->selection);
+            if (SUCCEEDED(hr) && view) hr = value->git->RegisterInterfaceInGlobal(view,IID_IUnknown,&value->site);
+            if (FAILED(hr)) return hr;
+            value->selectionSource = items; value->siteSource = view;
+            *result = std::move(value);
+            return S_OK;
+        } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
+          catch (...) { return E_FAIL; }
+    }
+};
+
 struct NamespaceCommandStateTask::Impl {
     struct Shared {
         std::atomic<bool> cancelled{false};
@@ -844,17 +916,9 @@ struct NamespaceCommandStateTask::Impl {
     };
     DWORD thread = GetCurrentThreadId();
     bool independentVerbs = false;
-    ComPtr<IGlobalInterfaceTable> git;
-    DWORD selection = 0,site = 0;
+    std::shared_ptr<NamespaceStateRegistration> registration;
     std::shared_ptr<Shared> shared = std::make_shared<Shared>();
-    void revoke() noexcept {
-        if (git) {
-            if (selection) git->RevokeInterfaceFromGlobal(selection);
-            if (site) git->RevokeInterfaceFromGlobal(site);
-        }
-        selection = site = 0;
-    }
-    ~Impl() { shared->cancelled.store(true); revoke(); }
+    ~Impl() { shared->cancelled.store(true); }
 };
 
 namespace {
@@ -865,6 +929,32 @@ struct StatePhaseTimer {
 };
 bool validAssociationVerb(std::wstring_view verb) noexcept {
     return !verb.empty() && verb.size()<=128 && verb.find_first_of(L"\\/\0",0,3)==std::wstring_view::npos;
+}
+
+HRESULT selectionVerbNames(std::span<const std::wstring_view> verbs,size_t limit,std::vector<std::wstring>& result) {
+    if (verbs.empty() || verbs.size() > limit) return E_INVALIDARG;
+    std::vector<std::wstring> names; names.reserve(verbs.size());
+    for (const auto verb : verbs) {
+        if (!validAssociationVerb(verb)) return E_INVALIDARG;
+        for (const auto& previous : names) if (equal(previous,verb)) return E_INVALIDARG;
+        names.emplace_back(verb);
+    }
+    result = std::move(names);
+    return S_OK;
+}
+
+bool requestsResourceVerb(std::span<const std::wstring_view> verbs) noexcept {
+    for (auto verb : verbs) {
+        if (verb.size() > 8 && equal(verb.substr(0,8),L"Windows.")) verb.remove_prefix(8);
+        // Include registered aliases conservatively as well as the documented
+        // built-in resource names. Any resource request keeps the full menu.
+        for (const auto resource : {L"cut",L"copy",L"paste",L"link",L"delete",L"rename",L"properties",
+                                   L"pastelink",L"pasteshortcut",L"recycle",L"PermanentDelete",L"RibbonDelete",
+                                   L"copyaspath"})
+            if (equal(verb,resource)) return true;
+        if (verb.size() > 11 && equal(verb.substr(verb.size()-11),L".properties")) return true;
+    }
+    return false;
 }
 
 HRESULT selectionIdentitySnapshot(IShellItemArray* original,DWORD count,
@@ -894,8 +984,10 @@ HRESULT selectionIdentitySnapshot(IShellItemArray* original,DWORD count,
         medium.value.hGlobal,static_cast<const BYTE*>(GlobalLock(medium.value.hGlobal))};
     if(!locked.value)return HRESULT_FROM_WIN32(GetLastError());
     UINT nativeCount=0;std::memcpy(&nativeCount,locked.value,sizeof(nativeCount));
+    const size_t availableOffsets=(bytes-sizeof(UINT))/sizeof(UINT);
+    if(nativeCount!=count||static_cast<size_t>(nativeCount)>=availableOffsets)
+        return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
     const size_t header=sizeof(UINT)+(static_cast<size_t>(nativeCount)+1)*sizeof(UINT);
-    if(nativeCount!=count||header>bytes)return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
     const auto idAt=[&](size_t index,PCUIDLIST_RELATIVE* item)->HRESULT {
         UINT offset=0;std::memcpy(&offset,locked.value+sizeof(UINT)+index*sizeof(UINT),sizeof(offset));
         if(offset<header||offset>bytes-sizeof(USHORT))return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
@@ -931,6 +1023,30 @@ struct RegisteredSelectionMenu {
     ComPtr<IShellFolder> parent;
     std::vector<OwnedPidl> absolute;
     std::vector<PCUITEMID_CHILD> children;
+    HRESULT createBackground(IShellItemArray* folder,const std::atomic<bool>* cancelled,IContextMenu** result) {
+        if(!result)return E_POINTER;*result=nullptr;
+        if(!folder)return E_INVALIDARG;
+        if(cancelled&&cancelled->load())return HRESULT_FROM_WIN32(ERROR_CANCELLED);
+        DWORD count=0;auto hr=folder->GetCount(&count);if(FAILED(hr))return hr;
+        if(count!=1)return E_INVALIDARG;
+        ComPtr<IShellItem> item;hr=folder->GetItemAt(0,&item);if(FAILED(hr))return hr;
+        if(!item)return E_UNEXPECTED;
+        SFGAOF attributes=0;hr=item->GetAttributes(SFGAO_FOLDER,&attributes);if(FAILED(hr))return hr;
+        if(!(attributes&SFGAO_FOLDER))return E_INVALIDARG;
+        hr=item->BindToHandler(nullptr,BHID_SFObject,IID_PPV_ARGS(&parent));
+        PIDLIST_ABSOLUTE raw=nullptr;
+        if(SUCCEEDED(hr))hr=SHGetIDListFromObject(item.Get(),&raw);
+        folderId.reset(raw);if(FAILED(hr))return hr;
+        if(!parent||!folderId)return E_UNEXPECTED;
+        if(cancelled&&cancelled->load())return HRESULT_FROM_WIN32(ERROR_CANCELLED);
+        hr=HRESULT_FROM_WIN32(RegOpenKeyExW(HKEY_LOCAL_MACHINE,commandStorePath,0,KEY_READ,&key.value));
+        if(FAILED(hr))return hr;
+        // Identical public background definition to normal invocation, with
+        // no creator HWND on the worker. No selected Bin item is substituted.
+        DEFCONTEXTMENU definition{};definition.pidlFolder=folderId.get();definition.psf=parent.Get();
+        definition.cKeys=1;definition.aKeys=&key.value;
+        return SHCreateDefaultContextMenu(&definition,IID_PPV_ARGS(result));
+    }
     HRESULT create(IShellItemArray* selection,const std::atomic<bool>* cancelled,IContextMenu** result) {
         if(!result)return E_POINTER;*result=nullptr;
         DWORD count=0;auto hr=selection->GetCount(&count);if(FAILED(hr))return hr;
@@ -962,7 +1078,7 @@ struct RegisteredSelectionMenu {
 HRESULT readSelectionVerbState(IShellItemArray* selection,IUnknown* site,std::span<const std::wstring_view> verbs,
                                const std::atomic<bool>* cancelled,NamespaceCommandState* result,bool workerLocal=false,
                                std::wstring_view registeredCommand={},std::vector<NamespaceSelectionVerbState>* independent=nullptr,
-                               NamespaceCommandStateTimings* timings=nullptr) {
+                               NamespaceCommandStateTimings* timings=nullptr,bool registeredBackground=false) {
     if(!result)return E_POINTER;
     if(!selection||verbs.empty()||verbs.size()>(independent?maximumMenuEntries:16))return E_INVALIDARG;
     for(const auto verb:verbs)if(!validAssociationVerb(verb))return E_INVALIDARG;
@@ -970,10 +1086,11 @@ HRESULT readSelectionVerbState(IShellItemArray* selection,IUnknown* site,std::sp
     if(stopped())return HRESULT_FROM_WIN32(ERROR_CANCELLED);
     DWORD count=0;HRESULT hr=selection->GetCount(&count);
     if(FAILED(hr))return hr;if(!count)return E_INVALIDARG;
+    if(registeredBackground&&(registeredCommand.empty()||count!=1||independent))return E_INVALIDARG;
     if(stopped())return HRESULT_FROM_WIN32(ERROR_CANCELLED);
     bool identitySnapshot=false;
     ComPtr<IShellItemArray> local;
-    if(workerLocal) {
+    if(workerLocal&&!registeredBackground) {
         hr=selectionIdentitySnapshot(selection,count,cancelled,&local,timings);
         if(SUCCEEDED(hr)) {
             DWORD localCount=0;hr=local->GetCount(&localCount);if(FAILED(hr))return hr;
@@ -991,7 +1108,8 @@ HRESULT readSelectionVerbState(IShellItemArray* selection,IUnknown* site,std::sp
     {
         StatePhaseTimer phase{timings?&timings->contextBindMicroseconds:nullptr};
         hr=registeredCommand.empty()?(local?local.Get():selection)->BindToHandler(nullptr,BHID_SFUIObject,IID_PPV_ARGS(&context))
-                                    :registered.create(local?local.Get():selection,cancelled,&context);
+            :registeredBackground?registered.createBackground(selection,cancelled,&context)
+                                 :registered.create(local?local.Get():selection,cancelled,&context);
     }
     if(FAILED(hr))return hr;if(!context)return E_UNEXPECTED;
     ComPtr<IObjectWithSite> withSite;context.As(&withSite);
@@ -1001,8 +1119,9 @@ HRESULT readSelectionVerbState(IShellItemArray* selection,IUnknown* site,std::sp
     // STA, while the real view/site is supplied through a marshaled interface.
     {
         StatePhaseTimer phase{timings?&timings->menuQueryMicroseconds:nullptr};
-        const UINT flags=CMF_ITEMMENU|CMF_EXTENDEDVERBS;
-        hr=workerLocal?menu.createLeafState(context.Get(),site,flags):menu.create(nullptr,context.Get(),site,flags);
+        const UINT flags=CMF_EXTENDEDVERBS|(registeredCommand.empty()?CMF_ITEMMENU:0);
+        hr=workerLocal?menu.createLeafState(context.Get(),site,flags,!requestsResourceVerb(verbs))
+                      :menu.create(nullptr,context.Get(),site,flags);
     }
     if(FAILED(hr))return hr;
     if(stopped())return HRESULT_FROM_WIN32(ERROR_CANCELLED);
@@ -1016,7 +1135,7 @@ HRESULT readSelectionVerbState(IShellItemArray* selection,IUnknown* site,std::sp
     StatePhaseTimer reduction{timings?&timings->stateReductionMicroseconds:nullptr};
     const auto stateFor=[&](const NamespaceInvocationPlan& plan) {
         NamespaceCommandState state;
-        state.contextMenu=true;state.selectionCount=count;
+        state.contextMenu=true;state.selectionCount=registeredBackground?0:count;
         state.identitySnapshot=identitySnapshot;
         state.siteAttached=site!=nullptr&&withSite!=nullptr;
         state.state=plan.enabled?ECS_ENABLED:ECS_DISABLED;
@@ -1080,12 +1199,8 @@ HRESULT NamespaceCommandStateTask::startSelectionVerbs(std::span<const std::wstr
     if(!result)return E_POINTER;
     if(!selection||verbs.empty()||verbs.size()>16)return E_INVALIDARG;
     try {
-        std::vector<std::wstring> names;names.reserve(verbs.size());
-        for(const auto verb:verbs) {
-            if(!validAssociationVerb(verb))return E_INVALIDARG;
-            for(const auto& previous:names)if(equal(previous,verb))return E_INVALIDARG;
-            names.emplace_back(verb);
-        }
+        std::vector<std::wstring> names;
+        const auto copied=selectionVerbNames(verbs,16,names);if(FAILED(copied))return copied;
         return startImpl({},selection,site,false,std::move(names),result);
     } catch(const std::bad_alloc&){return E_OUTOFMEMORY;}
       catch(...){return E_FAIL;}
@@ -1096,29 +1211,26 @@ HRESULT NamespaceCommandStateTask::startSelectionVerbBatch(std::span<const std::
     if(!result)return E_POINTER;
     if(!selection||verbs.empty()||verbs.size()>maximumMenuEntries)return E_INVALIDARG;
     try {
-        std::vector<std::wstring> names;names.reserve(verbs.size());
-        for(const auto verb:verbs) {
-            if(!validAssociationVerb(verb))return E_INVALIDARG;
-            for(const auto& previous:names)if(equal(previous,verb))return E_INVALIDARG;
-            names.emplace_back(verb);
-        }
+        std::vector<std::wstring> names;
+        const auto copied=selectionVerbNames(verbs,maximumMenuEntries,names);if(FAILED(copied))return copied;
         return startImpl({},selection,site,false,std::move(names),result,true);
     }catch(const std::bad_alloc&){return E_OUTOFMEMORY;}
      catch(...){return E_FAIL;}
 }
 
 HRESULT NamespaceCommandStateTask::startRegisteredMenu(std::wstring_view command,IShellItemArray* selection,IUnknown* site,
-                                                       std::unique_ptr<NamespaceCommandStateTask>* result) {
+                                                       std::unique_ptr<NamespaceCommandStateTask>* result,NamespaceMenuScope scope) {
     if(!result)return E_POINTER;
-    if(!selection||!validCommand(command))return E_INVALIDARG;
-    try{return startImpl(command,selection,site,false,{std::wstring(command)},result);}
+    if(!selection||!validCommand(command)||(scope!=NamespaceMenuScope::Selection&&scope!=NamespaceMenuScope::Background))return E_INVALIDARG;
+    try{return startImpl(command,selection,site,scope==NamespaceMenuScope::Background,{std::wstring(command)},result);}
     catch(const std::bad_alloc&){return E_OUTOFMEMORY;}
     catch(...){return E_FAIL;}
 }
 
 HRESULT NamespaceCommandStateTask::startImpl(std::wstring_view command,IShellItemArray* selection,IUnknown* site,
                                             bool background,std::vector<std::wstring> selectionVerbs,
-                                            std::unique_ptr<NamespaceCommandStateTask>* result,bool independentVerbs) {
+                                            std::unique_ptr<NamespaceCommandStateTask>* result,bool independentVerbs,
+                                            std::shared_ptr<NamespaceStateRegistration> registration) {
     if (!result) return E_POINTER;
     const bool selectionVerb=!selectionVerbs.empty();
     if(selectionVerb?!selection:!validCommand(command))return E_INVALIDARG;
@@ -1127,20 +1239,22 @@ HRESULT NamespaceCommandStateTask::startImpl(std::wstring_view command,IShellIte
     HRESULT hr = CoGetApartmentType(&apartment,&qualifier);
     if (FAILED(hr)) return hr;
     if (apartment != APTTYPE_STA && apartment != APTTYPE_MAINSTA) return RPC_E_WRONG_THREAD;
+    if (registration && !registration->matches(selection,site)) return E_INVALIDARG;
     // Cancellation cannot interrupt a native QueryContextMenu already in
-    // flight. Retain one default-selection-menu work slot until that worker
-    // releases native references, uninitializes COM and finishes its lease.
-    // Registered-only menus and registered state providers remain separate.
-    const bool defaultMenu=selectionVerb&&command.empty();
-    if(defaultMenu) {
+    // flight. A default menu and a registered-only menu can both marshal the
+    // same native data object/site back into the view during elevation checks.
+    // Serialize their complete lifetimes, including COM teardown. Direct
+    // registered GetState providers remain independent of menu construction.
+    const bool selectionMenu=selectionVerb;
+    if(selectionMenu) {
         unsigned expected=0;
-        if(!defaultMenuWorkers.compare_exchange_strong(expected,1))return HRESULT_FROM_WIN32(ERROR_BUSY);
+        if(!selectionMenuWorkers.compare_exchange_strong(expected,1))return HRESULT_FROM_WIN32(ERROR_BUSY);
     }
     struct DefaultMenuReservation {
         std::atomic<unsigned>* value;
         bool transferred=false;
         ~DefaultMenuReservation(){if(value&&!transferred)--*value;}
-    } defaultReservation{defaultMenu?&defaultMenuWorkers:nullptr};
+    } defaultReservation{selectionMenu?&selectionMenuWorkers:nullptr};
     static std::atomic<unsigned> workers{0};
     unsigned count = workers.load();
     do { if (count >= 16) return HRESULT_FROM_WIN32(ERROR_BUSY); }
@@ -1156,15 +1270,13 @@ HRESULT NamespaceCommandStateTask::startImpl(std::wstring_view command,IShellIte
         if(FAILED(hr))return hr;
         auto impl = std::make_unique<Impl>();
         impl->independentVerbs=independentVerbs;
-        hr = CoCreateInstance(CLSID_StdGlobalInterfaceTable,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&impl->git));
-        if (SUCCEEDED(hr) && selection) hr = impl->git->RegisterInterfaceInGlobal(selection,__uuidof(IShellItemArray),&impl->selection);
-        if (SUCCEEDED(hr) && site) hr = impl->git->RegisterInterfaceInGlobal(site,IID_IUnknown,&impl->site);
+        if (!registration) hr = NamespaceStateRegistration::create(selection,site,&registration);
         if (FAILED(hr)) return hr;
+        impl->registration = registration;
         const auto shared = impl->shared;
-        const DWORD selectionCookie = impl->selection,siteCookie = impl->site;
         auto task = std::unique_ptr<NamespaceCommandStateTask>(new NamespaceCommandStateTask(std::move(impl)));
-        std::thread([shared,name=std::wstring(command),verbs=std::move(selectionVerbs),selectionCookie,siteCookie,background,selectionVerb,independentVerbs,
-                     lease=std::move(lease),workerCount=&workers,defaultMenuCount=defaultReservation.value] {
+        std::thread([shared,name=std::wstring(command),verbs=std::move(selectionVerbs),registration=std::move(registration),background,selectionVerb,independentVerbs,
+                     lease=std::move(lease),workerCount=&workers,defaultMenuCount=defaultReservation.value] () mutable {
             struct WorkerRelease {
                 std::atomic<unsigned>* value;
                 void finish() noexcept{if(value){--*value;value=nullptr;}}
@@ -1184,20 +1296,29 @@ HRESULT NamespaceCommandStateTask::startImpl(std::wstring_view command,IShellIte
                     ComPtr<IShellItemArray> items;
                     ComPtr<IUnknown> view;
                     final = CoCreateInstance(CLSID_StdGlobalInterfaceTable,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&git));
-                    if (SUCCEEDED(final) && selectionCookie) final = git->GetInterfaceFromGlobal(selectionCookie,IID_PPV_ARGS(&items));
-                    if (SUCCEEDED(final) && siteCookie) final = git->GetInterfaceFromGlobal(siteCookie,IID_PPV_ARGS(&view));
+                    if (SUCCEEDED(final) && registration->selection) final = git->GetInterfaceFromGlobal(registration->selection,IID_PPV_ARGS(&items));
+                    if (SUCCEEDED(final) && registration->site) final = git->GetInterfaceFromGlobal(registration->site,IID_PPV_ARGS(&view));
                     if (SUCCEEDED(final) && !shared->cancelled.load()) {
                         if(selectionVerb) {
                             std::vector<std::wstring_view> names;names.reserve(verbs.size());
                             for(const auto& verb:verbs)names.emplace_back(verb);
-                            final=readSelectionVerbState(items.Get(),view.Get(),names,&shared->cancelled,&state,true,name,independentVerbs?&states:nullptr,&timings);
+                            final=readSelectionVerbState(items.Get(),view.Get(),names,&shared->cancelled,&state,true,name,independentVerbs?&states:nullptr,&timings,background);
                         } else final=registeredCommandState(name,items.Get(),view.Get(),TRUE,background,&state);
                     }
                 }
             } catch (const std::bad_alloc&) { final = E_OUTOFMEMORY; }
               catch (...) { final = E_FAIL; }
-            // All provider/proxy/GIT references above are gone before teardown.
-            if (initialized) {if(selectionVerb)OleUninitialize();else CoUninitialize();}
+            // Revoke only after every lookup/provider/proxy has released its
+            // lease, and always inside an initialized apartment. Failed worker
+            // initialization retires its final lease on the pumping creator.
+            if (initialized) {
+                registration.reset();
+                if(selectionVerb)OleUninitialize();else CoUninitialize();
+            } else {
+                std::shared_ptr<void> keepalive = std::move(registration);
+                const auto deferred = lease->deferCreatorRelease(keepalive);
+                if (FAILED(deferred)) final = deferred;
+            }
             const auto released=lease->finish();
             if(SUCCEEDED(final)&&FAILED(released))final=released;
             if (shared->cancelled.load()) final = HRESULT_FROM_WIN32(ERROR_CANCELLED);
@@ -1254,7 +1375,7 @@ HRESULT NamespaceCommandStateTask::pollTimings(NamespaceCommandStateTimings* res
 
 void NamespaceCommandStateTask::cancel() noexcept {
     impl_->shared->cancelled.store(true);
-    impl_->revoke();
+    impl_->registration.reset();
 }
 
 bool NamespaceCommandStateTask::completed() const {
@@ -1474,6 +1595,9 @@ struct NativeNamespaceActions::Impl {
     DWORD thread = 0;
     NamespaceTarget target;
     ComPtr<IShellItemArray> targets;
+    ComPtr<IShellItemArray> backgroundTargets;
+    std::shared_ptr<NamespaceStateRegistration> selectionRegistration,backgroundRegistration;
+    unsigned long long targetGeneration = 1;
     NamespaceFacts facts;
     NativeContextMenu selection;
     NativeContextMenu commands;
@@ -1519,6 +1643,70 @@ struct NativeNamespaceActions::Impl {
     HRESULT onThread() const noexcept {
         if (!thread || !target.folder || !targets) return E_UNEXPECTED;
         return thread == GetCurrentThreadId() ? S_OK : RPC_E_WRONG_THREAD;
+    }
+
+    HRESULT stateTargets(NamespaceMenuScope scope,ComPtr<IShellItemArray>* result) {
+        if (scope != NamespaceMenuScope::Selection && scope != NamespaceMenuScope::Background) return E_INVALIDARG;
+        const auto generation = targetGeneration;
+        ComPtr<IShellItemArray> items;
+        if (scope == NamespaceMenuScope::Selection) items = targets;
+        else if (backgroundTargets) items = backgroundTargets;
+        else {
+            const auto folder = target.folder;
+            auto hr = SHCreateShellItemArrayFromShellItem(folder.Get(),IID_PPV_ARGS(&items));
+            if (FAILED(hr)) return hr;
+            auto cachedItems = items;
+            if (generation != targetGeneration || folder.Get() != target.folder.Get() || backgroundTargets)
+                return HRESULT_FROM_WIN32(ERROR_BUSY);
+            backgroundTargets.Swap(cachedItems);
+        }
+        if (generation != targetGeneration || items.Get() !=
+            (scope == NamespaceMenuScope::Selection ? targets.Get() : backgroundTargets.Get()))
+            return HRESULT_FROM_WIN32(ERROR_BUSY);
+        *result = std::move(items);
+        return S_OK;
+    }
+
+    HRESULT stateRegistration(NamespaceMenuScope scope,std::shared_ptr<NamespaceStateRegistration>* result) {
+        const auto generation = targetGeneration;
+        ComPtr<IShellItemArray> items;
+        auto hr = stateTargets(scope,&items);if (FAILED(hr)) return hr;
+        const auto site = target.site;
+        if (generation != targetGeneration || site.Get() != target.site.Get()) return HRESULT_FROM_WIN32(ERROR_BUSY);
+        auto& cached = scope == NamespaceMenuScope::Background ? backgroundRegistration : selectionRegistration;
+        if (cached && cached->matches(items.Get(),site.Get())) {
+            *result = cached;return S_OK;
+        }
+        std::shared_ptr<NamespaceStateRegistration> candidate;
+        hr = NamespaceStateRegistration::create(items.Get(),site.Get(),&candidate);
+        if (FAILED(hr)) return hr;
+        if (generation != targetGeneration || site.Get() != target.site.Get() || items.Get() !=
+            (scope == NamespaceMenuScope::Background ? backgroundTargets.Get() : targets.Get()))
+            return HRESULT_FROM_WIN32(ERROR_BUSY);
+        if (!cached) cached = candidate;
+        if (!cached->matches(items.Get(),site.Get())) return HRESULT_FROM_WIN32(ERROR_BUSY);
+        *result = cached;
+        return S_OK;
+    }
+
+    HRESULT startState(std::wstring_view name,NamespaceMenuScope scope,std::vector<std::wstring> verbs,
+                       bool independent,std::unique_ptr<NamespaceCommandStateTask>* result) {
+        if (!result) return E_POINTER;
+        const auto generation = targetGeneration;
+        std::shared_ptr<NamespaceStateRegistration> registration;
+        auto hr = stateRegistration(scope,&registration);if (FAILED(hr)) return hr;
+        std::unique_ptr<NamespaceCommandStateTask> task;
+        hr = NamespaceCommandStateTask::startImpl(name,registration->selectionSource,registration->siteSource,
+            scope == NamespaceMenuScope::Background,std::move(verbs),&task,independent,registration);
+        if (FAILED(hr)) return hr;
+        // Native registration/preparation may dispatch creator callbacks. A
+        // target replacement never publishes an old-generation task/cache.
+        if (generation != targetGeneration || registration->siteSource != target.site.Get() ||
+            registration->selectionSource != (scope == NamespaceMenuScope::Background ? backgroundTargets.Get() : targets.Get())) {
+            task->cancel();return HRESULT_FROM_WIN32(ERROR_BUSY);
+        }
+        *result = std::move(task);
+        return S_OK;
     }
 
     HRESULT visibleInteraction(bool headless) const noexcept {
@@ -1974,17 +2162,20 @@ struct NativeNamespaceActions::Impl {
         unsigned budget = maximumMenuEntries;
         const HMENU popup = findSubmenu(menu.menu(), plan.commandId, 0, budget);
         if (!popup) return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+        UINT popupFlags = 0;
+        const auto layoutStatus = popupUiFlags(owner, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON, &popupFlags);
+        if (FAILED(layoutStatus)) return layoutStatus;
         if (!point.x && !point.y) {
             RECT rect{};
             if (!GetWindowRect(owner, &rect)) return HRESULT_FROM_WIN32(GetLastError());
-            point = {rect.left + 24, rect.top + 100};
+            point = {(popupFlags & TPM_LAYOUTRTL) ? rect.right - 24 : rect.left + 24, rect.top + 100};
         }
         struct ActiveMenu {
             Impl& owner;
             explicit ActiveMenu(Impl& value, NativeContextMenu& native) : owner(value) { owner.active = &native; }
             ~ActiveMenu() { owner.active = nullptr; }
         } tracking(*this, menu);
-        const UINT id = TrackPopupMenuEx(popup, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
+        const UINT id = TrackPopupMenuEx(popup, popupFlags,
                                          point.x, point.y, owner, nullptr);
         if (!id) return HRESULT_FROM_WIN32(ERROR_CANCELLED);
         return menu.invoke(id, point);
@@ -2004,8 +2195,13 @@ struct NativeNamespaceActions::Impl {
         }
         // Public fallback still asks the user before applying the native
         // selection restore verb; it never moves $R files by guessed paths.
+        bool rightToLeft = false;
+        const auto layoutStatus = windowUiDirection(owner, &rightToLeft);
+        if (FAILED(layoutStatus)) return layoutStatus;
+        const UINT messageFlags = MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2 |
+            (rightToLeft ? MB_RTLREADING | MB_RIGHT : 0);
         const int answer = MessageBoxW(owner, L"Are you sure you want to restore all items from the Recycle Bin?",
-                                        L"Restore all items", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2);
+                                        L"Restore all items", messageFlags);
         if (answer != IDYES) return HRESULT_FROM_WIN32(ERROR_CANCELLED);
         ComPtr<IEnumShellItems> enumerator;
         HRESULT hr = target.folder->BindToHandler(nullptr, BHID_EnumItems, IID_PPV_ARGS(&enumerator));
@@ -2060,6 +2256,10 @@ void NativeNamespaceActions::reset(bool cancelPending) noexcept {
         impl_->offlineOperations.clear();
     }
     if (impl_->active) return;
+    ++impl_->targetGeneration;
+    impl_->selectionRegistration.reset();
+    impl_->backgroundRegistration.reset();
+    impl_->backgroundTargets.Reset();
     ++impl_->menuGeneration;
     impl_->active = nullptr;
     impl_->selection.reset();
@@ -2116,6 +2316,7 @@ HRESULT NativeNamespaceActions::initialize(HWND owner, const NamespaceTarget& ta
     impl_->thread = GetCurrentThreadId();
     impl_->target = retained;
     impl_->targets = targets;
+    if (!count) impl_->backgroundTargets = targets;
     impl_->facts = std::move(facts);
     impl_->describeOffline();
     return S_OK;
@@ -2324,9 +2525,9 @@ HRESULT NativeNamespaceActions::invokeViewSelection(std::wstring_view command,IS
         if (FAILED(hr)) return hr;
         if (!IsEqualGUID(actual,expected)) return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
         unsigned vacant = 0;
-        if (!defaultMenuWorkers.compare_exchange_strong(vacant,1)) return HRESULT_FROM_WIN32(ERROR_BUSY);
+        if (!selectionMenuWorkers.compare_exchange_strong(vacant,1)) return HRESULT_FROM_WIN32(ERROR_BUSY);
         struct Reservation {
-            ~Reservation() { --defaultMenuWorkers; }
+            ~Reservation() { --selectionMenuWorkers; }
         } reservation;
         struct Interaction {
             Impl& owner;
@@ -2376,8 +2577,12 @@ HRESULT NativeNamespaceActions::queryCommandState(std::wstring_view command, Nam
     if (scope == NamespaceMenuScope::Background) {
         try {
             ComPtr<IShellItemArray> folder;
-            const HRESULT created = SHCreateShellItemArrayFromShellItem(impl_->target.folder.Get(),IID_PPV_ARGS(&folder));
-            return FAILED(created) ? created : registeredCommandState(command,folder.Get(),impl_->target.site.Get(),FALSE,true,result);
+            const HRESULT created = impl_->stateTargets(scope,&folder);
+            if(FAILED(created))return created;
+            const auto state=registeredCommandState(command,folder.Get(),impl_->target.site.Get(),FALSE,true,result);
+            if(state==E_UNEXPECTED&&impl_->facts.recycleBin&&recyclePropertiesMenuComposite(command)==S_OK)
+                return E_PENDING; // Native menu work is required; no enabled state is invented.
+            return state;
         } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
           catch (...) { return E_FAIL; }
     }
@@ -2388,27 +2593,34 @@ HRESULT NativeNamespaceActions::queryCommandState(std::wstring_view command, Nam
 HRESULT NativeNamespaceActions::startCommandStateTask(std::wstring_view command,std::unique_ptr<NamespaceCommandStateTask>* result,
                                                        NamespaceMenuScope scope) {
     if (!result) return E_POINTER;
+    if (!validCommand(command)) return E_INVALIDARG;
     const HRESULT hr = impl_->onThread();
     if (FAILED(hr)) return hr;
-    ComPtr<IShellItemArray> folder;
-    if (scope == NamespaceMenuScope::Background) {
-        const HRESULT created = SHCreateShellItemArrayFromShellItem(impl_->target.folder.Get(),IID_PPV_ARGS(&folder));
-        if (FAILED(created)) return created;
-    }
-    return NamespaceCommandStateTask::start(command,scope == NamespaceMenuScope::Background ? folder.Get() : impl_->targets.Get(),
-        impl_->target.site.Get(),scope == NamespaceMenuScope::Background,result);
+    try {
+        if (scope == NamespaceMenuScope::Background) {
+            if(impl_->facts.recycleBin&&recyclePropertiesMenuComposite(command)==S_OK)
+                return impl_->startState(command,scope,{std::wstring(command)},false,result);
+        }
+        return impl_->startState(command,scope,{},false,result);
+    } catch(const std::bad_alloc&){return E_OUTOFMEMORY;}catch(...){return E_FAIL;}
 }
 
 HRESULT NativeNamespaceActions::startStaticVerbStateTask(std::wstring_view verb,std::unique_ptr<NamespaceCommandStateTask>* result) {
     if(!result)return E_POINTER;
     const auto hr=impl_->onThread();if(FAILED(hr))return hr;
-    return NamespaceCommandStateTask::startSelectionVerb(verb,impl_->targets.Get(),impl_->target.site.Get(),result);
+    if (!validAssociationVerb(verb)) return E_INVALIDARG;
+    try { return impl_->startState({},NamespaceMenuScope::Selection,{std::wstring(verb)},false,result); }
+    catch(const std::bad_alloc&){return E_OUTOFMEMORY;}catch(...){return E_FAIL;}
 }
 
 HRESULT NativeNamespaceActions::startStaticVerbStateBatch(std::span<const std::wstring_view> verbs,std::unique_ptr<NamespaceCommandStateTask>* result) {
     if(!result)return E_POINTER;
     const auto hr=impl_->onThread();if(FAILED(hr))return hr;
-    return NamespaceCommandStateTask::startSelectionVerbBatch(verbs,impl_->targets.Get(),impl_->target.site.Get(),result);
+    try {
+        std::vector<std::wstring> names;
+        const auto copied=selectionVerbNames(verbs,maximumMenuEntries,names);if(FAILED(copied))return copied;
+        return impl_->startState({},NamespaceMenuScope::Selection,std::move(names),true,result);
+    } catch(const std::bad_alloc&){return E_OUTOFMEMORY;}catch(...){return E_FAIL;}
 }
 
 HRESULT NativeNamespaceActions::startActionStateTask(NamespaceAction action,std::unique_ptr<NamespaceCommandStateTask>* result) {
@@ -2418,7 +2630,9 @@ HRESULT NativeNamespaceActions::startActionStateTask(NamespaceAction action,std:
     try {
         const auto verbs=nativeVerbs(action);
         if(verbs.empty())return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
-        return NamespaceCommandStateTask::startSelectionVerbs(verbs,impl_->targets.Get(),impl_->target.site.Get(),result);
+        std::vector<std::wstring> names;
+        const auto copied=selectionVerbNames(verbs,16,names);if(FAILED(copied))return copied;
+        return impl_->startState({},NamespaceMenuScope::Selection,std::move(names),false,result);
     }catch(const std::bad_alloc&){return E_OUTOFMEMORY;}
      catch(...){return E_FAIL;}
 }
@@ -2426,7 +2640,9 @@ HRESULT NativeNamespaceActions::startActionStateTask(NamespaceAction action,std:
 HRESULT NativeNamespaceActions::startRegisteredMenuStateTask(std::wstring_view command,std::unique_ptr<NamespaceCommandStateTask>* result) {
     if(!result)return E_POINTER;
     const auto hr=impl_->onThread();if(FAILED(hr))return hr;
-    return NamespaceCommandStateTask::startRegisteredMenu(command,impl_->targets.Get(),impl_->target.site.Get(),result);
+    if (!validCommand(command)) return E_INVALIDARG;
+    try { return impl_->startState(command,NamespaceMenuScope::Selection,{std::wstring(command)},false,result); }
+    catch(const std::bad_alloc&){return E_OUTOFMEMORY;}catch(...){return E_FAIL;}
 }
 
 HRESULT NativeNamespaceActions::queryCommandChildren(std::wstring_view command,std::unique_ptr<NativeNamespaceCommandChildren>* result,

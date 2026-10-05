@@ -4,15 +4,13 @@
 #include "explorer/selection.hpp"
 #include "explorer/saved_search.hpp"
 #include "explorer/search_presentation_store.hpp"
-#include "explorer/extra_operations.hpp"
 #include "explorer/input.hpp"
-#include "explorer/item_actions.hpp"
-#include "explorer/status.hpp"
 #include "explorer/ribbon_commands.hpp"
 #include "explorer/theme.hpp"
 #include "explorer/chrome.hpp"
 #include "explorer/worker_sta.hpp"
 #include "explorer/typed_address.hpp"
+#include "explorer/ui_strings.hpp"
 #include <initguid.h>
 #include <oleacc.h>
 #include <windowsx.h>
@@ -24,18 +22,221 @@
 #include <winnetwk.h>
 #include <algorithm>
 #include <array>
-#include <fstream>
 #include <functional>
-#include <sstream>
+#include <cstring>
+#include <limits>
+#include <new>
 
 namespace explorer {
 namespace {
 constexpr wchar_t WindowClass[] = L"WindowsExplorer.Native.Window";
 constexpr UINT DeferredUpdate = WM_APP + 1;
 constexpr UINT DeferredView = WM_APP + 2;
-constexpr UINT ShareResult = WM_APP + 3;
 constexpr UINT NamespaceResult = WM_APP + 4;
 constexpr UINT TypedAddressFirst = 44000;
+constexpr SFGAOF CommandSelectionAttributes = SFGAO_FILESYSTEM | SFGAO_HIDDEN | SFGAO_CANCOPY | SFGAO_CANMOVE |
+    SFGAO_CANDELETE | SFGAO_CANRENAME | SFGAO_HASPROPSHEET | SFGAO_FOLDER | SFGAO_LINK;
+bool samePidlBytes(PCIDLIST_ABSOLUTE left, PCIDLIST_ABSOLUTE right) {
+    if (!left || !right) return false;
+    if (left == right) return true;
+    const auto size = ILGetSize(left);
+    return size == ILGetSize(right) && std::memcmp(left, right, size) == 0;
+}
+HRESULT readCommandSelection(IShellItemArray* selected,IFolderView2* view,DWORD* count,SFGAOF* attributes) {
+    *count=0;*attributes=0;
+    if(!selected) {
+        int actual=-1;const auto hr=view?view->ItemCount(SVGIO_SELECTION,&actual):E_UNEXPECTED;
+        return SUCCEEDED(hr)&&actual==0?S_OK:FAILED(hr)?hr:HRESULT_FROM_WIN32(ERROR_RETRY);
+    }
+    auto hr=selected->GetCount(count);
+    if(SUCCEEDED(hr)&&*count)hr=selected->GetAttributes(static_cast<SIATTRIBFLAGS>(SIATTRIBFLAGS_AND|SIATTRIBFLAGS_ALLITEMS),
+        CommandSelectionAttributes,attributes);
+    if(FAILED(hr))*attributes=0;
+    return hr;
+}
+HRESULT commandSelectionIdentities(IShellItemArray* selected,DWORD count,std::vector<Pidl>* result) {
+    try {
+        std::vector<Pidl> ids;
+        if(!count){*result=std::move(ids);return S_OK;}
+        if(!selected)return E_INVALIDARG;
+        ComPtr<IDataObject> data;auto hr=selected->BindToHandler(nullptr,BHID_DataObject,IID_PPV_ARGS(&data));
+        if(FAILED(hr))return hr;if(!data)return E_UNEXPECTED;
+        const auto format=RegisterClipboardFormatW(CFSTR_SHELLIDLIST);
+        if(!format)return HRESULT_FROM_WIN32(GetLastError());
+        FORMATETC request{static_cast<CLIPFORMAT>(format),nullptr,DVASPECT_CONTENT,-1,TYMED_HGLOBAL};
+        struct Medium{STGMEDIUM value{};~Medium(){if(value.tymed)ReleaseStgMedium(&value);}}medium;
+        hr=data->GetData(&request,&medium.value);if(FAILED(hr))return hr;
+        if(medium.value.tymed!=TYMED_HGLOBAL||!medium.value.hGlobal)return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+        const auto bytes=GlobalSize(medium.value.hGlobal);
+        if(bytes<sizeof(UINT)||bytes>std::numeric_limits<UINT>::max())return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+        struct Lock{HGLOBAL memory;const BYTE* value;~Lock(){if(value)GlobalUnlock(memory);}}locked{
+            medium.value.hGlobal,static_cast<const BYTE*>(GlobalLock(medium.value.hGlobal))};
+        if(!locked.value)return HRESULT_FROM_WIN32(GetLastError());
+        UINT actual=0;std::memcpy(&actual,locked.value,sizeof(actual));
+        // Bound the offset count before addition/multiplication, including
+        // 32-bit hosts. A CIDA also has one parent offset after its children.
+        const size_t maximumOffsets=(bytes-sizeof(UINT))/sizeof(UINT);
+        if(actual!=count||actual>=maximumOffsets)return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+        const size_t header=sizeof(UINT)+(static_cast<size_t>(actual)+1)*sizeof(UINT);
+        const auto idAt=[&](size_t index,PCUIDLIST_RELATIVE* result)->HRESULT {
+            UINT offset=0;std::memcpy(&offset,locked.value+sizeof(UINT)+index*sizeof(UINT),sizeof(offset));
+            if(offset<header||offset>bytes-sizeof(USHORT))return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+            size_t cursor=offset;
+            for(;;) {
+                if(cursor>bytes-sizeof(USHORT))return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+                USHORT length=0;std::memcpy(&length,locked.value+cursor,sizeof(length));
+                if(!length){*result=reinterpret_cast<PCUIDLIST_RELATIVE>(locked.value+offset);return S_OK;}
+                if(length<sizeof(USHORT)||length>bytes-cursor)return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+                cursor+=length;
+            }
+        };
+        PCUIDLIST_RELATIVE parent=nullptr;hr=idAt(0,&parent);if(FAILED(hr))return hr;
+        ids.reserve(count);
+        for(DWORD index=0;index<count;++index) {
+            PCUIDLIST_RELATIVE child=nullptr;hr=idAt(static_cast<size_t>(index)+1,&child);if(FAILED(hr))return hr;
+            Pidl id(ILCombine(parent,child));if(!id)return E_OUTOFMEMORY;ids.push_back(std::move(id));
+        }
+        DWORD retained=0;hr=selected->GetCount(&retained);if(FAILED(hr))return hr;
+        if(retained!=count)return HRESULT_FROM_WIN32(ERROR_RETRY);
+        *result=std::move(ids);return S_OK;
+    }catch(const std::bad_alloc&){return E_OUTOFMEMORY;}catch(...){return E_FAIL;}
+}
+bool usableOwnedControl(HWND host,HWND control) {
+    if(!host||!control||!IsWindow(control)||!IsWindowEnabled(control)||
+       (control!=host&&!IsChild(host,control)))return false;
+    DWORD process=0;
+    if(GetWindowThreadProcessId(control,&process)!=GetCurrentThreadId()||process!=GetCurrentProcessId())return false;
+    for(auto parent=control;parent&&parent!=host;parent=GetParent(parent))
+        if(!(GetWindowLongPtrW(parent,GWL_STYLE)&WS_VISIBLE)||!IsWindowEnabled(parent))return false;
+    return true;
+}
+struct NativeFocusElement {
+    ComPtr<IAccessible> object;
+    LONG child=CHILDID_SELF;
+    VARIANT argument() const {VARIANT value{};value.vt=VT_I4;value.lVal=child;return value;}
+    LONG role() const {
+        VARIANT value{};const auto hr=object?object->get_accRole(argument(),&value):E_POINTER;
+        const auto result=SUCCEEDED(hr)&&value.vt==VT_I4?value.lVal:0;VariantClear(&value);return result;
+    }
+    bool state(LONG* result) const {
+        VARIANT value{};const auto hr=object?object->get_accState(argument(),&value):E_POINTER;
+        const bool read=SUCCEEDED(hr)&&value.vt==VT_I4;if(read)*result=value.lVal;VariantClear(&value);return read;
+    }
+    HWND window() const {HWND result=nullptr;if(object)WindowFromAccessibleObject(object.Get(),&result);return result;}
+    bool usable(HWND host) const {
+        LONG flags=0,left=0,top=0,width=0,height=0;const auto owner=window();RECT bounds{},visible{};
+        if(!usableOwnedControl(host,owner)||!state(&flags)||
+           (flags&(STATE_SYSTEM_INVISIBLE|STATE_SYSTEM_OFFSCREEN|STATE_SYSTEM_UNAVAILABLE))||
+           FAILED(object->accLocation(&left,&top,&width,&height,argument()))||width<=0||height<=0||
+           !GetWindowRect(owner,&bounds))return false;
+        const auto right=static_cast<LONGLONG>(left)+width,bottom=static_cast<LONGLONG>(top)+height;
+        if(right>std::numeric_limits<LONG>::max()||bottom>std::numeric_limits<LONG>::max())return false;
+        const RECT item{left,top,static_cast<LONG>(right),static_cast<LONG>(bottom)};
+        return IntersectRect(&visible,&bounds,&item)!=FALSE;
+    }
+    bool focused() const {
+        LONG flags=0;const auto owner=window(),focus=GetFocus();
+        return state(&flags)&&(flags&STATE_SYSTEM_FOCUSED)&&owner==focus&&owner;
+    }
+    HRESULT focus(HWND host) const {
+        if(!usable(host))return HRESULT_FROM_WIN32(ERROR_RETRY);
+        // Native status radios omit FOCUSABLE until focused. Visibility,
+        // geometry, ownership and the provider's actual focused readback
+        // determine success; this never invokes or selects their commands.
+        const auto hr=object->accSelect(SELFLAG_TAKEFOCUS,argument());
+        return hr==S_OK?(usable(host)&&focused()?S_OK:E_FAIL):hr;
+    }
+};
+NativeFocusElement accessibleChild(const NativeFocusElement& parent,LONG index) {
+    NativeFocusElement result;if(!parent.object||parent.child!=CHILDID_SELF)return result;
+    VARIANT value{};LONG obtained=0;
+    if(SUCCEEDED(AccessibleChildren(parent.object.Get(),index,1,&value,&obtained))&&obtained==1) {
+        if(value.vt==VT_DISPATCH&&value.pdispVal)value.pdispVal->QueryInterface(IID_PPV_ARGS(&result.object));
+        else if(value.vt==VT_I4){result.object=parent.object;result.child=value.lVal;}
+    }
+    VariantClear(&value);return result;
+}
+LONG accessibleCount(const NativeFocusElement& parent) {
+    LONG count=0;if(parent.object&&parent.child==CHILDID_SELF)parent.object->get_accChildCount(&count);return std::max(0L,count);
+}
+struct NativeFocusRegions {
+    std::vector<NativeFocusElement> sorting,status;
+    HWND tree=nullptr;
+};
+void collectStatusFocus(const NativeFocusElement& element,HWND host,bool inStatus,unsigned depth,
+                        std::vector<NativeFocusElement>* result) {
+    if(!element.object||depth>6||!element.usable(host))return;
+    const auto role=element.role();inStatus=inStatus||role==ROLE_SYSTEM_STATUSBAR;
+    if(inStatus&&role==ROLE_SYSTEM_RADIOBUTTON){result->push_back(element);return;}
+    // The native frame's small layout/status hierarchy is separate from its
+    // hosted folder and namespace controls. Do not enumerate file/tree rows.
+    if(role==ROLE_SYSTEM_WINDOW||role==ROLE_SYSTEM_CLIENT||role==ROLE_SYSTEM_LIST||
+       role==ROLE_SYSTEM_OUTLINE||role==ROLE_SYSTEM_LISTITEM||role==ROLE_SYSTEM_OUTLINEITEM)return;
+    const auto count=std::min(32L,accessibleCount(element));
+    for(LONG index=0;index<count;++index)collectStatusFocus(accessibleChild(element,index),host,inStatus,depth+1,result);
+}
+NativeFocusRegions nativeFocusRegions(HWND host,HWND view,bool details) {
+    NativeFocusRegions result;
+    struct Discovery{HWND host,view;bool details;NativeFocusRegions* result;}discovery{host,view,details,&result};
+    EnumChildWindows(host,[](HWND child,LPARAM context)->BOOL {
+        auto& search=*reinterpret_cast<Discovery*>(context);if(!usableOwnedControl(search.host,child))return TRUE;
+        wchar_t type[64]{};GetClassNameW(child,type,64);
+        const bool inView=search.view&&(child==search.view||IsChild(search.view,child));
+        if(_wcsicmp(type,WC_TREEVIEWW)==0&&!inView) {
+            for(auto parent=GetParent(child);parent&&parent!=search.host;parent=GetParent(parent)) {
+                GetClassNameW(parent,type,64);
+                if(_wcsicmp(type,L"NamespaceTreeControl")==0){search.result->tree=child;break;}
+            }
+            return TRUE;
+        }
+        if(_wcsicmp(type,L"DirectUIHWND")!=0&&_wcsicmp(type,WC_HEADERW)!=0)return TRUE;
+        bool nativeFrame=false;
+        for(auto parent=child;parent&&parent!=search.host;parent=GetParent(parent)) {
+            GetClassNameW(parent,type,64);if(_wcsicmp(type,L"ExplorerBrowserControl")==0){nativeFrame=true;break;}
+        }
+        if(!nativeFrame)return TRUE;
+        NativeFocusElement root;
+        if(FAILED(AccessibleObjectFromWindow(child,static_cast<DWORD>(OBJID_CLIENT),IID_PPV_ARGS(&root.object))))return TRUE;
+        if(inView&&search.details&&search.result->sorting.empty()) {
+            // The native Details header is an immediate Items View container.
+            // Inspect its controls only, never the complete selection/content.
+            const auto count=std::min(32L,accessibleCount(root));
+            for(LONG index=0;index<count&&search.result->sorting.empty();++index) {
+                auto container=accessibleChild(root,index);const auto role=container.role();
+                if(role==ROLE_SYSTEM_COLUMNHEADER&&container.usable(search.host))search.result->sorting.push_back(std::move(container));
+                else if(role==ROLE_SYSTEM_LIST) {
+                    const auto columns=std::min(128L,accessibleCount(container));
+                    for(LONG column=0;column<columns;++column) {
+                        auto button=accessibleChild(container,column);const auto buttonRole=button.role();
+                        if((buttonRole==ROLE_SYSTEM_SPLITBUTTON||buttonRole==ROLE_SYSTEM_COLUMNHEADER)&&button.usable(search.host))
+                            search.result->sorting.push_back(std::move(button));
+                    }
+                }
+            }
+        } else if(!inView&&search.result->status.empty())collectStatusFocus(root,search.host,false,0,&search.result->status);
+        return TRUE;
+    },reinterpret_cast<LPARAM>(&discovery));
+    return result;
+}
+struct ToolbarFocusItem {HWND control=nullptr;int button=-1;};
+void appendToolbarFocus(HWND host,HWND control,std::vector<ToolbarFocusItem>* result) {
+    if(!usableOwnedControl(host,control))return;
+    RECT client{};if(!GetClientRect(control,&client))return;
+    const auto count=SendMessageW(control,TB_BUTTONCOUNT,0,0);
+    for(int index=0;index<count;++index) {
+        TBBUTTON button{};RECT bounds{},visible{};
+        if(SendMessageW(control,TB_GETBUTTON,index,reinterpret_cast<LPARAM>(&button))&&
+           (button.fsState&TBSTATE_ENABLED)&&!(button.fsState&TBSTATE_HIDDEN)&&!(button.fsStyle&BTNS_SEP)&&
+           SendMessageW(control,TB_GETITEMRECT,index,reinterpret_cast<LPARAM>(&bounds))&&IntersectRect(&visible,&client,&bounds))
+            result->push_back({control,index});
+    }
+}
+HRESULT focusToolbarItem(HWND host,const ToolbarFocusItem& item) {
+    if(!usableOwnedControl(host,item.control))return HRESULT_FROM_WIN32(ERROR_RETRY);
+    SetFocus(item.control);
+    if(item.button>=0)SendMessageW(item.control,TB_SETHOTITEM,item.button,0);
+    return GetFocus()==item.control&&(item.button<0||SendMessageW(item.control,TB_GETHOTITEM,0,0)==item.button)?S_OK:E_FAIL;
+}
 std::filesystem::path quickAccessSettingsPath() {
     const auto settings = preferencesPath();
     return settings.empty() ? std::filesystem::path{} : settings.parent_path() / L"qat.ini";
@@ -108,18 +309,6 @@ std::wstring quoteArgument(const std::wstring& value) {
     result += L'"';
     return result;
 }
-HRESULT unusedPath(const std::filesystem::path& parent, const std::wstring& stem, const std::wstring& extension, std::filesystem::path& out) {
-    std::error_code error;
-    for (unsigned i = 1; i <= 10000; ++i) {
-        auto name = stem + (i == 1 ? L"" : L" (" + std::to_wstring(i) + L")") + extension;
-        if (!validLeafName(name)) return E_INVALIDARG;
-        auto candidate = parent / name;
-        const bool exists = std::filesystem::exists(candidate, error);
-        if (error) return HRESULT_FROM_WIN32(error.value());
-        if (!exists) { out = std::move(candidate); return S_OK; }
-    }
-    return HRESULT_FROM_WIN32(ERROR_TOO_MANY_NAMES);
-}
 HRESULT shellExecute(HWND owner, const wchar_t* target, const wchar_t* arguments = nullptr, const wchar_t* directory = nullptr) {
     SHELLEXECUTEINFOW info{sizeof(info)};
     info.fMask = SEE_MASK_FLAG_NO_UI;
@@ -150,7 +339,6 @@ ExplorerApp::ExplorerApp(HINSTANCE instance, bool headless, RibbonLayout ribbonL
 }
 
 ExplorerApp::~ExplorerApp() {
-    nativeShare_.reset();
     if(searchAutocomplete_)searchAutocomplete_->Enable(FALSE);
     searchAutocomplete_.Reset();searchSuggestions_.Reset();
     namespaceActions_.reset(true);
@@ -277,16 +465,74 @@ HRESULT ExplorerApp::openNewWindow(const std::wstring& location) {
     if(!count)return HRESULT_FROM_WIN32(GetLastError());
     if(count>=executable.size())return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
     executable.resize(count);
+    if(searchActive_&&location==currentLocation_) {
+        SearchWindowContext context;
+        const auto captured=currentSearchWindowContext(&context);
+        return FAILED(captured)?captured:launchSearchWindow(executable,context);
+    }
     return shellExecute(window_,executable.c_str(),(L"--path "+quoteArgument(location)).c_str());
 }
 
+HRESULT ExplorerApp::currentSearchWindowContext(SearchWindowContext* result) {
+    if(!result)return E_POINTER;
+    if(closing_||navigating_||!searchActive_||!searchScope_||!view_||!folderView_)return E_UNEXPECTED;
+    try {
+        const auto nativeView=view_;const auto nativeFolderView=folderView_;
+        const auto revision=searchInteractionRevision_;const auto navigation=navigationCount_;
+        const auto query=activeQuery_;
+        Pidl location(currentPidl_?ILCloneFull(currentPidl_.get()):nullptr);
+        if(!location)return E_OUTOFMEMORY;
+        auto hr=captureActiveSearchPresentation();if(FAILED(hr))return hr;
+        SearchWindowContext candidate;candidate.query=query;candidate.recursive=searchRecursive_;
+        hr=SHCreateItemFromIDList(searchScope_.get(),IID_PPV_ARGS(&candidate.primaryScope));
+        if(FAILED(hr))return hr;
+        candidate.scopes=searchScopes_;
+        if(!candidate.scopes)hr=SHCreateShellItemArrayFromShellItem(candidate.primaryScope.Get(),IID_PPV_ARGS(&candidate.scopes));
+        if(FAILED(hr))return hr;
+        if(searchWindowOrigin_)candidate.closeOrigin=searchWindowOrigin_;
+        else if(liveSearchOrigin_)hr=SHCreateItemFromIDList(liveSearchOrigin_.get(),IID_PPV_ARGS(&candidate.closeOrigin));
+        else candidate.closeOrigin=candidate.primaryScope;
+        if(FAILED(hr))return hr;
+        candidate.rules=searchScopeRules_;candidate.presentation=searchPresentation_;candidate.fileProperties=searchFileProperties_;
+        if(closing_||navigating_||!searchActive_||view_.Get()!=nativeView.Get()||folderView_.Get()!=nativeFolderView.Get()||
+           searchInteractionRevision_!=revision||navigationCount_!=navigation||activeQuery_!=query||
+           !samePidlBytes(location.get(),currentPidl_.get()))return HRESULT_FROM_WIN32(ERROR_RETRY);
+        *result=std::move(candidate);return S_OK;
+    } catch(const std::bad_alloc&) {return E_OUTOFMEMORY;}
+}
+
+HRESULT ExplorerApp::prepareSearchWindowContext(const SearchWindowContext& context) {
+    if(window_||browser_||closing_||preparedSearchWindowTarget_||!searchLocations_.empty())return E_UNEXPECTED;
+    try {
+        // Validate the same complete packet accepted by child startup. This
+        // also keeps direct private-host verification on the production path.
+        std::vector<BYTE> packet;auto hr=encodeSearchWindowContext(context,&packet);if(FAILED(hr))return hr;
+        SearchWindowContext checked;if(FAILED(hr=decodeSearchWindowContext(packet,&checked)))return hr;
+        ComPtr<IShellItem> results;
+        hr=checked.rules.empty()?createSearchFolderForScopes(checked.query,checked.scopes.Get(),&results,checked.recursive):
+            createSearchFolderForScopeRules(checked.query,checked.rules,&results);
+        if(FAILED(hr))return hr;
+        PIDLIST_ABSOLUTE raw=nullptr;hr=SHGetIDListFromObject(results.Get(),&raw);Pidl target(raw);
+        if(FAILED(hr))return hr;if(!target)return E_UNEXPECTED;
+        Pidl prepared(ILCloneFull(target.get()));if(!prepared)return E_OUTOFMEMORY;
+        raw=nullptr;hr=SHGetIDListFromObject(checked.primaryScope.Get(),&raw);Pidl scope(raw);
+        if(FAILED(hr))return hr;if(!scope)return E_UNEXPECTED;
+        SearchLocation entry{};entry.location=std::move(target);entry.scope=std::move(scope);
+        entry.query=checked.query;entry.recursive=checked.recursive;entry.base=checked.query;
+        entry.scopes=std::move(checked.scopes);entry.scopeRules=std::move(checked.rules);
+        entry.presentation=std::move(checked.presentation);entry.fileProperties=std::move(checked.fileProperties);
+        entry.importedPresentation=true;entry.windowOrigin=checked.closeOrigin?checked.closeOrigin:checked.primaryScope;
+        searchLocations_.push_back(std::move(entry));preparedSearchWindowTarget_=std::move(prepared);return S_OK;
+    } catch(const std::bad_alloc&) {return E_OUTOFMEMORY;}
+}
+
 HRESULT ExplorerApp::OnDefaultCommand(IShellView* source) {
-    if(!newWindowMode_||!source)return S_FALSE;
-    if(headless_)return E_ACCESSDENIED;
+    if(!source)return S_FALSE;
+    if(newWindowMode_&&headless_)return E_ACCESSDENIED;
     if(navigating_||closing_||!view_)return S_FALSE;
     // Preserve the view's modifier-specific default command (for example Alt
     // properties); this policy applies to an ordinary folder activation.
-    if((GetKeyState(VK_CONTROL)|GetKeyState(VK_SHIFT)|GetKeyState(VK_MENU))&0x8000)return S_FALSE;
+    if(!headless_&&((GetKeyState(VK_CONTROL)|GetKeyState(VK_SHIFT)|GetKeyState(VK_MENU))&0x8000))return S_FALSE;
     ComPtr<IUnknown> activeIdentity,sourceIdentity;
     if(FAILED(view_.As(&activeIdentity))||FAILED(source->QueryInterface(IID_PPV_ARGS(&sourceIdentity)))||
        activeIdentity.Get()!=sourceIdentity.Get())return S_FALSE;
@@ -296,18 +542,41 @@ HRESULT ExplorerApp::OnDefaultCommand(IShellView* source) {
     ComPtr<IShellItem> item;SFGAOF attributes=0;
     if(FAILED(selected->GetItemAt(0,&item))||FAILED(item->GetAttributes(SFGAO_FOLDER,&attributes))||
        !(attributes&SFGAO_FOLDER))return S_FALSE;
+    if(!newWindowMode_)return openLongSavedSearch(item.Get());
     const auto location=itemName(item.Get(),SIGDN_DESKTOPABSOLUTEPARSING);
     const auto hr=openNewWindow(location);
     return SUCCEEDED(hr)?S_OK:hr;
 }
 
+HRESULT ExplorerApp::prepareHeadlessVisual(const VisualScene& scene) {
+    const auto desktop=PrivateDesktop::current();
+    if(!headless_||!desktop||!desktop->ready()||FAILED(desktop->verifyIsolation()))return E_ACCESSDENIED;
+    if(window_||browser_||view_||folderView_)return E_UNEXPECTED;
+    // Pane visibility is read during creation of the original native view.
+    // Avoid replacing a view that may already own asynchronous native work.
+    preferences_.detailsPane=scene.details;
+    preferences_.previewPane=false;
+    return S_OK;
+}
+
 HRESULT ExplorerApp::create(const std::wstring& location) {
+    auto directionStatus = loadThreadUiDirection(&uiDirection_);
+    if (FAILED(directionStatus)) return directionStatus;
+    bool rightToLeft = uiDirection_.rightToLeft;
+    if (headlessDirectionOverride_) {
+        const auto desktop = PrivateDesktop::current();
+        if (!headless_ || window_ || !desktop || !desktop->ready() || FAILED(desktop->verifyIsolation())) return E_ACCESSDENIED;
+        rightToLeft = *headlessDirectionOverride_;
+    }
     WNDCLASSEXW wc{sizeof(wc)};
     wc.hInstance = instance_; wc.lpszClassName = WindowClass; wc.lpfnWndProc = windowProc;
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW); wc.hbrBackground = GetSysColorBrush(COLOR_WINDOW);
     wc.hIcon = LoadIconW(nullptr, IDI_APPLICATION); wc.hIconSm = wc.hIcon;
     if (!RegisterClassExW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return HRESULT_FROM_WIN32(GetLastError());
-    window_ = CreateWindowExW(WS_EX_CONTROLPARENT, WindowClass, L"Windows Explorer", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+    // Mirroring already implies RTL reading. RTLREADING reverses that
+    // direction again when combined with LAYOUTRTL.
+    const DWORD extended = WS_EX_CONTROLPARENT | (rightToLeft ? WS_EX_LAYOUTRTL : 0);
+    window_ = CreateWindowExW(extended, WindowClass, L"Windows Explorer", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
                              CW_USEDEFAULT, CW_USEDEFAULT, preferences_.windowWidth, preferences_.windowHeight,
                              nullptr, nullptr, instance_, this);
     if (!window_) return HRESULT_FROM_WIN32(GetLastError());
@@ -321,12 +590,15 @@ HRESULT ExplorerApp::create(const std::wstring& location) {
     NONCLIENTMETRICSW metrics{sizeof(metrics)};
     SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0, dpi_);
     font_ = CreateFontIndirectW(&metrics.lfMessageFont);
+    initializeSearchRefinementChoices();
     auto hr = createControls();
     if (FAILED(hr)) { DestroyWindow(window_); return hr; }
     hr = createBrowser();
     if (FAILED(hr)) { DestroyWindow(window_); return hr; }
     layout();
-    hr = navigate(location.empty() ? (preferences_.useWindowsStartup ? windowsDefaultStartupLocation() : preferences_.startupLocation) : location);
+    hr = preparedSearchWindowTarget_?browser_->BrowseToIDList(preparedSearchWindowTarget_.get(),SBSP_ABSOLUTE):
+        navigate(location.empty() ? (preferences_.useWindowsStartup ? windowsDefaultStartupLocation() : preferences_.startupLocation) : location);
+    preparedSearchWindowTarget_.reset();
     if (FAILED(hr)) DestroyWindow(window_);
     return hr;
 }
@@ -353,7 +625,6 @@ HRESULT ExplorerApp::createBrowser() {
     hr = browser_.As(&filterSite);
     if (SUCCEEDED(hr)) hr = filterSite->SetFilter(static_cast<IFolderFilter*>(this));
     if (FAILED(hr)) { destroyBrowser(); return hr; }
-    browser_->SetEmptyText(L"This folder is empty.");
     return S_OK;
 }
 void ExplorerApp::destroyBrowser() {
@@ -381,18 +652,78 @@ void ExplorerApp::destroyBrowser() {
         browser_.Reset();
     }
 }
-HRESULT ExplorerApp::recreateBrowser() {
+HRESULT ExplorerApp::recreateBrowser(UINT toggleCommand) {
+    if(toggleCommand!=NavigationPane&&toggleCommand!=PreviewPane&&toggleCommand!=DetailsPane&&toggleCommand!=HiddenItems)
+        return E_INVALIDARG;
+    if(closing_||navigating_)return HRESULT_FROM_WIN32(ERROR_BUSY);
+    CommandRefreshScope refresh(*this);
     Pidl location(currentPidl_ ? ILCloneFull(currentPidl_.get()) : nullptr);
+    if(currentPidl_&&!location)return E_OUTOFMEMORY;
+    const auto originalView=view_;
+    const auto originalFolderView=folderView_;
+    const auto originalNavigation=navigationCount_;
+    const auto originalRevision=searchInteractionRevision_;
+    if(searchActive_) {
+        const auto captured=captureActiveSearchPresentation();
+        if(FAILED(captured))return captured;
+    }
+    if(closing_||navigating_||view_.Get()!=originalView.Get()||folderView_.Get()!=originalFolderView.Get()||
+       navigationCount_!=originalNavigation||searchInteractionRevision_!=originalRevision||
+       (location?!samePidlBytes(location.get(),currentPidl_.get()):currentPidl_!=nullptr))return HRESULT_FROM_WIN32(ERROR_RETRY);
+    const auto previousNavigation=preferences_.navigationPane;
+    const auto previousPreview=preferences_.previewPane;
+    const auto previousDetails=preferences_.detailsPane;
+    const auto previousHidden=preferences_.showHidden;
+    const auto restorePreferences=[&] {
+        preferences_.navigationPane=previousNavigation;preferences_.previewPane=previousPreview;
+        preferences_.detailsPane=previousDetails;preferences_.showHidden=previousHidden;
+    };
+    SHELLSTATE previousSettings{};
+    const auto restoreHiddenPolicy=[&] {
+        if(toggleCommand!=HiddenItems||headless_)return;
+        SHELLSTATE current{};SHGetSetSettings(&current,SSF_SHOWALLOBJECTS,FALSE);
+        if(static_cast<bool>(current.fShowAllObjects)==!previousHidden) {
+            SHGetSetSettings(&previousSettings,SSF_SHOWALLOBJECTS,TRUE);
+            SHChangeNotify(SHCNE_ASSOCCHANGED,SHCNF_IDLIST,nullptr,nullptr);
+        }
+    };
+    switch(toggleCommand) {
+    case NavigationPane: preferences_.navigationPane=!previousNavigation;break;
+    case PreviewPane: preferences_.previewPane=!previousPreview;preferences_.detailsPane=false;break;
+    case DetailsPane: preferences_.detailsPane=!previousDetails;preferences_.previewPane=false;break;
+    case HiddenItems:
+        preferences_.showHidden=!previousHidden;
+        if(!headless_) {
+            SHGetSetSettings(&previousSettings,SSF_SHOWALLOBJECTS,FALSE);
+            auto settings=previousSettings;settings.fShowAllObjects=preferences_.showHidden;
+            SHGetSetSettings(&settings,SSF_SHOWALLOBJECTS,TRUE);
+            SHChangeNotify(SHCNE_ASSOCCHANGED,SHCNF_IDLIST,nullptr,nullptr);
+        }
+        break;
+    }
+    if(closing_||navigating_||view_.Get()!=originalView.Get()||folderView_.Get()!=originalFolderView.Get()||
+       navigationCount_!=originalNavigation||searchInteractionRevision_!=originalRevision||
+       (location?!samePidlBytes(location.get(),currentPidl_.get()):currentPidl_!=nullptr)) {
+        restorePreferences();
+        restoreHiddenPolicy();
+        return HRESULT_FROM_WIN32(ERROR_RETRY);
+    }
     destroyBrowser();
     const auto hr = createBrowser();
     layout();
-    if (FAILED(hr)) return hr;
-    return location ? browser_->BrowseToIDList(location.get(), SBSP_ABSOLUTE) :
+    if (FAILED(hr)) {
+        restorePreferences();
+        restoreHiddenPolicy();
+        return hr;
+    }
+    const auto browsed=location ? browser_->BrowseToIDList(location.get(), SBSP_ABSOLUTE) :
         navigate(preferences_.useWindowsStartup ? windowsDefaultStartupLocation() : preferences_.startupLocation);
+    if(FAILED(browsed)){restorePreferences();restoreHiddenPolicy();}
+    rebuildRibbon();
+    return browsed;
 }
 HRESULT ExplorerApp::navigate(const std::wstring& location, bool typedAddress) {
     if (!browser_) return E_UNEXPECTED;
-    pendingTypedAddress_.clear();pendingTypedAddressTarget_.reset();
     auto target = trim(expandEnvironment(location));
     if (target.size() > 1 && target.front() == L'"' && target.back() == L'"') target = target.substr(1, target.size() - 2);
     if (target.empty()) return E_INVALIDARG;
@@ -418,7 +749,10 @@ HRESULT ExplorerApp::navigate(const std::wstring& location, bool typedAddress) {
         const auto attributeRead=item->GetAttributes(SFGAO_FOLDER, &attributes);
         if(FAILED(attributeRead))return attributeRead;
         if (!(attributes & SFGAO_FOLDER)) return headless_ ? (typedAddress?E_ACCESSDENIED:HRESULT_FROM_WIN32(ERROR_DIRECTORY)) : shellExecute(window_, target.c_str());
+        const auto savedOpen=openLongSavedSearch(item.Get(),typedAddress?location:std::wstring{});
+        if(savedOpen!=S_FALSE)return savedOpen;
     }
+    pendingTypedAddress_.clear();pendingTypedAddressTarget_.reset();
     pendingHistory_ = -1;
     if(typedAddress&&typedAddressHistoryAllowed_) {
         pendingTypedAddress_=location;
@@ -432,6 +766,119 @@ HRESULT ExplorerApp::navigate(const std::wstring& location, bool typedAddress) {
     if(FAILED(browseResult)){pendingTypedAddress_.clear();pendingTypedAddressTarget_.reset();}
     else if(!navigating_&&currentPidl_&&ILIsEqual(currentPidl_.get(),pidl.get()))rememberAddressNavigation(currentPidl_.get());
     return browseResult;
+}
+HRESULT ExplorerApp::openLongSavedSearch(IShellItem* item, const std::wstring& typedAddress) {
+    if(!item||!browser_||!itemHasFastType(item,L".search-ms"))return S_FALSE;
+    const auto filesystem=itemName(item,SIGDN_FILESYSPATH);
+    if(filesystem.empty())return S_FALSE;
+    // The Shell may report a short alias even though the saved file's real
+    // name exceeds MAX_PATH. Resolve that existing name through Win32 without
+    // substituting another file or changing any long-path machine setting.
+    auto input=filesystem;
+    if(!input.starts_with(L"\\\\?\\"))input=input.starts_with(L"\\\\")?L"\\\\?\\UNC\\"+input.substr(2):L"\\\\?\\"+input;
+    const auto needed=GetLongPathNameW(input.c_str(),nullptr,0);
+    if(!needed||needed>32768)return S_FALSE;
+    std::wstring path(needed,L'\0');
+    const auto copied=GetLongPathNameW(input.c_str(),path.data(),needed);
+    if(!copied||copied>=needed)return S_FALSE;
+    path.resize(copied);
+    auto shellPath=path;
+    if(shellPath.starts_with(L"\\\\?\\UNC\\"))shellPath=L"\\\\"+shellPath.substr(8);
+    else if(shellPath.starts_with(L"\\\\?\\"))shellPath.erase(0,4);
+    if(shellPath.size()<MAX_PATH||_wcsicmp(std::filesystem::path(shellPath).extension().c_str(),L".search-ms")!=0)return S_FALSE;
+    const auto revision=searchInteractionRevision_;
+    ComPtr<IShellFolder> nativeFolder;
+    const auto native=item->BindToHandler(nullptr,BHID_SFObject,IID_PPV_ARGS(&nativeFolder));
+    if(native!=HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER))return S_FALSE;
+    SavedSearchMetadata metadata;
+    auto hr=readSavedSearch(std::filesystem::path(path),&metadata);
+    // Unsupported external shapes retain their original native failure;
+    // there is no partially imported context or changed query meaning.
+    if(FAILED(hr))return native;
+    auto presentation=metadata.presentation;
+    if(!headless_) {
+        auto actual=presentation.value_or(SearchViewPresentation{});
+        hr=loadSearchPresentationCompanion(std::filesystem::path(path),searchPresentationDirectory(),&actual);
+        if(FAILED(hr))return hr;
+        if(hr==S_OK)presentation=std::move(actual);
+    }
+    ComPtr<IShellItem> results;
+    if(FAILED(hr=createSearchFolderForScopeRules(metadata.query,metadata.scopeRules,&results)))return hr;
+    ComPtr<IShellFolder> restoredFolder;
+    if(FAILED(hr=results->BindToHandler(nullptr,BHID_SFObject,IID_PPV_ARGS(&restoredFolder))))return hr;
+    PIDLIST_ABSOLUTE raw=nullptr;
+    if(FAILED(hr=SHGetIDListFromObject(results.Get(),&raw)))return hr;
+    Pidl location(raw);
+    raw=nullptr;
+    if(FAILED(hr=SHGetIDListFromObject(metadata.scope.Get(),&raw)))return hr;
+    Pidl scope(raw);
+    Pidl addressTarget(typedAddress.empty()?nullptr:ILCloneFull(location.get()));
+    if(!location||!scope||(!typedAddress.empty()&&!addressTarget))return E_OUTOFMEMORY;
+    if(closing_||searchInteractionRevision_!=revision)return E_ABORT;
+    if(navigating_||pendingDirectSearchTarget_||pendingLiveSearchTarget_)return HRESULT_FROM_WIN32(ERROR_BUSY);
+    SearchLocation imported{std::move(location),std::move(scope),metadata.query,metadata.recursive,
+        metadata.query,{},metadata.scopes,std::move(metadata.scopeRules),std::move(presentation),std::move(metadata.fileProperties),false,false,true};
+    Pidl nativeTarget(ILCloneFull(imported.location.get()));
+    const bool alreadyCurrent=currentPidl_&&ILIsEqual(currentPidl_.get(),imported.location.get());
+    Pidl reusedScope(alreadyCurrent?ILCloneFull(imported.scope.get()):nullptr);
+    if(!nativeTarget||(alreadyCurrent&&!reusedScope))return E_OUTOFMEMORY;
+    // All import/factory validation has completed. The ordinary browser
+    // callbacks now commit only the genuinely completed native results view.
+    cancelLiveSearch();
+    const auto installedRevision=searchInteractionRevision_;
+    pendingHistory_=-1;
+    pendingTypedAddress_.clear();pendingTypedAddressTarget_.reset();
+    if(!typedAddress.empty()&&typedAddressHistoryAllowed_) {
+        pendingTypedAddress_=typedAddress;pendingTypedAddressTarget_=std::move(addressTarget);
+    }
+    std::optional<SearchLocation> previous;
+    const auto existing=std::find_if(searchLocations_.rbegin(),searchLocations_.rend(),
+        [&](const SearchLocation& entry){return ILIsEqual(entry.location.get(),nativeTarget.get());});
+    PCIDLIST_ABSOLUTE registered=nullptr;
+    if(existing!=searchLocations_.rend()) {
+        // A factory PIDL identifies its query/scopes, not the saved source
+        // file's metadata. Replace this context tentatively rather than
+        // spending another cache entry for each repeated file open.
+        previous.emplace(std::move(*existing));*existing=std::move(imported);registered=existing->location.get();
+    } else {searchLocations_.push_back(std::move(imported));registered=searchLocations_.back().location.get();}
+    hr=alreadyCurrent?S_OK:browser_->BrowseToObject(results.Get(),SBSP_ABSOLUTE);
+    if(FAILED(hr)) {
+        const auto failed=std::find_if(searchLocations_.begin(),searchLocations_.end(),
+            [&](const SearchLocation& entry){return entry.location.get()==registered;});
+        if(failed!=searchLocations_.end()) {
+            if(previous)*failed=std::move(*previous);
+            else searchLocations_.erase(failed);
+        }
+        pendingTypedAddress_.clear();pendingTypedAddressTarget_.reset();
+        return hr;
+    }
+    const auto retained=std::find_if(searchLocations_.begin(),searchLocations_.end(),
+        [&](const SearchLocation& entry){return entry.location.get()==registered;});
+    if(alreadyCurrent&&!navigating_&&searchInteractionRevision_==installedRevision&&retained!=searchLocations_.end()&&
+       currentPidl_&&ILIsEqual(currentPidl_.get(),nativeTarget.get())) {
+        // Reusing the same actual native PIDL need not produce callbacks.
+        // Apply only the newly imported file metadata and presentation to
+        // that verified view; history and navigation counts stay untouched.
+        auto& context=*retained;
+        searchActive_=searchBackground_=pendingSearchActive_=pendingSearchBackground_=true;
+        searchScope_=std::move(reusedScope);searchScopes_=context.scopes;searchScopeRules_=context.scopeRules;
+        activeQuery_=context.query;searchBase_=context.base;searchFilters_=context.filters;searchRecursive_=context.recursive;
+        searchPresentation_=context.presentation;searchFileProperties_=context.fileProperties;
+        context.completedLocation.reset(ILCloneFull(currentPidl_.get()));
+        rememberSearchCacheHistory(currentPidl_.get());
+        context.importedPresentation=false;
+        searchPresentationStatus_=S_OK;searchPresentationPending_=searchPresentation_.has_value();
+        setSearchText(activeQuery_);refreshSearchRefinements();updateContextTabs();PostMessageW(window_,DeferredView,0,0);scheduleDeferredUpdate();
+        rememberAddressNavigation(currentPidl_.get());
+    }
+    const auto newest=std::find_if(searchLocations_.rbegin(),searchLocations_.rend(),
+        [&](const SearchLocation& entry){return ILIsEqual(entry.location.get(),nativeTarget.get());});
+    if(newest!=searchLocations_.rend()&&newest->location.get()==registered)
+        std::erase_if(searchLocations_,[&](const SearchLocation& entry) {
+            return entry.location.get()!=registered&&ILIsEqual(entry.location.get(),nativeTarget.get());
+        });
+    pruneSearchCaches();
+    return S_OK;
 }
 HRESULT ExplorerApp::OnNavigationPending(PCIDLIST_ABSOLUTE pidl) {
     if(closing_)return E_ABORT;
@@ -457,7 +904,6 @@ HRESULT ExplorerApp::OnNavigationPending(PCIDLIST_ABSOLUTE pidl) {
     cancelCommandStates();extractDestinations_.reset();KillTimer(window_,3);navigationExpansion_.clear();navigationTree_.Reset();
     if (breadcrumbTask_) { breadcrumbTask_->cancel(); breadcrumbTask_.reset(); KillTimer(window_, 2); }
     navigating_ = true; navigationStarted_ = GetTickCount64();
-    setStatus(L"Loading…");
     // Owned test callback at the real in-flight browser boundary. Normal
     // windows never install it; it cannot fabricate navigation/provider state.
     if(headless_&&expectedLive&&pendingLiveSearch_&&pendingLiveSearch_->kind==LiveSearchKind::Query&&
@@ -490,12 +936,18 @@ HRESULT ExplorerApp::OnNavigationComplete(PCIDLIST_ABSOLUTE pidl) {
                                     [&](const SearchLocation& item) { return ILIsEqual(item.location.get(), pidl); });
     searchActive_ = search != searchLocations_.rend();
     searchBackground_ = searchActive_ || isExternalSearch(pidl);
+    searchWindowOrigin_.Reset();
     searchPresentation_.reset();
+    searchFileProperties_.reset();
     searchPresentationPending_=false;
     searchPresentationStatus_=S_OK;
     std::wstring completedExplicitQuery;
     auto completedQueryRevision=directRevision;
     if (searchActive_) {
+        // The browser can complete with a native PIDL that is canonically
+        // equal to the factory PIDL but has different serialized bytes.
+        // Preserve that supplied identity without changing the factory key.
+        search->completedLocation.reset(ILCloneFull(pidl));
         searchScope_.reset(ILCloneFull(search->scope.get()));
         searchScopes_=search->scopes;
         searchScopeRules_=search->scopeRules;
@@ -504,6 +956,8 @@ HRESULT ExplorerApp::OnNavigationComplete(PCIDLIST_ABSOLUTE pidl) {
         searchBase_ = search->base;
         searchFilters_ = search->filters;
         searchPresentation_=search->presentation;
+        searchFileProperties_=search->fileProperties;
+        searchWindowOrigin_=search->windowOrigin;
         if(search->rememberOnComplete&&!search->remembered) {
             // Consume an obsolete direct request too, so visiting this query
             // later through Back does not commit a superseded interaction.
@@ -529,6 +983,7 @@ HRESULT ExplorerApp::OnNavigationComplete(PCIDLIST_ABSOLUTE pidl) {
                 searchRecursive_ = metadata.recursive;
                 searchActive_ = true;
                 searchPresentation_=std::move(metadata.presentation);
+                searchFileProperties_=std::move(metadata.fileProperties);
                 if(!headless_) {
                     SearchViewPresentation actual=searchPresentation_.value_or(SearchViewPresentation{});
                     const auto presentationRead=loadSearchPresentationCompanion(std::filesystem::path(path),
@@ -539,10 +994,15 @@ HRESULT ExplorerApp::OnNavigationComplete(PCIDLIST_ABSOLUTE pidl) {
             }
         }
     } else {searchScopes_.Reset();searchScopeRules_.clear();}
-    if(searchActive_) {
+    const bool importedPresentation=searchActive_&&search!=searchLocations_.rend()&&search->importedPresentation;
+    if(importedPresentation)search->importedPresentation=false;
+    if(searchActive_&&!importedPresentation) {
         const auto remembered=std::find_if(searchPresentationLocations_.rbegin(),searchPresentationLocations_.rend(),
             [&](const SearchPresentationLocation& entry){return ILIsEqual(entry.location.get(),pidl);});
-        if(remembered!=searchPresentationLocations_.rend())searchPresentation_=remembered->presentation;
+        if(remembered!=searchPresentationLocations_.rend()) {
+            remembered->completedLocation.reset(ILCloneFull(pidl));
+            searchPresentation_=remembered->presentation;
+        }
     }
     searchPresentationPending_=searchPresentation_.has_value()||FAILED(searchPresentationStatus_);
     pendingSearchActive_ = searchActive_;
@@ -596,9 +1056,12 @@ HRESULT ExplorerApp::OnNavigationComplete(PCIDLIST_ABSOLUTE pidl) {
         if (history_.size() > 100) { history_.erase(history_.begin()); --historyIndex_; }
     }
     if(liveQuery)liveSearchHistoryIndex_=historyIndex_;
+    rememberSearchCacheHistory(pidl);
     updateFrameTitle();
     SetWindowTextW(address_, currentLocation_.c_str());
-    SendMessageW(search_, EM_SETCUEBANNER, FALSE, reinterpret_cast<LPARAM>((L"Search " + currentName_).c_str()));
+    UiString searchCue;
+    if (SUCCEEDED(formatUiString(UiText::SearchCue, currentName_, &searchCue)))
+        SendMessageW(search_, EM_SETCUEBANNER, FALSE, reinterpret_cast<LPARAM>(searchCue.text.c_str()));
     if(liveNavigation)completeLiveSearchNavigation(pidl,S_OK);
     else if(directNavigation) {
         // The factory may pump a real edit after the chosen command has
@@ -619,6 +1082,7 @@ HRESULT ExplorerApp::OnNavigationComplete(PCIDLIST_ABSOLUTE pidl) {
         setSearchText(searchActive_?activeQuery_:L"");
     }
     updateBreadcrumbs();
+    refreshSearchRefinements();
     updateContextTabs();
     if(!completedExplicitQuery.empty()&&searchInteractionRevision_==completedQueryRevision)rememberQuery(completedExplicitQuery);
     rememberAddressNavigation(pidl);
@@ -639,14 +1103,37 @@ HRESULT ExplorerApp::OnNavigationFailed(PCIDLIST_ABSOLUTE pidl) {
     pendingSearchActive_ = searchActive_;
     pendingSearchBackground_ = searchBackground_;
     lastError_ = L"This location could not be opened. Check its availability and your permissions.";
-    setStatus(lastError_);
     return S_OK;
 }
-HRESULT ExplorerApp::OnStateChange(IShellView*, ULONG change) {
+HRESULT ExplorerApp::OnStateChange(IShellView* source, ULONG change) {
+    const auto event = std::min<size_t>(change, headlessCurrentViewStateEvents_.size() - 1);
+    const auto stale = [&] {
+        if(headless_)++headlessStaleViewStateEvents_[event];
+        return S_OK;
+    };
+    if(closing_||!source||!view_)return stale();
+    // A replaced native view can finish asynchronous selection/state work
+    // after navigation. Only its own current view may invalidate this host's
+    // selection snapshot; otherwise it cancels unrelated native state jobs.
+    // Retain the candidate while QI runs, and reject a reentrant replacement.
+    ComPtr<IShellView> active = view_;
+    if(source!=active.Get()) {
+        ComPtr<IUnknown> activeIdentity, sourceIdentity;
+        if(FAILED(active.As(&activeIdentity))||FAILED(source->QueryInterface(IID_PPV_ARGS(&sourceIdentity)))||
+           activeIdentity.Get()!=sourceIdentity.Get())return stale();
+    }
+    if(active.Get()!=view_.Get())return stale();
+    if(headless_)++headlessCurrentViewStateEvents_[event];
     // Ribbon popup focus does not change the original view selection. Retain
     // its native command snapshot until selection, rename or state changes.
     if(change==CDBOSC_SETFOCUS||change==CDBOSC_KILLFOCUS)return S_OK;
-    selectionStateDirty_ = namespaceDirty_ = true;
+    // Selection notifications may arrive repeatedly while the native view's
+    // selection is already settled. Compare its full original identities in
+    // deferred readback before cancelling native command-state work. Rename
+    // and checkbox/state notifications also invalidate metadata for the same
+    // identities, so they retain their unconditional namespace refresh.
+    selectionStateDirty_ = true;
+    if(change!=CDBOSC_SELCHANGE)namespaceDirty_=true;
     scheduleDeferredUpdate(); return S_OK;
 }
 void ExplorerApp::scheduleDeferredUpdate() {
@@ -689,22 +1176,47 @@ double ExplorerApp::commandTimingNow() {
 }
 
 HRESULT ExplorerApp::createControls() {
+    bool rightToLeft = false;
+    const auto directionRead = windowUiDirection(window_, &rightToLeft);
+    if (FAILED(directionRead)) return directionRead;
+    UiString navigationName, addressToolbarName, backName, forwardName, historyName, upName;
+    UiString addressName, searchName, refreshName, collapseName, collapseTip;
+    for (const auto& [key, text] : std::array<std::pair<UiText, UiString*>, 11>{{
+        {UiText::NavigationButtons, &navigationName}, {UiText::AddressToolbar, &addressToolbarName},
+        {UiText::Back, &backName}, {UiText::Forward, &forwardName}, {UiText::RecentLocations, &historyName},
+        {UiText::UpTooltip, &upName}, {UiText::AddressBar, &addressName}, {UiText::SearchBox, &searchName},
+        {UiText::Refresh, &refreshName}, {UiText::MinimiseRibbon, &collapseName},
+        {UiText::MinimiseRibbonTooltip, &collapseTip}}}) {
+        const auto loaded = loadUiString(key, text);
+        if (FAILED(loaded)) return loaded;
+    }
     auto control = [&](const wchar_t* type, const wchar_t* label, DWORD style, UINT id) {
         auto hwnd = CreateWindowExW(0, type, label, WS_CHILD | WS_VISIBLE | style, 0, 0, 1, 1,
                                    window_, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(id)), instance_, nullptr);
         if (hwnd) SendMessageW(hwnd, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
         return hwnd;
     };
-    nav_ = control(TOOLBARCLASSNAMEW, L"Navigation", TBSTYLE_FLAT | TBSTYLE_TOOLTIPS | CCS_NORESIZE | CCS_NOPARENTALIGN | CCS_NODIVIDER, 901);
+    nav_ = control(TOOLBARCLASSNAMEW, navigationName.text.c_str(), WS_TABSTOP | TBSTYLE_FLAT | TBSTYLE_TOOLTIPS | CCS_NORESIZE | CCS_NOPARENTALIGN | CCS_NODIVIDER, 901);
+    if (!nav_) return HRESULT_FROM_WIN32(GetLastError());
     SendMessageW(nav_, TB_BUTTONSTRUCTSIZE, sizeof(TBBUTTON), 0);
-    auto navButton = [&](UINT id, const wchar_t* label) {
+    auto toolbarButton = [&](HWND toolbar, UINT id, const std::wstring& label) -> HRESULT {
+        // TB_ADDSTRING copies its double-NUL-terminated input. The toolbar
+        // retains its own caption after these local resource results expire.
+        auto strings = label;
+        strings.push_back(L'\0');
+        const auto stringIndex = SendMessageW(toolbar, TB_ADDSTRINGW, 0, reinterpret_cast<LPARAM>(strings.c_str()));
+        if (stringIndex < 0) return E_OUTOFMEMORY;
         TBBUTTON button{}; button.iBitmap = I_IMAGENONE; button.idCommand = id;
         button.fsState = TBSTATE_ENABLED; button.fsStyle = BTNS_BUTTON;
-        button.iString = reinterpret_cast<INT_PTR>(label);
-        SendMessageW(nav_, TB_ADDBUTTONS, 1, reinterpret_cast<LPARAM>(&button));
+        button.iString = stringIndex;
+        return SendMessageW(toolbar, TB_ADDBUTTONS, 1, reinterpret_cast<LPARAM>(&button)) ? S_OK : E_FAIL;
     };
-    navButton(Back, L"Back"); navButton(Forward, L"Forward"); navButton(HistoryMenu, L"Recent locations"); navButton(Up, L"Up");
-    breadcrumbs_ = control(TOOLBARCLASSNAMEW, L"Location breadcrumbs", TBSTYLE_FLAT | TBSTYLE_LIST | TBSTYLE_TOOLTIPS |
+    for (const auto& [command, text] : std::array<std::pair<UINT, const UiString*>, 4>{{
+        {Back, &backName}, {Forward, &forwardName}, {HistoryMenu, &historyName}, {Up, &upName}}}) {
+        const auto added = toolbarButton(nav_, command, text->text);
+        if (FAILED(added)) return added;
+    }
+    breadcrumbs_ = control(TOOLBARCLASSNAMEW, addressToolbarName.text.c_str(), WS_TABSTOP | TBSTYLE_FLAT | TBSTYLE_LIST | TBSTYLE_TOOLTIPS |
         CCS_NORESIZE | CCS_NOPARENTALIGN | CCS_NODIVIDER, 902);
     SendMessageW(breadcrumbs_, TB_BUTTONSTRUCTSIZE, sizeof(TBBUTTON), 0);
     SendMessageW(breadcrumbs_, TB_SETEXTENDEDSTYLE, 0, TBSTYLE_EX_DRAWDDARROWS | TBSTYLE_EX_MIXEDBUTTONS);
@@ -719,31 +1231,29 @@ HRESULT ExplorerApp::createControls() {
         searchSuggestions_->replace(recentSearches_);
         attachSearchSuggestions(search_,searchSuggestions_.Get(),false,&searchAutocomplete_);
     }
-    status_ = control(STATUSCLASSNAMEW, L"Ready", SBARS_SIZEGRIP, 903);
-    ShowWindow(status_, SW_HIDE);
-    statusView_ = control(TOOLBARCLASSNAMEW, L"View shortcuts", TBSTYLE_FLAT | TBSTYLE_TOOLTIPS |
-        CCS_NORESIZE | CCS_NOPARENTALIGN | CCS_NODIVIDER, 904);
-    SendMessageW(statusView_, TB_BUTTONSTRUCTSIZE, sizeof(TBBUTTON), 0);
-    for (const auto command : {ViewFirst + static_cast<UINT>(ViewMode::Details), ViewFirst + static_cast<UINT>(ViewMode::LargeIcons)}) {
-        TBBUTTON button{}; button.iBitmap = I_IMAGENONE; button.idCommand = command;
-        button.fsState = TBSTATE_ENABLED; button.fsStyle = BTNS_CHECKGROUP;
-        button.iString = reinterpret_cast<INT_PTR>(command == ViewFirst + 5 ? L"Details" : L"Large icons");
-        SendMessageW(statusView_, TB_ADDBUTTONS, 1, reinterpret_cast<LPARAM>(&button));
-    }
-    ShowWindow(statusView_, SW_HIDE);
-    addressActions_ = control(TOOLBARCLASSNAMEW, L"Address actions", TBSTYLE_FLAT | TBSTYLE_TOOLTIPS |
+    addressActions_ = control(TOOLBARCLASSNAMEW, addressToolbarName.text.c_str(), WS_TABSTOP | TBSTYLE_FLAT | TBSTYLE_TOOLTIPS |
         CCS_NORESIZE | CCS_NOPARENTALIGN | CCS_NODIVIDER, 905);
+    if (!nav_ || !breadcrumbs_ || !address_ || !search_ || !addressActions_) return HRESULT_FROM_WIN32(GetLastError());
     SendMessageW(addressActions_, TB_BUTTONSTRUCTSIZE, sizeof(TBBUTTON), 0);
-    TBBUTTON refresh{}; refresh.iBitmap=I_IMAGENONE; refresh.idCommand=Refresh;
-    refresh.fsState=TBSTATE_ENABLED; refresh.fsStyle=BTNS_BUTTON; refresh.iString=reinterpret_cast<INT_PTR>(L"Refresh");
-    SendMessageW(addressActions_,TB_ADDBUTTONS,1,reinterpret_cast<LPARAM>(&refresh));
-    if (!nav_ || !breadcrumbs_ || !address_ || !search_ || !status_ || !statusView_ || !addressActions_) return HRESULT_FROM_WIN32(GetLastError());
+    const auto refreshAdded = toolbarButton(addressActions_, Refresh, refreshName.text);
+    if (FAILED(refreshAdded)) return refreshAdded;
+    // Toolbar tooltips are owned popup windows, so native child inheritance
+    // cannot supply their layout. Keep their direction tied to this host.
+    if (rightToLeft) for (const auto toolbar : {nav_, breadcrumbs_, addressActions_}) {
+        const auto tooltip = reinterpret_cast<HWND>(SendMessageW(toolbar, TB_GETTOOLTIPS, 0, 0));
+        if (!tooltip) continue;
+        const auto style = GetWindowLongPtrW(tooltip, GWL_EXSTYLE);
+        SetLastError(ERROR_SUCCESS);
+        if (!SetWindowLongPtrW(tooltip, GWL_EXSTYLE, (style | WS_EX_LAYOUTRTL) & ~static_cast<LONG_PTR>(WS_EX_RTLREADING)) && GetLastError())
+            return HRESULT_FROM_WIN32(GetLastError());
+    }
     ComPtr<IAccPropServices> accessible;
     if (SUCCEEDED(CoCreateInstance(CLSID_AccPropServices, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&accessible)))) {
-        accessible->SetHwndPropStr(address_, static_cast<DWORD>(OBJID_CLIENT), CHILDID_SELF, PROPID_ACC_NAME, L"Address");
-        accessible->SetHwndPropStr(search_, static_cast<DWORD>(OBJID_CLIENT), CHILDID_SELF, PROPID_ACC_NAME, L"Search");
+        accessible->SetHwndPropStr(address_, static_cast<DWORD>(OBJID_CLIENT), CHILDID_SELF, PROPID_ACC_NAME, addressName.text.c_str());
+        accessible->SetHwndPropStr(search_, static_cast<DWORD>(OBJID_CLIENT), CHILDID_SELF, PROPID_ACC_NAME, searchName.text.c_str());
     }
-    applyChrome(nav_, breadcrumbs_, address_, search_, statusView_, addressActions_);
+    const auto chromeStatus = applyChrome(nav_, breadcrumbs_, address_, search_, addressActions_);
+    if (FAILED(chromeStatus)) return chromeStatus;
     RibbonCallbacks callbacks;
     callbacks.execute = [this](UINT command) { auto hr = executeRibbon(command); showError(hr, L"Command"); return hr; };
     callbacks.query = [this](UINT command) { return ribbonState(command); };
@@ -767,14 +1277,15 @@ HRESULT ExplorerApp::createControls() {
     }
     if (!nativeSettingsLoaded) ribbon_.setMinimized(preferences_.ribbonCollapsed);
     else ribbon_.minimized(preferences_.ribbonCollapsed);
-    ribbonCollapse_=control(L"BUTTON",L"Minimize the Ribbon",BS_OWNERDRAW|BS_FLAT|WS_TABSTOP,Collapse);
+    ribbonCollapse_=control(L"BUTTON",collapseName.text.c_str(),BS_OWNERDRAW|BS_FLAT|WS_TABSTOP,Collapse);
     if(!ribbonCollapse_)return HRESULT_FROM_WIN32(GetLastError());
     const auto collapseTheme=applyRibbonCollapseButton(ribbonCollapse_);
     if(FAILED(collapseTheme))return collapseTheme;
-    ribbonCollapseTooltip_=CreateWindowExW(WS_EX_TOPMOST,TOOLTIPS_CLASSW,nullptr,WS_POPUP|TTS_ALWAYSTIP|TTS_NOPREFIX,
+    const DWORD tooltipExtended = WS_EX_TOPMOST | (rightToLeft ? WS_EX_LAYOUTRTL : 0);
+    ribbonCollapseTooltip_=CreateWindowExW(tooltipExtended,TOOLTIPS_CLASSW,nullptr,WS_POPUP|TTS_ALWAYSTIP|TTS_NOPREFIX,
         CW_USEDEFAULT,CW_USEDEFAULT,CW_USEDEFAULT,CW_USEDEFAULT,window_,nullptr,instance_,nullptr);
     if(ribbonCollapseTooltip_) {
-        ribbonCollapseTip_=L"Minimize the Ribbon (Ctrl+F1)";
+        ribbonCollapseTip_=collapseTip.text;
         TOOLINFOW tool{sizeof(tool)};tool.uFlags=TTF_IDISHWND|TTF_SUBCLASS;tool.hwnd=window_;
         tool.uId=reinterpret_cast<UINT_PTR>(ribbonCollapse_);tool.lpszText=ribbonCollapseTip_.data();
         SendMessageW(ribbonCollapseTooltip_,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tool));
@@ -818,7 +1329,6 @@ void ExplorerApp::layout() {
     MoveWindow(addressActions_, navWidth + addressWidth - px(24), y + px(5), px(24), px(30), TRUE);
     fitBreadcrumbs(std::max(px(60),addressWidth-px(25)));
     MoveWindow(search_, navWidth + addressWidth + px(12), y + px(5), searchWidth, px(30), TRUE);
-    ShowWindow(status_,SW_HIDE); ShowWindow(statusView_,SW_HIDE);
     if (browser_) {
         RECT viewRect{0, y + px(41), width, std::max(y + px(42), height)};
         browser_->SetRect(nullptr, viewRect);
@@ -842,6 +1352,7 @@ void ExplorerApp::updateNamespaceImpl() {
     newItemTypes_.reset();
     ribbonCommandChildren_.clear();
     ribbonCommandPaths_.clear();
+    ComPtr<IShellView> targetView=view_;
     NamespaceTarget target;
     currentFolder(target.folder);
     namespaceNetwork_=false;
@@ -852,12 +1363,19 @@ void ExplorerApp::updateNamespaceImpl() {
            SUCCEEDED(target.folder->Compare(network.Get(),SICHINT_CANONICAL,&comparison)))namespaceNetwork_=comparison==0;
     }
     selection(target.selection);
+    std::optional<std::vector<Pidl>> targetIdentities;
+    DWORD targetSelectionCount=0;SFGAOF targetSelectionAttributes=0;
+    if(SUCCEEDED(readCommandSelection(target.selection.Get(),folderView_.Get(),&targetSelectionCount,&targetSelectionAttributes))) {
+        std::vector<Pidl> identities;
+        if(SUCCEEDED(commandSelectionIdentities(target.selection.Get(),targetSelectionCount,&identities)))
+            targetIdentities=std::move(identities);
+    }
     selectionKinds_={};
     const auto kindsStarted=commandTimingNow();
     if(target.selection)namespaceSelectionKinds(target.selection.Get(),&selectionKinds_);
     const auto kindsCompleted=commandTimingNow();
     if(headless_)commandTimings_.selectionKindsMs+=kindsCompleted-kindsStarted;
-    target.site = view_;
+    target.site = targetView;
     target.completionMessage = NamespaceResult;
     const auto initialized = namespaceActions_.initialize(window_, target);
     auto background=target;background.selection.Reset();
@@ -909,11 +1427,9 @@ void ExplorerApp::updateNamespaceImpl() {
         }
     }
     commandCapabilities_=std::move(capabilities);
-    const auto enabled = [this](UINT id) {
-        const auto found = commandCapabilities_.find(id);
-        return found != commandCapabilities_.end() && found->second.enabled;
-    };
-    undoAvailable_ = enabled(Undo); redoAvailable_ = enabled(Redo);
+    commandSelectionIdentities_=std::move(targetIdentities);
+    commandSelectionAttributes_=targetSelectionAttributes;
+    commandSelectionView_=targetView.Get();
     const auto catalogCompleted=commandTimingNow();
     if(headless_)commandTimings_.providerCatalogMs+=catalogCompleted-catalogStarted;
     ribbon_.invalidateItems();
@@ -974,50 +1490,66 @@ void ExplorerApp::updateContextTabsImpl() {
 }
 
 HRESULT ExplorerApp::cycleFocus(bool backwards) {
-    HWND nativeView = nullptr;
-    if (view_) view_->GetWindow(&nativeView);
-    HWND tree = nullptr;
-    struct TreeSearch { HWND host; HWND view; HWND tree = nullptr; } treeSearch{window_, nativeView};
-    EnumChildWindows(window_, [](HWND child, LPARAM data) -> BOOL {
-        auto& search = *reinterpret_cast<TreeSearch*>(data);
-        wchar_t name[64]{}; GetClassNameW(child, name, 64);
-        if (_wcsicmp(name, WC_TREEVIEWW) != 0 || (search.view && IsChild(search.view, child))) return TRUE;
-        bool namespaceTree = false;
-        for (auto current = child; current && current != search.host; current = GetParent(current)) {
-            if (!(GetWindowLongPtrW(current, GWL_STYLE) & WS_VISIBLE)) return TRUE;
-            GetClassNameW(current, name, 64);
-            if (_wcsicmp(name, L"NamespaceTreeControl") == 0) namespaceTree = true;
-        }
-        if (namespaceTree) { search.tree = child; return FALSE; }
-        return TRUE;
-    }, reinterpret_cast<LPARAM>(&treeSearch));
-    tree = treeSearch.tree;
-    auto usable = [](HWND hwnd) { return hwnd && IsWindow(hwnd) && IsWindowEnabled(hwnd); };
-    const auto focus = GetFocus();
-    auto within = [&](HWND hwnd) { return hwnd && (focus == hwnd || IsChild(hwnd, focus)); };
-    std::optional<FocusRegion> current;
-    if (within(address_) || within(breadcrumbs_)) current = FocusRegion::Address;
-    else if (within(search_)) current = FocusRegion::Search;
-    else if (within(nativeView)) current = FocusRegion::FolderView;
-    else if (within(tree)) current = FocusRegion::Navigation;
-    else if (focus && ribbon_.valid() && IsChild(window_, focus))
-        current = FocusRegion::CommandBand;
-    const FocusAvailability available{usable(address_), usable(search_), usable(nativeView), ribbon_.valid(),
-                                      preferences_.navigationPane && usable(tree)};
-    const auto next = cycleFocusRegion(current, backwards, available);
+    const auto activeView=view_;HWND nativeView=nullptr;
+    if(activeView)activeView->GetWindow(&nativeView);
+    FOLDERVIEWMODE mode=FVM_AUTO;int iconSize=0;
+    const bool details=folderView_&&SUCCEEDED(folderView_->GetViewModeAndIconSize(&mode,&iconSize))&&mode==FVM_DETAILS;
+    const auto regions=nativeFocusRegions(window_,nativeView,details);
+    std::vector<ToolbarFocusItem> toolbar;
+    appendToolbarFocus(window_,nav_,&toolbar);
+    if(addressEditing_&&usableOwnedControl(window_,address_))toolbar.push_back({address_,-1});
+    else appendToolbarFocus(window_,breadcrumbs_,&toolbar);
+    appendToolbarFocus(window_,addressActions_,&toolbar);
+    if(usableOwnedControl(window_,search_))toolbar.push_back({search_,-1});
+    if(activeView.Get()!=view_.Get()||closing_)return HRESULT_FROM_WIN32(ERROR_RETRY);
+    const auto current=currentFocusRegion();
+    if(activeView.Get()!=view_.Get()||closing_)return HRESULT_FROM_WIN32(ERROR_RETRY);
+    const FocusAvailability available{usableOwnedControl(window_,nativeView),!regions.sorting.empty(),!regions.status.empty(),
+                                      !toolbar.empty(),preferences_.navigationPane&&usableOwnedControl(window_,regions.tree)};
+    const auto next=cycleFocusRegion(current,backwards,available);
     if (!next) return S_FALSE;
+    HRESULT focused=E_UNEXPECTED;
     switch (*next) {
-    case FocusRegion::Address: editAddress(); break;
-    case FocusRegion::Search: SetFocus(search_); break;
-    case FocusRegion::FolderView: return view_->UIActivate(SVUIA_ACTIVATE_FOCUS);
-    case FocusRegion::CommandBand: {
-        auto bar = FindWindowExW(window_, nullptr, L"UIRibbonCommandBar", nullptr);
-        if (bar) SetFocus(bar);
-        break;
+    case FocusRegion::FolderView:focused=activeView->UIActivate(SVUIA_ACTIVATE_FOCUS);break;
+    case FocusRegion::Sorting:focused=regions.sorting.front().focus(window_);break;
+    case FocusRegion::Status:focused=regions.status.front().focus(window_);break;
+    case FocusRegion::Toolbar:focused=focusToolbarItem(window_,toolbar.front());break;
+    case FocusRegion::Navigation:SetFocus(regions.tree);focused=GetFocus()==regions.tree?S_OK:E_FAIL;break;
     }
-    case FocusRegion::Navigation: SetFocus(tree); break;
+    return activeView.Get()==view_.Get()&&!closing_?focused:HRESULT_FROM_WIN32(ERROR_RETRY);
+}
+std::optional<FocusRegion> ExplorerApp::currentFocusRegion() const {
+    const auto activeView=view_;HWND nativeView=nullptr;if(activeView)activeView->GetWindow(&nativeView);
+    FOLDERVIEWMODE mode=FVM_AUTO;int size=0;
+    const bool details=folderView_&&SUCCEEDED(folderView_->GetViewModeAndIconSize(&mode,&size))&&mode==FVM_DETAILS;
+    const auto regions=nativeFocusRegions(window_,nativeView,details);
+    if(activeView.Get()!=view_.Get()||closing_)return std::nullopt;
+    if(std::any_of(regions.sorting.begin(),regions.sorting.end(),[](const NativeFocusElement& item){return item.focused();}))return FocusRegion::Sorting;
+    if(std::any_of(regions.status.begin(),regions.status.end(),[](const NativeFocusElement& item){return item.focused();}))return FocusRegion::Status;
+    const auto focus=GetFocus();auto within=[focus](HWND parent){return parent&&(focus==parent||IsChild(parent,focus));};
+    if(within(nativeView))return FocusRegion::FolderView;
+    if(within(regions.tree))return FocusRegion::Navigation;
+    if(within(nav_)||within(breadcrumbs_)||within(address_)||within(addressActions_)||within(search_))return FocusRegion::Toolbar;
+    return std::nullopt;
+}
+HRESULT ExplorerApp::cycleToolbarFocus(bool backwards) {
+    std::vector<ToolbarFocusItem> items;
+    appendToolbarFocus(window_,nav_,&items);
+    if(addressEditing_&&usableOwnedControl(window_,address_))items.push_back({address_,-1});
+    else appendToolbarFocus(window_,breadcrumbs_,&items);
+    appendToolbarFocus(window_,addressActions_,&items);
+    if(usableOwnedControl(window_,search_))items.push_back({search_,-1});
+    if(items.empty())return S_FALSE;
+    const auto focus=GetFocus();
+    const auto current=std::find_if(items.begin(),items.end(),[focus](const ToolbarFocusItem& item){
+        return item.control==focus&&(item.button<0||SendMessageW(item.control,TB_GETHOTITEM,0,0)==item.button);
+    });
+    size_t index=backwards?items.size()-1:0;
+    if(current!=items.end()) {
+        const auto previous=static_cast<size_t>(current-items.begin());
+        index=backwards?(previous+items.size()-1)%items.size():(previous+1)%items.size();
     }
-    return S_OK;
+    return focusToolbarItem(window_,items[index]);
 }
 
 HRESULT ExplorerApp::toggleFullscreen() {
@@ -1070,56 +1602,64 @@ HRESULT ExplorerApp::sizeColumns() {
     return S_OK;
 }
 
-HRESULT ExplorerApp::toggleColumn(const PROPERTYKEY& key) {
-    if (!folderView_) return E_UNEXPECTED;
-    if (IsEqualPropertyKey(key, PKEY_ItemNameDisplay)) return E_ACCESSDENIED;
-    ComPtr<IColumnManager> columns;
-    auto hr = folderView_.As(&columns);
-    UINT count = 0;
-    if (SUCCEEDED(hr)) hr = columns->GetColumnCount(CM_ENUM_VISIBLE, &count);
-    if (FAILED(hr)) return hr;
-    if (count > 1000) return E_UNEXPECTED;
-    std::vector<PROPERTYKEY> keys(count);
-    hr = columns->GetColumns(CM_ENUM_VISIBLE, keys.data(), count);
-    if (FAILED(hr)) return hr;
-    const auto found = std::find_if(keys.begin(), keys.end(), [&](const PROPERTYKEY& value) { return IsEqualPropertyKey(key, value); });
-    if (found == keys.end()) keys.push_back(key);
-    else keys.erase(found);
-    if (keys.empty()) return E_INVALIDARG;
-    std::vector<CM_COLUMNINFO> info(keys.size());
-    for (size_t i = 0; i < keys.size(); ++i) {
-        info[i].cbSize = sizeof(CM_COLUMNINFO); info[i].dwMask = CM_MASK_WIDTH | CM_MASK_STATE;
-        if (FAILED(columns->GetColumnInfo(keys[i], &info[i]))) return E_INVALIDARG;
-    }
-    hr = columns->SetColumns(keys.data(), static_cast<UINT>(keys.size()));
-    for (size_t i = 0; SUCCEEDED(hr) && i < keys.size(); ++i) {
-        info[i].dwState |= CM_STATE_VISIBLE;
-        hr = columns->SetColumnInfo(keys[i], &info[i]);
-    }
-    return hr;
-}
-
 HRESULT ExplorerApp::captureActiveSearchPresentation() {
     if(!searchActive_||!folderView_)return E_UNEXPECTED;
-    SearchViewPresentation actual;
-    const auto hr=captureSearchViewPresentation(folderView_.Get(),&actual);
-    if(FAILED(hr))return hr;
-    searchPresentation_=actual;
-    if(currentPidl_) {
-        const auto location=std::find_if(searchLocations_.rbegin(),searchLocations_.rend(),
-            [&](const SearchLocation& entry){return ILIsEqual(entry.location.get(),currentPidl_.get());});
-        if(location!=searchLocations_.rend())location->presentation=actual;
-        const auto remembered=std::find_if(searchPresentationLocations_.rbegin(),searchPresentationLocations_.rend(),
-            [&](const SearchPresentationLocation& entry){return ILIsEqual(entry.location.get(),currentPidl_.get());});
-        if(remembered!=searchPresentationLocations_.rend())remembered->presentation=std::move(actual);
-        else {
-            Pidl locationCopy(ILCloneFull(currentPidl_.get()));
-            if(!locationCopy)return E_OUTOFMEMORY;
-            searchPresentationLocations_.push_back({std::move(locationCopy),std::move(actual)});
-            if(searchPresentationLocations_.size()>100)searchPresentationLocations_.erase(searchPresentationLocations_.begin());
+    try {
+        const auto nativeView=view_;
+        const auto nativeFolderView=folderView_;
+        const auto generation=navigationCount_;
+        const auto revision=searchInteractionRevision_;
+        Pidl identity(currentPidl_?ILCloneFull(currentPidl_.get()):nullptr);
+        if(currentPidl_&&!identity)return E_OUTOFMEMORY;
+        SearchViewPresentation actual;
+        const auto hr=captureSearchViewPresentation(nativeFolderView.Get(),&actual);
+        if(FAILED(hr))return hr;
+        if(closing_||navigating_||!searchActive_||view_.Get()!=nativeView.Get()||folderView_.Get()!=nativeFolderView.Get()||
+           navigationCount_!=generation||searchInteractionRevision_!=revision||
+           (identity?!samePidlBytes(identity.get(),currentPidl_.get()):currentPidl_!=nullptr))
+            return HRESULT_FROM_WIN32(ERROR_RETRY);
+        if(!identity){searchPresentation_=std::move(actual);return S_OK;}
+        // Completion/history aliases are already native-canonical identities.
+        // Byte comparisons here cannot dispatch COM while cache iterators live.
+        const auto matches=[&](const auto& entry) {
+            return samePidlBytes(entry.location.get(),identity.get())||
+                samePidlBytes(entry.completedLocation.get(),identity.get())||
+                samePidlBytes(entry.historyLocation.get(),identity.get());
+        };
+        if(std::none_of(searchPresentationLocations_.begin(),searchPresentationLocations_.end(),matches))
+            pruneSearchCaches(99); // Reserve the new current entry without pruning after publication.
+        const auto location=std::find_if(searchLocations_.rbegin(),searchLocations_.rend(),matches);
+        const auto remembered=std::find_if(searchPresentationLocations_.rbegin(),searchPresentationLocations_.rend(),matches);
+        const auto contextIndex=location==searchLocations_.rend()?searchLocations_.size():
+            static_cast<size_t>(std::distance(searchLocations_.begin(),location.base())-1);
+        const auto rememberedIndex=remembered==searchPresentationLocations_.rend()?searchPresentationLocations_.size():
+            static_cast<size_t>(std::distance(searchPresentationLocations_.begin(),remembered.base())-1);
+        Pidl contextCompleted(ILCloneFull(identity.get())),rememberedCompleted(ILCloneFull(identity.get()));
+        const bool historyValid=historyIndex_>=0&&historyIndex_<static_cast<int>(history_.size());
+        Pidl contextHistory(historyValid?ILCloneFull(history_[historyIndex_].get()):nullptr);
+        Pidl rememberedHistory(historyValid?ILCloneFull(history_[historyIndex_].get()):nullptr);
+        if(!contextCompleted||!rememberedCompleted||(historyValid&&(!contextHistory||!rememberedHistory)))return E_OUTOFMEMORY;
+        auto contextPresentation=actual;
+        auto rememberedPresentation=actual;
+        if(rememberedIndex==searchPresentationLocations_.size())searchPresentationLocations_.reserve(searchPresentationLocations_.size()+1);
+        // Presentation copies/allocations precede publication. Failed native
+        // read/staging does not publish new presentation metadata.
+        searchPresentation_=std::move(actual);
+        if(contextIndex<searchLocations_.size()) {
+            auto& context=searchLocations_[contextIndex];
+            context.completedLocation=std::move(contextCompleted);context.historyLocation=std::move(contextHistory);
+            context.presentation=std::move(contextPresentation);
         }
-    }
-    return S_OK;
+        if(rememberedIndex<searchPresentationLocations_.size()) {
+            auto& cached=searchPresentationLocations_[rememberedIndex];
+            cached.completedLocation=std::move(rememberedCompleted);cached.historyLocation=std::move(rememberedHistory);
+            cached.presentation=std::move(rememberedPresentation);
+        } else {
+            searchPresentationLocations_.push_back({std::move(identity),std::move(rememberedPresentation),
+                std::move(rememberedCompleted),std::move(rememberedHistory)});
+        }
+        return S_OK;
+    } catch(const std::bad_alloc&) {return E_OUTOFMEMORY;}
 }
 HRESULT ExplorerApp::saveSearch() {
     if (headless_) return E_ACCESSDENIED;
@@ -1165,8 +1705,9 @@ HRESULT ExplorerApp::saveSearch() {
     if (FAILED(hr)) return hr;
     const auto path = itemName(output.Get(), SIGDN_FILESYSPATH);
     if(path.empty())return E_INVALIDARG;
-    hr=searchScopeRules_.empty()?explorer::saveSearchForScopes(activeQuery_,scopes.Get(),searchRecursive_,std::filesystem::path(path),SearchSaveMode::UserConfirmed,&native):
-        explorer::saveSearchForScopeRules(activeQuery_,searchScopeRules_,std::filesystem::path(path),SearchSaveMode::UserConfirmed,&native);
+    const auto* properties=searchFileProperties_?&*searchFileProperties_:nullptr;
+    hr=searchScopeRules_.empty()?explorer::saveSearchForScopes(activeQuery_,scopes.Get(),searchRecursive_,std::filesystem::path(path),SearchSaveMode::UserConfirmed,&native,properties):
+        explorer::saveSearchForScopeRules(activeQuery_,searchScopeRules_,std::filesystem::path(path),SearchSaveMode::UserConfirmed,&native,properties);
     if(FAILED(hr))return hr;
     // The query is already published. Report a companion failure separately
     // so the user knows the saved search remains usable in Windows Explorer.
@@ -1225,44 +1766,6 @@ HRESULT ExplorerApp::openFileLocation() {
     hr = browser_->BrowseToObject(parent.Get(), SBSP_ABSOLUTE);
     if (FAILED(hr)) { selectionDestination_.reset(); selectionChild_.reset(); selectionTarget_.Reset(); }
     return hr;
-}
-
-HRESULT ExplorerApp::newItemMenu() {
-    if (headless_) return E_ACCESSDENIED;
-    if (navigating_) return HRESULT_FROM_WIN32(ERROR_BUSY);
-    ComPtr<IShellItem> folder;
-    auto hr = currentFolder(folder);
-    if (FAILED(hr)) return hr;
-    NativeContextMenu menu;
-    hr = menu.createNewItems(window_, folder.Get(), view_.Get());
-    if (FAILED(hr)) return hr;
-    const HWND anchor = GetDlgItem(window_, NewItems);
-    RECT rect{};
-    if (anchor) GetWindowRect(anchor, &rect);
-    else { POINT point{}; GetCursorPos(&point); rect.left = point.x; rect.bottom = point.y; }
-    struct ActiveMenu {
-        NativeContextMenu*& slot;
-        NativeContextMenu* previous;
-        ActiveMenu(NativeContextMenu*& target, NativeContextMenu* value) : slot(target), previous(target) { slot = value; }
-        ~ActiveMenu() { slot = previous; }
-    } active(activeContextMenu_, &menu);
-    const POINT point{rect.left, rect.bottom};
-    const auto selected = TrackPopupMenuEx(menu.popup(), TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
-        point.x, point.y, window_, nullptr);
-    return selected ? menu.invoke(selected, point, (GetKeyState(VK_CONTROL) & 0x8000) != 0,
-        (GetKeyState(VK_SHIFT) & 0x8000) != 0) : S_FALSE;
-}
-
-HRESULT ExplorerApp::shareFiles() {
-    if (headless_) return E_ACCESSDENIED;
-    ComPtr<IShellItemArray> items;
-    auto hr = selection(items);
-    if (FAILED(hr)) return hr;
-    SharePayload payload;
-    hr = makeSharePayload(items.Get(), L"Share files", payload);
-    if (FAILED(hr)) return hr;
-    if (!nativeShare_.ready()) hr = nativeShare_.initialize(window_, ShareResult);
-    return FAILED(hr) ? hr : nativeShare_.show(payload);
 }
 
 HRESULT ExplorerApp::newLibrary() {
@@ -1397,7 +1900,8 @@ void ExplorerApp::scheduleLiveSearch() {
     const auto deadline=liveSearchPolicy_.deadline();
     if(!deadline) {KillTimer(window_,6);return;}
     const auto now=GetTickCount64();
-    const auto delay=navigating_||commandRefreshActive_||liveSearchDispatchActive_?100ULL:
+    const auto delay=navigating_||pendingDirectSearchTarget_||pendingLiveSearchTarget_||
+        commandRefreshActive_||liveSearchDispatchActive_?100ULL:
         std::clamp(*deadline>now?*deadline-now:10ULL,10ULL,250ULL);
     SetTimer(window_,6,static_cast<UINT>(delay),nullptr);
 }
@@ -1416,12 +1920,19 @@ bool ExplorerApp::completeLiveSearchNavigation(PCIDLIST_ABSOLUTE target,HRESULT 
 }
 HRESULT ExplorerApp::processLiveSearch() {
     if(closing_)return E_ABORT;
-    if(navigating_||commandRefreshActive_||liveSearchDispatchActive_) {scheduleLiveSearch();return S_OK;}
+    if(navigating_||pendingDirectSearchTarget_||pendingLiveSearchTarget_||
+       commandRefreshActive_||liveSearchDispatchActive_) {scheduleLiveSearch();return S_OK;}
     LiveSearchDispatchScope dispatch(*this);
     const auto request=liveSearchPolicy_.takeReady(GetTickCount64(),true);
     if(!request) {scheduleLiveSearch();return S_FALSE;}
     KillTimer(window_,6);
     if(request->kind==LiveSearchKind::ReturnToOrigin) {
+        if(!liveSearchOrigin_&&searchWindowOrigin_) {
+            PIDLIST_ABSOLUTE raw=nullptr;auto hr=SHGetIDListFromObject(searchWindowOrigin_.Get(),&raw);Pidl origin(raw);
+            if(SUCCEEDED(hr)&&!origin)hr=E_UNEXPECTED;
+            if(FAILED(hr)){liveSearchPolicy_.finish(*request,hr);return hr;}
+            liveSearchOrigin_=std::move(origin);
+        }
         if(!liveSearchOrigin_&&searchActive_&&searchScope_)liveSearchOrigin_.reset(ILCloneFull(searchScope_.get()));
         if(!liveSearchOrigin_&&searchBackground_&&historyIndex_>0)
             liveSearchOrigin_.reset(ILCloneFull(history_[historyIndex_-1].get()));
@@ -1430,6 +1941,12 @@ HRESULT ExplorerApp::processLiveSearch() {
         }
         pendingLiveSearch_=*request;pendingLiveSearchTarget_.reset(ILCloneFull(liveSearchOrigin_.get()));
         if(!pendingLiveSearchTarget_) {liveSearchPolicy_.finish(*request,E_OUTOFMEMORY);pendingLiveSearch_.reset();return E_OUTOFMEMORY;}
+        if(currentPidl_&&ILIsEqual(currentPidl_.get(),liveSearchOrigin_.get())) {
+            // No browser request has been issued. A cancelled/deferred edit
+            // can already be at its actual origin, so finish without queuing
+            // a redundant native navigation behind the next user intent.
+            completeLiveSearchNavigation(currentPidl_.get(),S_OK);return S_OK;
+        }
         pendingHistory_=-1;
         for(size_t index=0;index<history_.size();++index)
             if(ILIsEqual(history_[index].get(),liveSearchOrigin_.get()))pendingHistory_=static_cast<int>(index);
@@ -1442,7 +1959,13 @@ HRESULT ExplorerApp::processLiveSearch() {
            historyIndex_<static_cast<int>(history_.size())&&ILIsEqual(history_[historyIndex_].get(),currentPidl_.get()))
             liveSearchHistoryIndex_=historyIndex_;
         if(!liveSearchOrigin_) {
-            if(searchActive_&&searchScope_)liveSearchOrigin_.reset(ILCloneFull(searchScope_.get()));
+            if(searchWindowOrigin_) {
+                PIDLIST_ABSOLUTE raw=nullptr;auto hr=SHGetIDListFromObject(searchWindowOrigin_.Get(),&raw);Pidl origin(raw);
+                if(SUCCEEDED(hr)&&!origin)hr=E_UNEXPECTED;
+                if(FAILED(hr)){liveSearchPolicy_.finish(*request,hr);return hr;}
+                liveSearchOrigin_=std::move(origin);
+            }
+            else if(searchActive_&&searchScope_)liveSearchOrigin_.reset(ILCloneFull(searchScope_.get()));
             else if(searchBackground_&&historyIndex_>0)liveSearchOrigin_.reset(ILCloneFull(history_[historyIndex_-1].get()));
             else liveSearchOrigin_.reset(ILCloneFull(currentPidl_.get()));
         }
@@ -1450,38 +1973,159 @@ HRESULT ExplorerApp::processLiveSearch() {
         liveSearchStatus_=startSearch(request->literal,searchRecursive_,{},L"",&*request);
     }
     const auto result=liveSearchStatus_;
+    bool retryScheduled=false;
     if(FAILED(result)) {
-        if(result==HRESULT_FROM_WIN32(ERROR_BUSY))liveSearchPolicy_.retry(*request,GetTickCount64());
+        if(result==HRESULT_FROM_WIN32(ERROR_BUSY))retryScheduled=liveSearchPolicy_.retry(*request,GetTickCount64());
         else liveSearchPolicy_.finish(*request,result);
         pendingLiveSearch_.reset();pendingLiveSearchTarget_.reset();scheduleLiveSearch();
-    } else if(!navigating_&&currentPidl_&&pendingLiveSearchTarget_&&
-              ILIsEqual(currentPidl_.get(),pendingLiveSearchTarget_.get()))completeLiveSearchNavigation(currentPidl_.get(),S_OK);
-    return result;
+    }
+    // Retain the native busy status for diagnostics, while an accepted Enter
+    // retry remains queued rather than opening an error dialog.
+    return retryScheduled?S_OK:result;
 }
+void ExplorerApp::rememberSearchCacheHistory(PCIDLIST_ABSOLUTE location) {
+    if (!location || historyIndex_ < 0 || historyIndex_ >= static_cast<int>(history_.size())) return;
+    const auto remember = [&](auto& cache) {
+        const auto entry = std::find_if(cache.rbegin(), cache.rend(), [&](const auto& value) {
+            return samePidlBytes(value.completedLocation.get(), location);
+        });
+        if (entry != cache.rend()) entry->historyLocation.reset(ILCloneFull(history_[historyIndex_].get()));
+    };
+    remember(searchLocations_);
+    remember(searchPresentationLocations_);
+}
+
+void ExplorerApp::pruneSearchCaches(size_t maximumCachedLocations) {
+    struct Fingerprint {
+        PCIDLIST_ABSOLUTE location = nullptr;
+        UINT size = 0;
+        std::uint64_t hash = 0;
+    };
+    const auto fingerprint = [](PCIDLIST_ABSOLUTE location) {
+        Fingerprint result;
+        if (!location) return result;
+        result.location = location;
+        result.size = ILGetSize(location);
+        result.hash = 14695981039346656037ULL;
+        const auto bytes = reinterpret_cast<const BYTE*>(location);
+        for (UINT index = 0; index < result.size; ++index) {
+            result.hash ^= bytes[index];
+            result.hash *= 1099511628211ULL;
+        }
+        return result;
+    };
+    // Only identical serialized native identities share a fingerprint.
+    // Navigation records actual completed/travel identities separately from
+    // a factory PIDL; no provider comparisons are needed during pruning.
+    // Hashes shortlist candidates; full bytes make collisions harmless.
+    const auto sameLocation = [](const Fingerprint& left, const Fingerprint& right) {
+        return left.location && right.location && (left.location == right.location ||
+            (left.size == right.size && left.hash == right.hash &&
+             std::memcmp(left.location, right.location, left.size) == 0));
+    };
+    const PCIDLIST_ABSOLUTE targets[] = {
+        currentPidl_.get(), pendingPidl_.get(), pendingDirectSearchTarget_.get(),
+        pendingLiveSearchTarget_.get(), liveSearchOrigin_.get(), pendingTypedAddressTarget_.get(),
+        selectionDestination_.get()
+    };
+    std::vector<Fingerprint> pins;
+    pins.reserve(history_.size() + std::size(targets));
+    for (const auto& location : history_) if (location) pins.push_back(fingerprint(location.get()));
+    for (const auto location : targets) if (location) pins.push_back(fingerprint(location));
+    using Identities = std::array<Fingerprint, 3>;
+    const auto sameEntry = [&](const Identities& left, const Identities& right) {
+        return std::any_of(left.begin(), left.end(), [&](const Fingerprint& location) {
+            return std::any_of(right.begin(), right.end(), [&](const Fingerprint& target) {
+                return sameLocation(location, target);
+            });
+        });
+    };
+    const auto pinned = [&](const Identities& entry, const Identities& newest) {
+        return sameEntry(entry, newest) || std::any_of(entry.begin(), entry.end(), [&](const Fingerprint& location) {
+            return std::any_of(pins.begin(), pins.end(), [&](const Fingerprint& target) {
+                return sameLocation(location, target);
+            });
+        });
+    };
+    const auto prune = [&](auto& cache) {
+        if (cache.empty()) return;
+        std::vector<Identities> identities;
+        identities.reserve(cache.size());
+        for (const auto& entry : cache) identities.push_back({fingerprint(entry.location.get()),
+            fingerprint(entry.completedLocation.get()), fingerprint(entry.historyLocation.get())});
+        std::vector<bool> retained(cache.size(), true);
+        auto retainedCount = cache.size();
+        // Completion resolves the newest matching context. Keep that same
+        // meaning when a query is revisited or a saved file is reimported.
+        for (size_t index = 0; index < cache.size(); ++index) {
+            const auto newer = identities.begin() + static_cast<std::ptrdiff_t>(index + 1);
+            if (std::any_of(newer, identities.end(),
+                [&](const Identities& entry) { return sameEntry(identities[index], entry); })) {
+                retained[index] = false; --retainedCount;
+            }
+        }
+        // The newest factory context is registered before its pending target.
+        // Travel history and in-flight navigation must remain reconstructible
+        // even after many live queries replace a single history slot.
+        const auto& newest = identities.back();
+        for (size_t index = 0; index < cache.size() && retainedCount > maximumCachedLocations; ++index) {
+            if (retained[index] && !pinned(identities[index], newest)) {
+                retained[index] = false; --retainedCount;
+            }
+        }
+        // If every entry is pinned, the 100-item travel history plus the fixed
+        // in-flight targets bound the cache; dropping one would lose metadata.
+        size_t destination = 0;
+        for (size_t index = 0; index < cache.size(); ++index) if (retained[index]) {
+            if (destination != index) cache[destination] = std::move(cache[index]);
+            ++destination;
+        }
+        cache.resize(destination);
+    };
+    prune(searchLocations_);
+    prune(searchPresentationLocations_);
+}
+
 HRESULT ExplorerApp::startSearch(const std::wstring& requested, bool recursive,
                                 std::optional<size_t> category, const std::wstring& filter,
                                 const LiveSearchRequest* liveRequest) {
     LiveSearchDispatchScope factoryDispatch(*this);
-    if(!liveRequest)cancelLiveSearch();
-    const auto directRevision=searchInteractionRevision_;
+    const bool nativeBrowsePending = navigating_ || pendingDirectSearchTarget_ || pendingLiveSearchTarget_;
     auto query = trim(requested);
     if (query.empty() && !category) return S_FALSE;
+    std::wstring refinedQuery;
+    if (category) {
+        if (*category >= searchFilters_.size()) return E_INVALIDARG;
+        const auto inspectionRevision = searchInteractionRevision_;
+        const auto inspectionNavigation = navigationCount_;
+        const auto inspectionQuery = activeQuery_;
+        std::shared_ptr<NativeSearchRefinements> refinement = searchActive_ && query == searchRefinementQuery_ ? searchRefinements_ : nullptr;
+        HRESULT refinementRead = S_OK;
+        if (!refinement && searchActive_ && query == searchRefinementQuery_ && FAILED(searchRefinementStatus_))
+            return searchRefinementStatus_;
+        if (!refinement) refinementRead = NativeSearchRefinements::inspect(query, &refinement);
+        if (SUCCEEDED(refinementRead)) refinementRead = refinement->replace(static_cast<SearchRefinementCategory>(*category), filter, &refinedQuery);
+        if (FAILED(refinementRead)) return refinementRead;
+        if (closing_ || searchInteractionRevision_ != inspectionRevision || navigationCount_ != inspectionNavigation || activeQuery_ != inspectionQuery)
+            return S_FALSE;
+    }
+    // A rejected native-category rewrite leaves the committed query and any
+    // newer live intent intact. Cancellation begins only after its preflight.
+    if(!liveRequest)cancelLiveSearch();
+    const auto directRevision=searchInteractionRevision_;
     if(searchActive_&&folderView_) {
         const auto captured=captureActiveSearchPresentation();
         if(FAILED(captured))return captured;
     }
     const auto presentation=searchActive_?searchPresentation_:std::optional<SearchViewPresentation>{};
+    const auto fileProperties=searchActive_?searchFileProperties_:std::optional<SearchFileProperties>{};
+    const auto windowOrigin=searchWindowOrigin_;
     auto base = query;
     std::array<std::wstring, 3> filters;
     if (searchActive_ && query == activeQuery_) { base = searchBase_; filters = searchFilters_; }
     if (category) {
-        if (*category >= filters.size()) return E_INVALIDARG;
         filters[*category] = filter;
-        query = base.empty() ? L"" : L"(" + base + L")";
-        for (const auto& refinement : filters) if (!refinement.empty()) {
-            if (!query.empty()) query += L" AND ";
-            query += refinement;
-        }
+        query = std::move(refinedQuery);
     }
     ComPtr<IShellItem> scope;
     auto hr = searchActive_ && searchScope_
@@ -1512,13 +2156,47 @@ HRESULT ExplorerApp::startSearch(const std::wstring& requested, bool recursive,
     }
     if(liveRequest&&!liveSearchPolicy_.current(*liveRequest)) {CoTaskMemFree(raw);return S_FALSE;}
     if(!liveRequest&&searchInteractionRevision_!=directRevision) {CoTaskMemFree(raw);return S_FALSE;}
+    if(!nativeBrowsePending&&!navigating_&&searchActive_&&recursive==searchRecursive_&&
+       currentPidl_&&ILIsEqual(location.get(),currentPidl_.get())) {
+        // The actual native view already represents this exact query/scope.
+        // A redundant BrowseToObject can be accepted before the browser posts
+        // OnNavigationPending, briefly rejecting a following Close/Back as
+        // busy despite the unchanged current view. Retain its context/history.
+        if(query!=activeQuery_||base!=searchBase_||filters!=searchFilters_) {
+            Pidl reusedScope(ILCloneFull(raw)),completed(ILCloneFull(currentPidl_.get()));
+            const bool hasHistory=historyIndex_>=0&&historyIndex_<static_cast<int>(history_.size());
+            Pidl travel(hasHistory?ILCloneFull(history_[static_cast<size_t>(historyIndex_)].get()):nullptr);
+            if(!reusedScope||!completed||(hasHistory&&!travel)) {CoTaskMemFree(raw);return E_OUTOFMEMORY;}
+            // The native condition/scope identity is unchanged, but a new
+            // textual intent owns its base/refinements and future Back metadata.
+            // Preserve the original factory identity plus actual view aliases.
+            searchLocations_.push_back({std::move(location),Pidl(raw),query,recursive,base,filters,
+                scopes,rules,presentation,fileProperties,!liveRequest,!liveRequest,false,std::move(completed),std::move(travel)});
+            searchLocations_.back().windowOrigin=windowOrigin;
+            raw=nullptr;
+            searchScope_=std::move(reusedScope);searchScopes_=scopes;searchScopeRules_=std::move(rules);
+            activeQuery_=query;searchBase_=base;searchFilters_=filters;searchRecursive_=recursive;
+            searchPresentation_=presentation;searchFileProperties_=fileProperties;
+            pruneSearchCaches();
+        }
+        CoTaskMemFree(raw);
+        if(liveRequest) {
+            pendingLiveSearch_=*liveRequest;
+            pendingLiveSearchTarget_.reset(ILCloneFull(currentPidl_.get()));
+            if(!pendingLiveSearchTarget_) {pendingLiveSearch_.reset();return E_OUTOFMEMORY;}
+            completeLiveSearchNavigation(currentPidl_.get(),S_OK);
+        } else {setSearchText(query);rememberQuery(query);}
+        refreshSearchRefinements();
+        return S_OK;
+    }
     Pidl directTarget;
     if(!liveRequest) {
         directTarget.reset(ILCloneFull(location.get()));
         if(!directTarget) {CoTaskMemFree(raw);return E_OUTOFMEMORY;}
     }
-    searchLocations_.push_back({std::move(location), Pidl(raw), query, recursive, base, filters,scopes,std::move(rules),presentation,!liveRequest,false});
-    if (searchLocations_.size() > 100) searchLocations_.erase(searchLocations_.begin());
+    searchLocations_.push_back({std::move(location), Pidl(raw), query, recursive, base, filters,scopes,std::move(rules),presentation,fileProperties,!liveRequest,false});
+    searchLocations_.back().windowOrigin=windowOrigin;
+    pruneSearchCaches();
     if(liveRequest) {
         pendingLiveSearch_=*liveRequest;
         pendingLiveSearchTarget_.reset(ILCloneFull(searchLocations_.back().location.get()));
@@ -1531,67 +2209,52 @@ HRESULT ExplorerApp::startSearch(const std::wstring& requested, bool recursive,
         auto probe=std::move(headlessLiveBrowseProbe_);headlessLiveBrowseProbe_={};hr=probe();
     } else hr = browser_->BrowseToObject(results.Get(), SBSP_ABSOLUTE);
     if(FAILED(hr)&&!liveRequest&&pendingDirectSearchRevision_==directRevision)pendingDirectSearchTarget_.reset();
-    if(SUCCEEDED(hr)&&!liveRequest&&!navigating_&&currentPidl_&&!searchLocations_.empty()&&
-       ILIsEqual(currentPidl_.get(),searchLocations_.back().location.get())&&!searchLocations_.back().remembered) {
-        searchLocations_.back().remembered=true;
-        if(searchInteractionRevision_==directRevision) {setSearchText(query);rememberQuery(query);}
-        else if(pendingDirectSearchRevision_==directRevision)pendingDirectSearchTarget_.reset();
-    }
     return hr;
 }
 
 void ExplorerApp::updateBreadcrumbs() {
-    while (SendMessageW(breadcrumbs_, TB_BUTTONCOUNT, 0, 0)) SendMessageW(breadcrumbs_, TB_DELETEBUTTON, 0, 0);
-    breadcrumbsPidls_.clear();
     if (!currentPidl_) return;
+    const auto generation = navigationCount_;
+    Pidl location(ILCloneFull(currentPidl_.get()));
+    Pidl cursor(location ? ILCloneFull(location.get()) : nullptr);
+    if (!cursor) { showError(E_OUTOFMEMORY, L"Read breadcrumb ancestors"); return; }
+    std::vector<Pidl> ancestors;
+    for (;;) {
+        Pidl ancestor(ILCloneFull(cursor.get()));
+        if (!ancestor) { showError(E_OUTOFMEMORY, L"Read breadcrumb ancestors"); return; }
+        ancestors.push_back(std::move(ancestor));
+        if (ILIsEmpty(cursor.get())) break;
+        if (!ILRemoveLastID(cursor.get())) { showError(E_FAIL, L"Read breadcrumb ancestors"); return; }
+    }
+    std::reverse(ancestors.begin(), ancestors.end());
+    std::vector<std::wstring> labels;
+    labels.reserve(ancestors.size());
+    for (const auto& ancestor : ancestors) {
+        auto label = pidlName(ancestor.get(), SIGDN_NORMALDISPLAY);
+        if (label.empty()) label = pidlName(ancestor.get(), SIGDN_DESKTOPABSOLUTEPARSING);
+        if (label.empty()) { showError(E_FAIL, L"Read breadcrumb name"); return; }
+        labels.push_back(std::move(label));
+    }
+    // Native name/icon providers may dispatch another real navigation. Never
+    // publish the older model over that completed destination.
+    if (closing_ || generation != navigationCount_ || !samePidlBytes(location.get(), currentPidl_.get())) return;
     SHFILEINFOW currentIcon{};
     const auto images=ImageList_Create(px(16),px(16),ILC_COLOR32|ILC_MASK,1,0);
     if(images) {
-        if(SHGetFileInfoW(reinterpret_cast<LPCWSTR>(currentPidl_.get()),0,&currentIcon,sizeof(currentIcon),
+        if(SHGetFileInfoW(reinterpret_cast<LPCWSTR>(location.get()),0,&currentIcon,sizeof(currentIcon),
             SHGFI_PIDL|SHGFI_ICON|SHGFI_SMALLICON)&&currentIcon.hIcon) {
             ImageList_AddIcon(images,currentIcon.hIcon);DestroyIcon(currentIcon.hIcon);
         } else if(folderIcon_)ImageList_AddIcon(images,folderIcon_);
+        if (closing_ || generation != navigationCount_ || !samePidlBytes(location.get(), currentPidl_.get())) {
+            ImageList_Destroy(images); return;
+        }
         SendMessageW(breadcrumbs_,TB_SETIMAGELIST,0,reinterpret_cast<LPARAM>(images));
         if(breadcrumbImages_)ImageList_Destroy(breadcrumbImages_);
         breadcrumbImages_=images;
     }
-    Pidl cursor(ILCloneFull(currentPidl_.get()));
-    for (;;) {
-        breadcrumbsPidls_.emplace_back(ILCloneFull(cursor.get()));
-        if (ILIsEmpty(cursor.get()) || !ILRemoveLastID(cursor.get())) break;
-    }
-    std::reverse(breadcrumbsPidls_.begin(), breadcrumbsPidls_.end());
-    // Keep the leaf and nearest ancestors accessible in narrow windows.
-    if (breadcrumbsPidls_.size() > 7) breadcrumbsPidls_.erase(breadcrumbsPidls_.begin() + 1, breadcrumbsPidls_.end() - 5);
-    for (size_t i = 0; i < breadcrumbsPidls_.size(); ++i) {
-        auto label = pidlName(breadcrumbsPidls_[i].get(), SIGDN_NORMALDISPLAY);
-        if (label.empty()) label = L"Desktop";
-
-        TBBUTTON button{}; button.iBitmap = i==0?0:I_IMAGENONE;
-        button.idCommand = BreadcrumbFirst + static_cast<int>(i);
-        // MIXEDBUTTONS honors explicit widths only when SHOWTEXT is present.
-        // The renderer uses dwData to retain Explorer's icon-only root while
-        // the native provider keeps its accessible label and exact hit box.
-        button.fsState = TBSTATE_ENABLED; button.fsStyle = BTNS_DROPDOWN | BTNS_SHOWTEXT;
-        button.dwData=i==0&&breadcrumbsPidls_.size()>1?1:0;
-        button.iString = reinterpret_cast<INT_PTR>(label.c_str());
-        SendMessageW(breadcrumbs_, TB_ADDBUTTONS, 1, reinterpret_cast<LPARAM>(&button));
-        TBBUTTONINFOW sizing{sizeof(sizing)};sizing.dwMask=TBIF_SIZE;
-        if(i==0&&breadcrumbsPidls_.size()>1)sizing.cx=static_cast<WORD>(px(34));
-        else {const auto dc=GetDC(breadcrumbs_);const auto old=dc&&font_?SelectObject(dc,font_):nullptr;SIZE text{};
-            if(dc)GetTextExtentPoint32W(dc,label.c_str(),static_cast<int>(label.size()),&text);
-            if(old)SelectObject(dc,old);if(dc)ReleaseDC(breadcrumbs_,dc);
-            sizing.cx=static_cast<WORD>(std::min(px(220),static_cast<int>(text.cx)+px(i==0?42:24)));}
-        SendMessageW(breadcrumbs_,TB_SETBUTTONINFOW,button.idCommand,reinterpret_cast<LPARAM>(&sizing));
-    }
-    TBBUTTON spacer{};spacer.idCommand=9021;spacer.fsStyle=BTNS_SEP;
-    SendMessageW(breadcrumbs_,TB_ADDBUTTONS,1,reinterpret_cast<LPARAM>(&spacer));
-    TBBUTTON edit{}; edit.iBitmap = I_IMAGENONE; edit.idCommand = AddressList;
-    edit.fsState = TBSTATE_ENABLED; edit.fsStyle = BTNS_BUTTON | BTNS_SHOWTEXT;
-    edit.iString = reinterpret_cast<INT_PTR>(L"Recent locations");
-    SendMessageW(breadcrumbs_, TB_ADDBUTTONS, 1, reinterpret_cast<LPARAM>(&edit));
-    TBBUTTONINFOW addressSize{sizeof(addressSize)};addressSize.dwMask=TBIF_SIZE;addressSize.cx=static_cast<WORD>(px(18));
-    SendMessageW(breadcrumbs_,TB_SETBUTTONINFOW,AddressList,reinterpret_cast<LPARAM>(&addressSize));
+    breadcrumbsPidls_ = std::move(ancestors);
+    breadcrumbLabels_ = std::move(labels);
+    breadcrumbButtons_.clear(); breadcrumbHiddenAncestors_.clear();
     RECT bounds{}; GetClientRect(breadcrumbs_, &bounds); fitBreadcrumbs(bounds.right);
 }
 void ExplorerApp::editAddress() {
@@ -1636,13 +2299,14 @@ void ExplorerApp::updateCommands() {
         }
     }
     if (preferences_.view != previousMode) namespaceDirty_ = true;
+    DWORD currentFlags = 0;
+    if (folderView_ && SUCCEEDED(folderView_->GetCurrentFolderFlags(&currentFlags)))
+        checkboxes_ = (currentFlags & FWF_CHECKSELECT) != 0;
     SORTCOLUMN sorted{};
     if (folderView_ && SUCCEEDED(folderView_->GetSortColumns(&sorted, 1))) ascending_ = sorted.direction == SORT_ASCENDING;
     const auto clipboardSequence = GetClipboardSequenceNumber();
     if (clipboardSequence != clipboardSequence_) {
         clipboardSequence_ = clipboardSequence;
-        clipboardFiles_ = IsClipboardFormatAvailable(CF_HDROP) ||
-            IsClipboardFormatAvailable(RegisterClipboardFormatW(CFSTR_SHELLIDLIST));
         namespaceDirty_ = true;
     }
     SendMessageW(nav_, TB_ENABLEBUTTON, Back, MAKELONG(historyIndex_ > 0, 0));
@@ -1658,32 +2322,30 @@ void ExplorerApp::updateCommands() {
         const auto selectionStarted=commandTimingNow();
         ComPtr<IShellItemArray> selected;
         selectionCount_ = 0; selectionAttributes_ = 0;
-        const bool selectionAvailable=SUCCEEDED(selection(selected))&&selected;
-        if (selectionAvailable) {
-            selected->GetCount(&selectionCount_);
-            if (selectionCount_&&FAILED(selected->GetAttributes(static_cast<SIATTRIBFLAGS>(SIATTRIBFLAGS_AND|SIATTRIBFLAGS_ALLITEMS),
-                SFGAO_FILESYSTEM | SFGAO_HIDDEN | SFGAO_CANCOPY | SFGAO_CANMOVE | SFGAO_CANDELETE | SFGAO_CANRENAME | SFGAO_HASPROPSHEET | SFGAO_FOLDER | SFGAO_LINK,
-                &selectionAttributes_)))selectionAttributes_=0;
+        selection(selected);
+        const auto selectedRead=readCommandSelection(selected.Get(),folderView_.Get(),&selectionCount_,&selectionAttributes_);
+        bool equivalent=false;
+        if(!namespaceDirty_&&SUCCEEDED(selectedRead)&&commandSelectionIdentities_&&commandSelectionView_==view_.Get()&&
+           selectionCount_==commandSelectionIdentities_->size()&&selectionAttributes_==commandSelectionAttributes_) {
+            std::vector<Pidl> identities;
+            if(SUCCEEDED(commandSelectionIdentities(selected.Get(),selectionCount_,&identities))) {
+                equivalent=identities.size()==commandSelectionIdentities_->size()&&
+                    std::equal(identities.begin(),identities.end(),commandSelectionIdentities_->begin(),
+                        [](const Pidl& current,const Pidl& previous){return ILIsEqual(current.get(),previous.get())!=FALSE;});
+            }else if(headless_)++headlessUncertainSelectionRefreshes_;
         }
         const auto attributesCompleted=commandTimingNow();
         if(headless_)commandTimings_.selectionCountAttributesMs+=attributesCompleted-selectionStarted;
-        if(selectionAvailable)selectionStatus(selected.Get(), &selectionStatus_);else selectionStatus_ = {};
         const auto statusCompleted=commandTimingNow();
         if(headless_)commandTimings_.selectionStatusMs+=statusCompleted-attributesCompleted;
-        selectionFilesystem_ = (selectionAttributes_ & SFGAO_FILESYSTEM) != 0;
-        selectionHidden_ = (selectionAttributes_ & SFGAO_HIDDEN) != 0;
-        SharePayload payload;
-        selectionShareable_ = headless_ && selectionCount_ && selectionCount_ <= maximumShareFiles &&
-            SUCCEEDED(makeSharePayload(selected.Get(), L"Share files", payload));
-        namespaceDirty_ = true;
+        if(equivalent) {if(headless_)++headlessEquivalentSelectionRefreshes_;}
+        else namespaceDirty_ = true;
         if(headless_)commandTimings_.selectionHostEligibilityMs+=commandTimingNow()-statusCompleted;
     }
     if (namespaceDirty_ && !navigating_) updateContextTabsImpl();
     const auto ribbonStarted=commandTimingNow();
     bool minimized = false;
     if (SUCCEEDED(ribbon_.minimized(minimized))) preferences_.ribbonCollapsed = minimized;
-    SendMessageW(statusView_, TB_CHECKBUTTON, ViewFirst + 5, MAKELONG(preferences_.view == ViewMode::Details, 0));
-    SendMessageW(statusView_, TB_CHECKBUTTON, ViewFirst + 1, MAKELONG(preferences_.view == ViewMode::LargeIcons, 0));
     ribbon_.invalidateState();
     if(headless_) {
         const auto completed=commandTimingNow();
@@ -1704,23 +2366,23 @@ void ExplorerApp::updateCommands() {
         lastCommandTimings_.ribbonInvalidationMs-=before.ribbonInvalidationMs;
     }
 }
-void ExplorerApp::setStatus(const std::wstring& text) {
-    if (status_) SendMessageW(status_, SB_SETTEXTW, 0, reinterpret_cast<LPARAM>(text.c_str()));
-}
-void ExplorerApp::updateStatus() {
-    if (archiveTask_.valid()) { setStatus(archiveAction_ + L"…"); return; }
-    if (navigating_ || !folderView_) return;
-    if (selectionStateDirty_) updateCommands();
-    int items = 0;
-    folderView_->ItemCount(SVGIO_ALLVIEW, &items);
-    setStatus(statusText(static_cast<unsigned>(std::max(0, items)), selectionStatus_));
-}
 HRESULT ExplorerApp::browseHistory(int offset) {
     auto index = historyIndex_ + offset;
     if (index < 0 || index >= static_cast<int>(history_.size())) return S_FALSE;
-    pendingHistory_ = index;
-    const auto hr = browser_->BrowseToIDList(history_[index].get(), SBSP_ABSOLUTE);
+    Pidl target(ILCloneFull(history_[index].get()));
+    return target ? browseHistoryLocation(target.get(), index) : E_OUTOFMEMORY;
+}
+HRESULT ExplorerApp::browseHistoryLocation(PCIDLIST_ABSOLUTE location, int originalIndex) {
+    if (!browser_ || !location) return E_UNEXPECTED;
+    pendingHistory_ = originalIndex >= 0 && originalIndex < static_cast<int>(history_.size()) &&
+        ILIsEqual(history_[originalIndex].get(), location) ? originalIndex : -1;
+    cancelLiveSearch();
+    const auto hr = browser_->BrowseToIDList(location, SBSP_ABSOLUTE);
     if (FAILED(hr)) pendingHistory_ = -1;
+    else if (!navigating_ && currentPidl_ && ILIsEqual(currentPidl_.get(), location) && pendingHistory_ >= 0) {
+        // Reusing the same folder can complete without a navigation callback.
+        historyIndex_ = pendingHistory_; pendingHistory_ = -1; updateCommands();
+    }
     return hr;
 }
 HRESULT ExplorerApp::setView(ViewMode mode) {
@@ -1774,12 +2436,16 @@ void ExplorerApp::refreshAddressHistoryPolicy() {
     typedAddresses_.clear();pendingTypedAddress_.clear();pendingTypedAddressTarget_.reset();
     if(!allowed)return;
     addressHistoryStatus_=loadAddressHistory(addressHistoryPath(),&typedAddresses_);
+    // An existing empty codec is the user's explicit app-history deletion.
+    // Import the read-only native list once, when our codec is absent.
+    if(addressHistoryStatus_!=HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)&&
+       addressHistoryStatus_!=HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND))return;
     std::vector<std::wstring> imported;
     const auto nativeRead=loadWindowsTypedAddresses(&imported);
     if(SUCCEEDED(nativeRead)) {
         const auto merge=mergeTypedAddressHistory(typedAddresses_,imported);
-        if(FAILED(merge))addressHistoryStatus_=merge;
-    } else if(SUCCEEDED(addressHistoryStatus_))addressHistoryStatus_=nativeRead;
+        addressHistoryStatus_=FAILED(merge)?merge:nativeRead;
+    } else addressHistoryStatus_=nativeRead;
 }
 void ExplorerApp::rememberAddressNavigation(PCIDLIST_ABSOLUTE location) {
     if(pendingTypedAddress_.empty()||!pendingTypedAddressTarget_)return;
@@ -1801,15 +2467,115 @@ HMENU ExplorerApp::createTypedAddressMenu() const {
     }
     return menu;
 }
+HRESULT ExplorerApp::addressContextSnapshot(AddressContextSnapshot* result) const {
+    if (!result) return E_POINTER;
+    if (!currentPidl_) return E_UNEXPECTED;
+    AddressContextSnapshot snapshot;
+    snapshot.location.reset(ILCloneFull(currentPidl_.get()));
+    if (!snapshot.location) return E_OUTOFMEMORY;
+    snapshot.text = pidlName(snapshot.location.get(), SIGDN_DESKTOPABSOLUTEEDITING);
+    if (snapshot.text.empty()) snapshot.text = pidlName(snapshot.location.get(), SIGDN_DESKTOPABSOLUTEPARSING);
+    if (snapshot.text.empty()) return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+    *result = std::move(snapshot); return S_OK;
+}
+HRESULT ExplorerApp::createAddressContextMenu(HMENU* result) const {
+    if (!result) return E_POINTER;
+    HMENU menu = nullptr;
+    wchar_t system[MAX_PATH]{};
+    const auto length = GetSystemDirectoryW(system, static_cast<UINT>(std::size(system)));
+    if (length && length < std::size(system)) {
+        const auto module = LoadLibraryExW((std::filesystem::path(system) / L"explorerframe.dll").c_str(),
+            nullptr, LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE);
+        if (module) {
+            const auto resource = LoadMenuW(module, MAKEINTRESOURCEW(272));
+            const auto popup = resource ? GetSubMenu(resource, 0) : nullptr;
+            constexpr std::array ids{AddressContextCommand::Copy, AddressContextCommand::CopyText,
+                AddressContextCommand::Edit, AddressContextCommand::DeleteHistory};
+            bool matches = popup && GetMenuItemCount(popup) == static_cast<int>(ids.size());
+            for (UINT index = 0; matches && index < ids.size(); ++index)
+                matches = GetMenuItemID(popup, index) == static_cast<UINT>(ids[index]);
+            if (matches && RemoveMenu(resource, 0, MF_BYPOSITION)) menu = popup;
+            if (resource) DestroyMenu(resource);
+            FreeLibrary(module);
+        }
+    }
+    if (!menu) {
+        menu = CreatePopupMenu();
+        if (!menu) return HRESULT_FROM_WIN32(GetLastError());
+        for (const auto& entry : std::array{
+                 std::pair{AddressContextCommand::Copy, L"&Copy address"},
+                 std::pair{AddressContextCommand::CopyText, L"C&opy address as text"},
+                 std::pair{AddressContextCommand::Edit, L"&Edit address"},
+                 std::pair{AddressContextCommand::DeleteHistory, L"&Delete history"}}) {
+            if (!AppendMenuW(menu, MF_STRING, static_cast<UINT>(entry.first), entry.second)) {
+                const auto error = HRESULT_FROM_WIN32(GetLastError()); DestroyMenu(menu); return error;
+            }
+        }
+    }
+    for (const auto command : {AddressContextCommand::Copy, AddressContextCommand::CopyText, AddressContextCommand::Edit})
+        EnableMenuItem(menu, static_cast<UINT>(command), MF_BYCOMMAND | (currentPidl_ ? MF_ENABLED : MF_GRAYED));
+    EnableMenuItem(menu, static_cast<UINT>(AddressContextCommand::DeleteHistory), MF_BYCOMMAND |
+        (!typedAddresses_.empty() || pendingTypedAddressTarget_ ? MF_ENABLED : MF_GRAYED));
+    *result = menu; return S_OK;
+}
+HRESULT ExplorerApp::executeAddressContext(AddressContextCommand command, const AddressContextSnapshot& target) {
+    if (closing_) return E_ABORT;
+    if (command == AddressContextCommand::Edit) {
+        if (!target.location || !currentPidl_ || !ILIsEqual(target.location.get(), currentPidl_.get()) || navigating_)
+            return HRESULT_FROM_WIN32(ERROR_CANCELLED);
+        editAddress(); SetWindowTextW(address_, target.text.c_str()); return S_OK;
+    }
+    // Copy and persistent history deletion must never alter shared state from
+    // a headless fixture, even with an otherwise valid native menu snapshot.
+    if (headless_) return E_ACCESSDENIED;
+    if (command == AddressContextCommand::DeleteHistory) {
+        const auto hr = saveAddressHistory(addressHistoryPath(), {});
+        if (FAILED(hr)) return hr;
+        typedAddresses_.clear(); pendingTypedAddress_.clear(); pendingTypedAddressTarget_.reset();
+        addressHistoryStatus_ = hr; return hr;
+    }
+    if (!target.location || target.text.empty()) return E_INVALIDARG;
+    if (command == AddressContextCommand::CopyText) return ShellOperations::copyText(window_, target.text);
+    if (command != AddressContextCommand::Copy) return E_INVALIDARG;
+    PCIDLIST_ABSOLUTE identity = target.location.get();
+    ComPtr<IShellItemArray> items;
+    const auto hr = SHCreateShellItemArrayFromIDLists(1, &identity, &items);
+    return FAILED(hr) ? hr : ShellOperations::copyToClipboard(window_, items.Get(), false);
+}
+HRESULT ExplorerApp::showAddressContextMenu(POINT point) {
+    if (headless_) return E_ACCESSDENIED;
+    if (closing_ || navigating_) return HRESULT_FROM_WIN32(ERROR_BUSY);
+    AddressContextSnapshot snapshot;
+    auto hr = addressContextSnapshot(&snapshot);
+    if (FAILED(hr)) return hr;
+    HMENU menu = nullptr;
+    hr = createAddressContextMenu(&menu);
+    if (FAILED(hr)) return hr;
+    UINT flags = 0;
+    hr = popupUiFlags(window_, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON, &flags);
+    if (SUCCEEDED(hr) && point.x == -1 && point.y == -1) {
+        RECT bounds{};
+        if (!GetWindowRect(breadcrumbs_, &bounds)) hr = HRESULT_FROM_WIN32(GetLastError());
+        UiPopupPlacement placement;
+        if (SUCCEEDED(hr)) hr = popupUiPlacement(window_, bounds, flags, &placement);
+        if (SUCCEEDED(hr)) { point = placement.anchor; flags = placement.flags; }
+    }
+    if (FAILED(hr)) { DestroyMenu(menu); return hr; }
+    const auto command = TrackPopupMenuEx(menu, flags,
+        point.x, point.y, window_, nullptr);
+    DestroyMenu(menu);
+    return command ? executeAddressContext(static_cast<AddressContextCommand>(command), snapshot) : S_FALSE;
+}
 void ExplorerApp::updateRibbonCollapseButton() {
     if(!ribbonCollapse_||!window_||!ribbon_.valid())return;
     bool minimized=false;
     if(FAILED(ribbon_.minimized(minimized)))return;
-    const wchar_t* label=minimized?L"Expand the Ribbon":L"Minimize the Ribbon";
-    if(textOf(ribbonCollapse_)!=label)SetWindowTextW(ribbonCollapse_,label);
-    const auto tip=std::wstring(label)+L" (Ctrl+F1)";
-    if(tip!=ribbonCollapseTip_) {
-        ribbonCollapseTip_=tip;
+    UiString label, tip;
+    if (FAILED(loadUiString(minimized ? UiText::ExpandRibbon : UiText::MinimiseRibbon, &label)) ||
+        FAILED(loadUiString(minimized ? UiText::ExpandRibbonTooltip : UiText::MinimiseRibbonTooltip, &tip))) return;
+    if(textOf(ribbonCollapse_)!=label.text)SetWindowTextW(ribbonCollapse_,label.text.c_str());
+    if(tip.text!=ribbonCollapseTip_) {
+        ribbonCollapseTip_=tip.text;
         if(ribbonCollapseTooltip_) {
             TOOLINFOW tool{sizeof(tool)};tool.hwnd=window_;tool.uId=reinterpret_cast<UINT_PTR>(ribbonCollapse_);
             tool.lpszText=ribbonCollapseTip_.data();
@@ -1824,81 +2590,11 @@ void ExplorerApp::updateRibbonCollapseButton() {
     },reinterpret_cast<LPARAM>(&bar));
     RECT tabs{};
     if(bar&&GetWindowRect(bar,&tabs)) {
-        MapWindowPoints(nullptr,window_,reinterpret_cast<POINT*>(&tabs),2);
+        if (FAILED(mapUiRect(nullptr, window_, tabs, &tabs))) return;
         SetWindowPos(ribbonCollapse_,HWND_TOP,std::max(0,static_cast<int>(tabs.right)-px(44)),tabs.top,
             px(22),px(24),SWP_NOACTIVATE|SWP_SHOWWINDOW);
         InvalidateRect(ribbonCollapse_,nullptr,FALSE);
     }
-}
-HRESULT ExplorerApp::chooseDestination(bool move) {
-    if (headless_) return E_ACCESSDENIED;
-    ComPtr<IShellItemArray> items;
-    auto hr = selection(items);
-    if (FAILED(hr)) return hr;
-    ComPtr<IFileOpenDialog> dialog;
-    hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog));
-    if (FAILED(hr)) return hr;
-    dialog->SetOptions(FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
-    dialog->SetTitle(move ? L"Move selected items to" : L"Copy selected items to");
-    ComPtr<IShellItem> folder;
-    if (SUCCEEDED(currentFolder(folder))) dialog->SetFolder(folder.Get());
-    hr = dialog->Show(window_);
-    if (FAILED(hr)) return hr;
-    ComPtr<IShellItem> destination;
-    hr = dialog->GetResult(&destination);
-    return SUCCEEDED(hr) ? ShellOperations::copyOrMove(window_, items.Get(), destination.Get(), move) : hr;
-}
-HRESULT ExplorerApp::newFolder() {
-    if (headless_) return E_ACCESSDENIED;
-    if (navigating_) return HRESULT_FROM_WIN32(ERROR_BUSY);
-    ComPtr<IShellItem> folder;
-    auto hr = currentFolder(folder);
-    if (FAILED(hr)) return hr;
-    if (!isPhysicalDirectory(folder.Get())) return HRESULT_FROM_WIN32(ERROR_DIRECTORY);
-    const auto base = itemName(folder.Get(), SIGDN_FILESYSPATH);
-    if (base.empty()) return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
-    std::wstring name = L"New folder";
-    std::error_code error;
-    unsigned i = 2;
-    while (std::filesystem::exists(std::filesystem::path(base) / name, error)) {
-        if (i > 30000) return HRESULT_FROM_WIN32(ERROR_TOO_MANY_NAMES);
-        name = L"New folder (" + std::to_wstring(i++) + L")";
-    }
-    if (error) return HRESULT_FROM_WIN32(error.value());
-    hr = ShellOperations::newFolder(window_, folder.Get(), name);
-    if (SUCCEEDED(hr)) {
-        PIDLIST_ABSOLUTE raw = nullptr;
-        auto path = (std::filesystem::path(base) / name).wstring();
-        if (SUCCEEDED(SHParseDisplayName(path.c_str(), nullptr, &raw, 0, nullptr))) {
-            Pidl pidl(raw);
-            if (view_) view_->SelectItem(ILFindLastID(pidl.get()), SVSI_SELECT | SVSI_DESELECTOTHERS | SVSI_EDIT | SVSI_ENSUREVISIBLE);
-        }
-    }
-    return hr;
-}
-HRESULT ExplorerApp::newText() {
-    if (headless_) return E_ACCESSDENIED;
-    if (navigating_) return HRESULT_FROM_WIN32(ERROR_BUSY);
-    ComPtr<IShellItem> folder;
-    auto hr = currentFolder(folder);
-    if (FAILED(hr)) return hr;
-    if (!isPhysicalDirectory(folder.Get())) return HRESULT_FROM_WIN32(ERROR_DIRECTORY);
-    auto base = itemName(folder.Get(), SIGDN_FILESYSPATH);
-    if (base.empty()) return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
-    std::wstring name = L"New Text Document.txt";
-    HANDLE file = INVALID_HANDLE_VALUE;
-    for (unsigned i = 1; i < 30000; ++i) {
-        auto path = (std::filesystem::path(base) / name).wstring();
-        file = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (file != INVALID_HANDLE_VALUE) {
-            CloseHandle(file);
-            SHChangeNotify(SHCNE_CREATE, SHCNF_PATHW, path.c_str(), nullptr);
-            return S_OK;
-        }
-        if (GetLastError() != ERROR_FILE_EXISTS) return HRESULT_FROM_WIN32(GetLastError());
-        name = L"New Text Document (" + std::to_wstring(i + 1) + L").txt";
-    }
-    return HRESULT_FROM_WIN32(ERROR_TOO_MANY_NAMES);
 }
 HRESULT ExplorerApp::showProperties(const wchar_t* page) {
     if (headless_) return E_ACCESSDENIED;
@@ -1913,139 +2609,43 @@ HRESULT ExplorerApp::showProperties(const wchar_t* page) {
     if (path.empty()) return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
     return SHObjectProperties(window_, SHOP_FILEPATH, path.c_str(), page) ? S_OK : E_FAIL;
 }
-HRESULT ExplorerApp::archive(bool extract) {
-    if (headless_) return E_ACCESSDENIED;
-    if (archiveTask_.valid()) return HRESULT_FROM_WIN32(ERROR_BUSY);
-    ComPtr<IShellItemArray> items;
-    auto hr = selection(items); if (FAILED(hr) || !items) return FAILED(hr) ? hr : E_INVALIDARG;
-    DWORD count = 0; items->GetCount(&count);
-    if (!count || (extract && count != 1)) return E_INVALIDARG;
-    std::vector<std::filesystem::path> sources;
-    for (DWORD i = 0; i < count; ++i) {
-        ComPtr<IShellItem> item;
-        hr = items->GetItemAt(i, &item); if (FAILED(hr)) return hr;
-        auto path = itemName(item.Get(), SIGDN_FILESYSPATH);
-        if (path.empty()) return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
-        sources.emplace_back(path);
-    }
-    std::filesystem::path output;
-    if (extract) {
-        ComPtr<IFileOpenDialog> dialog;
-        hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog));
-        if (FAILED(hr)) return hr;
-        dialog->SetOptions(FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
-        dialog->SetTitle(L"Extract to a new folder inside");
-        ComPtr<IShellItem> folder;
-        if (SUCCEEDED(currentFolder(folder))) dialog->SetFolder(folder.Get());
-        hr = dialog->Show(window_); if (FAILED(hr)) return hr;
-        ComPtr<IShellItem> destination; hr = dialog->GetResult(&destination); if (FAILED(hr)) return hr;
-        hr = unusedPath(itemName(destination.Get(), SIGDN_FILESYSPATH), sources.front().stem().wstring(), L"", output);
-        if (FAILED(hr)) return hr;
-    } else {
-        ComPtr<IFileSaveDialog> dialog;
-        hr = CoCreateInstance(CLSID_FileSaveDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog));
-        if (FAILED(hr)) return hr;
-        dialog->SetOptions(FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST | FOS_OVERWRITEPROMPT);
-        dialog->SetTitle(L"Create ZIP archive (choose a new file)");
-        COMDLG_FILTERSPEC filter{L"Compressed (zipped) folder", L"*.zip"};
-        dialog->SetFileTypes(1, &filter); dialog->SetDefaultExtension(L"zip");
-        auto name = sources.front().filename().wstring();
-        if (name.empty()) name = L"Archive";
-        dialog->SetFileName((name + L".zip").c_str());
-        ComPtr<IShellItem> folder;
-        if (SUCCEEDED(currentFolder(folder))) dialog->SetFolder(folder.Get());
-        hr = dialog->Show(window_); if (FAILED(hr)) return hr;
-        ComPtr<IShellItem> destination; hr = dialog->GetResult(&destination); if (FAILED(hr)) return hr;
-        output = itemName(destination.Get(), SIGDN_FILESYSPATH);
-    }
-    archiveAction_ = extract ? L"Extracting archive" : L"Creating ZIP archive";
-    archiveTask_ = std::async(std::launch::async, [sources = std::move(sources), output, extract] {
-        try {
-            return extract ? ExtraOperations::extractZip(sources.front(), output) : ExtraOperations::createZip(sources, output);
-        } catch (...) { return E_FAIL; }
-    });
-    updateCommands(); updateStatus();
-    return S_OK;
-}
-HRESULT ExplorerApp::makeShortcut(bool fromClipboard) {
-    if (headless_) return E_ACCESSDENIED;
-    if (navigating_) return HRESULT_FROM_WIN32(ERROR_BUSY);
-    ComPtr<IShellItem> folder;
-    auto hr = currentFolder(folder); if (FAILED(hr)) return hr;
-    if (!isPhysicalDirectory(folder.Get())) return HRESULT_FROM_WIN32(ERROR_DIRECTORY);
-    auto destination = itemName(folder.Get(), SIGDN_FILESYSPATH);
-    if (destination.empty()) return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
-    std::vector<std::filesystem::path> targets;
-    if (fromClipboard) {
-        ComPtr<IDataObject> clipboard;
-        hr = OleGetClipboard(&clipboard); if (FAILED(hr)) return hr;
-        ComPtr<IShellItemArray> items;
-        hr = SHCreateShellItemArrayFromDataObject(clipboard.Get(), IID_PPV_ARGS(&items));
-        if (FAILED(hr)) return hr;
-        DWORD count = 0; items->GetCount(&count);
-        for (DWORD i = 0; i < count; ++i) {
-            ComPtr<IShellItem> item; hr = items->GetItemAt(i, &item); if (FAILED(hr)) return hr;
-            auto path = itemName(item.Get(), SIGDN_FILESYSPATH);
-            if (path.empty()) return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
-            targets.emplace_back(path);
-        }
-    } else {
-        ComPtr<IFileOpenDialog> dialog;
-        hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog));
-        if (FAILED(hr)) return hr;
-        dialog->SetOptions(FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST);
-        dialog->SetTitle(L"Choose a file for the new shortcut");
-        hr = dialog->Show(window_); if (FAILED(hr)) return hr;
-        ComPtr<IShellItem> item; hr = dialog->GetResult(&item); if (FAILED(hr)) return hr;
-        targets.emplace_back(itemName(item.Get(), SIGDN_FILESYSPATH));
-    }
-    if (targets.empty()) return E_INVALIDARG;
-    for (const auto& target : targets) {
-        std::filesystem::path output;
-        auto name = target.filename().wstring();
-        if (name.empty()) name = L"Folder";
-        hr = unusedPath(destination, name + L" - Shortcut", L".lnk", output); if (FAILED(hr)) return hr;
-        hr = ExtraOperations::createShortcut(target, output); if (FAILED(hr)) return hr;
-        SHChangeNotify(SHCNE_CREATE, SHCNF_PATHW, output.c_str(), nullptr);
-    }
-    return S_OK;
-}
-
 HRESULT ExplorerApp::execute(UINT command) {
-    if(commandRefreshActive_) {deferCommandRefresh();return HRESULT_FROM_WIN32(ERROR_RETRY);}
     if(closing_)return E_ABORT;
+    if(command==Search) {
+        if(!search_||!IsWindow(search_))return E_UNEXPECTED;
+        ++searchInteractionRevision_;
+        const auto submitted=liveSearchPolicy_.submit(textOf(search_),GetTickCount64());
+        return FAILED(submitted)?submitted:processLiveSearch();
+    }
+    if(commandRefreshActive_) {deferCommandRefresh();return HRESULT_FROM_WIN32(ERROR_RETRY);}
     if(command==ExpandAncestors) {
         return applyNavigationOptions(true);
     }
     if(headless_&&command==OpenFileLocation)return openFileLocation();
-    if(headless_&&command==NewFolder)return newFolder();
+    if(headless_&&command==NewFolder)return E_ACCESSDENIED;
     if(command==NewFolder&&librariesRoot_)return newLibrary();
     if (const auto binding = appCommandBinding(command); binding && binding->route != AppCommandRoute::Host)
         return executeRibbon(command);
-    if (command == Terminal || command == NewShortcut || command == NewText || command == Zip ||
-        command == Extract || command == Security || command == LibraryLocations) return executeRibbon(command);
-    if (command >= BreadcrumbFirst && command - BreadcrumbFirst < breadcrumbsPidls_.size())
-        return browser_->BrowseToIDList(breadcrumbsPidls_[command - BreadcrumbFirst].get(), SBSP_ABSOLUTE);
+    if (command == NewShortcut || command == NewText || command == LibraryLocations) return executeRibbon(command);
     if (command >= ViewFirst && command <= ViewLast) return setView(static_cast<ViewMode>(command - ViewFirst));
     ComPtr<IShellItemArray> items;
-    ComPtr<IShellItem> folder;
     switch (command) {
     case Back: return browseHistory(-1);
     case Forward: return browseHistory(1);
     case Up: return browser_->BrowseToIDList(nullptr, SBSP_PARENT);
     case Refresh: return view_ ? view_->Refresh() : E_UNEXPECTED;
     case Address: editAddress(); return S_OK;
+    case BreadcrumbOverflow: return showBreadcrumbOverflow();
     case AddressList: popup(AddressList,breadcrumbs_);return headless_?E_ACCESSDENIED:S_OK;
     case FocusNext: return cycleFocus(false);
     case FocusPrevious: return cycleFocus(true);
     case Fullscreen: return toggleFullscreen();
     case FocusSearch: SetFocus(search_); SendMessageW(search_, EM_SETSEL, 0, -1); return S_OK;
-    case Search: {
-        ++searchInteractionRevision_;
-        const auto submitted=liveSearchPolicy_.submit(textOf(search_),GetTickCount64());
-        return FAILED(submitted)?submitted:processLiveSearch();
-    }
     case CloseSearch:
+        if(searchWindowOrigin_) {
+            const auto origin=searchWindowOrigin_;setSearchText(L"");
+            return browser_->BrowseToObject(origin.Get(),SBSP_ABSOLUTE);
+        }
         if(liveSearchOrigin_) {
             ++searchInteractionRevision_;
             liveSearchPolicy_.escape(GetTickCount64());setSearchText(L"",false);return processLiveSearch();
@@ -2063,10 +2663,9 @@ HRESULT ExplorerApp::execute(UINT command) {
     }
     case SaveSearch: return saveSearch();
     case OpenFileLocation: return openFileLocation();
-    case NewItems: return newItemMenu();
     case NewLibrary: return newLibrary();
     case IncludeLibraryFolder: return includeLibraryFolder();
-    case QuickAccessMenu: return S_FALSE;
+    case QuickAccessMenu: popup(command); return headless_ ? E_ACCESSDENIED : S_OK;
     case QuickAccessPlacement:
         { bool below = false; auto hr = ribbon_.quickAccessBelow(below);
           if (FAILED(hr)) return hr; hr = ribbon_.setQuickAccessBelow(!below); layout(); return hr; }
@@ -2082,9 +2681,8 @@ HRESULT ExplorerApp::execute(UINT command) {
     case Network: return navigate(L"shell:NetworkPlacesFolder");
     case RecycleBin: return navigate(L"shell:RecycleBinFolder");
     case Libraries: return navigate(L"shell:Libraries");
-    case FileMenu: case HistoryMenu: case ViewMenu: case SortMenu: case GroupMenu:
-    case ColumnsMenu: case RecentSearches: case SearchKindMenu: case SearchDateMenu: case SearchSizeMenu:
-    case LibraryLocations: case LibraryDefault: case LibraryOptimize:
+    case FileMenu: case HistoryMenu: case ViewMenu:
+    case RecentSearches: case SearchKindMenu: case SearchDateMenu: case SearchSizeMenu:
         popup(command); return S_OK;
     case SizeColumns: return sizeColumns();
     case Close: PostMessageW(window_, WM_CLOSE, 0, 0); return S_OK;
@@ -2096,70 +2694,20 @@ HRESULT ExplorerApp::execute(UINT command) {
         const auto hr = selection(items); if (FAILED(hr)) return hr;
         return command == CopyPath ? ShellOperations::copyPaths(window_, items.Get()) : ShellOperations::copyToClipboard(window_, items.Get(), command == Cut);
     }
-    case Paste: {
-        if (headless_) return E_ACCESSDENIED;
-        const auto hr = currentFolder(folder);
-        return SUCCEEDED(hr) ? ShellOperations::paste(window_, folder.Get()) : hr;
-    }
-    case PasteShortcut: return makeShortcut(true);
-    case HideSelected: {
-        if (headless_) return E_ACCESSDENIED;
-        auto hr = selection(items); if (FAILED(hr)) return hr;
-        HRESULT rollback = S_OK;
-        hr = ItemActions::toggleHidden(items.Get(), &rollback);
-        if (FAILED(rollback)) showError(rollback, L"Restore hidden attributes");
-        if (view_) view_->Refresh();
-        return hr;
-    }
-    case CopyTo: return chooseDestination(false);
-    case MoveTo: return chooseDestination(true);
-    case Delete: case PermanentDelete: {
-        if (headless_) return E_ACCESSDENIED;
-        const auto hr = selection(items); if (FAILED(hr)) return hr;
-        DWORD count = 0;
-        if (!items) return E_INVALIDARG;
-        const auto countResult = items->GetCount(&count);
-        if (FAILED(countResult)) return countResult;
-        if (!count) return E_INVALIDARG;
-        if (command == PermanentDelete && MessageBoxW(window_, L"Permanently delete the selected items? They will not go to the Recycle Bin.", L"Delete permanently", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) return S_FALSE;
-        return ShellOperations::remove(window_, items.Get(), command == PermanentDelete);
-    }
     case Rename: return folderView_ ? folderView_->DoRename() : E_UNEXPECTED;
-    case NewFolder: return newFolder();
-    case NewText: return newText();
-    case NewShortcut: return makeShortcut(false);
     case Properties: return showProperties(nullptr);
-    case Sharing: return shareFiles();
     case SharingProperties: return showProperties(L"Sharing");
-    case Security: return showProperties(L"Security");
     case Open: return nativeVerb(L"open");
     case Edit: return nativeVerb(L"edit");
     case Print: return nativeVerb(L"print");
     case Pin: return nativeVerb(L"pintohome", true);
-    case Undo: case Redo:
-        if (headless_) return E_ACCESSDENIED;
-        { auto hr = command == Undo ? ShellOperations::undo(window_) : ShellOperations::redo(window_);
-          namespaceDirty_ = true; ribbon_.invalidateState(); return hr; }
-    case Zip: return archive(false);
-    case Extract: return archive(true);
     case SelectAll: case SelectNone: case Invert: {
         updateNamespace();
         CommandRefreshScope nativeCommand(*this);
         const auto action=command==SelectAll?SelectionAction::All:command==SelectNone?SelectionAction::None:SelectionAction::Invert;
         return changeShellSelection(folderView_.Get(),view_.Get(),action,&backgroundActions_,headless_);
     }
-    case NavigationPane: preferences_.navigationPane = !preferences_.navigationPane; break;
-    case PreviewPane: preferences_.previewPane = !preferences_.previewPane; preferences_.detailsPane = false; break;
-    case DetailsPane: preferences_.detailsPane = !preferences_.detailsPane; preferences_.previewPane = false; break;
-    case HiddenItems:
-        preferences_.showHidden = !preferences_.showHidden;
-        if(!headless_) {
-            SHELLSTATE settings{};SHGetSetSettings(&settings,SSF_SHOWALLOBJECTS,FALSE);
-            settings.fShowAllObjects=preferences_.showHidden;
-            SHGetSetSettings(&settings,SSF_SHOWALLOBJECTS,TRUE);
-            SHChangeNotify(SHCNE_ASSOCCHANGED,SHCNF_IDLIST,nullptr,nullptr);
-        }
-        break;
+    case NavigationPane: case PreviewPane: case DetailsPane: case HiddenItems: break;
     case Extensions: {
         if (headless_) return E_ACCESSDENIED;
         SHELLSTATE state{}; SHGetSetSettings(&state, SSF_SHOWEXTENSIONS, FALSE);
@@ -2176,9 +2724,19 @@ HRESULT ExplorerApp::execute(UINT command) {
         if(SUCCEEDED(hr)){preferences_.ribbonCollapsed=!minimized;layout();}
         return hr;
     }
-    case Checkboxes:
-        checkboxes_ = !checkboxes_; rebuildRibbon();
-        return folderView_ ? folderView_->SetCurrentFolderFlags(FWF_CHECKSELECT, checkboxes_ ? FWF_CHECKSELECT : 0) : E_UNEXPECTED;
+    case Checkboxes: {
+        if (!folderView_) return E_UNEXPECTED;
+        DWORD flags = 0;
+        auto hr = folderView_->GetCurrentFolderFlags(&flags);
+        if (FAILED(hr)) return hr;
+        const bool checked = (flags & FWF_CHECKSELECT) == 0;
+        hr = folderView_->SetCurrentFolderFlags(FWF_CHECKSELECT, checked ? FWF_CHECKSELECT : 0);
+        if (FAILED(hr)) return hr;
+        checkboxes_ = checked;
+        namespaceDirty_ = selectionStateDirty_ = true;
+        updateCommands();
+        return hr;
+    }
     case SortName: return setSort(PKEY_ItemNameDisplay);
     case SortDate: return setSort(PKEY_DateModified);
     case SortType: return setSort(PKEY_ItemTypeText);
@@ -2203,18 +2761,9 @@ HRESULT ExplorerApp::execute(UINT command) {
         if (headless_) return E_ACCESSDENIED;
         { auto result = command == MapDrive ? WNetConnectionDialog(window_, RESOURCETYPE_DISK) : WNetDisconnectDialog(window_, RESOURCETYPE_DISK);
           return result == NO_ERROR ? S_OK : result == static_cast<DWORD>(-1) ? S_FALSE : HRESULT_FROM_WIN32(result); }
-    case Terminal: {
-        if (headless_) return E_ACCESSDENIED;
-        if (navigating_) return HRESULT_FROM_WIN32(ERROR_BUSY);
-        auto hr = currentFolder(folder); if (FAILED(hr)) return hr;
-        if (!isPhysicalDirectory(folder.Get())) return HRESULT_FROM_WIN32(ERROR_DIRECTORY);
-        auto path = itemName(folder.Get(), SIGDN_FILESYSPATH);
-        return path.empty() ? HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED) : shellExecute(window_, L"cmd.exe", nullptr, path.c_str());
-    }
     default: return E_NOTIMPL;
     }
-    rebuildRibbon();
-    return recreateBrowser();
+    return recreateBrowser(command);
 }
 
 void ExplorerApp::popup(UINT command, HWND anchor) {
@@ -2228,9 +2777,13 @@ void ExplorerApp::popup(UINT command, HWND anchor) {
         if(!SendMessageW(breadcrumbs_,TB_GETRECT,AddressList,reinterpret_cast<LPARAM>(&button))) {
             DestroyMenu(menu);return;
         }
-        MapWindowPoints(breadcrumbs_,nullptr,reinterpret_cast<POINT*>(&button),2);
-        const auto selected=addresses.empty()?0:TrackPopupMenu(menu,TPM_RETURNCMD|TPM_NONOTIFY|TPM_LEFTALIGN|TPM_TOPALIGN,
-            button.left,button.bottom,0,window_,nullptr);
+        auto placementRead = mapUiRect(breadcrumbs_, nullptr, button, &button);
+        UiPopupPlacement placement;
+        if (SUCCEEDED(placementRead)) placementRead = popupUiPlacement(window_, button,
+            TPM_RETURNCMD | TPM_NONOTIFY | TPM_TOPALIGN, &placement);
+        if (FAILED(placementRead)) { DestroyMenu(menu); showError(placementRead, L"Recent locations"); return; }
+        const auto selected=addresses.empty()?0:TrackPopupMenu(menu,placement.flags,
+            placement.anchor.x,placement.anchor.y,0,window_,nullptr);
         DestroyMenu(menu);
         if(selected>=TypedAddressFirst&&selected-TypedAddressFirst<addresses.size()) {
             addressEditing_=false;
@@ -2249,8 +2802,13 @@ void ExplorerApp::popup(UINT command, HWND anchor) {
         auto& actions=binding&&binding->scope==NamespaceMenuScope::Background?backgroundActions_:namespaceActions_;
         auto hr = queryAppCommandPopup(actions, command, commandContext(), &native);
         POINT point{};
-        if (anchor) { RECT rect{}; GetWindowRect(anchor, &rect); point = {rect.left, rect.bottom}; }
-        else GetCursorPos(&point);
+        if (SUCCEEDED(hr) && anchor) {
+            RECT bounds{};
+            if (!GetWindowRect(anchor, &bounds)) hr = HRESULT_FROM_WIN32(GetLastError());
+            UiPopupPlacement placement;
+            if (SUCCEEDED(hr)) hr = popupUiPlacement(window_, bounds, TPM_RETURNCMD | TPM_NONOTIFY, &placement);
+            if (SUCCEEDED(hr)) point = placement.anchor;
+        } else if (SUCCEEDED(hr) && !GetCursorPos(&point)) hr = HRESULT_FROM_WIN32(GetLastError());
         activeNamespaceMenu_=&actions;
         if (SUCCEEDED(hr)) hr = actions.invokeCommandStorePopup(native, false, point);
         activeNamespaceMenu_=nullptr;
@@ -2260,45 +2818,15 @@ void ExplorerApp::popup(UINT command, HWND anchor) {
     }
     auto menu = CreatePopupMenu();
     auto add = [&](UINT id, const wchar_t* text, bool checked = false, bool disabled = false) {
-        AppendMenuW(menu, MF_STRING | (checked ? MF_CHECKED : 0) | (disabled ? MF_GRAYED : 0), id, text);
+        std::wstring label;
+        for (const auto character : std::wstring_view(text)) { label += character; if (character == L'&') label += character; }
+        AppendMenuW(menu, MF_STRING | (checked ? MF_CHECKED : 0) | (disabled ? MF_GRAYED : 0), id, label.c_str());
     };
     auto separator = [&] { AppendMenuW(menu, MF_SEPARATOR, 0, nullptr); };
-    std::vector<PROPERTYKEY> columnKeys;
     std::vector<std::wstring> refinements;
-    std::vector<LibraryFolder> libraryFolders;
-    Pidl libraryTarget(currentPidl_ ? ILCloneFull(currentPidl_.get()) : nullptr);
-    const auto libraryGeneration = navigationCount_;
-    auto refine = [&](const wchar_t* label, const wchar_t* query) {
-        add(28000 + static_cast<UINT>(refinements.size()), label);
-        refinements.emplace_back(query);
-    };
-    if (command == LibraryLocations || command == LibraryDefault) {
-        const auto hr = library_.folders(libraryFolders);
-        if (FAILED(hr)) { DestroyMenu(menu); showError(hr, L"Read library locations"); return; }
-        ComPtr<IShellItem> defaultFolder;
-        library_.defaultSaveFolder(defaultFolder);
-        for (size_t i = 0; i < libraryFolders.size(); ++i) {
-            int order = 1;
-            const bool current = defaultFolder && SUCCEEDED(libraryFolders[i].item->Compare(defaultFolder.Get(),
-                SICHINT_CANONICAL | SICHINT_TEST_FILESYSPATH_IF_NOT_EQUAL, &order)) && order == 0;
-            const auto label = libraryFolders[i].path.empty() ? libraryFolders[i].displayName : libraryFolders[i].path.wstring();
-            if (command == LibraryDefault) add(35000 + static_cast<UINT>(i), label.c_str(), current, !library_.writable());
-            else {
-                const auto location = CreatePopupMenu();
-                AppendMenuW(location, MF_STRING, 34000 + i, L"Open location");
-                AppendMenuW(location, MF_STRING | (current ? MF_CHECKED : 0) | (library_.writable() ? 0 : MF_GRAYED), 35000 + i, L"Set as save location");
-                AppendMenuW(location, MF_STRING | (library_.writable() ? 0 : MF_GRAYED), 36000 + i, L"Remove from library");
-                AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(location), label.c_str());
-            }
-        }
-        if (libraryFolders.empty()) add(0, L"No included locations", false, true);
-    } else if (command == LibraryOptimize) {
-        GUID type{}; library_.folderType(type);
-        const auto current = libraryKindForType(type);
-        const auto kinds = libraryKinds();
-        for (size_t i = 0; i < kinds.size(); ++i)
-            add(37000 + static_cast<UINT>(i), kinds[i].label.data(), current == kinds[i].kind, !library_.writable());
-    } else if (command == QuickAccessMenu) {
+    std::vector<Pidl> historyLocations;
+    const auto queries = recentSearches_;
+    if (command == QuickAccessMenu) {
         const auto catalog = quickAccessCommands();
         const auto choices = CreatePopupMenu();
         for (size_t i = 0; i < catalog.size(); ++i)
@@ -2319,7 +2847,7 @@ void ExplorerApp::popup(UINT command, HWND anchor) {
         add(QuickAccessPlacement, quickAccessModel_.belowRibbon() ? L"Show above the ribbon" : L"Show below the ribbon");
         add(QuickAccessReset, L"Reset toolbar");
     } else if (command == FileMenu) {
-        add(NewWindow, L"Open new window\tCtrl+N"); add(Terminal, L"Open command prompt here", false, !physicalDirectory_ || navigating_); separator();
+        add(NewWindow, L"Open new window\tCtrl+N"); add(Terminal, L"Open Windows PowerShell here", false, !physicalDirectory_ || navigating_); separator();
         add(QuickAccess, L"Quick access"); add(ThisPC, L"This PC"); add(Desktop, L"Desktop");
         add(Documents, L"Documents"); add(Downloads, L"Downloads"); add(Pictures, L"Pictures");
         add(Music, L"Music"); add(Videos, L"Videos"); add(Libraries, L"Libraries");
@@ -2332,88 +2860,40 @@ void ExplorerApp::popup(UINT command, HWND anchor) {
         add(Close, L"Close\tAlt+F4");
     } else if (command == ViewMenu) {
         for (int i = 0; i < 8; ++i) add(ViewFirst + i, ViewNames[i], static_cast<int>(preferences_.view) == i);
-    } else if (command == SortMenu || command == GroupMenu) {
-        const bool group = command == GroupMenu;
-        add(group ? GroupName : SortName, L"Name"); add(group ? GroupDate : SortDate, L"Date modified");
-        add(group ? GroupType : SortType, L"Type"); add(group ? GroupSize : SortSize, L"Size");
-        if (group) add(GroupNone, L"(None)");
-        else { separator(); add(SortAscending, L"Ascending", ascending_); add(SortDescending, L"Descending", !ascending_); }
     } else if (command == HistoryMenu) {
+        historyLocations.reserve(history_.size());
+        for (const auto& location : history_) {
+            Pidl copy(ILCloneFull(location.get()));
+            if (!copy) { DestroyMenu(menu); showError(E_OUTOFMEMORY, L"Open history menu"); return; }
+            historyLocations.push_back(std::move(copy));
+        }
         for (int i = static_cast<int>(history_.size()) - 1; i >= 0; --i) {
-            auto name = pidlName(history_[i].get(), SIGDN_NORMALDISPLAY);
+            auto name = pidlName(historyLocations[i].get(), SIGDN_NORMALDISPLAY);
             add(4000 + i, name.c_str(), i == historyIndex_);
         }
-    } else if (command == ColumnsMenu) {
-        ComPtr<IColumnManager> columns;
-        UINT count = 0;
-        if (folderView_ && SUCCEEDED(folderView_.As(&columns)) && SUCCEEDED(columns->GetColumnCount(CM_ENUM_ALL, &count)) && count <= 1000) {
-            columnKeys.resize(count);
-            if (SUCCEEDED(columns->GetColumns(CM_ENUM_ALL, columnKeys.data(), count))) {
-                for (UINT i = 0; i < count; ++i) {
-                    CM_COLUMNINFO info{sizeof(info)}; info.dwMask = CM_MASK_NAME | CM_MASK_STATE;
-                    if (SUCCEEDED(columns->GetColumnInfo(columnKeys[i], &info)) && *info.wszName)
-                        add(26000 + i, info.wszName, (info.dwState & CM_STATE_VISIBLE) != 0,
-                            IsEqualPropertyKey(columnKeys[i], PKEY_ItemNameDisplay));
-                }
-            }
-        }
-        separator(); add(SizeColumns, L"Size all columns to fit");
     } else if (command == RecentSearches) {
-        for (size_t i = 0; i < recentSearches_.size(); ++i) add(27000 + static_cast<UINT>(i), recentSearches_[i].c_str());
-    } else if (command == SearchKindMenu) {
-        refine(L"Documents", L"System.Kind:=System.Kind#Document"); refine(L"Pictures", L"System.Kind:=System.Kind#Picture");
-        refine(L"Music", L"System.Kind:=System.Kind#Music"); refine(L"Videos", L"System.Kind:=System.Kind#Video");
-        refine(L"Folders", L"System.Kind:=System.Kind#Folder"); refine(L"Programs", L"System.Kind:=System.Kind#Program");
-    } else if (command == SearchDateMenu) {
-        refine(L"Today", L"System.DateModified:System.StructuredQueryType.DateTime#Today");
-        refine(L"Yesterday", L"System.DateModified:System.StructuredQueryType.DateTime#Yesterday");
-        refine(L"This week", L"System.DateModified:System.StructuredQueryType.DateTime#ThisWeek");
-        refine(L"Last week", L"System.DateModified:System.StructuredQueryType.DateTime#LastWeek");
-        refine(L"This month", L"System.DateModified:System.StructuredQueryType.DateTime#ThisMonth");
-        refine(L"This year", L"System.DateModified:System.StructuredQueryType.DateTime#ThisYear");
-    } else if (command == SearchSizeMenu) {
-        refine(L"Empty (0 KB)", L"System.Size:System.Size#Empty");
-        refine(L"Tiny (0–16 KB)", L"System.Size:System.Size#Tiny");
-        refine(L"Small (16 KB–1 MB)", L"System.Size:System.Size#Small");
-        refine(L"Medium (1–128 MB)", L"System.Size:System.Size#Medium");
-        refine(L"Large (128 MB–1 GB)", L"System.Size:System.Size#Large");
-        refine(L"Huge (1–4 GB)", L"System.Size:System.Size#Huge");
-        refine(L"Gigantic (over 4 GB)", L"System.Size:System.Size#Gigantic");
+        for (size_t i = 0; i < queries.size(); ++i) add(27000 + static_cast<UINT>(i), queries[i].c_str());
+    } else if (command == SearchKindMenu || command == SearchDateMenu || command == SearchSizeMenu) {
+        const auto result = appendSearchRefinementMenu(command, menu, &refinements);
+        if (FAILED(result)) { DestroyMenu(menu); showError(result, L"Read search refinements"); return; }
     }
     if (!anchor) anchor = command == FileMenu ? window_ : command == HistoryMenu ? nav_ : window_;
-    RECT rect{};
-    if (anchor) GetWindowRect(anchor, &rect);
-    else { POINT point{}; GetCursorPos(&point); rect.left = point.x; rect.bottom = point.y; }
-    if (command == QuickAccessMenu && false) {
-        RECT button{};
-        if (SendMessageW(window_, TB_GETRECT, QuickAccessMenu, reinterpret_cast<LPARAM>(&button))) {
-            MapWindowPoints(window_, nullptr, reinterpret_cast<POINT*>(&button), 2);
-            rect.left = button.left; rect.bottom = button.bottom;
-        }
-    }
-    const auto selected = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_LEFTALIGN | TPM_TOPALIGN, rect.left, rect.bottom, 0, window_, nullptr);
+    POINT menuPoint{}; UINT menuFlags = 0;
+    auto placementRead = popupUiFlags(window_, TPM_RETURNCMD | TPM_NONOTIFY | TPM_TOPALIGN, &menuFlags);
+    if (SUCCEEDED(placementRead) && anchor) {
+        RECT bounds{};
+        if (!GetWindowRect(anchor, &bounds)) placementRead = HRESULT_FROM_WIN32(GetLastError());
+        UiPopupPlacement placement;
+        if (SUCCEEDED(placementRead)) placementRead = popupUiPlacement(window_, bounds, menuFlags, &placement);
+        if (SUCCEEDED(placementRead)) { menuPoint = placement.anchor; menuFlags = placement.flags; }
+    } else if (SUCCEEDED(placementRead) && !GetCursorPos(&menuPoint)) placementRead = HRESULT_FROM_WIN32(GetLastError());
+    if (FAILED(placementRead)) { DestroyMenu(menu); showError(placementRead, L"Open menu"); return; }
+    const auto selected = TrackPopupMenu(menu, menuFlags, menuPoint.x, menuPoint.y, 0, window_, nullptr);
     DestroyMenu(menu);
-    const bool libraryEdit = (selected >= 35000 && selected - 35000 < libraryFolders.size()) ||
-        (selected >= 36000 && selected - 36000 < libraryFolders.size()) ||
-        (command == LibraryOptimize && selected >= 37000 && selected - 37000 < libraryKinds().size());
-    if (libraryEdit && (navigating_ || libraryGeneration != navigationCount_ || !libraryTarget || !currentPidl_ ||
-        !ILIsEqual(libraryTarget.get(), currentPidl_.get()))) return;
     bool toolbarChanged = false;
     const auto catalog = quickAccessCommands();
     const auto& commands = quickAccessModel_.commands();
-    if (selected >= 34000 && selected - 34000 < libraryFolders.size()) {
-        const auto& location = libraryFolders[selected - 34000];
-        showError(location.path.empty() ? browser_->BrowseToObject(location.item.Get(), SBSP_ABSOLUTE) : navigate(location.path.wstring()), L"Open library location");
-    } else if (selected >= 35000 && selected - 35000 < libraryFolders.size()) {
-        const auto hr = library_.setDefaultSaveFolder(libraryFolders[selected - 35000].item.Get());
-        showError(FAILED(hr) ? hr : commitLibrary(), L"Set library save location");
-    } else if (selected >= 36000 && selected - 36000 < libraryFolders.size()) {
-        const auto hr = library_.removeFolder(libraryFolders[selected - 36000].item.Get());
-        showError(FAILED(hr) ? hr : commitLibrary(), L"Remove library location");
-    } else if (command == LibraryOptimize && selected >= 37000 && selected - 37000 < libraryKinds().size()) {
-        const auto hr = library_.optimize(libraryKinds()[selected - 37000].kind);
-        showError(FAILED(hr) ? hr : commitLibrary(), L"Optimize library");
-    } else if (command == QuickAccessMenu && selected >= 30000 && selected - 30000 < catalog.size()) {
+    if (command == QuickAccessMenu && selected >= 30000 && selected - 30000 < catalog.size()) {
         const auto id = catalog[selected - 30000].command;
         toolbarChanged = quickAccessModel_.contains(id) ? quickAccessModel_.remove(id) : quickAccessModel_.add(id);
     } else if (command == QuickAccessMenu && selected >= 31000 && selected - 31000 < commands.size()) {
@@ -2424,15 +2904,11 @@ void ExplorerApp::popup(UINT command, HWND anchor) {
         toolbarChanged = index + 1 < commands.size() && quickAccessModel_.move(commands[index], index + 1);
     } else if (command == QuickAccessMenu && selected >= 33000 && selected - 33000 < commands.size()) {
         toolbarChanged = quickAccessModel_.remove(commands[selected - 33000]);
-    } else if (selected >= 4000 && selected - 4000 < history_.size()) {
-        pendingHistory_ = selected - 4000;
-        auto hr = browser_->BrowseToIDList(history_[pendingHistory_].get(), SBSP_ABSOLUTE);
-        if (FAILED(hr)) pendingHistory_ = -1;
-        showError(hr, L"Open history location");
-    } else if (selected >= 26000 && selected - 26000 < columnKeys.size()) {
-        showError(toggleColumn(columnKeys[selected - 26000]), L"Change columns");
-    } else if (selected >= 27000 && selected - 27000 < recentSearches_.size()) {
-        setSearchText(recentSearches_[selected - 27000]);
+    } else if (command == HistoryMenu && selected >= 4000 && selected - 4000 < historyLocations.size()) {
+        const auto index = selected - 4000;
+        showError(browseHistoryLocation(historyLocations[index].get(), static_cast<int>(index)), L"Open history location");
+    } else if (command == RecentSearches && selected >= 27000 && selected - 27000 < queries.size()) {
+        setSearchText(queries[selected - 27000]);
         showError(execute(Search), L"Search");
     } else if (selected >= 28000 && selected - 28000 < refinements.size()) {
         const auto previous = trim(textOf(search_));
@@ -2444,8 +2920,12 @@ void ExplorerApp::popup(UINT command, HWND anchor) {
 void ExplorerApp::showError(HRESULT hr, const wchar_t* action) {
     if (SUCCEEDED(hr) || isShellOperationCancelled(hr)) return;
     lastError_ = std::wstring(action) + L": " + hresultMessage(hr);
-    setStatus(lastError_);
-    if (!headless_) MessageBoxW(window_, lastError_.c_str(), L"Windows Explorer", MB_OK | MB_ICONERROR);
+    if (!headless_) {
+        bool rightToLeft = false;
+        windowUiDirection(window_, &rightToLeft);
+        MessageBoxW(window_, lastError_.c_str(), L"Windows Explorer", MB_OK | MB_ICONERROR |
+            (rightToLeft ? MB_RTLREADING | MB_RIGHT : 0));
+    }
 }
 void ExplorerApp::persist() {
     if (headless_) return;
@@ -2467,6 +2947,10 @@ void ExplorerApp::persist() {
     if (!settings.empty()) ribbon_.saveSettings(settings.parent_path() / L"ribbon.bin");
 }
 bool ExplorerApp::preprocess(MSG& message) {
+    // Native dialogs and auxiliary windows on this STA own their keyboard
+    // messages. Only the Explorer host and its descendants can dispatch its
+    // navigation/selection shortcuts or participate in its Tab cycle.
+    if (!window_ || !message.hwnd || (message.hwnd != window_ && !IsChild(window_, message.hwnd))) return false;
     if (message.message == WM_KEYDOWN || message.message == WM_SYSKEYDOWN) {
         const bool control = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
         const bool alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
@@ -2478,8 +2962,19 @@ bool ExplorerApp::preprocess(MSG& message) {
         const bool inEdit = focus == address_ || focus == search_ || _wcsicmp(focusClass, L"Edit") == 0 ||
                             _wcsnicmp(focusClass, L"RichEdit", 8) == 0;
         if (alt && key == VK_F4) return false;
+        if(focus&&focus!=window_&&!IsChild(window_,focus))return false;
         const auto command = shortcutCommand(static_cast<UINT>(key), control, shift, alt, inEdit);
         if (command) { showError(execute(*command), L"Command"); return true; }
+        if(message.message==WM_KEYDOWN&&key==VK_RETURN&&!control&&!shift&&!alt&&
+           (focus==nav_||focus==breadcrumbs_||focus==addressActions_)) {
+            const auto index=SendMessageW(focus,TB_GETHOTITEM,0,0);TBBUTTON button{};
+            if(index>=0&&SendMessageW(focus,TB_GETBUTTON,index,reinterpret_cast<LPARAM>(&button))&&
+               (button.fsState&TBSTATE_ENABLED)&&!(button.fsState&TBSTATE_HIDDEN)&&!(button.fsStyle&BTNS_SEP)) {
+                const auto toolbarCommand = static_cast<UINT>(button.idCommand);
+                showError(focus == breadcrumbs_ && breadcrumbAncestor(toolbarCommand) ? browseBreadcrumb(toolbarCommand) : execute(toolbarCommand), L"Command");
+                return true;
+            }
+        }
     }
     HWND nativeView = nullptr;
     if (view_ && SUCCEEDED(view_->GetWindow(&nativeView)) &&
@@ -2487,6 +2982,9 @@ bool ExplorerApp::preprocess(MSG& message) {
         view_->TranslateAccelerator(&message) == S_OK) return true;
     if (message.message == WM_KEYDOWN && message.wParam == VK_TAB &&
         !(GetKeyState(VK_CONTROL) & 0x8000) && !(GetKeyState(VK_MENU) & 0x8000)) {
+        const auto focus=GetFocus();
+        if(focus==nav_||focus==breadcrumbs_||focus==address_||focus==addressActions_||focus==search_)
+            return cycleToolbarFocus((GetKeyState(VK_SHIFT)&0x8000)!=0)==S_OK;
         auto next = GetNextDlgTabItem(window_, GetFocus(), (GetKeyState(VK_SHIFT) & 0x8000) != 0);
         if (next) { SetFocus(next); return true; }
     }
@@ -2549,22 +3047,30 @@ LRESULT ExplorerApp::onMessage(UINT message, WPARAM wparam, LPARAM lparam) {
     }
     switch (message) {
     case WM_SIZE: layout(); return 0;
+    case WM_CONTEXTMENU:
+        if (reinterpret_cast<HWND>(wparam) == breadcrumbs_) {
+            showError(showAddressContextMenu({GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)}), L"Address menu");
+            return 0;
+        }
+        break;
     case WM_CLIPBOARDUPDATE:
         cancelCommandStates();namespaceDirty_=true;
         if(!closing_&&!navigating_)updateCommands();
         return 0;
     case WM_SETCURSOR:
         if(LOWORD(lparam)==HTCLIENT) {
-            POINT cursor{};GetCursorPos(&cursor);ScreenToClient(window_,&cursor);
-            RECT searchBounds{};GetWindowRect(search_,&searchBounds);MapWindowPoints(nullptr,window_,reinterpret_cast<POINT*>(&searchBounds),2);
-            if(searchResizing_ || (cursor.x>=searchBounds.left-px(9)&&cursor.x<searchBounds.left&&cursor.y>=searchBounds.top&&cursor.y<searchBounds.bottom)) {
+            POINT cursor{}; RECT searchBounds{};
+            const bool mapped = GetCursorPos(&cursor) && GetWindowRect(search_, &searchBounds) &&
+                SUCCEEDED(mapUiPoint(nullptr, window_, cursor, &cursor)) && SUCCEEDED(mapUiRect(nullptr, window_, searchBounds, &searchBounds));
+            if(searchResizing_ || (mapped && cursor.x>=searchBounds.left-px(9)&&cursor.x<searchBounds.left&&cursor.y>=searchBounds.top&&cursor.y<searchBounds.bottom)) {
                 SetCursor(LoadCursorW(nullptr,IDC_SIZEWE));return TRUE;
             }
         }
         break;
     case WM_LBUTTONDOWN: {
         const POINT cursor{GET_X_LPARAM(lparam),GET_Y_LPARAM(lparam)};
-        RECT searchBounds{};GetWindowRect(search_,&searchBounds);MapWindowPoints(nullptr,window_,reinterpret_cast<POINT*>(&searchBounds),2);
+        RECT searchBounds{};
+        if (!GetWindowRect(search_, &searchBounds) || FAILED(mapUiRect(nullptr, window_, searchBounds, &searchBounds))) break;
         if(cursor.x>=searchBounds.left-px(9)&&cursor.x<searchBounds.left&&cursor.y>=searchBounds.top&&cursor.y<searchBounds.bottom) {
             searchResizing_=true;searchDragOffset_=searchBounds.left-cursor.x;SetCapture(window_);return 0;
         }
@@ -2592,15 +3098,15 @@ LRESULT ExplorerApp::onMessage(UINT message, WPARAM wparam, LPARAM lparam) {
         NONCLIENTMETRICSW metrics{sizeof(metrics)};
         SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0, dpi_);
         auto old = font_; font_ = CreateFontIndirectW(&metrics.lfMessageFont);
-        for (auto hwnd : {nav_, address_, breadcrumbs_, search_, status_, statusView_, addressActions_}) SendMessageW(hwnd, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
-        applyChrome(nav_, breadcrumbs_, address_, search_, statusView_, addressActions_);
+        for (auto hwnd : {nav_, address_, breadcrumbs_, search_, addressActions_}) SendMessageW(hwnd, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
+        applyChrome(nav_, breadcrumbs_, address_, search_, addressActions_);
         applyWindowTheme(window_); applyRibbonTheme(ribbon_.framework());
         ribbon_.invalidate(); rebuildRibbon(); updateBreadcrumbs(); layout(); if (old) DeleteObject(old);
         return 0;
     }
     case WM_THEMECHANGED: case WM_SETTINGCHANGE: case WM_SYSCOLORCHANGE:
         refreshProcessTheme(); applyWindowTheme(window_); applyRibbonTheme(ribbon_.framework());
-        applyChrome(nav_, breadcrumbs_, address_, search_, statusView_, addressActions_);
+        applyChrome(nav_, breadcrumbs_, address_, search_, addressActions_);
         if(!headless_) {
             refreshAddressHistoryPolicy();
             refreshCabinetPolicy();updateFrameTitle();
@@ -2638,6 +3144,10 @@ LRESULT ExplorerApp::onMessage(UINT message, WPARAM wparam, LPARAM lparam) {
             return reinterpret_cast<LRESULT>(brush);
         break;
     case WM_COMMAND:
+        if (reinterpret_cast<HWND>(lparam) == breadcrumbs_ && HIWORD(wparam) == BN_CLICKED &&
+            breadcrumbAncestor(LOWORD(wparam))) {
+            showError(browseBreadcrumb(LOWORD(wparam)), L"Open breadcrumb folder"); return 0;
+        }
         if(reinterpret_cast<HWND>(lparam)==search_&&HIWORD(wparam)==EN_CHANGE) {
             if(!suppressSearchChanges_&&!closing_) {
                 ++searchInteractionRevision_;
@@ -2658,13 +3168,46 @@ LRESULT ExplorerApp::onMessage(UINT message, WPARAM wparam, LPARAM lparam) {
         return 0;
     case WM_NOTIFY: {
         auto notification = reinterpret_cast<NMHDR*>(lparam);
-        if (notification->code == NM_CUSTOMDRAW && (notification->hwndFrom == nav_ || notification->hwndFrom == statusView_ || notification->hwndFrom == addressActions_))
-            return chromeToolbarCustomDraw(*reinterpret_cast<NMTBCUSTOMDRAW*>(lparam), notification->hwndFrom == statusView_, dpi_);
+        if (!notification) return 0;
+        if (notification->code == TBN_GETINFOTIPW &&
+            (notification->hwndFrom == nav_ || notification->hwndFrom == addressActions_)) {
+            const auto info = reinterpret_cast<NMTBGETINFOTIPW*>(lparam);
+            UiText key = UiText::Count;
+            if (notification->hwndFrom == nav_) {
+                switch (info->iItem) {
+                case Back: key = UiText::BackTooltip; break;
+                case Forward: key = UiText::ForwardTooltip; break;
+                case HistoryMenu: key = UiText::RecentLocations; break;
+                case Up: key = UiText::UpTooltip; break;
+                }
+            } else if (info->iItem == Refresh) key = UiText::RefreshTooltip;
+            UiString tip;
+            const auto loaded = key == UiText::RefreshTooltip ? formatUiString(key, currentName_, &tip) :
+                key != UiText::Count ? loadUiString(key, &tip) : E_INVALIDARG;
+            if (SUCCEEDED(loaded) && info->pszText && info->cchTextMax > 0) {
+                auto& stored = navigationTooltipText_[static_cast<UINT>(info->iItem)];
+                if (stored != tip.text) stored = std::move(tip.text);
+                auto count = std::min(stored.size(), static_cast<size_t>(info->cchTextMax - 1));
+                if (count && count < stored.size() && stored[count - 1] >= 0xd800 && stored[count - 1] <= 0xdbff &&
+                    stored[count] >= 0xdc00 && stored[count] <= 0xdfff) --count;
+                std::copy_n(stored.data(), count, info->pszText);
+                info->pszText[count] = L'\0';
+            }
+            return 0;
+        }
+        if (notification->code == NM_CUSTOMDRAW && (notification->hwndFrom == nav_ || notification->hwndFrom == addressActions_))
+            return chromeToolbarCustomDraw(*reinterpret_cast<NMTBCUSTOMDRAW*>(lparam), dpi_);
         if(notification->code==NM_CUSTOMDRAW&&notification->hwndFrom==breadcrumbs_)
             return chromeBreadcrumbCustomDraw(*reinterpret_cast<NMTBCUSTOMDRAW*>(lparam),dpi_);
         if (notification->hwndFrom==breadcrumbs_ && notification->code==TBN_DROPDOWN) {
             const auto dropdown=reinterpret_cast<NMTOOLBARW*>(lparam);
             beginBreadcrumbMenu(static_cast<UINT>(dropdown->iItem)); return TBDDRET_NODEFAULT;
+        }
+        if (notification->hwndFrom == breadcrumbs_ && notification->code == NM_RCLICK) {
+            const auto mouse = reinterpret_cast<NMMOUSE*>(lparam);
+            auto point = mouse->pt;
+            if (FAILED(mapUiPoint(breadcrumbs_, nullptr, point, &point))) return FALSE;
+            showError(showAddressContextMenu(point), L"Address menu"); return TRUE;
         }
         return 0;
     }
@@ -2675,12 +3218,7 @@ LRESULT ExplorerApp::onMessage(UINT message, WPARAM wparam, LPARAM lparam) {
         if (wparam==4) { pollCommandStates(); return 0; }
         if (wparam==5) { pollFrequentPlaces(); return 0; }
         if (!closing_) {
-            if (archiveTask_.valid() && archiveTask_.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
-                const auto hr = archiveTask_.get();
-                if (FAILED(hr)) showError(hr, archiveAction_.c_str());
-                else if (view_) view_->Refresh();
-            }
-            applyPendingSelection(); updateStatus(); updateCommands();
+            applyPendingSelection(); updateCommands();
         }
         return 0;
     case WM_APPCOMMAND:
@@ -2689,7 +3227,7 @@ LRESULT ExplorerApp::onMessage(UINT message, WPARAM wparam, LPARAM lparam) {
         break;
     case DeferredUpdate:
         deferredUpdateQueued_=false;
-        if(!closing_) {applyPendingSelection();updateStatus();updateCommands();}
+        if(!closing_) {applyPendingSelection();updateCommands();}
         return 0;
     case WM_DRAWITEM: {
         const auto draw=reinterpret_cast<const DRAWITEMSTRUCT*>(lparam);
@@ -2700,18 +3238,14 @@ LRESULT ExplorerApp::onMessage(UINT message, WPARAM wparam, LPARAM lparam) {
         }
         break;
     }
-    case ShareResult:
-        if (!closing_ && static_cast<HRESULT>(wparam) != E_PENDING && FAILED(static_cast<HRESULT>(wparam)))
-            showError(static_cast<HRESULT>(wparam), L"Prepare files for sharing");
-        return 0;
     case NamespaceResult:
         if(closing_)return 0;
         if (FAILED(static_cast<HRESULT>(lparam))) showError(static_cast<HRESULT>(lparam), L"Offline files");
         namespaceDirty_ = true; updateCommands(); return 0;
     case DeferredView:
         if (!closing_&&folderView_ && !navigating_) {
-            if(headless_)folderView_->SetCurrentFolderFlags(FWF_CHECKSELECT, checkboxes_ ? FWF_CHECKSELECT : 0);
-            else { DWORD flags{};if(SUCCEEDED(folderView_->GetCurrentFolderFlags(&flags)))checkboxes_=(flags&FWF_CHECKSELECT)!=0; }
+            DWORD flags{};
+            if(SUCCEEDED(folderView_->GetCurrentFolderFlags(&flags)))checkboxes_=(flags&FWF_CHECKSELECT)!=0;
             // Quick access is an aggregate home page; Windows 10 presents its
             // category headers without a standalone Name/Type column header.
             if(quickAccessLocation_)
@@ -2743,7 +3277,7 @@ LRESULT ExplorerApp::onMessage(UINT message, WPARAM wparam, LPARAM lparam) {
         if(SUCCEEDED(shutdownStatus_)) {
             // The native frequent-place pin callback can arrive on Destroy.
             // Keep its original Shell view site alive until that callback ends.
-            nativeShare_.reset();forgetRibbonTheme(ribbon_.framework());ribbon_.reset();destroyBrowser();
+            forgetRibbonTheme(ribbon_.framework());ribbon_.reset();destroyBrowser();
         }
         if (!headless_) PostQuitMessage(0);
         return 0;

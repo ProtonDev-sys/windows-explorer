@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <iostream>
 #include <stdexcept>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -137,7 +138,7 @@ Variant property(IPropertyStore* store, REFPROPERTYKEY key) {
     return output;
 }
 
-void nativeTests(explorer::PrivateDesktop& desktop) {
+bool nativeTests(explorer::PrivateDesktop& desktop, explorer::RibbonLayout layout) {
     const auto appsBefore = readSetting(L"AppsUseLightTheme");
     const auto systemBefore = readSetting(L"SystemUsesLightTheme");
     HIGHCONTRASTW contrastBefore{}; contrastBefore.cbSize = sizeof(contrastBefore);
@@ -153,9 +154,35 @@ void nativeTests(explorer::PrivateDesktop& desktop) {
         WS_OVERLAPPEDWINDOW, 0, 0, 900, 550, nullptr, nullptr, instance, nullptr)};
     require(window.value != nullptr, "Create owned private theme host");
     explorer::NativeRibbon ribbon;
-    succeeded(ribbon.initialize(window.value, instance, {}), "Native Ribbon initialization");
+    succeeded(ribbon.initialize(window.value, instance, {}, layout), "Native Ribbon initialization");
+    if (layout == explorer::RibbonLayout::InstalledWindows10 && ribbon.layout() != layout) {
+        std::cout << "SKIP: installed Windows 10 theme layout unavailable, HRESULT=" <<
+            static_cast<ULONG>(ribbon.installedLayoutStatus()) << '\n';
+        return false;
+    }
     ComPtr<IPropertyStore> store;
     succeeded(ribbon.framework()->QueryInterface(IID_PPV_ARGS(&store)), "Framework property store");
+    ComPtr<IUnknown> frameworkIdentity, propertyIdentity;
+    ComPtr<IUIFramework> roundTrip;
+    succeeded(ribbon.framework()->QueryInterface(IID_PPV_ARGS(&frameworkIdentity)), "Framework COM identity");
+    succeeded(store->QueryInterface(IID_PPV_ARGS(&propertyIdentity)), "Property store COM identity");
+    succeeded(store->QueryInterface(IID_PPV_ARGS(&roundTrip)), "Property store framework round trip");
+    require(frameworkIdentity == propertyIdentity && roundTrip.Get() == ribbon.framework(),
+        "Framework/property store lost a consistent COM identity");
+    ComPtr<IPropertyStore> nativeStore;
+    succeeded(ribbon.nativeFramework()->QueryInterface(IID_PPV_ARGS(&nativeStore)), "Underlying native property store");
+    DWORD facadeCount = 0, nativeCount = 0;
+    const auto facadeCountResult = store->GetCount(&facadeCount);
+    const auto nativeCountResult = nativeStore->GetCount(&nativeCount);
+    require(facadeCountResult == nativeCountResult && facadeCount == nativeCount,
+        "Facade changed framework property enumeration");
+    for (DWORD index = 0; SUCCEEDED(nativeCountResult) && index < nativeCount; ++index) {
+        PROPERTYKEY facadeKey{}, nativeKey{};
+        const auto facadeKeyResult = store->GetAt(index, &facadeKey);
+        const auto nativeKeyResult = nativeStore->GetAt(index, &nativeKey);
+        require(facadeKeyResult == nativeKeyResult && IsEqualPropertyKey(facadeKey, nativeKey),
+            "Facade translated a global property key or result");
+    }
     succeeded(explorer::applyWindowTheme(window.value), "Apply initial Light to private host");
     succeeded(explorer::applyRibbonTheme(ribbon.framework()), "Apply native Ribbon Light");
     auto lightBackground = property(store.Get(), UI_PKEY_GlobalBackgroundColor);
@@ -273,9 +300,10 @@ void nativeTests(explorer::PrivateDesktop& desktop) {
     ribbon.reset();
     succeeded(explorer::initializeProcessTheme(explorer::ThemeMode::Auto), "Restore process Auto policy");
     std::cout << "PASS: native Light restoration, unchanged public Ribbon defaults, read-only preferences, thread ownership\n";
+    return true;
 }
 
-void startupDarkRoundTrip() {
+void startupDarkRoundTrip(explorer::RibbonLayout layout) {
     succeeded(explorer::initializeProcessTheme(explorer::ThemeMode::Dark), "Initialize startup Dark policy");
     if (explorer::themeState().actual != explorer::ThemeMode::Dark) {
         succeeded(explorer::initializeProcessTheme(explorer::ThemeMode::Auto), "Restore unsupported startup Auto");
@@ -286,7 +314,8 @@ void startupDarkRoundTrip() {
         WS_OVERLAPPEDWINDOW, 0, 0, 900, 550, nullptr, nullptr, instance, nullptr)};
     require(dark.value != nullptr, "Startup Dark window");
     explorer::NativeRibbon darkRibbon;
-    succeeded(darkRibbon.initialize(dark.value, instance, {}), "Startup Dark Ribbon");
+    succeeded(darkRibbon.initialize(dark.value, instance, {}, layout), "Startup Dark Ribbon");
+    require(darkRibbon.layout() == layout, "Startup Dark silently changed Ribbon layout");
     succeeded(explorer::applyWindowTheme(dark.value), "Startup Dark native window");
     succeeded(explorer::applyRibbonTheme(darkRibbon.framework()), "Startup Dark native Ribbon");
     succeeded(explorer::initializeProcessTheme(explorer::ThemeMode::Light), "Startup Dark to Light policy");
@@ -296,7 +325,8 @@ void startupDarkRoundTrip() {
         WS_OVERLAPPEDWINDOW, 0, 0, 900, 550, nullptr, nullptr, instance, nullptr)};
     require(fresh.value != nullptr, "Fresh Light window");
     explorer::NativeRibbon lightRibbon;
-    succeeded(lightRibbon.initialize(fresh.value, instance, {}), "Fresh native Light Ribbon");
+    succeeded(lightRibbon.initialize(fresh.value, instance, {}, layout), "Fresh native Light Ribbon");
+    require(lightRibbon.layout() == layout, "Fresh Light silently changed Ribbon layout");
     succeeded(explorer::applyWindowTheme(fresh.value), "Fresh Light native window");
     succeeded(explorer::applyRibbonTheme(lightRibbon.framework()), "Fresh Light native Ribbon");
     ComPtr<IPropertyStore> darkStore, lightStore;
@@ -316,8 +346,10 @@ void startupDarkRoundTrip() {
 }
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX);
+    if (argc > 2 || (argc == 2 && std::string_view(argv[1]) != "--installed")) return 2;
+    const auto layout = argc == 2 ? explorer::RibbonLayout::InstalledWindows10 : explorer::RibbonLayout::Authored;
     // No COM, HWND, or theme activation precedes the private desktop transition.
     explorer::PrivateDesktop desktop;
     if (FAILED(desktop.initialize())) return 2;
@@ -326,8 +358,8 @@ int main() {
     int result = 0;
     try {
         policyTests(); std::cout << "PASS: Auto/Light/Dark, high contrast, legacy/unsupported dark policy\n";
-        nativeTests(desktop);
-        startupDarkRoundTrip();
+        if (nativeTests(desktop, layout)) startupDarkRoundTrip(layout);
+        else result = 77;
     } catch (const std::exception& error) { std::cerr << "FAIL: " << error.what() << '\n'; result = 1; }
     OleUninitialize();
     return result;

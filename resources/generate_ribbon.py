@@ -104,7 +104,7 @@ labels = {
     'RibbonNewProcess': 'Open new window in new process',
     'RibbonPowerShellAdmin': 'Open Windows PowerShell as administrator',
     'RibbonHelp': 'Help', 'RibbonAbout': 'About Windows', 'RibbonResetLibrary': 'Restore settings',
-    'RibbonRemoveLibraryFolder': 'Remove folder', 'RibbonSearchOtherProperties': 'Other properties',
+    'RibbonSearchOtherProperties': 'Other properties',
     'RibbonSearchContents': 'File contents', 'RibbonSearchSystemFiles': 'System files',
     'RibbonSearchZipFiles': 'Zipped (compressed) folders',
     'RibbonChangeIndexedLocations': 'Change indexed locations',

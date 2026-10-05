@@ -1,6 +1,7 @@
 #include "explorer/search.hpp"
 #include "explorer/context_menu.hpp"
 #include "explorer/namespace_actions.hpp"
+#include "explorer/headless_visual.hpp"
 
 #include <shlobj.h>
 #include <searchapi.h>
@@ -48,6 +49,12 @@ bool environmentEquals(const wchar_t* name, const wchar_t* expected) {
     return size && size < 32 && std::wcscmp(value, expected) == 0;
 }
 void pump() {
+    if (const auto desktop = explorer::PrivateDesktop::current()) {
+        bool visible = true;
+        succeeded(desktop->verifyIsolation(), "native-search pump lost its private desktop");
+        succeeded(desktop->visibleWindowsOnInputDesktop(visible), "observe native-search input desktop");
+        require(!visible, "native-search fixture exposed an input-desktop window");
+    }
     MSG message{};
     while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&message); DispatchMessageW(&message); }
 }
@@ -61,20 +68,26 @@ void waitFor(const std::function<bool()>& ready, const char* message, DWORD time
 class VisibilityObserver final {
 public:
     HRESULT start() {
-        EnumWindows([](HWND window, LPARAM argument) -> BOOL {
+        input_ = OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS | DESKTOP_ENUMERATE | DESKTOP_HOOKCONTROL);
+        if (!input_) return HRESULT_FROM_WIN32(GetLastError());
+        if (!EnumDesktopWindows(input_, [](HWND window, LPARAM argument) -> BOOL {
             if (IsWindowVisible(window)) reinterpret_cast<VisibilityObserver*>(argument)->baseline_.insert(window);
             return TRUE;
-        }, reinterpret_cast<LPARAM>(this));
+        }, reinterpret_cast<LPARAM>(this))) return HRESULT_FROM_WIN32(GetLastError());
         current_.store(this);
+        privateHook_ = SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW, nullptr,
+            &shown, 0, 0, WINEVENT_OUTOFCONTEXT);
+        if (!privateHook_) return HRESULT_FROM_WIN32(GetLastError());
         std::promise<HRESULT> ready;
         auto result = ready.get_future();
         worker_ = std::thread([this, ready = std::move(ready)]() mutable {
+            if (!SetThreadDesktop(input_)) { ready.set_value(HRESULT_FROM_WIN32(GetLastError())); return; }
             const auto hook = SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW, nullptr, &shown, 0, 0, WINEVENT_OUTOFCONTEXT);
             ready.set_value(hook ? S_OK : HRESULT_FROM_WIN32(GetLastError()));
             while (!stop_.load()) {
-                EnumWindows([](HWND window, LPARAM argument) -> BOOL {
+                if (!EnumDesktopWindows(input_, [](HWND window, LPARAM argument) -> BOOL {
                     reinterpret_cast<VisibilityObserver*>(argument)->inspect(window); return TRUE;
-                }, reinterpret_cast<LPARAM>(this));
+                }, reinterpret_cast<LPARAM>(this))) visible_.store(true);
                 MsgWaitForMultipleObjects(0, nullptr, FALSE, 10, QS_ALLINPUT); pump();
             }
             if (hook) UnhookWinEvent(hook);
@@ -82,7 +95,12 @@ public:
         return result.get();
     }
     ~VisibilityObserver() { stop(); }
-    void stop() { stop_.store(true); if (worker_.joinable()) worker_.join(); current_.store(nullptr); }
+    void stop() {
+        if (privateHook_) { UnhookWinEvent(privateHook_); privateHook_ = nullptr; }
+        stop_.store(true); if (worker_.joinable()) worker_.join();
+        if (input_) { CloseDesktop(input_); input_ = nullptr; }
+        current_.store(nullptr);
+    }
     bool visible() const { return visible_.load(); }
 private:
     static void CALLBACK shown(HWINEVENTHOOK, DWORD, HWND window, LONG object, LONG child, DWORD, DWORD) {
@@ -94,6 +112,8 @@ private:
         if (process == GetCurrentProcessId() || !baseline_.contains(window)) visible_.store(true);
     }
     inline static std::atomic<VisibilityObserver*> current_{nullptr};
+    HDESK input_ = nullptr;
+    HWINEVENTHOOK privateHook_ = nullptr;
     std::unordered_set<HWND> baseline_;
     std::atomic_bool stop_ = false, visible_ = false;
     std::thread worker_;
@@ -543,6 +563,9 @@ void describeOptionFailure(HiddenBrowser& browser,const TestOption& option,IShel
     freshBrowser.close();
 }
 void auditAndTest() {
+    const auto desktop = explorer::PrivateDesktop::current();
+    require(desktop && desktop->ready(), "native search options require an initialized private desktop");
+    succeeded(desktop->verifyIsolation(), "native search options lost initial desktop isolation");
     SettingsGuard settings;
     Fixture fixture; auto scope = shellItem(fixture.root);
     VisibilityObserver visibility; succeeded(visibility.start(), "watch actual Shell providers for visible UI");
@@ -618,6 +641,7 @@ void auditAndTest() {
         require(!visibility.visible(), "native search advanced option displayed visible UI");
     }
     browser.close(); visibility.stop(); require(!visibility.visible(), "hidden search audit exposed visible UI");
+    succeeded(desktop->verifyIsolation(), "native search options changed desktop isolation");
     if constexpr (ReadOnlyAudit) settings.verifyReadOnly();
     else settings.restore();
     std::cout << (ReadOnlyAudit ? "Read-only native advanced-search audit completed; no command invoked\n" :
@@ -631,10 +655,16 @@ int main() {
         }
     }
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX);
+    explorer::PrivateDesktop desktop;
+    if (FAILED(desktop.initialize()) || FAILED(desktop.verifyIsolation())) {
+        std::cerr << "Cannot initialize isolated native-search desktop\n"; return 2;
+    }
     const auto initialized = OleInitialize(nullptr);
     if (FAILED(initialized)) return 2;
     int result = 0;
     try { auditAndTest(); }
     catch (const std::exception& error) { std::cerr << "FAIL: native search option verification: " << error.what() << '\n'; result = 1; }
-    OleUninitialize(); return result;
+    OleUninitialize();
+    if (FAILED(desktop.verifyIsolation())) result = 1;
+    return result;
 }

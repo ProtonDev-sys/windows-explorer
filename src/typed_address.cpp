@@ -35,11 +35,15 @@ size_t executableEnd(std::wstring_view input) {
     }
     return input.npos;
 }
+bool validText(std::wstring_view input) {
+    return input.size()<=32767&&input.find(L'\0')==input.npos&&
+        (input.empty()||WideCharToMultiByte(CP_UTF8,WC_ERR_INVALID_CHARS,input.data(),
+            static_cast<int>(input.size()),nullptr,0,nullptr,nullptr)!=0);
+}
 }
 HRESULT parseTypedAddressLaunch(std::wstring_view input,TypedAddressLaunch* result) {
     if(!result)return E_POINTER;
-    if(input.empty()||input.size()>32767||input.find(L'\0')!=input.npos||
-       !WideCharToMultiByte(CP_UTF8,WC_ERR_INVALID_CHARS,input.data(),static_cast<int>(input.size()),nullptr,0,nullptr,nullptr))return E_INVALIDARG;
+    if(input.empty()||!validText(input))return E_INVALIDARG;
     input=leftTrim(input);if(input.empty())return E_INVALIDARG;
     try {
         TypedAddressLaunch parsed;
@@ -50,8 +54,16 @@ HRESULT parseTypedAddressLaunch(std::wstring_view input,TypedAddressLaunch* resu
             parsed.target=input.substr(1,end-1);
             parsed.parameters=leftTrim(input.substr(end+1));
         } else {
-            auto end=executableEnd(input);
-            if(end==input.npos)end=input.find_first_of(L" \t\r\n");
+            const auto firstSpace=input.find_first_of(L" \t\r\n");
+            const auto firstToken=input.substr(0,firstSpace);
+            // A command alias ends at its first separator. Looking for an
+            // executable suffix in its arguments would turn `cmd /c a.exe`
+            // into one nonexistent executable. Unquoted paths can still
+            // contain spaces; filenames containing spaces without a path
+            // prefix must be quoted to distinguish them from parameters.
+            const bool path=firstToken.find_first_of(L"\\/:")!=firstToken.npos;
+            auto end=executableEnd(path?input:firstToken);
+            if(end==input.npos)end=firstSpace;
             if(end==input.npos)end=input.size();
             parsed.target=input.substr(0,end);
             parsed.parameters=leftTrim(input.substr(end));
@@ -63,7 +75,7 @@ HRESULT parseTypedAddressLaunch(std::wstring_view input,TypedAddressLaunch* resu
 }
 HRESULT launchTypedAddress(HWND owner,std::wstring_view input,bool headless,const TypedAddressLauncher& testLauncher,std::wstring_view directory) {
     if(headless)return E_ACCESSDENIED;
-    if(directory.size()>32767||directory.find(L'\0')!=directory.npos)return E_INVALIDARG;
+    if(!validText(directory))return E_INVALIDARG;
     TypedAddressLaunch launch;auto hr=parseTypedAddressLaunch(input,&launch);
     if(FAILED(hr))return hr;
     try{launch.directory=directory;}catch(const std::bad_alloc&){return E_OUTOFMEMORY;}catch(...){return E_FAIL;}

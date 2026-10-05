@@ -61,8 +61,72 @@ jobs:
             !artifacts/visual/**/private-source/**
             !artifacts/**/binary/**
           if-no-files-found: warn
-      - name: Upload native application
+      - name: Stage native application for combined validation
+        uses: actions/upload-artifact@v7
+        with:
+          name: WindowsExplorer-x64-build
+          path: build/Release/WindowsExplorer.exe
+          if-no-files-found: error
+  native-transfer:
+    # Clipboard transfers create real Shell undo records. Keep this fixture
+    # on a fresh disposable machine, separate from the native history suite.
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build native transfer fixture
+        shell: pwsh
+        run: ./scripts/build.ps1 -Configuration Release
+      - name: Exercise native clipboard and destination transfers headlessly
+        shell: pwsh
+        env:
+          WINDOWSEXPLORER_NATIVE_TRANSFER_TEST: '1'
+        run: |
+          New-Item -ItemType Directory -Path artifacts -Force | Out-Null
+          ctest --test-dir build -C Release -R '^native_shell_transfer$' --no-tests=error --output-on-failure --output-junit artifacts/native-transfer.xml 2>&1 | Tee-Object -FilePath artifacts/native-transfer.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          [xml]$transferReport = Get-Content -LiteralPath artifacts/native-transfer.xml -Raw
+          $transferCases = @($transferReport.testsuite.testcase)
+          if ($transferCases.Count -ne 1 -or $transferCases[0].name -ne 'native_shell_transfer' -or
+              $transferCases[0].status -ne 'run' -or $null -ne $transferCases[0].SelectSingleNode('skipped') -or
+              $null -ne $transferCases[0].SelectSingleNode('failure')) {
+            throw 'The dedicated native transfer job requires one actual passing test; a skip is not verification.'
+          }
+      - name: Upload native transfer evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-transfer-reports
+          path: |
+            artifacts/native-transfer.xml
+            artifacts/native-transfer.log
+          if-no-files-found: warn
+  validated-application:
+    needs: [build, native-transfer]
+    runs-on: windows-2022
+    timeout-minutes: 5
+    steps:
+      - name: Retrieve the tested application
+        uses: actions/download-artifact@v8
+        with:
+          name: WindowsExplorer-x64-build
+          path: validated
+      - name: Record executable identity and completed gates
+        shell: pwsh
+        run: |
+          $application = Join-Path $PWD 'validated/WindowsExplorer.exe'
+          $applicationHash = (Get-FileHash -LiteralPath $application -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$applicationHash  WindowsExplorer.exe" | Set-Content -LiteralPath validated/SHA256SUMS.txt -Encoding ascii
+          @{
+            sourceCommit = $env:GITHUB_SHA
+            executableSha256 = $applicationHash
+            workflowRun = $env:GITHUB_RUN_ID
+            headlessBuildAndTests = 'passed'
+            nativeTransfer = 'passed'
+          } | ConvertTo-Json | Set-Content -LiteralPath validated/build-info.json -Encoding utf8
+      - name: Publish the application after both headless jobs pass
         uses: actions/upload-artifact@v7
         with:
           name: WindowsExplorer-x64
-          path: build/Release/WindowsExplorer.exe
+          path: validated/*
+          if-no-files-found: error

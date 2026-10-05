@@ -11,18 +11,19 @@ namespace explorer {
 std::optional<Command> shortcutCommand(UINT key, bool control, bool shift,
                                        bool alt, bool editing) noexcept;
 
-enum class FocusRegion { Address, Search, FolderView, CommandBand, Navigation };
+enum class FocusRegion { FolderView, Sorting, Status, Toolbar, Navigation };
 
 struct FocusAvailability {
-    bool address = true;
-    bool search = true;
     bool folderView = true;
-    bool commandBand = true;
+    bool sorting = true;
+    bool status = true;
+    bool toolbar = true;
     bool navigation = true;
 };
 
-// Cycles address -> search -> folder view -> command band -> navigation and
-// skips unavailable regions. An unknown current region starts at the first
+// Windows 10 cycles content -> sorting header -> status -> toolbar -> navigation.
+// Ribbon navigation uses Alt; address and search have direct shortcuts. The
+// cycle skips unavailable regions. An unknown current region starts at the first
 // available region in the chosen direction. No available region returns empty.
 std::optional<FocusRegion> cycleFocusRegion(std::optional<FocusRegion> current,
                                            bool backwards,

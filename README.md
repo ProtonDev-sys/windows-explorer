@@ -8,7 +8,7 @@ The [feature matrix](docs/feature-matrix.md) records each Windows 10 feature, it
 
 ## Run
 
-Build the current source using the instructions below, or download a published build from [Releases](https://github.com/ProtonDev-sys/windows-explorer/releases).
+Build the current source using the instructions below. [Releases](https://github.com/ProtonDev-sys/windows-explorer/releases) currently provides the earlier v0.1.0 preview; its executable does not include subsequent source fixes. A newer executable must be matched to its own test reports and source commit.
 
 ```powershell
 ./WindowsExplorer.exe

@@ -1,30 +1,32 @@
 #include "explorer/core.hpp"
+#include "explorer/headless_visual.hpp"
 #include "explorer/worker_sta.hpp"
 
 #include <objbase.h>
+#include <cstdlib>
 #include <fstream>
 #include <functional>
 #include <iostream>
-#include <limits>
 #include <stdexcept>
 #include <string_view>
 #include <utility>
 #include <vector>
 
 int runShellOperationTests();
-int runExtraOperationTests();
 int runInputTests();
 int runItemActionTests();
 int runSearchTests();
+int runSearchRefinementTests();
+int runUiStringsTests();
+int runUiDirectionTests();
 int runContextMenuTests();
 int runQuickAccessTests();
 int runSavedSearchTests();
-int runShareTests();
 int runLibraryTests();
 int runNamespaceActionTests();
-int runStatusTests();
 int runBreadcrumbTests();
 int runAppCommandTests();
+int runNativeMenuStateTests();
 int runSearchHistoryTests();
 int runAddressHistoryTests();
 int runTypedAddressTests();
@@ -135,13 +137,7 @@ void invalidSettingsFallback() {
     require(!explorer::savePreferences(temporary.path, explorer::Preferences{}), "Directory settings target must fail");
 }
 
-void searchAndEnvironment() {
-    require(explorer::searchUri(L"kind:picture \u732B & \U0001F600", L"C:\\My folder\\\u65E5\u672C") ==
-        L"search-ms:query=kind%3Apicture%20%E7%8C%AB%20%26%20%F0%9F%98%80&crumb=location:C%3A%5CMy%20folder%5C%E6%97%A5%E6%9C%AC", "Search query or scope is not UTF-8 URL encoded");
-    require(explorer::searchUri(L"a&crumb=location:C:\\", L"\\\\server\\a,b") ==
-        L"search-ms:query=a%26crumb%3Dlocation%3AC%3A%5C&crumb=location:%5C%5Cserver%5Ca%2Cb", "Search delimiters were not escaped");
-    require(explorer::searchUri(L"", L"") == L"search-ms:query=", "Empty search must remain syntactically valid");
-    require(explorer::searchUri(L"_.~-", L"") == L"search-ms:query=_.~-", "Unreserved URL characters changed");
+void environmentExpansion() {
     const std::wstring variable = L"WINDOWSEXPLORER_TEST_" + std::to_wstring(GetCurrentProcessId());
     require(SetEnvironmentVariableW(variable.c_str(), L"C:\\test \u65E5\u672C\U0001F4C1") != FALSE, "Cannot set test environment variable");
     const auto expanded = explorer::expandEnvironment(L"%" + variable + L"%\\child");
@@ -151,16 +147,25 @@ void searchAndEnvironment() {
     require(explorer::trim(L" \t\r\n folder name \n") == L"folder name" && explorer::trim(L" \r\n").empty(), "Trim failed");
 }
 
-void namesAndSizes() {
+void namesAndErrors() {
     const std::vector<std::wstring> invalid{ L"", L".", L"..", L"file.", L"file ", L"a/b", L"a\\b", L"a:b", L"a*", L"a?", L"a\"b", L"a<b", L"a>b", L"a|b", L"NUL", L"con.txt", L"COM1.tar.gz", L"lpt9", L"COM\u00B9", L"LPT\u00B2.txt", L"COM\u00B3", L"CON .txt", L"CONIN$", std::wstring(256, L'a'), std::wstring(1, L'\0'), std::wstring(1, static_cast<wchar_t>(0xD800)) };
     for (const auto& name : invalid) require(!explorer::validLeafName(name), "Invalid Windows file name was accepted");
     const std::vector<std::wstring> valid{ L"hello.txt", L".gitignore", L"COM10", L"LPT0", L"console.txt", L"space inside.txt", L"\u65E5\u672C\u8A9E\U0001F4C1.txt", std::wstring(255, L'a') };
     for (const auto& name : valid) require(explorer::validLeafName(name), "Valid Windows file name was rejected");
-    require(explorer::formatBytes(0) == L"0 bytes" && explorer::formatBytes(1) == L"1 byte" && explorer::formatBytes(1023) == L"1023 bytes", "Byte-size singular or small value is wrong");
-    require(explorer::formatBytes(1024) == L"1.00 KB" && explorer::formatBytes(1536) == L"1.50 KB" && explorer::formatBytes(1024ull * 1024) == L"1.00 MB", "Binary file-size unit conversion is wrong");
-    require(explorer::formatBytes(std::numeric_limits<std::uint64_t>::max()) == L"16.00 EB", "Large file size overflowed");
     require(explorer::hresultMessage(E_ACCESSDENIED).find(L"0x80070005") != std::wstring::npos, "Error message omitted HRESULT code");
     require(explorer::hresultMessage(static_cast<HRESULT>(0x81234567)).find(L"0x81234567") != std::wstring::npos, "Unknown HRESULT lacks fallback code");
+}
+void drainCreatorBeforeShutdown() {
+    const auto drained = explorer::drainStaWorkers(5000);
+    if (FAILED(drained)) {
+        std::cerr << "FAIL: final creator STA worker drain HRESULT="
+                  << static_cast<unsigned long>(drained) << '\n';
+        std::cerr.flush();
+        // Keep the initialized creator and its private desktop alive until
+        // process termination if native work cannot actually be drained.
+        if (!TerminateProcess(GetCurrentProcess(), 10)) std::_Exit(10);
+        std::_Exit(10);
+    }
 }
 } // namespace
 
@@ -170,11 +175,46 @@ int main(int argc, char** argv) {
     std::cout.setf(std::ios::unitbuf);
     std::wcout.setf(std::ios::unitbuf);
     const auto suiteStarted = GetTickCount64();
+    // Even console fixtures can cause a native provider to create a helper
+    // HWND. Attach before any COM call and keep the input desktop untouched.
+    explorer::PrivateDesktop desktop;
+    const auto isolated = desktop.initialize();
+    if (FAILED(isolated)) {
+        std::cerr << "FAIL: initialize core private desktop HRESULT="
+                  << static_cast<unsigned long>(isolated) << '\n';
+        return 1;
+    }
     if (argc == 2 && std::string_view(argv[1]) == "--worker-only") return runStaWorkerTests();
+    if (argc == 2 && std::string_view(argv[1]) == "--menu-state-only") {
+        const auto initialized = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        if (FAILED(initialized)) return 1;
+        const auto failures = runNativeMenuStateTests();
+        drainCreatorBeforeShutdown();
+        CoUninitialize();
+        return failures ? 1 : 0;
+    }
+    if (argc == 2 && (std::string_view(argv[1]) == "--search-only" || std::string_view(argv[1]) == "--namespace-only" ||
+                     std::string_view(argv[1]) == "--refinement-only" || std::string_view(argv[1]) == "--ui-strings-only" ||
+                     std::string_view(argv[1]) == "--saved-search-only" || std::string_view(argv[1]) == "--app-commands-only" ||
+                     std::string_view(argv[1]) == "--direction-only")) {
+        const auto initialized = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        if (FAILED(initialized)) return 1;
+        const auto mode = std::string_view(argv[1]);
+        const auto failures = mode == "--search-only" ? runSearchTests() :
+            mode == "--namespace-only" ? runNamespaceActionTests() :
+            mode == "--refinement-only" ? runSearchRefinementTests() :
+            mode == "--ui-strings-only" ? runUiStringsTests() :
+            mode == "--saved-search-only" ? runSavedSearchTests() :
+            mode == "--app-commands-only" ? runAppCommandTests() : runUiDirectionTests();
+        drainCreatorBeforeShutdown();
+        CoUninitialize();
+        return failures ? 1 : 0;
+    }
     if (argc == 2 && std::string_view(argv[1]) == "--worker-after-autocomplete") {
         const auto initialized = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
         if (FAILED(initialized)) return 1;
         const auto failures = runSearchHistoryTests() + runStaWorkerTests();
+        drainCreatorBeforeShutdown();
         CoUninitialize();
         return failures ? 1 : 0;
     }
@@ -188,8 +228,8 @@ int main(int argc, char** argv) {
         {"defaults and missing settings", defaultsAndMissingSettings},
         {"Unicode settings round trip and atomic replacement", unicodeSettingsRoundTrip},
         {"invalid settings and bounded fallback", invalidSettingsFallback},
-        {"Unicode search URI and environment expansion", searchAndEnvironment},
-        {"Windows leaf names, size formatting, HRESULTs", namesAndSizes}
+        {"Unicode environment expansion", environmentExpansion},
+        {"Windows leaf names and HRESULTs", namesAndErrors}
     };
     unsigned failures = 0;
     for (const auto& [name, test] : tests) {
@@ -201,30 +241,29 @@ int main(int argc, char** argv) {
     try { failures += static_cast<unsigned>(runShellOperationTests()); }
     catch (const std::exception& error) { ++failures; std::cerr << "FAIL: Shell file operations: " << error.what() << '\n'; }
     catch (...) { ++failures; std::cerr << "FAIL: Shell file operations: unknown exception\n"; }
-    try { failures += static_cast<unsigned>(runExtraOperationTests()); }
-    catch (const std::exception& error) { ++failures; std::cerr << "FAIL: Additional file operations: " << error.what() << '\n'; }
-    catch (...) { ++failures; std::cerr << "FAIL: Additional file operations: unknown exception\n"; }
     failures += static_cast<unsigned>(runInputTests());
     failures += static_cast<unsigned>(runItemActionTests());
     failures += static_cast<unsigned>(runSearchTests());
+    failures += static_cast<unsigned>(runSearchRefinementTests());
+    failures += static_cast<unsigned>(runUiStringsTests());
+    failures += static_cast<unsigned>(runUiDirectionTests());
     failures += static_cast<unsigned>(runContextMenuTests());
     failures += static_cast<unsigned>(runQuickAccessTests());
     failures += static_cast<unsigned>(runSavedSearchTests());
-    failures += static_cast<unsigned>(runShareTests());
     failures += static_cast<unsigned>(runLibraryTests());
     failures += static_cast<unsigned>(runNamespaceActionTests());
-    failures += static_cast<unsigned>(runStatusTests());
     failures += static_cast<unsigned>(runBreadcrumbTests());
     failures += static_cast<unsigned>(runAppCommandTests());
     failures += static_cast<unsigned>(runSearchHistoryTests());
     failures += static_cast<unsigned>(runAddressHistoryTests());
     failures += static_cast<unsigned>(runTypedAddressTests());
     failures += static_cast<unsigned>(runStaWorkerTests());
-    const auto drained = explorer::drainStaWorkers(5000);
-    if (FAILED(drained)) {
+    drainCreatorBeforeShutdown();
+    bool inputUnchanged = false, visible = true;
+    if (FAILED(desktop.verifyIsolation(&inputUnchanged)) || !inputUnchanged ||
+        FAILED(desktop.visibleWindowsOnInputDesktop(visible)) || visible) {
         ++failures;
-        std::cerr << "FAIL: final creator STA worker drain HRESULT="
-                  << static_cast<unsigned long>(drained) << '\n';
+        std::cerr << "FAIL: final core private-desktop/input-window isolation\n";
     }
     CoUninitialize();
     std::cout << "Core suite elapsed_ms=" << GetTickCount64() - suiteStarted

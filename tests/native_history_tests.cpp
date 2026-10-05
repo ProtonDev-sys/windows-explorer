@@ -1,5 +1,6 @@
 #include "explorer/context_menu.hpp"
 #include "explorer/namespace_actions.hpp"
+#include "explorer/headless_visual.hpp"
 
 #include <shlobj.h>
 #include <wrl/implements.h>
@@ -45,6 +46,12 @@ bool environmentEquals(const wchar_t* name, const wchar_t* expected) {
     return length && length < 32 && std::wcscmp(value, expected) == 0;
 }
 void pump() {
+    if (const auto desktop = explorer::PrivateDesktop::current()) {
+        bool visible = true;
+        succeeded(desktop->verifyIsolation(), "native-history pump lost its private desktop");
+        succeeded(desktop->visibleWindowsOnInputDesktop(visible), "observe native-history input desktop");
+        require(!visible, "native-history fixture exposed an input-desktop window");
+    }
     MSG message{};
     while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
         TranslateMessage(&message);
@@ -63,23 +70,29 @@ void waitFor(const std::function<bool()>& ready, const char* message, DWORD time
 class VisibilityObserver final {
 public:
     HRESULT start() {
-        EnumWindows([](HWND window, LPARAM argument) -> BOOL {
+        input_ = OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS | DESKTOP_ENUMERATE | DESKTOP_HOOKCONTROL);
+        if (!input_) return HRESULT_FROM_WIN32(GetLastError());
+        if (!EnumDesktopWindows(input_, [](HWND window, LPARAM argument) -> BOOL {
             if (IsWindowVisible(window)) reinterpret_cast<VisibilityObserver*>(argument)->baseline_.insert(window);
             return TRUE;
-        }, reinterpret_cast<LPARAM>(this));
+        }, reinterpret_cast<LPARAM>(this))) return HRESULT_FROM_WIN32(GetLastError());
         current_.store(this);
+        privateHook_ = SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW, nullptr,
+            &shown, 0, 0, WINEVENT_OUTOFCONTEXT);
+        if (!privateHook_) return HRESULT_FROM_WIN32(GetLastError());
         std::promise<HRESULT> ready;
         auto result = ready.get_future();
         worker_ = std::thread([this, ready = std::move(ready)]() mutable {
+            if (!SetThreadDesktop(input_)) { ready.set_value(HRESULT_FROM_WIN32(GetLastError())); return; }
             const HWINEVENTHOOK hook = SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW, nullptr,
                 &shown, 0, 0, WINEVENT_OUTOFCONTEXT);
             const DWORD error = hook ? ERROR_SUCCESS : GetLastError();
             ready.set_value(hook ? S_OK : HRESULT_FROM_WIN32(error ? error : ERROR_GEN_FAILURE));
             while (!stop_.load()) {
-                EnumWindows([](HWND window, LPARAM argument) -> BOOL {
+                if (!EnumDesktopWindows(input_, [](HWND window, LPARAM argument) -> BOOL {
                     reinterpret_cast<VisibilityObserver*>(argument)->inspect(window);
                     return TRUE;
-                }, reinterpret_cast<LPARAM>(this));
+                }, reinterpret_cast<LPARAM>(this))) visible_.store(true);
                 MsgWaitForMultipleObjects(0, nullptr, FALSE, 10, QS_ALLINPUT);
                 pump();
             }
@@ -89,8 +102,10 @@ public:
     }
     ~VisibilityObserver() { stop(); }
     void stop() {
+        if (privateHook_) { UnhookWinEvent(privateHook_); privateHook_ = nullptr; }
         stop_.store(true);
         if (worker_.joinable()) worker_.join();
+        if (input_) { CloseDesktop(input_); input_ = nullptr; }
         current_.store(nullptr);
     }
     bool sawVisibleWindow() const { return visible_.load(); }
@@ -110,6 +125,8 @@ private:
         if (process == GetCurrentProcessId() || !baseline_.contains(window)) visible_.store(true);
     }
     inline static std::atomic<VisibilityObserver*> current_{nullptr};
+    HDESK input_ = nullptr;
+    HWINEVENTHOOK privateHook_ = nullptr;
     std::unordered_set<HWND> baseline_;
     std::atomic_bool visible_ = false;
     std::atomic_bool stop_ = false;
@@ -388,6 +405,9 @@ fs::path nativeCopy(HWND owner, IShellItem* source, IShellItem* destination) {
 }
 
 void runNativeHistory() {
+    const auto desktop = explorer::PrivateDesktop::current();
+    require(desktop && desktop->ready(), "native history requires its initialized private desktop");
+    succeeded(desktop->verifyIsolation(), "native history lost initial desktop isolation");
     VisibilityObserver observer;
     succeeded(observer.start(), "start headless native-history visibility observer");
     Fixture fixture;
@@ -465,11 +485,12 @@ void runNativeHistory() {
     require(!IsWindowVisible(browser.window()), "native-history owner remained hidden through Redo");
     browser.close();
     observer.stop();
+    succeeded(desktop->verifyIsolation(), "native history changed desktop isolation");
     require(!observer.sawVisibleWindow(),
         "native Undo/Redo fixture must never display a window");
     // A Copy Redo may legitimately recreate the copy. Identity preservation is
     // asserted for the source and reported for copies, rather than invented as
-    // a public Shell Undo contract. The isolated journal tests cover same IDs.
+    // a public Shell Undo contract.
     std::cout << "Native history: real registered Undo/Redo, 8 KB copy, exact contents/count, source identity, state transitions and no visible UI passed\n";
     std::cout << "Native Redo copy retained first copy identity: " << (sameIdentity(copiedId, restoredId) ? "yes" : "no (copy recreated)") << '\n';
     reportIdentity("Owned source identity", sourceId);
@@ -485,6 +506,10 @@ int main() {
         return 0;
     }
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX);
+    explorer::PrivateDesktop desktop;
+    if (FAILED(desktop.initialize()) || FAILED(desktop.verifyIsolation())) {
+        std::cerr << "Cannot initialize isolated native-history desktop\n"; return 1;
+    }
     const HRESULT initialized = OleInitialize(nullptr);
     if (FAILED(initialized)) { std::cerr << "Cannot initialize native-history STA\n"; return 1; }
     int result = 0;
@@ -492,5 +517,6 @@ int main() {
     catch (const std::exception& error) { std::cerr << "FAIL: CI-only native Undo/Redo: " << error.what() << '\n'; result = 1; }
     catch (...) { std::cerr << "FAIL: CI-only native Undo/Redo: unknown exception\n"; result = 1; }
     OleUninitialize();
+    if (FAILED(desktop.verifyIsolation())) result = 1;
     return result;
 }

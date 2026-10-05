@@ -1,4 +1,7 @@
 #include "explorer/address_history.hpp"
+#include "explorer/quick_access.hpp"
+#include "explorer/search_history.hpp"
+#include "state_file_security_fixture.hpp"
 #include <objbase.h>
 #include <array>
 #include <cstring>
@@ -209,14 +212,77 @@ void registryReadOnly() {
     require(explorer::readTypedAddressRegistry(nullptr, &values) == E_INVALIDARG && values == saved &&
             explorer::readTypedAddressRegistry(fixture.key, nullptr) == E_POINTER, "registry injection guards changed output");
 }
+void exactStateFilePermissions() {
+    Fixture fixture;
+    const std::vector<std::wstring> addressBefore{L"C:\\資料😀", L"%USERPROFILE%\\Desktop", L"shell:Downloads"};
+    const std::vector<std::wstring> addressAfter{L"\\\\owned-server\\share", L"C:\\different typed address"};
+    explorer::test::stateFileSecurityProfiles(fixture.root, L"typed-address",
+        [&](const fs::path& path, bool replacement) {
+            return explorer::saveAddressHistory(path, replacement ? addressAfter : addressBefore);
+        }, [&](const fs::path& path, bool replacement) {
+            std::vector<std::wstring> restored;
+            succeeded(explorer::loadAddressHistory(path, &restored), "decode actual exact-ACL typed-address codec");
+            require(restored == (replacement ? addressAfter : addressBefore), "exact-ACL typed-address roundtrip lost literal strings");
+        });
+    const std::vector<std::wstring> searchBefore{L"owned initial query", L"資料😀"};
+    const std::vector<std::wstring> searchAfter{L"owned changed query", L"System.FileExtension:=\"txt\""};
+    explorer::test::stateFileSecurityProfiles(fixture.root, L"search-history",
+        [&](const fs::path& path, bool replacement) {
+            return explorer::saveSearchHistory(path, replacement ? searchAfter : searchBefore);
+        }, [&](const fs::path& path, bool replacement) {
+            std::vector<std::wstring> restored;
+            succeeded(explorer::loadSearchHistory(path, &restored), "decode actual exact-ACL search-history codec");
+            require(restored == (replacement ? searchAfter : searchBefore), "exact-ACL search history lost literal queries");
+        });
+    explorer::Preferences preferencesBefore, preferencesAfter;
+    preferencesBefore.windowWidth = 940; preferencesBefore.windowHeight = 690;
+    preferencesBefore.useWindowsStartup = false; preferencesBefore.startupLocation = L"shell:Downloads";
+    preferencesAfter = preferencesBefore; preferencesAfter.windowWidth = 1460; preferencesAfter.windowHeight = 950;
+    preferencesAfter.view = explorer::ViewMode::Content; preferencesAfter.showHidden = true;
+    preferencesAfter.startupLocation = L"C:\\資料😀\\owned preference";
+    explorer::test::stateFileSecurityProfiles(fixture.root, L"preferences",
+        [&](const fs::path& path, bool replacement) {
+            return explorer::savePreferences(path, replacement ? preferencesAfter : preferencesBefore) ? S_OK : E_FAIL;
+        }, [&](const fs::path& path, bool replacement) {
+            const auto restored = explorer::loadPreferences(path);
+            const auto& expected = replacement ? preferencesAfter : preferencesBefore;
+            require(restored.windowWidth == expected.windowWidth && restored.windowHeight == expected.windowHeight &&
+                restored.view == expected.view && restored.showHidden == expected.showHidden &&
+                restored.useWindowsStartup == expected.useWindowsStartup && restored.startupLocation == expected.startupLocation,
+                "exact-ACL preferences roundtrip lost actual settings");
+        });
+    explorer::QuickAccessToolbar qatBefore, qatAfter;
+    qatBefore.clear(); require(qatBefore.add(explorer::Properties) && qatBefore.add(explorer::Copy), "prepare owned QAT baseline");
+    qatAfter.clear(); require(qatAfter.add(explorer::Paste) && qatAfter.add(explorer::NewFolder) &&
+        qatAfter.add(explorer::Rename), "prepare owned QAT replacement"); qatAfter.setBelowRibbon(true);
+    explorer::test::stateFileSecurityProfiles(fixture.root, L"quick-access-toolbar",
+        [&](const fs::path& path, bool replacement) {
+            return explorer::saveQuickAccessToolbar(path, replacement ? qatAfter : qatBefore) ? S_OK : E_FAIL;
+        }, [&](const fs::path& path, bool replacement) {
+            const auto restored = explorer::loadQuickAccessToolbar(path);
+            const auto& expected = replacement ? qatAfter : qatBefore;
+            require(restored.commands() == expected.commands() && restored.belowRibbon() == expected.belowRibbon(),
+                    "exact-ACL QAT codec lost actual command order or placement");
+        });
+}
 } // namespace
+int runStateFileSecurityTests() {
+    try {
+        exactStateFilePermissions();
+        std::cout << "PASS: actual typed-address/search-history/preferences/QAT codecs preserve six exact ACL profiles and failure metadata\n";
+        return 0;
+    } catch (const std::exception& error) {
+        std::cerr << "FAIL: owned state codec security: " << error.what() << '\n'; return 1;
+    }
+}
 int runAddressHistoryTests() {
     unsigned failures = 0;
     const std::pair<const char*, void(*)()> groups[]{
         {"exact Unicode/env/UNC/virtual persistence and atomic failure preservation", persistenceAndFailure},
         {"separate bounded codec, malformed input and output preservation", malformedCodec},
         {"typed ordinal MRU and own-priority native import", orderingAndImport},
-        {"read-only native registry format on exclusively owned volatile key", registryReadOnly}};
+        {"read-only native registry format on exclusively owned volatile key", registryReadOnly},
+        {"four actual state codecs retain six ACL profiles, compression and atomic failures", exactStateFilePermissions}};
     for (const auto& [name, test] : groups) {
         try { test(); std::cout << "PASS: Address history: " << name << '\n'; }
         catch (const std::exception& error) { ++failures; std::cerr << "FAIL: Address history: " << name << ": " << error.what() << '\n'; }

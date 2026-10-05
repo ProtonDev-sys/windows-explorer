@@ -1,20 +1,22 @@
 #pragma once
 #include "explorer/core.hpp"
 #include "explorer/commands.hpp"
+#include "explorer/input.hpp"
 #include "explorer/context_menu.hpp"
 #include "explorer/quick_access.hpp"
-#include "explorer/share.hpp"
 #include "explorer/library.hpp"
 #include "explorer/headless_visual.hpp"
 #include "explorer/ribbon.hpp"
 #include "explorer/namespace_actions.hpp"
-#include "explorer/status.hpp"
 #include "explorer/breadcrumb.hpp"
 #include "explorer/app_commands.hpp"
 #include "explorer/search_history.hpp"
 #include "explorer/address_history.hpp"
 #include "explorer/search.hpp"
+#include "explorer/search_refinement.hpp"
+#include "explorer/search_window.hpp"
 #include "explorer/live_search.hpp"
+#include "explorer/ui_direction.hpp"
 #include <shlobj.h>
 #include <commctrl.h>
 #include <shobjidl.h>
@@ -23,7 +25,6 @@
 #include <atomic>
 #include <memory>
 #include <vector>
-#include <future>
 #include <functional>
 #include <exception>
 #include <array>
@@ -37,6 +38,11 @@ struct PidlDeleter {
     void operator()(pointer p) const noexcept { CoTaskMemFree(p); }
 };
 using Pidl = std::unique_ptr<ITEMIDLIST, PidlDeleter>;
+enum class AddressContextCommand : UINT { Edit = 1280, Copy = 1281, CopyText = 1282, DeleteHistory = 1283 };
+struct AddressContextSnapshot {
+    Pidl location;
+    std::wstring text;
+};
 struct VisualScene {
     std::wstring page = L"Home";
     std::wstring select;
@@ -47,6 +53,14 @@ struct VisualScene {
     bool details = false;
         bool collapsed = false;
     bool nativeView = false;
+    bool openSearchDateMenu = false;
+};
+struct HeadlessStateWorkerTiming {
+    UINT command = 0;
+    bool selectionBatch = false;
+    HRESULT status = E_PENDING;
+    HRESULT timingStatus = E_PENDING;
+    NamespaceCommandStateTimings native;
 };
 struct HeadlessCommandTimings {
     HRESULT status = E_PENDING;
@@ -62,15 +76,24 @@ struct HeadlessCommandTimings {
     double stateTaskSchedulingMs = 0;
     double contextMs = 0;
     double ribbonInvalidationMs = 0;
+    std::vector<HeadlessStateWorkerTiming> completedStateWorkers;
+};
+struct HeadlessStartupTimings {
+    double clockStartMs = 0;
+    double desktopReadyMs = 0;
+    double platformReadyMs = 0;
+    double createReturnedMs = 0;
 };
 
 class ExplorerApp final : public IExplorerBrowserEvents, public IServiceProvider,
                           public IExplorerPaneVisibility, public ICommDlgBrowser3, public IFolderFilter {
 public:
     ExplorerApp(HINSTANCE instance, bool headless, RibbonLayout ribbonLayout = RibbonLayout::Authored);
+    HRESULT prepareHeadlessVisual(const VisualScene& scene);
     HRESULT create(const std::wstring& location);
+    HRESULT prepareSearchWindowContext(const SearchWindowContext& context);
     int run(int showCommand);
-    int headlessBenchmark(const std::filesystem::path& report);
+    int headlessBenchmark(const std::filesystem::path& report, const HeadlessStartupTimings& startup);
     int headlessSmoke(const std::filesystem::path& report);
     int headlessVisual(const PrivateDesktop& desktop, const std::filesystem::path& screenshot,
                        const std::filesystem::path& report, const VisualScene& scene);
@@ -81,7 +104,8 @@ public:
     void resetHeadlessCommandTimings() noexcept { if(headless_){commandTimings_={};lastCommandTimings_={};} }
     bool commandStatesPending() const noexcept {
         if(selectionStateBatch_||!commandStateTasks_.empty())return true;
-        for(const auto& entry:commandCapabilities_)if(entry.second.status==E_PENDING)return true;
+        for(const auto& entry:commandCapabilities_)
+            if(entry.second.status==E_PENDING&&!entry.second.slowStateCompleted)return true;
         return false;
     }
     unsigned long long headlessDeferredCommandUpdates() const noexcept { return headless_?deferredCommandUpdates_:0; }
@@ -109,6 +133,7 @@ public:
     HRESULT STDMETHODCALLTYPE ShouldShow(IShellFolder*, PCIDLIST_ABSOLUTE, PCUITEMID_CHILD) override;
     HRESULT STDMETHODCALLTYPE GetEnumFlags(IShellFolder*, PCIDLIST_ABSOLUTE, HWND*, DWORD*) override;
 private:
+    HRESULT openLongSavedSearch(IShellItem* item, const std::wstring& typedAddress = {});
     ~ExplorerApp();
     HRESULT shutdownStatus_ = S_OK;
     static LRESULT CALLBACK windowProc(HWND, UINT, WPARAM, LPARAM);
@@ -132,11 +157,11 @@ private:
     };
     void scheduleDeferredUpdate();
     double commandTimingNow();
-    void updateStatus();
     void updateBreadcrumbs();
     void updateContextTabs();
     RibbonCommandState ribbonState(UINT command);
     std::vector<RibbonItem> ribbonItems(UINT command);
+    HRESULT appendSearchRefinementMenu(UINT command, HMENU menu, std::vector<std::wstring>* expressions) const;
     HRESULT executeRibbon(UINT command);
     HRESULT executeRibbonItem(UINT command, UINT item);
     void updateNamespace();
@@ -155,20 +180,30 @@ private:
     void beginBreadcrumbMenu(UINT command);
     void pollBreadcrumbMenu();
     void fitBreadcrumbs(int width);
+    std::optional<size_t> breadcrumbAncestor(UINT command) const;
+    HRESULT breadcrumbDropdownTarget(UINT command, IShellItem** parent, IShellItem** selected) const;
+    HRESULT createBreadcrumbOverflowMenu(HMENU* result, std::vector<Pidl>* targets) const;
+    HRESULT showBreadcrumbOverflow();
+    HRESULT browseBreadcrumb(UINT command);
+    HRESULT browseBreadcrumbTarget(PCIDLIST_ABSOLUTE target, unsigned generation);
     HRESULT cycleFocus(bool backwards);
+    HRESULT cycleToolbarFocus(bool backwards);
+    std::optional<FocusRegion> currentFocusRegion() const;
     HRESULT toggleFullscreen();
     HRESULT sizeColumns();
-    HRESULT toggleColumn(const PROPERTYKEY& key);
     HRESULT saveSearch();
     HRESULT captureActiveSearchPresentation();
     HRESULT openFileLocation();
-    HRESULT newItemMenu();
-    HRESULT shareFiles();
     HRESULT newLibrary();
     HRESULT includeLibraryFolder();
     HRESULT commitLibrary();
     void reloadLibrary();
     void applyPendingSelection();
+    void pruneSearchCaches(size_t maximumCachedLocations = 100);
+    void initializeSearchRefinementChoices();
+    void refreshSearchRefinements();
+    void rememberSearchCacheHistory(PCIDLIST_ABSOLUTE location);
+    HRESULT clearSearchHistory(const std::filesystem::path* ownedHeadlessPath = nullptr);
     HRESULT startSearch(const std::wstring& query, bool recursive,
                         std::optional<size_t> category = {}, const std::wstring& filter = L"",
                         const LiveSearchRequest* liveRequest = nullptr);
@@ -187,37 +222,40 @@ private:
     void editAddress();
     void finishAddress(bool navigateNow);
     HMENU createTypedAddressMenu() const;
+    HRESULT addressContextSnapshot(AddressContextSnapshot* result) const;
+    HRESULT createAddressContextMenu(HMENU* result) const;
+    HRESULT executeAddressContext(AddressContextCommand command, const AddressContextSnapshot& target);
+    HRESULT showAddressContextMenu(POINT point);
     void rememberAddressNavigation(PCIDLIST_ABSOLUTE location);
     void refreshAddressHistoryPolicy();
     HRESULT createBrowser();
     void destroyBrowser();
-    HRESULT recreateBrowser();
+    HRESULT recreateBrowser(UINT toggleCommand);
     HRESULT browseHistory(int offset);
+    HRESULT browseHistoryLocation(PCIDLIST_ABSOLUTE location, int originalIndex);
     HRESULT setView(ViewMode mode);
     HRESULT setSort(const PROPERTYKEY& key);
     HRESULT setGroup(const PROPERTYKEY& key);
     HRESULT selection(ComPtr<IShellItemArray>& out, bool folderIfEmpty = false);
     HRESULT currentFolder(ComPtr<IShellItem>& out);
-    HRESULT chooseDestination(bool move);
     HRESULT nativeVerb(const wchar_t* verb, bool folderIfEmpty = false);
-    HRESULT newFolder();
-    HRESULT newText();
     HRESULT showProperties(const wchar_t* page);
-    HRESULT archive(bool extract);
-    HRESULT makeShortcut(bool fromClipboard);
     void popup(UINT command, HWND anchor = nullptr);
     void showError(HRESULT hr, const wchar_t* action);
     void persist();
-    void setStatus(const std::wstring& text);
     void updateCaptionIcon();
     HRESULT refreshCabinetPolicy();
     void updateFrameTitle();
     void updateRibbonCollapseButton();
     HRESULT openNewWindow(const std::wstring& location);
+    HRESULT currentSearchWindowContext(SearchWindowContext* result);
     int px(int value) const { return MulDiv(value, static_cast<int>(dpi_), 96); }
     std::atomic<ULONG> references_{1};
     HINSTANCE instance_;
     bool headless_;
+    UiDirectionPolicy uiDirection_;
+    // Declared only by an owned private headless fixture before any HWND exists.
+    std::optional<bool> headlessDirectionOverride_;
     bool closing_ = false;
     bool browserInitialized_ = false;
     bool addressEditing_ = false;
@@ -235,10 +273,14 @@ private:
     bool commandStatesCancelPending_ = false;
     bool commandItemsRefreshPending_ = false;
     unsigned long long deferredCommandUpdates_ = 0;
+    // Headless diagnostics: CDBOSC values 0..4, with other values at index 5.
+    std::array<unsigned long long,6> headlessCurrentViewStateEvents_{},headlessStaleViewStateEvents_{};
+    unsigned long long headlessEquivalentSelectionRefreshes_=0,headlessUncertainSelectionRefreshes_=0;
     std::function<void()> headlessCommandReentryProbe_;
-    bool selectionFilesystem_ = false;
-    bool selectionHidden_ = false;
-    bool selectionShareable_ = false;
+    // Owned headless regression only: consume one finished native state query
+    // as a provider that honestly returns E_PENDING even with slow work allowed.
+    std::optional<UINT> headlessCompletedPendingCommand_;
+    HRESULT headlessCompletedPendingOriginalStatus_ = E_PENDING;
     bool filesystemFolder_ = false;
     bool physicalDirectory_ = false;
     bool fullscreen_ = false;
@@ -262,14 +304,14 @@ private:
     WINDOWPLACEMENT windowPlacement_{sizeof(WINDOWPLACEMENT)};
     RECT windowRect_{};
     HWND window_ = nullptr, nav_ = nullptr, address_ = nullptr;
-    HWND breadcrumbs_ = nullptr, search_ = nullptr, status_ = nullptr, statusView_ = nullptr, addressActions_ = nullptr;
+    HWND breadcrumbs_ = nullptr, search_ = nullptr, addressActions_ = nullptr;
     HWND ribbonCollapse_=nullptr,ribbonCollapseTooltip_=nullptr;
     std::wstring ribbonCollapseTip_;
+    std::map<UINT, std::wstring> navigationTooltipText_;
     HICON folderIcon_ = nullptr;
     HICON largeIcon_ = nullptr;
     HIMAGELIST breadcrumbImages_ = nullptr;
     NativeContextMenu* activeContextMenu_ = nullptr;
-    NativeShare nativeShare_;
     ComPtr<SearchSuggestionList> searchSuggestions_;
     ComPtr<IAutoComplete2> searchAutocomplete_;
     NativeRibbon ribbon_;
@@ -293,7 +335,6 @@ private:
     bool archiveTargetValid_ = false;
     bool namespaceDirty_ = true;
     UINT64 namespaceGeneration_ = 0;
-    bool undoAvailable_ = false, redoAvailable_ = false;
     bool expandCurrent_ = false, showAllFolders_ = false, showLibraries_ = true;
     RibbonContext ribbonContexts_ = RibbonContext::None;
     bool ribbonComputer_ = false;
@@ -301,13 +342,17 @@ private:
     bool ribbonNetworkActiveDirectory_ = true;
     bool namespaceNetwork_ = false;
     DWORD clipboardSequence_ = MAXDWORD;
-    bool clipboardFiles_ = false;
     DWORD selectionCount_ = 0;
     SFGAOF selectionAttributes_ = 0;
-    SelectionStatus selectionStatus_;
+    // Exact complete native identities/attributes of the committed command
+    // target. The view pointer is an identity token only, never dereferenced.
+    std::optional<std::vector<Pidl>> commandSelectionIdentities_;
+    SFGAOF commandSelectionAttributes_=0;
+    IShellView* commandSelectionView_=nullptr;
     NamespaceSelectionKinds selectionKinds_;
     std::map<UINT, AppCommandCapability> commandCapabilities_;
     std::map<UINT,std::unique_ptr<NamespaceCommandStateTask>> commandStateTasks_;
+    ULONGLONG commandStateStartAt_ = 0;
     std::unique_ptr<NamespaceCommandStateTask> selectionStateBatch_;
     std::vector<AppSelectionStateBinding> selectionStateBindings_;
     ComPtr<INameSpaceTreeControl2> navigationTree_;
@@ -331,6 +376,11 @@ private:
     ComPtr<IFolderView2> folderView_;
     DWORD adviseCookie_ = 0;
     std::vector<Pidl> breadcrumbsPidls_;
+    std::vector<std::wstring> breadcrumbLabels_;
+    // Full native ancestry is independent of the rendered toolbar slots.
+    // Width-driven overflow retains every omitted ancestor and adjacency.
+    std::vector<size_t> breadcrumbButtons_, breadcrumbHiddenAncestors_;
+    bool breadcrumbLayoutActive_ = false;
     ComPtr<BreadcrumbDropTarget> breadcrumbDrop_;
     std::unique_ptr<BreadcrumbEnumerationTask> breadcrumbTask_;
     unsigned breadcrumbGeneration_ = 0;
@@ -342,28 +392,39 @@ private:
         ComPtr<IShellItemArray> scopes;
         std::vector<SearchScopeRule> scopeRules;
         std::optional<SearchViewPresentation> presentation;
+        std::optional<SearchFileProperties> fileProperties;
         bool rememberOnComplete = false;
         bool remembered = false;
+        bool importedPresentation = false;
+        Pidl completedLocation;
+        Pidl historyLocation;
+        ComPtr<IShellItem> windowOrigin;
     };
     std::vector<SearchLocation> searchLocations_;
     struct SearchPresentationLocation {
         Pidl location;
         SearchViewPresentation presentation;
+        Pidl completedLocation;
+        Pidl historyLocation;
     };
     std::vector<SearchPresentationLocation> searchPresentationLocations_;
     int historyIndex_ = -1, pendingHistory_ = -1;
     Pidl currentPidl_;
     Pidl pendingPidl_;
     Pidl searchScope_;
+    ComPtr<IShellItem> searchWindowOrigin_;
+    Pidl preparedSearchWindowTarget_;
     ComPtr<IShellItemArray> searchScopes_;
     std::vector<SearchScopeRule> searchScopeRules_;
     std::optional<SearchViewPresentation> searchPresentation_;
+    std::optional<SearchFileProperties> searchFileProperties_;
     bool searchPresentationPending_ = false;
     HRESULT searchPresentationStatus_ = S_OK;
     Pidl selectionDestination_, selectionChild_;
     ComPtr<IShellItem> selectionTarget_;
     ULONGLONG selectionDeadline_ = 0, selectionRetryAt_ = 0;
     std::vector<std::wstring> recentSearches_;
+    std::vector<std::wstring> displayedRecentSearches_;
     std::vector<std::wstring> typedAddresses_;
     std::wstring pendingTypedAddress_;
     Pidl pendingTypedAddressTarget_;
@@ -384,10 +445,13 @@ private:
     HRESULT liveSearchStatus_ = S_OK;
     std::wstring searchBase_;
     std::array<std::wstring, 3> searchFilters_;
+    std::shared_ptr<NativeSearchRefinements> searchRefinements_;
+    std::wstring searchRefinementQuery_;
+    HRESULT searchRefinementStatus_ = E_PENDING;
+    bool searchRefinementInspected_ = false;
+    std::array<UINT, 3> searchRefinementSelected_{UI_COLLECTION_INVALIDINDEX, UI_COLLECTION_INVALIDINDEX, UI_COLLECTION_INVALIDINDEX};
     std::wstring currentLocation_, currentName_, lastError_;
     ULONGLONG navigationStarted_ = 0, lastNavigationMs_ = 0;
     unsigned navigationCount_ = 0;
-    std::future<HRESULT> archiveTask_;
-    std::wstring archiveAction_;
 };
 }

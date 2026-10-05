@@ -13,6 +13,7 @@
 #include <vector>
 
 namespace explorer {
+struct NativePopupCapture;
 enum class RibbonContext : UINT {
     None = 0, Picture = 1, Drive = 2, Compressed = 4, Search = 8,
     Library = 16, Recycle = 32, Application = 64, Music = 128, Video = 256, DiscImage = 512,
@@ -55,6 +56,10 @@ struct RibbonCollectionReadback {
     UINT sourceRequests=0;
     UINT currentVariantType=VT_EMPTY;
     HRESULT lastInvalidation=E_PENDING;
+    UINT selectedRequests=0;
+    UINT lastSelectedIndex=UI_COLLECTION_INVALIDINDEX;
+    UINT publishedItems=0;
+    UINT pendingInvalidations=0;
 };
 
 enum class RibbonLayout { Authored, InstalledWindows10 };
@@ -91,6 +96,10 @@ public:
     RibbonLayout layout() const noexcept;
     HRESULT installedLayoutStatus() const noexcept;
     HRESULT selectTab(UINT tab);
+    // Capture-only: expand the actual Date modified parent on the guarded
+    // private desktop and read all requested physical native rows. No Invoke.
+    HRESULT expandSearchDateMenu(std::span<const std::wstring> expectedRows, UINT& matchedRows,
+                                 NativePopupCapture* popup = nullptr);
     HRESULT setMinimized(bool minimized);
     HRESULT minimized(bool& value) const;
     HRESULT setQuickAccessBelow(bool below);

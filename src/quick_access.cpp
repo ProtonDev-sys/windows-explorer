@@ -1,3 +1,4 @@
+#include "state_file.hpp"
 #include "explorer/quick_access.hpp"
 
 #include <algorithm>
@@ -204,29 +205,7 @@ bool saveQuickAccessToolbar(const std::filesystem::path& path, const QuickAccess
     }
     output << '\n';
     const auto contents = output.str();
-    std::error_code error;
-    if (!path.parent_path().empty()) {
-        std::filesystem::create_directories(path.parent_path(), error);
-        if (error) return false;
-    }
-    std::filesystem::path temporary;
-    HANDLE file = INVALID_HANDLE_VALUE;
-    for (unsigned attempt = 0; attempt < 8; ++attempt) {
-        temporary = path;
-        temporary += L".tmp-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetCurrentThreadId()) + L"-" + std::to_wstring(GetTickCount64()) + L"-" + std::to_wstring(attempt);
-        file = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (file != INVALID_HANDLE_VALUE) break;
-        if (GetLastError() != ERROR_FILE_EXISTS && GetLastError() != ERROR_ALREADY_EXISTS) return false;
-    }
-    if (file == INVALID_HANDLE_VALUE) return false;
-    DWORD written = 0;
-    const bool wrote = WriteFile(file, contents.data(), static_cast<DWORD>(contents.size()), &written, nullptr) && written == contents.size() && FlushFileBuffers(file);
-    const bool closed = CloseHandle(file) != FALSE;
-    if (!wrote || !closed || !MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-        DeleteFileW(temporary.c_str());
-        return false;
-    }
-    return true;
+    return SUCCEEDED(writeStateFileAtomic(path, std::string_view(contents)));
 }
 
 } // namespace explorer

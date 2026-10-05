@@ -5,8 +5,14 @@
 #include <shellapi.h>
 #include <filesystem>
 #include <cstdio>
+#include <cstdlib>
+#include <cerrno>
+#include <limits>
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
+    LARGE_INTEGER startupFrequency{}, startupEntry{};
+    const bool startupClock = QueryPerformanceFrequency(&startupFrequency) && startupFrequency.QuadPart > 0 &&
+        QueryPerformanceCounter(&startupEntry);
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX);
     int count = 0;
     auto arguments = CommandLineToArgvW(GetCommandLineW(), &count);
@@ -15,12 +21,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     bool visual = false;
     bool benchmark = false;
     bool installedRibbon = false;
+    bool sourceDocumentsLibrary = false;
     explorer::ThemeMode theme = explorer::ThemeMode::Auto;
     explorer::PrivateDesktop privateDesktop;
     explorer::VisualScene scene;
     std::filesystem::path screenshot;
     std::filesystem::path crashDump;
     std::wstring location;
+    ULONG_PTR searchContextHandle = 0;
     std::filesystem::path report = L"headless-smoke.json";
     for (int i = 1; i < count; ++i) {
         const std::wstring arg = arguments[i];
@@ -32,6 +40,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
         else if (arg == L"--screenshot" && i + 1 < count) screenshot = arguments[++i];
         else if (arg == L"--crash-dump" && i + 1 < count) crashDump = arguments[++i];
         else if (arg == L"--page" && i + 1 < count) scene.page = arguments[++i];
+        else if (arg == L"--source-documents-library") sourceDocumentsLibrary = true;
         else if ((arg == L"--select" || arg == L"--select-shell") && i + 1 < count) scene.select = arguments[++i];
         else if (arg == L"--theme" && i + 1 < count) {
             const std::wstring value = arguments[++i];
@@ -42,6 +51,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
         }
         else if (arg == L"--details") scene.details = true;
         else if (arg == L"--collapsed") scene.collapsed = true;
+        else if (arg == L"--open-search-date-menu") scene.openSearchDateMenu = true;
         else if ((arg == L"--width" || arg == L"--height" || arg == L"--dpi") && i + 1 < count) {
             wchar_t* end = nullptr;
             const auto value = wcstoul(arguments[++i], &end, 10);
@@ -61,12 +71,34 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
             }
             if (!found) { LocalFree(arguments); return 2; }
         }
+        else if (arg == L"--search-context-handle" && i + 1 < count) {
+            const std::wstring value = arguments[++i];
+            if (searchContextHandle || value.empty() || value.find_first_not_of(L"0123456789") != std::wstring::npos) { LocalFree(arguments); return 2; }
+            errno = 0; wchar_t* end = nullptr;
+            const auto parsed = wcstoull(value.c_str(), &end, 10);
+            if (errno == ERANGE || !end || *end || !parsed || parsed > (std::numeric_limits<ULONG_PTR>::max)()) { LocalFree(arguments); return 2; }
+            searchContextHandle = static_cast<ULONG_PTR>(parsed);
+        }
         else if (arg == L"--path" && i + 1 < count) location = arguments[++i];
         else if (arg.starts_with(L"--")) { LocalFree(arguments); return 2; }
         else location = arg;
     }
     LocalFree(arguments);
+    if (searchContextHandle && (!location.empty() || visual || benchmark)) return 2;
+    explorer::HeadlessStartupTimings startup;
+    if (benchmark && !startupClock) return 2;
+    if (benchmark) startup.clockStartMs = static_cast<double>(startupEntry.QuadPart) * 1000.0 /
+        static_cast<double>(startupFrequency.QuadPart);
+    const auto startupElapsed = [&] {
+        LARGE_INTEGER counter{};
+        if (!benchmark || !QueryPerformanceCounter(&counter)) return 0.0;
+        return static_cast<double>(counter.QuadPart - startupEntry.QuadPart) * 1000.0 /
+            static_cast<double>(startupFrequency.QuadPart);
+    };
     if (visual && (screenshot.empty() || benchmark)) return 2;
+    if (sourceDocumentsLibrary && (!visual || scene.page != L"Library" ||
+        !location.empty() || !scene.select.empty() || searchContextHandle)) return 2;
+    if (scene.openSearchDateMenu && (!visual || scene.page != L"Search" || scene.collapsed)) return 2;
     if (installedRibbon && !headless) return 2;
     if (!crashDump.empty()) {
         const auto diagnostic = explorer::initializeHeadlessCrashDump(headless, crashDump);
@@ -77,14 +109,42 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
         }
     }
     if (headless && (FAILED(privateDesktop.initialize()) || FAILED(privateDesktop.verifyIsolation()))) return 5;
+    if (benchmark) startup.desktopReadyMs = startupElapsed();
     if (FAILED(explorer::initializeProcessTheme(theme))) return 6;
     const auto hr = OleInitialize(nullptr);
     if (FAILED(hr)) return 3;
     INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_WIN95_CLASSES | ICC_STANDARD_CLASSES};
     InitCommonControlsEx(&controls);
+    if (benchmark) startup.platformReadyMs = startupElapsed();
+    if (sourceDocumentsLibrary) {
+        auto source = std::make_unique<explorer::DocumentsLibraryVisualSource>();
+        explorer::VisualCaptureReport restricted;
+        const auto resolved = source->resolve(privateDesktop, location, restricted.documentsLibrarySource);
+        const auto verified = SUCCEEDED(resolved) ? source->verifyMetadata(privateDesktop,
+            restricted.documentsLibrarySource) : resolved;
+        restricted.documentsLibrarySource.displayUnsupported = true;
+        restricted.desktopName = privateDesktop.name();
+        restricted.inputDesktopName = privateDesktop.originalInputName();
+        const auto isolated = privateDesktop.verifyIsolation(&restricted.inputDesktopUnchanged);
+        const auto observed = privateDesktop.visibleWindowsOnInputDesktop(restricted.visibleInputDesktopWindows);
+        const auto reported = explorer::writeVisualCaptureReport(std::filesystem::absolute(report), restricted);
+        std::fprintf(stderr, "Documents Library display restricted before App creation; protected metadata HRESULT=0x%08lX.\n",
+            static_cast<unsigned long>(verified));
+        source.reset(); // Release every native interface and the lease before COM.
+        OleUninitialize();
+        return SUCCEEDED(isolated) && SUCCEEDED(observed) && !restricted.visibleInputDesktopWindows &&
+            SUCCEEDED(reported) && (SUCCEEDED(verified) || restricted.documentsLibrarySource.unavailable) ? 9 : 7;
+    }
     auto app = new explorer::ExplorerApp(instance, headless,
         (installedRibbon || !headless) ? explorer::RibbonLayout::InstalledWindows10 : explorer::RibbonLayout::Authored);
-    const auto created = app->create(location);
+    auto prepared = visual ? app->prepareHeadlessVisual(scene) : S_OK;
+    if (SUCCEEDED(prepared) && searchContextHandle) {
+        explorer::SearchWindowContext context;
+        prepared = explorer::consumeSearchWindowContext(searchContextHandle, &context);
+        if (SUCCEEDED(prepared)) prepared = app->prepareSearchWindowContext(context);
+    }
+    const auto created = SUCCEEDED(prepared) ? app->create(location) : prepared;
+    if (benchmark) startup.createReturnedMs = startupElapsed();
     int result = 0;
     if (FAILED(created)) {
         if (!headless) MessageBoxW(nullptr, explorer::hresultMessage(created).c_str(), L"Windows Explorer could not start", MB_OK | MB_ICONERROR);
@@ -92,7 +152,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
             static_cast<unsigned long>(created));
         result = 4;
     } else result = visual ? app->headlessVisual(privateDesktop, std::filesystem::absolute(screenshot),
-            std::filesystem::absolute(report), scene) : benchmark ? app->headlessBenchmark(std::filesystem::absolute(report)) : headless ? app->headlessSmoke(report) : app->run(showCommand);
+            std::filesystem::absolute(report), scene) : benchmark ? app->headlessBenchmark(std::filesystem::absolute(report), startup) : headless ? app->headlessSmoke(report) : app->run(showCommand);
     // The browser's site/filter retain the COM host. Destroy the owned frame
     // while this STA is alive so WM_DESTROY breaks that cycle before Release.
     // A hidden capture returns without running the normal WM_CLOSE loop.
@@ -107,7 +167,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
         // apartment and its sites until process exit instead of releasing them
         // underneath a live marshaled call.
         std::fflush(stderr);
-        ExitProcess(8); // Stop read-only workers before C++ static teardown.
+        // A stalled native thread may hold locks needed by DLL detach code.
+        // Stop this process without releasing its borrowed STA resources.
+        if (!TerminateProcess(GetCurrentProcess(), 8)) std::_Exit(8);
+        std::_Exit(8);
     }
     explorer::ShellOperations::flushClipboardIfOwned();
     // Native context-menu Copy uses its own data object. Flush it only when

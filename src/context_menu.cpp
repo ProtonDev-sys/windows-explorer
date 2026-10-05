@@ -75,12 +75,13 @@ HRESULT NativeContextMenu::create(HWND owner, IContextMenu* context, IUnknown* s
     return createImpl(owner, context, site, flags, false);
 }
 
-HRESULT NativeContextMenu::createLeafState(IContextMenu* context, IUnknown* site, UINT flags) {
-    return createImpl(nullptr, context, site, flags, true);
+HRESULT NativeContextMenu::createLeafState(IContextMenu* context, IUnknown* site, UINT flags,
+                                         bool omitResourceVerbs) {
+    return createImpl(nullptr, context, site, flags, true, omitResourceVerbs);
 }
 
 HRESULT NativeContextMenu::createImpl(HWND owner, IContextMenu* context, IUnknown* site,
-                                     UINT flags, bool leafStateOnly) {
+                                     UINT flags, bool leafStateOnly, bool omitResourceVerbs) {
     // Retain inputs first: a caller may rebuild using this object's current menu.
     ComPtr<IContextMenu> retained = context;
     ComPtr<IUnknown> retainedSite = site;
@@ -98,15 +99,47 @@ HRESULT NativeContextMenu::createImpl(HWND owner, IContextMenu* context, IUnknow
         if (FAILED(hr)) { reset(); return hr; }
         siteAttached_ = true;
     }
+    ComPtr<IDefaultFolderMenuInitialize> configuration;
+    DEFAULT_FOLDER_MENU_RESTRICTIONS previous = DFMR_DEFAULT;
+    bool restrictedResources = false;
+    if (leafStateOnly && omitResourceVerbs) {
+        HRESULT restriction = context_.As(&configuration);
+        if (restriction != E_NOINTERFACE) {
+            // Preserve every documented restriction. Only unrelated built-in
+            // operation entries are omitted; association and dynamic native
+            // handlers still receive the original selection and view site.
+            constexpr auto mask = static_cast<DEFAULT_FOLDER_MENU_RESTRICTIONS>(
+                DFMR_NO_STATIC_VERBS | DFMR_STATIC_VERBS_ONLY | DFMR_NO_RESOURCE_VERBS |
+                DFMR_OPTIN_HANDLERS_ONLY | DFMR_RESOURCE_AND_FOLDER_VERBS_ONLY |
+                DFMR_USE_SPECIFIED_HANDLERS | DFMR_USE_SPECIFIED_VERBS | DFMR_NO_ASYNC_VERBS |
+                DFMR_NO_NATIVECPU_VERBS | DFMR_NO_NONWOW_VERBS);
+            if (SUCCEEDED(restriction)) restriction = configuration->GetMenuRestrictions(mask,&previous);
+            if (SUCCEEDED(restriction) && !(previous & DFMR_NO_RESOURCE_VERBS)) {
+                restriction = configuration->SetMenuRestrictions(
+                    static_cast<DEFAULT_FOLDER_MENU_RESTRICTIONS>(previous | DFMR_NO_RESOURCE_VERBS));
+                restrictedResources = SUCCEEDED(restriction);
+            }
+            if (FAILED(restriction)) { reset(); return restriction; }
+        }
+    }
     menu_ = CreatePopupMenu();
-    if (!menu_) { const HRESULT hr = menuError(); reset(); return hr; }
+    if (!menu_) {
+        const HRESULT hr = menuError();
+        if (restrictedResources) configuration->SetMenuRestrictions(previous);
+        reset(); return hr;
+    }
     popup_ = menu_;
     // Real popups need populated cascades. A read-only leaf-state worker never
     // opens those cascades, so avoid requesting their synchronous enumeration.
     const UINT nativeFlags = leafStateOnly ? flags & ~CMF_SYNCCASCADEMENU : flags | CMF_SYNCCASCADEMENU;
     const HRESULT hr = context_->QueryContextMenu(menu_, 0, firstCommand_, lastCommand_,
                                                  nativeFlags);
+    // A custom namespace can retain this same provider for a later normal
+    // popup. Restrict only this query; canonical readback below must still use
+    // the native menu that was just created, with the provider's original flags.
+    const HRESULT restored = restrictedResources ? configuration->SetMenuRestrictions(previous) : S_OK;
     if (FAILED(hr)) { reset(); return hr; }
+    if (FAILED(restored)) { reset(); return restored; }
     commandCount_ = HRESULT_CODE(hr);
     if (commandCount_ > lastCommand_ - firstCommand_ + 1) {
         reset();
