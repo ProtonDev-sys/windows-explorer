@@ -9,7 +9,63 @@ every navigation and selection change. The current implementation reads native
 command state once per change and constructs full provider menus when requested.
 Native Ribbon property callbacks use cached results.
 
-## Latest isolated run
+## Interleaved optimization candidate
+
+On 2026-10-05, twelve alternating-order baseline/candidate rounds ran serially
+between 17:34 and 17:46 UTC, with no concurrent owned build or native probe.
+Baseline source is `f909f69`; the candidate adds bounded parent-attribute
+enumeration and paired native icon extraction. These measurements predate the
+subsequent ownership/error/fallback revisions and their additional edge tests;
+they do not validate that revised source. The unchanged measured executables
+are baseline `38f1de781933ee2c99540c7ad49a89ee995662134e00bcef87b3efba1d840012`
+and candidate `00f330dc92012a4e917f83fb9edf62ec3def138d6eaf30b988a5d8fa4158e4a2`.
+Every report passes the benchmark's native selection, readiness and isolation
+checks on Windows 10 Home 19045.6466.
+
+The following medians have twelve independent process runs per side. Intervals
+are the analysis script's 10,000-resample bootstrap for baseline minus candidate;
+permutation values use 20,000 randomized label assignments. They are exploratory,
+unadjusted comparisons across multiple metrics, not universal performance bounds.
+
+| Metric | Baseline → candidate (ms) | 95% interval for difference (ms) | Permutation p |
+| --- | ---: | ---: | ---: |
+| Select all: namespace preparation | 212.5 → 22.1 | [179.2, 217.2] | 0/20,000 exceedances |
+| Select all: creator host work | 661.7 → 427.7 | [33.6, 561.4] | 0.014 |
+| Select all: creator queue drained | 1,446.2 → 1,000.5 | [-153.9, 842.2] | 0.061 |
+| Select all: all command states ready | 7,123.1 → 6,973.3 | [-343.8, 884.9] | 0.617 |
+| Invert none to all: namespace preparation | 207.2 → 22.0 | [177.8, 199.2] | 0/20,000 exceedances |
+| Invert none to all: creator host work | 602.6 → 384.2 | [125.3, 284.6] | 0.001 |
+| Invert none to all: creator queue drained | 938.2 → 795.5 | [-143.3, 341.7] | 0.079 |
+| Invert none to all: all command states ready | 6,560.9 → 6,303.8 | [-168.3, 532.6] | 0.222 |
+| Startup: native view ready | 704.0 → 659.2 | [-118.0, 294.4] | 0.634 |
+| Navigation median: 10 files | 133.8 → 133.8 | [-50.9, 48.1] | 1.000 |
+| Navigation median: 1,000 files | 136.8 → 197.3 | [-75.0, 0.2] | 0.050 |
+| Navigation median: 10,000 files | 143.2 → 122.5 | [-55.2, 62.5] | 0.714 |
+
+The namespace and creator-host phases improve in this experiment. Complete
+command readiness, startup and queue-drained timings remain inconclusive.
+The 1,000-file navigation result is a possible regression requiring investigation;
+slow run episodes and the unchanged navigation code do not rule it out. No
+samples were filtered. Private memory is 51.9 → 52.6 MB with a difference interval
+of [-1.4, 0.7] MB and p=0.241. Invert all to none and Select none remain
+inconclusive. The second batch reduces the apparent significance of some
+first-batch queue improvements, so the combined results take precedence.
+
+A separate eight-process-per-mode icon microbenchmark compares all 23 startup
+specifications at 32/16 pixels through the production DrawIconEx path. All modes
+are byte-identical across 117,760 compared bytes. Separate extraction's median
+is 16.34 ms; paired extraction's is 11.70 ms. Keeping source modules mapped
+gives no observed gain and is not used. This does not establish the production
+cache's behavior at every DPI or a significant startup improvement.
+
+Retained report lists are
+`D:/Development/fe-micro/ab-20261005-173408/runs.txt` and
+`D:/Development/fe-micro/ab-20261005-174056/runs.txt`; the reproducible calculation
+is `D:/Development/fe-micro/analyze.py`. Each copied executable's actual hash
+matches its environment record. Source changes require their own correctness
+and timing validation before integration.
+
+## Latest isolated main-checkout run
 
 The 2026-10-05 17:12 UTC installed-layout v48 run used executable
 `9cea818574f6301b47becd3edcbfd419fe94bb525e35506a180d1433b3dc4573`.

@@ -116,7 +116,7 @@ active and four shared-state targets that correctly skip locally. Core has a
 has 45 seconds. The disposable native-transfer target has 150 seconds. Individual
 native worker deadlines are unchanged. Earlier failures remain preserved below.
 
-The latest completed hosted run, [commit `f909f69`](https://github.com/ProtonDev-sys/windows-explorer/actions/runs/37346525314),
+The earlier hosted run, [commit `f909f69`](https://github.com/ProtonDev-sys/windows-explorer/actions/runs/37346525314),
 passed fifteen active main-job targets and correctly skipped its ordinary
 transfer target. The actual opted-in history, search-options and view-persistence
 targets passed on that genuine disposable runner. The App target failed five
@@ -126,7 +126,7 @@ with an `E_UNEXPECTED` fixture sentinel; it does not identify a production API
 failure. Subsequent source changes retain stage HRESULTs and wait for complete
 native enumeration, selection and data-object readiness under common deadlines.
 RTL margins are applied after native frame restoration and size/font processing.
-These changes still require local and hosted runtime validation.
+The later local and hosted results below validate these changes.
 
 The separate opted-in transfer job passed real native Copy/Paste and Cut/Paste,
 including complete CIDA, preferred effects, content and exact source/destination
@@ -159,7 +159,47 @@ input-desktop and HWND privacy checks pass. Both the App and independent native
 reference expose zero contained preview elements or handler HWNDs. The fixture
 omitted the native view activation performed by normal `run()`; a subsequent
 fixture correction activates the actual private view and verifies the focused
-source by FileID. Its rendering result remains pending.
+source by FileID.
+
+The v57 authored App run completes all 259 checks in 117.18 seconds, again with
+native RTF Preview as the sole failure. Both the App and independent original
+native browser have the exact selected and focused source FileID and successful
+native view activation. Their pane exposes an empty `Thumbnail Module` document;
+UI Automation's document-range read returns `E_PENDING`. The actual App pane
+captures are uniform and unchanged between the two owned RTF files. These are
+failed render proofs, not successful screenshots. Source files, view/site state
+and input-desktop isolation remain preserved. Its report is
+`artifacts/continuation-headless-smoke-v57.json`, executable SHA-256
+`9e5051bdbeed5b131a489a0281a454c361d45e6558d6781ba6a6ba518148a9f8`.
+No edition, policy or production cause is established by this observation.
+
+The bounded no-UI diagnostic on v58 proves the effective original native
+surrogate route before activation. Factory acquisition, instance creation,
+both preview/stream interfaces and initialization with the owned read-only RTF
+stream all return `S_OK`; neither `SetWindow` nor `DoPreview` is called by that
+diagnostic. Reading only the owned desktop's integrity label succeeds and finds
+no explicit label. The real App and reference panes still fail rendering. All
+259 authored checks complete in 111.04 seconds, with that same sole failure,
+executable SHA-256
+`feaf62b6607142e5c597b67e3c9e0ef89ae0f4a6ba7cdbfbf1beb20ed54bb6e6`.
+Reports are `artifacts/continuation-app-v58.log` and
+`artifacts/continuation-headless-smoke-v58.json`. Successful activation does not
+establish which integrity level or desktop performs the actual preview render.
+
+The latest completed hosted run, [commit `781fd49`](https://github.com/ProtonDev-sys/windows-explorer/actions/runs/37352985840),
+passes all five previously failing selection, saved-item and RTL checks. Fifteen
+active main-job targets pass, the ordinary transfer target skips, and the App
+target fails only native RTF Preview among 259 checks. The actual opted-in
+history, search-options and view-persistence targets pass on that genuine
+disposable runner. The separate transfer job again passes native Copy/Paste and
+Cut/Paste; Paste Shortcut remains disabled after bounded normal dispatch, so
+the direct-drop stages are not reached. Its original view background menu also
+publishes that disabled native command. Producer and clipboard-consumer
+identities and COPY preference remain exact, but their `DVASPECT_LINK`
+`QueryGetData` results differ. Query results alone do not prove actual rendering
+or identify the cause. Reports are preserved under
+`artifacts/ci/run-37352985840-{main,transfer}/`. The combined application job
+correctly skips; this run certifies no release.
 
 The earlier [commit `317914b` run](https://github.com/ProtonDev-sys/windows-explorer/actions/runs/37249626987)
 failed Open File Location's folder-identity check; subsequent checks use actual

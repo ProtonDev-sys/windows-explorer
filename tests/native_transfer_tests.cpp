@@ -219,8 +219,9 @@ struct Fixture {
     }
 };
 
-// Observe both desktops on separate non-COM threads. The only permitted
-// private top-level HWND is our frame. No desktop is ever switched. New input
+// Observe both desktops on separate non-COM threads. Only the explicitly
+// created destination and source-control frames may be visible privately.
+// Every other private top-level HWND fails. No desktop is switched. New input
 // desktop windows (including another Shell process) fail the fixture.
 class VisibilityObserver final {
 public:
@@ -243,6 +244,7 @@ public:
     }
     ~VisibilityObserver() { stop(); }
     void allowFrame(HWND frame) noexcept { frame_.store(frame); }
+    void allowControlFrame(HWND frame) noexcept { controlFrame_.store(frame); }
     bool unexpected() const noexcept { return unexpected_.load(); }
     unsigned long long inputObservations() const noexcept { return inputObservations_.load(); }
     unsigned long long privateObservations() const noexcept { return privateObservations_.load(); }
@@ -347,7 +349,7 @@ private:
     void inspect(HWND window, bool privateDesktop) noexcept {
         if (!window || !IsWindowVisible(window) || GetAncestor(window, GA_ROOT) != window) return;
         if (privateDesktop) {
-            if (window != frame_.load()) unexpected_.store(true);
+            if (window != frame_.load() && window != controlFrame_.load()) unexpected_.store(true);
         } else {
             DWORD process = 0; GetWindowThreadProcessId(window, &process);
             if (process == GetCurrentProcessId() || !baseline_.contains(window)) unexpected_.store(true);
@@ -396,6 +398,7 @@ private:
     Sample inputSample_, privateSample_;
     std::unordered_set<HWND> baseline_;
     std::atomic<HWND> frame_{nullptr};
+    std::atomic<HWND> controlFrame_{nullptr};
     std::atomic_bool stop_{false}, unexpected_{false};
     std::atomic<unsigned long long> inputObservations_{0}, privateObservations_{0};
     std::atomic<unsigned long long> inputEmptyObservations_{0}, privateEmptyObservations_{0};
@@ -438,6 +441,7 @@ public:
 };
 struct Browser {
     HWND owner = nullptr;
+    bool controlFrame = false;
     DWORD cookie = 0;
     ComPtr<IExplorerBrowser> browser;
     ComPtr<IShellView> view;
@@ -453,29 +457,34 @@ struct Browser {
         if (browser) { if (cookie) browser->Unadvise(cookie); browser->Destroy(); browser.Reset(); }
         events.Reset();
         if (owner) { DestroyWindow(owner); owner = nullptr; }
-        if (observation) observation->allowFrame(nullptr);
+        if (observation) {
+            if (controlFrame) observation->allowControlFrame(nullptr);
+            else observation->allowFrame(nullptr);
+        }
     }
-    void initialize(const fs::path& destination) {
+    void initialize(const fs::path& destination, int expectedCount = 0, bool control = false) {
+        controlFrame = control;
         WNDCLASSW definition{}; definition.lpfnWndProc = DefWindowProcW;
         definition.hInstance = GetModuleHandleW(nullptr); definition.lpszClassName = L"WindowsExplorerCITransferOwner";
         require(RegisterClassW(&definition) || GetLastError() == ERROR_CLASS_ALREADY_EXISTS, "Register private transfer host");
         owner = CreateWindowExW(0, definition.lpszClassName, L"Owned native transfer fixture", WS_OVERLAPPEDWINDOW,
             0, 0, 900, 600, nullptr, nullptr, definition.hInstance, nullptr);
         require(owner != nullptr, "Create private transfer host");
-        observation->allowFrame(owner);
+        if (controlFrame) observation->allowControlFrame(owner);
+        else observation->allowFrame(owner);
         succeeded(CoCreateInstance(CLSID_ExplorerBrowser, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&browser)), "Create transfer native browser");
         succeeded(browser->SetOptions(EBO_NOTRAVELLOG | EBO_NOPERSISTVIEWSTATE), "Suppress transfer navigation/view persistence");
         RECT bounds{0, 0, 900, 600}; FOLDERSETTINGS settings{FVM_DETAILS, FWF_AUTOARRANGE};
         succeeded(browser->Initialize(owner, &bounds, &settings), "Initialize transfer native browser");
         events = Make<Events>(); require(events != nullptr, "Allocate transfer browser events");
         succeeded(browser->Advise(events.Get(), &cookie), "Observe transfer navigation");
-        navigate(destination);
+        navigate(destination, expectedCount);
         ShowWindow(owner, SW_SHOWNOACTIVATE); SetActiveWindow(owner); UpdateWindow(owner);
         require(IsWindowVisible(owner) && GetActiveWindow() == owner, "Activate exact private transfer frame");
         succeeded(view->UIActivate(SVUIA_ACTIVATE_NOFOCUS), "Activate exact private native transfer view");
         pump();
     }
-    void navigate(const fs::path& destination) {
+    void navigate(const fs::path& destination, int expectedCount = 0) {
         actions.reset(); folderView.Reset(); view.Reset(); folder = shellItem(destination);
         events->complete = false; events->result = E_PENDING;
         succeeded(browser->BrowseToObject(folder.Get(), SBSP_ABSOLUTE), "Browse fresh owned transfer destination");
@@ -487,8 +496,8 @@ struct Browser {
         DWORD process = 0;
         require(child && IsChild(owner, child) && GetWindowThreadProcessId(child, &process) == GetCurrentThreadId() &&
             process == GetCurrentProcessId(), "Native transfer view must belong to its exact owner STA");
-        waitFor([&] { int count = -1; return SUCCEEDED(folderView->ItemCount(SVGIO_ALLVIEW, &count)) && !count; },
-            "Fresh native transfer destination is not empty");
+        waitFor([&] { int count = -1; return SUCCEEDED(folderView->ItemCount(SVGIO_ALLVIEW, &count)) && count == expectedCount; },
+            "Actual owned native folder membership differs from its expected count");
         explorer::NamespaceTarget target; target.folder = folder; target.site = view;
         succeeded(actions.initialize(owner, target), "Attach original native transfer view site");
         if (IsWindowVisible(owner))
@@ -648,6 +657,27 @@ struct Publication {
 };
 
 void describeTransferFormats(const char* label, IDataObject* object) {
+    ComPtr<IEnumFORMATETC> enumeration;
+    HRESULT enumerated = object->EnumFormatEtc(DATADIR_GET, &enumeration);
+    std::cout << "Native transfer enumeration object=" << label << " HRESULT=" << static_cast<ULONG>(enumerated) << std::endl;
+    if (SUCCEEDED(enumerated) && enumeration) {
+        unsigned row = 0;
+        for (; row < 64; ++row) {
+            FORMATETC format{};
+            ULONG fetched = 0;
+            enumerated = enumeration->Next(1, &format, &fetched);
+            if (fetched == 1) {
+                std::cout << "Native transfer enumeration object=" << label << " row=" << row
+                    << " formatId=" << format.cfFormat << " aspect=" << format.dwAspect
+                    << " index=" << format.lindex << " medium=" << format.tymed
+                    << " targetDevice=" << (format.ptd != nullptr) << std::endl;
+            }
+            CoTaskMemFree(format.ptd);
+            if (enumerated != S_OK || fetched != 1) break;
+        }
+        std::cout << "Native transfer enumeration object=" << label << " stoppedAt=" << row
+            << " HRESULT=" << static_cast<ULONG>(enumerated) << " bounded=" << (row == 64) << std::endl;
+    }
     const std::array<std::pair<const char*, CLIPFORMAT>, 6> formats{{
         {"cida", static_cast<CLIPFORMAT>(RegisterClipboardFormatW(CFSTR_SHELLIDLIST))},
         {"hdrop", static_cast<CLIPFORMAT>(CF_HDROP)},
@@ -665,6 +695,22 @@ void describeTransferFormats(const char* label, IDataObject* object) {
             const HRESULT result = object->QueryGetData(&request);
             std::cout << "Native transfer format object=" << label << " format=" << name
                 << " aspect=" << aspect << " HRESULT=" << static_cast<ULONG>(result) << std::endl;
+            // QueryGetData and actual clipboard rendering can differ. Render
+            // only these bounded identification formats, never arbitrary file
+            // contents or associated-application data.
+            if (aspect == DVASPECT_LINK && (std::strcmp(name, "cida") == 0 ||
+                std::strcmp(name, "hdrop") == 0 || std::strcmp(name, "filenameW") == 0)) {
+                Medium data;
+                const HRESULT rendered = object->GetData(&request, &data.value);
+                const SIZE_T bytes = data.value.tymed == TYMED_HGLOBAL && data.value.hGlobal ?
+                    GlobalSize(data.value.hGlobal) : 0;
+                std::cout << "Native transfer LINK render object=" << label << " format=" << name
+                    << " HRESULT=" << static_cast<ULONG>(rendered) << " medium=" << data.value.tymed
+                    << " bytes=" << bytes << std::endl;
+                if (rendered == S_OK)
+                    require(data.value.tymed == TYMED_HGLOBAL && data.value.hGlobal && bytes && bytes <= 1024 * 1024,
+                        "Native link identification rendering exceeded its global-data bound");
+            }
         }
     }
 }
@@ -705,7 +751,7 @@ struct ShortcutState {
     unsigned viewBackgroundMatches = 0;
     bool viewBackgroundEnabled = false;
 };
-ShortcutState describeShortcutState(Browser& browser, Publication& clipboard, const Source& source,
+ShortcutState describeShortcutState(Browser& browser, IDataObject* producer, const Source& source,
                                     const char* phase, bool formats) {
     // Inspect the normal registered leaf and independently created, fully
     // populated native folder background menu. Neither route invokes a leaf.
@@ -748,7 +794,7 @@ ShortcutState describeShortcutState(Browser& browser, Publication& clipboard, co
     const HRESULT attributesStatus = shellItem(source.path)->GetAttributes(SFGAO_CANLINK | SFGAO_FILESYSTEM, &attributes);
     HWND child = nullptr;
     const HRESULT childStatus = browser.view->GetWindow(&child);
-    const HRESULT current = OleIsCurrentClipboard(clipboard.producer.Get());
+    const HRESULT current = producer ? OleIsCurrentClipboard(producer) : E_NOINTERFACE;
     std::cout << "Native shortcut state phase=" << phase << " sequence=" << GetClipboardSequenceNumber()
         << " registeredHRESULT=" << static_cast<ULONG>(result.registeredStatus)
         << " planHRESULT=" << static_cast<ULONG>(result.registered.status)
@@ -760,25 +806,26 @@ ShortcutState describeShortcutState(Browser& browser, Publication& clipboard, co
         << " viewBackgroundHRESULT=" << static_cast<ULONG>(result.viewBackgroundStatus)
         << " viewBackgroundMatches=" << result.viewBackgroundMatches << " viewBackgroundEnabled=" << result.viewBackgroundEnabled
         << " sourceAttributesHRESULT=" << static_cast<ULONG>(attributesStatus) << " sourceAttributes=" << attributes
+        << " producerPointerObserved=" << (producer != nullptr)
         << " currentProducerHRESULT=" << static_cast<ULONG>(current)
         << " viewWindowHRESULT=" << static_cast<ULONG>(childStatus)
         << " activeOwner=" << (GetActiveWindow() == browser.owner)
         << " focusInView=" << (GetFocus() == child || (child && IsChild(child, GetFocus()))) << std::endl;
-    require(current == S_OK && preserved(source), "Paste Shortcut diagnostics lost the exact owned clipboard/source");
+    require((!producer || current == S_OK) && preserved(source), "Paste Shortcut diagnostics lost the exact owned clipboard/source");
     ComPtr<IDataObject> consumer;
     succeeded(OleGetClipboard(&consumer), "Read actual shortcut clipboard consumer");
-    verifyCida(clipboard.producer.Get(), {&source});
+    if (producer) verifyCida(producer, {&source});
     verifyCida(consumer.Get(), {&source});
-    const DWORD producerEffect = effectData(clipboard.producer.Get(), CFSTR_PREFERREDDROPEFFECT);
+    const DWORD producerEffect = producer ? effectData(producer, CFSTR_PREFERREDDROPEFFECT) : MAXDWORD;
     const DWORD consumerEffect = effectData(consumer.Get(), CFSTR_PREFERREDDROPEFFECT);
     std::cout << "Native shortcut clipboard phase=" << phase << " completeCidaIdentityMatches=1 producerEffect="
         << producerEffect << " consumerEffect=" << consumerEffect << std::endl;
-    require(producerEffect == DROPEFFECT_COPY && consumerEffect == DROPEFFECT_COPY,
+    require((!producer || producerEffect == DROPEFFECT_COPY) && consumerEffect == DROPEFFECT_COPY,
         "Paste Shortcut producer/consumer changed its native COPY preference");
-    describeShortcutHdrop(phase, "producer", clipboard.producer.Get(), source);
+    if (producer) describeShortcutHdrop(phase, "producer", producer, source);
     describeShortcutHdrop(phase, "consumer", consumer.Get(), source);
     if (formats) {
-        describeTransferFormats("producer", clipboard.producer.Get());
+        if (producer) describeTransferFormats("producer", producer);
         describeTransferFormats("consumer", consumer.Get());
     }
     return result;
@@ -786,7 +833,7 @@ ShortcutState describeShortcutState(Browser& browser, Publication& clipboard, co
 
 void waitShortcutEnabled(Browser& browser, Publication& clipboard, const Source& source) {
     const auto started = GetTickCount64();
-    const auto initial = describeShortcutState(browser, clipboard, source, "published", true);
+    const auto initial = describeShortcutState(browser, clipboard.producer.Get(), source, "published", true);
     bool enabled = SUCCEEDED(initial.registeredStatus) && initial.registered.enabled;
     unsigned samples = 1;
     // Clipboard/view work may still be queued after OleSetClipboard. Dispatch
@@ -799,7 +846,7 @@ void waitShortcutEnabled(Browser& browser, Publication& clipboard, const Source&
         enabled = browser.plan(L"Windows.pastelink").enabled;
         ++samples;
     }
-    const auto settled = describeShortcutState(browser, clipboard, source, "settled", !enabled);
+    const auto settled = describeShortcutState(browser, clipboard.producer.Get(), source, "settled", !enabled);
     std::cout << "Native shortcut readiness samples=" << samples << " elapsedMs=" << GetTickCount64() - started << std::endl;
     require(SUCCEEDED(settled.registeredStatus) && settled.registered.enabled,
         "Native Paste Shortcut remained disabled after normal clipboard/view dispatch");
@@ -807,6 +854,164 @@ void waitShortcutEnabled(Browser& browser, Publication& clipboard, const Source&
         "Native registered Paste Shortcut differs from the unique enabled folder-background leaf");
     require(SUCCEEDED(settled.viewBackgroundStatus) && settled.viewBackgroundMatches == 1 && settled.viewBackgroundEnabled,
         "Native registered Paste Shortcut differs from the unique enabled actual view-background leaf");
+}
+
+bool ownedClipboardWindow(HWND window) {
+    DWORD process = 0;
+    const DWORD thread = window ? GetWindowThreadProcessId(window, &process) : 0;
+    const auto desktop = explorer::PrivateDesktop::current();
+    if (!desktop || !desktop->ready() || thread != GetCurrentThreadId() || process != GetCurrentProcessId()) return false;
+    wchar_t name[256]{};
+    DWORD needed = 0;
+    const HDESK actual = GetThreadDesktop(thread);
+    return actual && GetUserObjectInformationW(actual, UOI_NAME, name, sizeof(name), &needed) &&
+        needed && needed <= sizeof(name) && _wcsicmp(name, desktop->name().c_str()) == 0 &&
+        SUCCEEDED(desktop->verifyIsolation());
+}
+
+// Native InvokeCommand does not return its original clipboard producer. This
+// separate CI-only lease therefore proves ownership through the sole native
+// Copy invocation, its exact owned selection, native owner HWND/STA/desktop and
+// clipboard sequence. It never treats OleGetClipboard's wrapper as a producer.
+class NativeCopyPublication final {
+public:
+    NativeCopyPublication(HWND frame, const Source& source) : frame_(frame), source_(source) {
+        require(clipboardEmpty(frame_), "Native Copy control requires an empty clipboard");
+        before_ = GetClipboardSequenceNumber();
+        require(before_ != 0, "Read native Copy control clipboard sequence");
+    }
+    ~NativeCopyPublication() {
+        if (!cleared_) {
+            if (!captured_) unfinishedFailure("native Copy publication was not captured; original resources retained");
+            clear();
+        }
+    }
+    void capture() {
+        owner_ = GetClipboardOwner();
+        sequence_ = GetClipboardSequenceNumber();
+        require(sequence_ && sequence_ != before_ && ownedClipboardWindow(owner_),
+            "Native Copy did not publish through the exact owned private STA");
+        ComPtr<IDataObject> consumer;
+        succeeded(OleGetClipboard(&consumer), "Read original native Copy consumer");
+        verifyCida(consumer.Get(), {&source_});
+        require(effectData(consumer.Get(), CFSTR_PREFERREDDROPEFFECT) == DROPEFFECT_COPY && preserved(source_),
+            "Original native Copy changed its exact selection/effect/source");
+        describeShortcutHdrop("native-copy-capture", "consumer", consumer.Get(), source_);
+        require(ownedPublication(), "Original native Copy publication changed during capture");
+        captured_ = true;
+        std::cout << "Native Copy ownership ownerPrivateSTA=1 sequence=" << sequence_
+            << " exactCidaCopySource=1" << std::endl;
+    }
+    void verify() const {
+        require(captured_ && ownedPublication(), "Original native Copy clipboard owner/sequence was replaced");
+    }
+    void clear() {
+        verify();
+        const auto deadline = GetTickCount64() + 2000;
+        while (!OpenClipboard(frame_)) {
+            require(GetTickCount64() < deadline, "Open exact native Copy publication for owned cleanup");
+            pump();
+            verify();
+        }
+        // No COM/data rendering or message pump occurs between this locked
+        // owner/epoch check and EmptyClipboard. Foreign replacements fail
+        // without clearing them and without unwinding native resources.
+        const bool owned = ownedPublication();
+        const BOOL emptied = owned ? EmptyClipboard() : FALSE;
+        const DWORD emptyError = !owned || emptied ? ERROR_SUCCESS : GetLastError();
+        const BOOL closed = CloseClipboard();
+        const DWORD closeError = closed ? ERROR_SUCCESS : GetLastError();
+        require(owned, "Native Copy ownership changed under clipboard lock; unrelated data preserved");
+        require(emptied != FALSE, "Clear only exact native Copy publication");
+        succeeded(HRESULT_FROM_WIN32(emptyError), "Empty exact native Copy publication");
+        succeeded(HRESULT_FROM_WIN32(closeError ? closeError : closed ? ERROR_SUCCESS : ERROR_GEN_FAILURE),
+            "Close exact native Copy clipboard lock");
+        require(clipboardEmpty(frame_), "Original native Copy cleanup did not leave the clipboard empty");
+        cleared_ = true;
+        operation_.complete();
+    }
+private:
+    bool ownedPublication() const {
+        return GetClipboardOwner() == owner_ && GetClipboardSequenceNumber() == sequence_ && ownedClipboardWindow(owner_);
+    }
+    HWND frame_ = nullptr, owner_ = nullptr;
+    const Source& source_;
+    DWORD before_ = 0, sequence_ = 0;
+    bool captured_ = false, cleared_ = false;
+    OperationLease operation_;
+};
+
+void originalViewCopyControl(Browser& destination, Fixture& fixture) {
+    const auto& source = fixture.sources[3];
+    Browser original;
+    original.initialize(source.path.parent_path(), static_cast<int>(fixture.sources.size() - 1), true);
+    const auto item = shellItem(source.path);
+    PIDLIST_ABSOLUTE raw = nullptr;
+    succeeded(SHGetIDListFromObject(item.Get(), &raw), "Read original native Copy selection identity");
+    const Pidl sourceId(raw);
+    succeeded(original.view->SelectItem(ILFindLastID(sourceId.get()),
+        SVSI_DESELECTOTHERS | SVSI_SELECT | SVSI_FOCUSED | SVSI_ENSUREVISIBLE), "Select exact original native Copy source");
+    waitFor([&] {
+        int selected = -1;
+        return SUCCEEDED(original.folderView->ItemCount(SVGIO_SELECTION, &selected)) && selected == 1;
+    }, "Original native Copy selection did not settle");
+    ComPtr<IShellItemArray> selected;
+    succeeded(original.folderView->Items(SVGIO_SELECTION, IID_PPV_ARGS(&selected)), "Read complete original native Copy selection");
+    DWORD count = 0;
+    succeeded(selected->GetCount(&count), "Read original native Copy selection count");
+    ComPtr<IShellItem> selectedItem;
+    succeeded(selected->GetItemAt(0, &selectedItem), "Read original native Copy selected object");
+    require(count == 1 && identity(itemPath(selectedItem.Get())) == source.id,
+        "Original native Copy selection differs from its owned source");
+    ComPtr<IDataObject> viewData;
+    succeeded(original.view->GetItemObject(SVGIO_SELECTION, IID_PPV_ARGS(&viewData)), "Read original native view selection data");
+    verifyCida(viewData.Get(), {&source});
+    describeTransferFormats("original-view-selection", viewData.Get());
+    ComPtr<IContextMenu> context;
+    succeeded(original.view->GetItemObject(SVGIO_SELECTION, IID_PPV_ARGS(&context)), "Read original native selection menu");
+    explorer::NativeContextMenu menu;
+    succeeded(menu.create(original.owner, context.Get(), nullptr, CMF_EXTENDEDVERBS | CMF_ITEMMENU),
+        "Read already-sited original native Copy menu");
+    std::vector<explorer::ContextMenuEntry> entries;
+    succeeded(menu.enumerate(entries, false), "Enumerate original native Copy leaf");
+    unsigned matches = 0;
+    UINT command = 0;
+    bool enabled = false;
+    const auto find = [&](const auto& self, const std::vector<explorer::ContextMenuEntry>& rows) -> void {
+        for (const auto& row : rows) {
+            if (!row.submenu && !row.separator() && _wcsicmp(row.canonicalVerb.c_str(), L"copy") == 0) {
+                ++matches; command = row.id; enabled = row.enabled();
+            }
+            self(self, row.children);
+        }
+    };
+    find(find, entries);
+    require(matches == 1 && command && enabled, "Original native Copy requires one actual enabled canonical leaf");
+    {
+        NativeCopyPublication publication(original.owner, source);
+        succeeded(menu.invoke(command), "Invoke only original native view canonical Copy");
+        publication.capture();
+        SetActiveWindow(destination.owner);
+        require(GetActiveWindow() == destination.owner, "Reactivate exact private native Copy destination frame");
+        succeeded(destination.view->UIActivate(SVUIA_ACTIVATE_NOFOCUS), "Reactivate exact native Copy destination view");
+        const auto initial = describeShortcutState(destination, nullptr, source, "native-copy-published", true);
+        bool ready = SUCCEEDED(initial.registeredStatus) && initial.registered.enabled;
+        const auto started = GetTickCount64();
+        while (!ready && GetTickCount64() - started < 5000) {
+            pump(); publication.verify();
+            ready = destination.plan(L"Windows.pastelink").enabled;
+        }
+        const auto settled = describeShortcutState(destination, nullptr, source, "native-copy-settled", !ready);
+        publication.verify();
+        std::cout << "Native original Copy control registeredEnabled=" << settled.registered.enabled
+            << " viewEnabled=" << settled.viewBackgroundEnabled << " viewMatches=" << settled.viewBackgroundMatches
+            << " folderEnabled=" << settled.backgroundEnabled << " folderMatches=" << settled.backgroundMatches << std::endl;
+        publication.clear();
+    }
+    require(preserved(source), "Original native Copy control changed its source");
+    menu.reset(); context.Reset(); viewData.Reset(); selectedItem.Reset(); selected.Reset();
+    original.close();
+    require(GetActiveWindow() == destination.owner, "Original native Copy control lost the exact destination activation");
 }
 
 void waitMembership(Browser& browser, const fs::path& destination, size_t count) {
@@ -919,6 +1124,7 @@ void run() {
         std::cout << "PASS native Cut/Paste: MOVE preference, same-volume exact ID/content, source removal and native view\n";
     }
     browser.navigate(fixture.root / L"Shortcut");
+    originalViewCopyControl(browser, fixture);
     {
         Publication clipboard(browser.owner); clipboard.publish({&fixture.sources[3]}, false);
         waitShortcutEnabled(browser, clipboard, fixture.sources[3]);

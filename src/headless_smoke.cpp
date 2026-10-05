@@ -10,6 +10,7 @@
 #include <shlguid.h>
 #include <propvarutil.h>
 #include <propsys.h>
+#include <aclapi.h>
 #include <structuredquery.h>
 #include <commctrl.h>
 #include <UIRibbonPropertyHelpers.h>
@@ -18,6 +19,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -262,6 +264,189 @@ struct PaneObservation {
     RECT bounds{};
     std::wstring detail;
 };
+
+// Activation/stream initialization is diagnostic only: no preview parent is
+// supplied and DoPreview is never called. It cannot satisfy rendering proof.
+std::wstring nativePreviewActivationDiagnostic(REFCLSID handler, const std::vector<char>& source) {
+    const auto desktop = PrivateDesktop::current();
+    if (!desktop || FAILED(desktop->verifyIsolation()) || source.empty() || source.size() > 4096)
+        return L"native preview no-UI diagnostic rejected owned source/desktop";
+    // LOCAL_SERVER chooses the surrogate route, which must be proven separately
+    // from the caller's native InprocServer32 identity check.
+    wchar_t classId[40]{};
+    HRESULT route = StringFromGUID2(handler, classId, static_cast<int>(std::size(classId))) ? S_OK : E_FAIL;
+    const std::wstring classKey = std::wstring(L"CLSID\\") + classId;
+    const std::wstring appKey = L"AppID\\{6d2b5079-2f0b-48dd-ab7f-97cec514d30b}";
+    const auto noKey = [](HKEY root, const std::wstring& path) {
+        HKEY key = nullptr;
+        const auto read = RegOpenKeyExW(root, path.c_str(), 0, KEY_READ | KEY_WOW64_64KEY, &key);
+        if (key) RegCloseKey(key);
+        return read == ERROR_FILE_NOT_FOUND || read == ERROR_PATH_NOT_FOUND ? S_OK :
+            HRESULT_FROM_WIN32(read == ERROR_SUCCESS ? ERROR_NOT_SUPPORTED : read);
+    };
+    const auto noValue = [](HKEY root, const std::wstring& path, const wchar_t* name) {
+        DWORD bytes = 0;
+        const auto read = RegGetValueW(root, path.c_str(), name, RRF_RT_ANY | RRF_SUBKEY_WOW6464KEY,
+            nullptr, nullptr, &bytes);
+        return read == ERROR_FILE_NOT_FOUND || read == ERROR_PATH_NOT_FOUND ? S_OK :
+            HRESULT_FROM_WIN32(read == ERROR_SUCCESS || read == ERROR_MORE_DATA ? ERROR_NOT_SUPPORTED : read);
+    };
+    for (const auto name : {L"LocalServer32", L"LocalServer", L"TreatAs", L"AutoTreatAs"})
+        if (SUCCEEDED(route)) route = noKey(HKEY_CLASSES_ROOT, classKey + L"\\" + name);
+    std::array<wchar_t, 128> actualApp{};
+    DWORD bytes = static_cast<DWORD>(sizeof(actualApp));
+    if (SUCCEEDED(route)) route = HRESULT_FROM_WIN32(RegGetValueW(HKEY_CLASSES_ROOT, classKey.c_str(), L"AppID",
+        RRF_RT_REG_SZ | RRF_SUBKEY_WOW6464KEY, nullptr, actualApp.data(), &bytes));
+    GUID app{}, expectedApp{};
+    if (SUCCEEDED(route) && (FAILED(CLSIDFromString(actualApp.data(), &app)) ||
+        FAILED(CLSIDFromString(L"{6d2b5079-2f0b-48dd-ab7f-97cec514d30b}", &expectedApp)) || !IsEqualGUID(app, expectedApp)))
+        route = HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+    std::array<wchar_t, 32768> system{};
+    const auto systemLength = GetSystemDirectoryW(system.data(), static_cast<UINT>(system.size()));
+    FILE_ID_INFO expectedServer{};
+    if (SUCCEEDED(route)) route = systemLength && systemLength < system.size() ?
+        nativeFileIdentity(std::filesystem::path(system.data()) / L"prevhost.exe", expectedServer) : HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+    for (const auto root : {HKEY_CLASSES_ROOT, HKEY_LOCAL_MACHINE}) {
+        const auto path = root == HKEY_CLASSES_ROOT ? appKey : L"SOFTWARE\\Classes\\" + appKey;
+        for (const auto name : {L"LocalService", L"RunAs", L"DllSurrogateExecutable", L"RemoteServerName"})
+            if (SUCCEEDED(route)) route = noValue(root, path, name);
+        if (FAILED(route)) break;
+        std::array<wchar_t, 32768> server{}, expanded{};
+        DWORD type = 0; bytes = static_cast<DWORD>(sizeof(server));
+        route = HRESULT_FROM_WIN32(RegGetValueW(root, path.c_str(), L"DllSurrogate",
+            RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND | RRF_SUBKEY_WOW6464KEY,
+            &type, server.data(), &bytes));
+        if (SUCCEEDED(route) && type == REG_EXPAND_SZ) {
+            const auto length = ExpandEnvironmentStringsW(server.data(), expanded.data(), static_cast<DWORD>(expanded.size()));
+            if (!length || length > expanded.size()) route = HRESULT_FROM_WIN32(length ? ERROR_INSUFFICIENT_BUFFER : GetLastError());
+        }
+        const std::filesystem::path serverPath = type == REG_EXPAND_SZ ? expanded.data() : server.data();
+        FILE_ID_INFO actualServer{};
+        if (SUCCEEDED(route)) route = serverPath.is_absolute() ? nativeFileIdentity(serverPath, actualServer) : HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+        if (SUCCEEDED(route) && (actualServer.VolumeSerialNumber != expectedServer.VolumeSerialNumber ||
+            std::memcmp(actualServer.FileId.Identifier, expectedServer.FileId.Identifier, sizeof(expectedServer.FileId.Identifier)) != 0))
+            route = HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+    }
+    if (FAILED(route)) return L"native preview no-UI surrogate route unavailable=" + hresultMessage(route) + L"; factory calls=0";
+    struct Label {
+        HRESULT read = E_PENDING;
+        bool present = false;
+        DWORD rid = 0, mask = 0;
+    } label;
+    struct DesktopRead {
+        HDESK handle = nullptr;
+        ~DesktopRead() { if (handle) CloseDesktop(handle); }
+    } query{OpenDesktopW(desktop->name().c_str(), 0, FALSE,
+        READ_CONTROL | DESKTOP_READOBJECTS | DESKTOP_WRITEOBJECTS)};
+    struct DescriptorRead {
+        PSECURITY_DESCRIPTOR value = nullptr;
+        ~DescriptorRead() { if (value) LocalFree(value); }
+    } descriptor;
+    label.read = query.handle ? HRESULT_FROM_WIN32(GetSecurityInfo(query.handle, SE_WINDOW_OBJECT,
+        LABEL_SECURITY_INFORMATION, nullptr, nullptr, nullptr, nullptr, &descriptor.value)) : HRESULT_FROM_WIN32(GetLastError());
+    if (SUCCEEDED(label.read)) {
+        PACL acl = nullptr; BOOL present = FALSE, defaulted = FALSE;
+        if (!GetSecurityDescriptorSacl(descriptor.value, &present, &acl, &defaulted)) label.read = HRESULT_FROM_WIN32(GetLastError());
+        else if (present && acl) for (DWORD index = 0; index < acl->AceCount; ++index) {
+            void* raw = nullptr;
+            if (!GetAce(acl, index, &raw)) { label.read = HRESULT_FROM_WIN32(GetLastError()); break; }
+            const auto ace = static_cast<const SYSTEM_MANDATORY_LABEL_ACE*>(raw);
+            if (ace->Header.AceType != SYSTEM_MANDATORY_LABEL_ACE_TYPE) continue;
+            constexpr auto sidOffset = offsetof(SYSTEM_MANDATORY_LABEL_ACE, SidStart);
+            const auto sid = reinterpret_cast<const SID*>(&ace->SidStart);
+            const auto sidBytes = ace->Header.AceSize >= sidOffset ? ace->Header.AceSize - sidOffset : 0;
+            const auto expectedSidBytes = offsetof(SID, SubAuthority) + static_cast<size_t>(sidBytes >= offsetof(SID, SubAuthority) ? sid->SubAuthorityCount : 0) * sizeof(DWORD);
+            if (sidBytes < offsetof(SID, SubAuthority) || expectedSidBytes > sidBytes || !sid->SubAuthorityCount ||
+                !IsValidSid(const_cast<SID*>(sid))) {
+                label.read = HRESULT_FROM_WIN32(ERROR_INVALID_DATA); break;
+            }
+            label.present = true; label.mask = ace->Mask;
+            label.rid = sid->SubAuthority[sid->SubAuthorityCount - 1];
+        }
+    }
+    struct Activation {
+        HRESULT apartment = E_PENDING, cancellation = E_PENDING, factory = E_PENDING, instance = E_PENDING;
+        HRESULT preview = E_PENDING, initializer = E_PENDING, stream = E_PENDING, initialized = E_PENDING;
+    };
+    const auto targetDesktop = GetThreadDesktop(GetCurrentThreadId());
+    const auto cancelled = std::make_shared<std::atomic_bool>(false);
+    const auto deadline = GetTickCount64() + 4500;
+    std::promise<Activation> promise;
+    auto future = promise.get_future();
+    std::thread worker([handler, source, targetDesktop, cancelled, deadline, output = std::move(promise)]() mutable {
+        Activation result;
+        struct Apartment {
+            HDESK previous = GetThreadDesktop(GetCurrentThreadId());
+            HRESULT initialized = E_ACCESSDENIED, cancellation = E_PENDING;
+            explicit Apartment(HDESK target) {
+                if (SetThreadDesktop(target)) initialized = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+                else initialized = HRESULT_FROM_WIN32(GetLastError());
+                if (SUCCEEDED(initialized)) cancellation = CoEnableCallCancellation(nullptr);
+            }
+            ~Apartment() {
+                if (SUCCEEDED(cancellation)) CoDisableCallCancellation(nullptr);
+                if (SUCCEEDED(initialized)) CoUninitialize();
+                SetThreadDesktop(previous);
+            }
+        } apartment(targetDesktop);
+        try {
+            result.apartment = apartment.initialized; result.cancellation = apartment.cancellation;
+            const auto budget = [&] { return !cancelled->load() && GetTickCount64() < deadline; };
+            const auto phase = [](const char* name) {
+                std::fprintf(stderr, "headless-preview-no-ui phase=%s\n", name); std::fflush(stderr);
+            };
+            ComPtr<IClassFactory> factory;
+            ComPtr<IUnknown> instance;
+            ComPtr<IPreviewHandler> preview;
+            ComPtr<IInitializeWithStream> initializer;
+            ComPtr<IStream> stream;
+            if (SUCCEEDED(result.apartment) && SUCCEEDED(result.cancellation) && budget()) {
+                phase("factory"); result.factory = CoGetClassObject(handler, CLSCTX_LOCAL_SERVER, nullptr, IID_PPV_ARGS(&factory));
+            }
+            if (SUCCEEDED(result.factory) && budget()) {
+                phase("instance"); result.instance = factory->CreateInstance(nullptr, IID_PPV_ARGS(&instance));
+            }
+            if (SUCCEEDED(result.instance) && budget()) {
+                phase("preview-qi"); result.preview = instance.As(&preview);
+            }
+            if (SUCCEEDED(result.instance) && budget()) {
+                phase("initializer-qi"); result.initializer = instance.As(&initializer);
+            }
+            if (SUCCEEDED(result.preview) && SUCCEEDED(result.initializer) && budget()) {
+                stream.Attach(SHCreateMemStream(reinterpret_cast<const BYTE*>(source.data()), static_cast<UINT>(source.size())));
+                result.stream = stream ? S_OK : E_OUTOFMEMORY;
+            }
+            if (SUCCEEDED(result.stream) && budget()) {
+                phase("initialize-read-only-stream"); result.initialized = initializer->Initialize(stream.Get(), STGM_READ);
+            }
+        } catch (const std::bad_alloc&) { result.initialized = E_OUTOFMEMORY; }
+          catch (...) { result.initialized = E_FAIL; }
+        output.set_value(result);
+    });
+    const auto nativeThread = static_cast<HANDLE>(worker.native_handle());
+    const auto ready = [&] { return WaitForSingleObject(nativeThread, 0) == WAIT_OBJECT_0 &&
+        future.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready; };
+    const bool completed = pumpUntil(ready, 5000);
+    if (!completed) {
+        cancelled->store(true);
+        CoCancelCall(GetThreadId(nativeThread), 0);
+        if (!pumpUntil(ready, 5000)) {
+            std::fprintf(stderr, "headless preview no-UI diagnostic did not join after cancellation; private resources retained\n");
+            std::fflush(stderr);
+            if (!TerminateProcess(GetCurrentProcess(), 9)) std::_Exit(9);
+            std::_Exit(9);
+        }
+    }
+    worker.join();
+    const auto actual = future.get();
+    const auto preserved = desktop->verifyIsolation();
+    return L"verified native surrogate route=" + hresultMessage(route) + L"; owned desktop label HRESULT/present/RID/mask=" + hresultMessage(label.read) + L"/" + std::to_wstring(label.present) +
+        L"/" + std::to_wstring(label.rid) + L"/" + std::to_wstring(label.mask) + L"; no-UI apartment/cancellation/factory/instance/previewQI/initializerQI/stream/initialize=" +
+        hresultMessage(actual.apartment) + L"/" + hresultMessage(actual.cancellation) + L"/" + hresultMessage(actual.factory) + L"/" +
+        hresultMessage(actual.instance) + L"/" + hresultMessage(actual.preview) + L"/" + hresultMessage(actual.initializer) + L"/" +
+        hresultMessage(actual.stream) + L"/" + hresultMessage(actual.initialized) + L"; completed within budget=" + std::to_wstring(completed) +
+        L"; input/private isolation=" + hresultMessage(preserved) + L"; owned RTF bytes=" + std::to_wstring(source.size()) + L"; SetWindow/DoPreview calls=0/0";
+}
 
 // A pane has no documented HWND getter. Derive its physical region from the
 // actual DefView and host client, then inspect only visible providers within
@@ -2556,6 +2741,11 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report) {
                 const auto mainHistoryIndex = historyIndex_;
                 const auto mainQuery = activeQuery_;
                 Pidl mainLocation(currentPidl_ ? ILCloneFull(currentPidl_.get()) : nullptr);
+                std::wstring previewActivationDiagnostic;
+                if (nativeHandler) {
+                    previewActivationDiagnostic = nativePreviewActivationDiagnostic(handler, originalBytes[2]);
+                    std::cerr << "headless-preview-no-ui " << jsonString(previewActivationDiagnostic) << std::endl;
+                }
                 auto releasePaneApp = [](ExplorerApp* value) {
                     if (value->window_ && IsWindow(value->window_)) SendMessageW(value->window_, WM_CLOSE, 0, 0);
                     value->Release();
@@ -2696,6 +2886,7 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report) {
                         std::to_wstring(actualReady) + L"/" + std::to_wstring(presentation.ready) + L"/" + std::to_wstring(caseReady) +
                         L"; native view activation=" + hresultMessage(activation) + L"; view window=" + hresultMessage(windowRead) + L"; original App pane site=" +
                         std::to_wstring(originalSite) + L"/" + hresultMessage(siteRead) + L"; pane pixels changed=" + std::to_wstring(pixelsChanged);
+                    if (preview) diagnostic += L"; " + previewActivationDiagnostic;
                     for (size_t index = 0; index < observations.size(); ++index) diagnostic += L"; " + std::to_wstring(index) + L": " +
                         L"exact selected/retained state=" + std::to_wstring(selections[index]) + L"/" + std::to_wstring(retainedStates[index]) +
                         L"; native focused item HRESULT/index/exactFileID=" + hresultMessage(focusedItems[index].read) + L"/" +
