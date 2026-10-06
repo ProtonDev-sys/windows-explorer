@@ -457,6 +457,28 @@ struct NativeBackgroundView {
         std::cout<<"NativeBackground identity phase="<<phase<<" origin="<<origin<<" member="<<index<<" HRESULT="<<static_cast<unsigned long>(status)
             <<" volume="<<identity.VolumeSerialNumber<<" FileID="<<encoded.data()<<'\n';
     }
+    struct PathIdentityReadback {
+        HRESULT originalRead=E_PENDING,reportedRead=E_PENDING,finalOriginalRead=E_PENDING;
+        FILE_ID_INFO original{},reported{},finalOriginal{};
+        bool accepted=false;
+    };
+    // The caller first proves the actual native child/full-PIDL and retained
+    // private view source. Spelling, case and 8.3 aliases are not file identity.
+    static PathIdentityReadback readOwnedReportedPathIdentity(const fs::path& originalPath,
+            const fs::path& reportedPath,const FILE_ID_INFO& immutableIdentity,
+            const std::function<bool()>& stillCurrent={}) {
+        PathIdentityReadback result;
+        if(stillCurrent&&!stillCurrent()){result.originalRead=E_ABORT;return result;}
+        result.originalRead=readIdentity(originalPath,result.original);
+        if(result.originalRead!=S_OK||!sameIdentity(result.original,immutableIdentity))return result;
+        if(stillCurrent&&!stillCurrent()){result.reportedRead=E_ABORT;return result;}
+        result.reportedRead=readIdentity(reportedPath,result.reported);
+        if(result.reportedRead!=S_OK||!sameIdentity(result.reported,immutableIdentity))return result;
+        if(stillCurrent&&!stillCurrent()){result.finalOriginalRead=E_ABORT;return result;}
+        result.finalOriginalRead=readIdentity(originalPath,result.finalOriginal);
+        result.accepted=result.finalOriginalRead==S_OK&&sameIdentity(result.finalOriginal,immutableIdentity);
+        return result;
+    }
     bool sourceCurrent(IFolderView2* folderView,const char* phase=nullptr) {
         const auto desktop=explorer::PrivateDesktop::current();
         if(!desktop||FAILED(desktop->verifyIsolation())||!owner||!IsWindow(owner)||IsWindowVisible(owner))return false;
@@ -551,6 +573,7 @@ struct NativeBackgroundView {
             ComPtr<IFolderView2> folderView;succeeded(view.As(&folderView),"Read original native membership readiness view");
             unsigned observations=0;int lastCount=-2;HRESULT lastStatus=E_PENDING;
             std::array<bool,10> rejectionLogged{};
+            bool aliasAdmissionLogged=false;
             const auto reject=[&](unsigned reason,const char* name,int index,HRESULT status,bool present,PCUIDLIST_RELATIVE child=nullptr) noexcept {
                 if(reason>=rejectionLogged.size()||rejectionLogged[reason])return;
                 rejectionLogged[reason]=true;
@@ -617,80 +640,111 @@ struct NativeBackgroundView {
                     const auto memberIndex=static_cast<size_t>(found-expectedMembers.begin());if(matched[memberIndex]){reject(4,"duplicate-owned-member",index,S_OK,true);return false;}
                     ComPtr<IShellItem> row;const auto rowRead=folderView->GetItem(index,IID_PPV_ARGS(&row));
                     if(rowRead!=S_OK||!row){reject(5,"native-row-read",index,rowRead,row!=nullptr);return false;}
+                    PIDLIST_ABSOLUTE rawRowIdentity=nullptr;
+                    const auto rowIdentityRead=SHGetIDListFromObject(row.Get(),&rawRowIdentity);Pidl rowIdentity(rawRowIdentity);
+                    if(rowIdentityRead!=S_OK||!rowIdentity||!ILIsEqual(rowIdentity.get(),found->pidl.get())) {
+                        reject(5,"native-row-full-pidl",index,rowIdentityRead,rowIdentity!=nullptr);return false;
+                    }
                     PWSTR rawPath=nullptr;const auto pathRead=row->GetDisplayName(SIGDN_FILESYSPATH,&rawPath);
                     std::unique_ptr<wchar_t,decltype(&CoTaskMemFree)> path(rawPath,CoTaskMemFree);
-                    if(pathRead!=S_OK||!path||fs::path(path.get())!=found->path) {
-                        const bool first=!rejectionLogged[6];
-                        reject(6,"native-display-path",index,pathRead,path!=nullptr);
-                        // The original literal-path rejection remains final.
-                        // Only its first already-owned row gets extra evidence.
-                        if(first&&pathRead==S_OK&&path)try {
-                            const auto expectedText=found->path.native();
-                            const std::wstring nativeText(path.get());
-                            const auto sensitive=CompareStringOrdinal(expectedText.c_str(),-1,nativeText.c_str(),-1,FALSE);
-                            const auto insensitive=CompareStringOrdinal(expectedText.c_str(),-1,nativeText.c_str(),-1,TRUE);
-                            const auto prefix=[](const std::wstring& text,const wchar_t* start) {
-                                const size_t length=wcslen(start);
-                                return text.size()>=length&&CompareStringOrdinal(text.data(),static_cast<int>(length),start,
-                                    static_cast<int>(length),TRUE)==CSTR_EQUAL;
-                            };
-                            const bool sourceBefore=sourceCurrent(folderView.Get(),"display-path-rejection-before");
-                            FILE_ID_INFO originalIdentity{},nativeIdentity{};
-                            const auto originalRead=sourceBefore&&GetTickCount64()<deadline?readIdentity(found->path,originalIdentity):E_ABORT;
-                            const bool originalMatches=originalRead==S_OK&&sameIdentity(originalIdentity,found->identity);
-                            const bool byteMatches=ILIsEqual(child.get(),ILFindLastID(found->pidl.get()));
-                            // Exact byte membership, the original source ID and
-                            // the retained private folder/view authorize only
-                            // this real native row's reported path read.
-                            const bool nativeAuthorized=originalMatches&&byteMatches&&sourceCurrent(folderView.Get())&&GetTickCount64()<deadline;
-                            const auto nativeRead=nativeAuthorized?readIdentity(fs::path(nativeText),nativeIdentity):E_ACCESSDENIED;
-                            std::wcout<<L"NativeBackground displayPathDiagnostic expectedPath=["<<expectedText
-                                <<L"] nativePath=["<<nativeText<<L"]\n";
-                            const auto units=[](const char* label,const std::wstring& text) {
-                                constexpr char hex[]="0123456789abcdef";
-                                std::cout<<"NativeBackground displayPathDiagnostic "<<label<<"Length="<<text.size()<<" utf16=";
-                                for(const auto character:text) {
-                                    const auto value=static_cast<unsigned short>(character);
-                                    const std::array<char,4> encoded{hex[(value>>12)&15],hex[(value>>8)&15],hex[(value>>4)&15],hex[value&15]};
-                                    std::cout.write(encoded.data(),static_cast<std::streamsize>(encoded.size()));
-                                }
-                                std::cout<<'\n';
-                            };
-                            units("expectedPath",expectedText);units("nativePath",nativeText);
-                            std::cout<<"NativeBackground displayPathDiagnostic diagnosticOnly=1 row="<<index
-                                <<" expectedMember="<<memberIndex<<" ordinalSensitive="<<sensitive<<" ordinalInsensitive="<<insensitive
-                                <<" expectedExtendedPrefix="<<prefix(expectedText,L"\\\\?\\")<<" nativeExtendedPrefix="<<prefix(nativeText,L"\\\\?\\")
-                                <<" expectedUNCPrefix="<<prefix(expectedText,L"\\\\")<<" nativeUNCPrefix="<<prefix(nativeText,L"\\\\")
-                                <<" exactChildByteMatch="<<byteMatches<<" sourceBefore="<<sourceBefore
-                                <<" originalIdentityHRESULT="<<static_cast<unsigned long>(originalRead)<<" originalImmutableFileIDMatches="<<originalMatches
-                                <<" nativePathReadAuthorized="<<nativeAuthorized<<" nativeIdentityHRESULT="<<static_cast<unsigned long>(nativeRead)
-                                <<" nativeImmutableFileIDMatches="<<(nativeRead==S_OK&&sameIdentity(nativeIdentity,found->identity))<<'\n';
-                            printIdentity("display-path-rejection","original-owned-path",memberIndex,originalRead,originalIdentity);
-                            printIdentity("display-path-rejection","native-reported-owned-row-path",memberIndex,nativeRead,nativeIdentity);
-                            PIDLIST_ABSOLUTE rawRow=nullptr;
-                            const auto rowPidlRead=nativeAuthorized&&sourceCurrent(folderView.Get())&&GetTickCount64()<deadline?
-                                SHGetIDListFromObject(row.Get(),&rawRow):E_ABORT;
-                            Pidl rowPidl(rawRow);
-                            ComPtr<IShellFolder> nativeFolder;
-                            const auto nativeFolderRead=sourceCurrent(folderView.Get())&&GetTickCount64()<deadline?
-                                folderView->GetFolder(IID_PPV_ARGS(&nativeFolder)):E_ABORT;
-                            const auto canonical=sourceCurrent(folderView.Get())&&nativeFolderRead==S_OK&&nativeFolder&&GetTickCount64()<deadline?
-                                nativeFolder->CompareIDs(SHCIDS_CANONICALONLY,child.get(),ILFindLastID(found->pidl.get())):E_ABORT;
-                            const bool sourceAfter=sourceCurrent(folderView.Get(),"display-path-rejection-after");
-                            std::cout<<"NativeBackground displayPathDiagnostic rowFullPIDLHRESULT="<<static_cast<unsigned long>(rowPidlRead)
-                                <<" rowFullPIDLPresent="<<(rowPidl!=nullptr)<<" rowFullPIDLBytes="<<(rowPidl?ILGetSize(rowPidl.get()):0)
-                                <<" expectedFullPIDLBytes="<<ILGetSize(found->pidl.get())
-                                <<" exactFullPIDLByteMatch="<<(rowPidl&&ILIsEqual(rowPidl.get(),found->pidl.get()))
-                                <<" nativeFolderHRESULT="<<static_cast<unsigned long>(nativeFolderRead)
-                                <<" nativeCanonicalHRESULT="<<static_cast<unsigned long>(canonical)
-                                <<" nativeCanonicalSucceeded="<<SUCCEEDED(canonical)
-                                <<" nativeCanonicalOrder="<<(SUCCEEDED(canonical)?static_cast<short>(HRESULT_CODE(canonical)):0)
-                                <<" sourceAfter="<<sourceAfter<<" deadlineReached="<<(GetTickCount64()>=deadline)<<'\n'<<std::flush;
-                        }catch(...) {std::cout<<"NativeBackground displayPathDiagnostic diagnosticException=1\n"<<std::flush;}
+                    if(pathRead!=S_OK||!path){reject(6,"native-display-path",index,pathRead,path!=nullptr);return false;}
+                    // Exact complete child membership/full row PIDL plus a
+                    // fresh immutable original FileID authorizes metadata-only
+                    // reading of this real native row's reported path.
+                    const auto stillCurrent=[&]{return GetTickCount64()<deadline&&sourceCurrent(folderView.Get())&&GetTickCount64()<deadline;};
+                    const bool identitySourceBefore=stillCurrent();
+                    if(!identitySourceBefore){reject(9,"source-before-path-identity",index,E_ABORT,true);return false;}
+                    const auto identity=readOwnedReportedPathIdentity(found->path,fs::path(path.get()),found->identity,stillCurrent);
+                    const bool identitySourceAfter=stillCurrent();
+                    if(!identity.accepted||!identitySourceAfter) {
+                        const auto identityStatus=identity.originalRead!=S_OK?identity.originalRead:
+                            identity.reportedRead!=S_OK?identity.reportedRead:
+                            identity.finalOriginalRead!=S_OK?identity.finalOriginalRead:HRESULT_FROM_WIN32(ERROR_RETRY);
+                        reject(7,"owned-reported-path-identity",index,identityStatus,true);
+                        if(fs::path(path.get())!=found->path) {
+                            const bool first=!rejectionLogged[6];
+                            reject(6,"native-display-path",index,pathRead,path!=nullptr);
+                            // Preserve the original one-shot failure receipt.
+                            // It never admits a failed immutable-ID/source check.
+                            if(first&&pathRead==S_OK&&path)try {
+                                const auto expectedText=found->path.native();
+                                const std::wstring nativeText(path.get());
+                                const auto sensitive=CompareStringOrdinal(expectedText.c_str(),-1,nativeText.c_str(),-1,FALSE);
+                                const auto insensitive=CompareStringOrdinal(expectedText.c_str(),-1,nativeText.c_str(),-1,TRUE);
+                                const auto prefix=[](const std::wstring& text,const wchar_t* start) {
+                                    const size_t length=wcslen(start);
+                                    return text.size()>=length&&CompareStringOrdinal(text.data(),static_cast<int>(length),start,
+                                        static_cast<int>(length),TRUE)==CSTR_EQUAL;
+                                };
+                                const bool sourceBefore=sourceCurrent(folderView.Get(),"display-path-rejection-before");
+                                FILE_ID_INFO originalIdentity{},nativeIdentity{};
+                                const auto originalRead=sourceBefore&&GetTickCount64()<deadline?readIdentity(found->path,originalIdentity):E_ABORT;
+                                const bool originalMatches=originalRead==S_OK&&sameIdentity(originalIdentity,found->identity);
+                                const bool byteMatches=ILIsEqual(child.get(),ILFindLastID(found->pidl.get()));
+                                // Exact byte membership, the original source ID and
+                                // the retained private folder/view authorize only
+                                // this real native row's reported path read.
+                                const bool nativeAuthorized=originalMatches&&byteMatches&&sourceCurrent(folderView.Get())&&GetTickCount64()<deadline;
+                                const auto nativeRead=nativeAuthorized?readIdentity(fs::path(nativeText),nativeIdentity):E_ACCESSDENIED;
+                                std::wcout<<L"NativeBackground displayPathDiagnostic expectedPath=["<<expectedText
+                                    <<L"] nativePath=["<<nativeText<<L"]\n";
+                                const auto units=[](const char* label,const std::wstring& text) {
+                                    constexpr char hex[]="0123456789abcdef";
+                                    std::cout<<"NativeBackground displayPathDiagnostic "<<label<<"Length="<<text.size()<<" utf16=";
+                                    for(const auto character:text) {
+                                        const auto value=static_cast<unsigned short>(character);
+                                        const std::array<char,4> encoded{hex[(value>>12)&15],hex[(value>>8)&15],hex[(value>>4)&15],hex[value&15]};
+                                        std::cout.write(encoded.data(),static_cast<std::streamsize>(encoded.size()));
+                                    }
+                                    std::cout<<'\n';
+                                };
+                                units("expectedPath",expectedText);units("nativePath",nativeText);
+                                std::cout<<"NativeBackground displayPathDiagnostic diagnosticOnly=1 row="<<index
+                                    <<" expectedMember="<<memberIndex<<" ordinalSensitive="<<sensitive<<" ordinalInsensitive="<<insensitive
+                                    <<" expectedExtendedPrefix="<<prefix(expectedText,L"\\\\?\\")<<" nativeExtendedPrefix="<<prefix(nativeText,L"\\\\?\\")
+                                    <<" expectedUNCPrefix="<<prefix(expectedText,L"\\\\")<<" nativeUNCPrefix="<<prefix(nativeText,L"\\\\")
+                                    <<" exactChildByteMatch="<<byteMatches<<" sourceBefore="<<sourceBefore
+                                    <<" originalIdentityHRESULT="<<static_cast<unsigned long>(originalRead)<<" originalImmutableFileIDMatches="<<originalMatches
+                                    <<" nativePathReadAuthorized="<<nativeAuthorized<<" nativeIdentityHRESULT="<<static_cast<unsigned long>(nativeRead)
+                                    <<" nativeImmutableFileIDMatches="<<(nativeRead==S_OK&&sameIdentity(nativeIdentity,found->identity))<<'\n';
+                                printIdentity("display-path-rejection","original-owned-path",memberIndex,originalRead,originalIdentity);
+                                printIdentity("display-path-rejection","native-reported-owned-row-path",memberIndex,nativeRead,nativeIdentity);
+                                PIDLIST_ABSOLUTE rawRow=nullptr;
+                                const auto rowPidlRead=nativeAuthorized&&sourceCurrent(folderView.Get())&&GetTickCount64()<deadline?
+                                    SHGetIDListFromObject(row.Get(),&rawRow):E_ABORT;
+                                Pidl rowPidl(rawRow);
+                                ComPtr<IShellFolder> nativeFolder;
+                                const auto nativeFolderRead=sourceCurrent(folderView.Get())&&GetTickCount64()<deadline?
+                                    folderView->GetFolder(IID_PPV_ARGS(&nativeFolder)):E_ABORT;
+                                const auto canonical=sourceCurrent(folderView.Get())&&nativeFolderRead==S_OK&&nativeFolder&&GetTickCount64()<deadline?
+                                    nativeFolder->CompareIDs(SHCIDS_CANONICALONLY,child.get(),ILFindLastID(found->pidl.get())):E_ABORT;
+                                const bool sourceAfter=sourceCurrent(folderView.Get(),"display-path-rejection-after");
+                                std::cout<<"NativeBackground displayPathDiagnostic rowFullPIDLHRESULT="<<static_cast<unsigned long>(rowPidlRead)
+                                    <<" rowFullPIDLPresent="<<(rowPidl!=nullptr)<<" rowFullPIDLBytes="<<(rowPidl?ILGetSize(rowPidl.get()):0)
+                                    <<" expectedFullPIDLBytes="<<ILGetSize(found->pidl.get())
+                                    <<" exactFullPIDLByteMatch="<<(rowPidl&&ILIsEqual(rowPidl.get(),found->pidl.get()))
+                                    <<" nativeFolderHRESULT="<<static_cast<unsigned long>(nativeFolderRead)
+                                    <<" nativeCanonicalHRESULT="<<static_cast<unsigned long>(canonical)
+                                    <<" nativeCanonicalSucceeded="<<SUCCEEDED(canonical)
+                                    <<" nativeCanonicalOrder="<<(SUCCEEDED(canonical)?static_cast<short>(HRESULT_CODE(canonical)):0)
+                                    <<" sourceAfter="<<sourceAfter<<" deadlineReached="<<(GetTickCount64()>=deadline)<<'\n'<<std::flush;
+                            }catch(...) {std::cout<<"NativeBackground displayPathDiagnostic diagnosticException=1\n"<<std::flush;}
+                        }
                         return false;
                     }
-                    FILE_ID_INFO identity{};const auto identityRead=readIdentity(found->path,identity);
-                    if(identityRead!=S_OK||!sameIdentity(identity,found->identity)){reject(7,"owned-file-identity",index,identityRead,true);return false;}
+                    if(!aliasAdmissionLogged&&fs::path(path.get())!=found->path) {
+                        aliasAdmissionLogged=true;
+                        std::cout<<"NativeBackground pathIdentityAdmission spellingDiffers=1 row="<<index<<" expectedMember="<<memberIndex
+                            <<" originalPathUnits="<<found->path.native().size()<<" reportedPathUnits="<<wcslen(path.get())
+                            <<" exactChildAndFullPIDL=1 original/reported/finalOriginalHRESULT="<<static_cast<unsigned long>(identity.originalRead)
+                            <<"/"<<static_cast<unsigned long>(identity.reportedRead)<<"/"<<static_cast<unsigned long>(identity.finalOriginalRead)
+                            <<" completeImmutableFileIDs=1 sourceBefore/After="<<identitySourceBefore<<"/"<<identitySourceAfter
+                            <<" elapsedMs="<<(GetTickCount64()-(deadline-5000))<<'\n';
+                        printIdentity("path-alias-admission","original-owned-path",memberIndex,identity.originalRead,identity.original);
+                        printIdentity("path-alias-admission","native-reported-owned-row-path",memberIndex,identity.reportedRead,identity.reported);
+                        printIdentity("path-alias-admission","final-original-owned-path",memberIndex,identity.finalOriginalRead,identity.finalOriginal);
+                        std::cout<<std::flush;
+                    }
                     matched[memberIndex]=true;targetAvailable=targetAvailable||ILIsEqual(child.get(),ILFindLastID(targetId.get()));
                 }
                 const bool result=targetAvailable&&sourceCurrent(folderView.Get())&&GetTickCount64()<deadline;
@@ -715,6 +769,184 @@ struct NativeBackgroundView {
         events.Reset();if(owner)DestroyWindow(owner);
     }
 };
+
+// This control owns exactly two files and one new directory. Every cleanup
+// checks the retained handle and current owned path, then deletes that exact
+// handle. It never recursively traverses or deletes an unexpected replacement.
+struct OwnedPathIdentityControl {
+    struct File {fs::path path;HANDLE handle=INVALID_HANDLE_VALUE;FILE_ID_INFO identity{};bool captured=false;};
+    fs::path root;
+    HANDLE directory=INVALID_HANDLE_VALUE;
+    FILE_ID_INFO directoryIdentity{};
+    bool created=false,captured=false;
+    std::array<File,2> files;
+    static HRESULT exactOwnedHandle(HANDLE handle,const fs::path& path,const FILE_ID_INFO& immutable,bool isDirectory) {
+        FILE_ID_INFO held{};FILE_BASIC_INFO basic{};FILE_STANDARD_INFO standard{};
+        if(!GetFileInformationByHandleEx(handle,FileIdInfo,&held,sizeof(held))||
+           !GetFileInformationByHandleEx(handle,FileBasicInfo,&basic,sizeof(basic))||
+           !GetFileInformationByHandleEx(handle,FileStandardInfo,&standard,sizeof(standard)))return HRESULT_FROM_WIN32(GetLastError());
+        if(!NativeBackgroundView::sameIdentity(held,immutable)||(basic.FileAttributes&FILE_ATTRIBUTE_REPARSE_POINT)||
+           static_cast<bool>(standard.Directory)!=isDirectory)return E_ACCESSDENIED;
+        struct Current {HANDLE value=INVALID_HANDLE_VALUE;~Current(){if(value!=INVALID_HANDLE_VALUE)CloseHandle(value);}}current;
+        current.value=CreateFileW(path.c_str(),FILE_READ_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
+            nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT|(isDirectory?FILE_FLAG_BACKUP_SEMANTICS:0),nullptr);
+        if(current.value==INVALID_HANDLE_VALUE)return HRESULT_FROM_WIN32(GetLastError());
+        FILE_ID_INFO actual{};
+        if(!GetFileInformationByHandleEx(current.value,FileIdInfo,&actual,sizeof(actual)))return HRESULT_FROM_WIN32(GetLastError());
+        return NativeBackgroundView::sameIdentity(actual,immutable)?S_OK:E_ACCESSDENIED;
+    }
+    void initialize() {
+        GUID guid{};succeeded(CoCreateGuid(&guid),"Generate owned path-control directory identity");
+        wchar_t formatted[40]{};require(StringFromGUID2(guid,formatted,40)!=0,"Format owned path-control identity");
+        root=fs::temp_directory_path()/(std::wstring(L"WindowsExplorer-PathIdentity-")+formatted);
+        require(root.is_absolute()&&CreateDirectoryW(root.c_str(),nullptr)!=FALSE,"Create only the new owned path-control directory");created=true;
+        // Retain the immutable parent identity without DELETE access that
+        // conflicts with the native rename API's target-directory open.
+        directory=CreateFileW(root.c_str(),FILE_READ_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
+            nullptr,OPEN_EXISTING,FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT,nullptr);
+        require(directory!=INVALID_HANDLE_VALUE,"Retain exclusively owned path-control directory");
+        require(GetFileInformationByHandleEx(directory,FileIdInfo,&directoryIdentity,sizeof(directoryIdentity))!=FALSE,
+            "Capture immutable owned path-control directory FileID");captured=true;
+        files[0].path=root/L"native reported document with long name.txt";
+        files[1].path=root/L"different owned file.txt";
+        for(auto& file:files) {
+            file.handle=CreateFileW(file.path.c_str(),FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,CREATE_NEW,FILE_ATTRIBUTE_NORMAL,nullptr);
+            require(file.handle!=INVALID_HANDLE_VALUE,"Create only the new owned path-control file");
+            require(GetFileInformationByHandleEx(file.handle,FileIdInfo,&file.identity,sizeof(file.identity))!=FALSE,
+                "Capture immutable owned path-control file FileID");file.captured=true;
+            require(exactOwnedHandle(file.handle,file.path,file.identity,false)==S_OK,"Verify newly owned ordinary path-control file");
+        }
+        require(exactOwnedHandle(directory,root,directoryIdentity,true)==S_OK,"Verify newly owned ordinary path-control directory");
+    }
+    void renameOwned(File& file,const fs::path& target) {
+        require(file.captured&&file.path.parent_path()==root&&target.parent_path()==root&&
+            exactOwnedHandle(directory,root,directoryIdentity,true)==S_OK&&
+            exactOwnedHandle(file.handle,file.path,file.identity,false)==S_OK,"Owned rename source/parent identity");
+        const auto mutation=CreateFileW(file.path.c_str(),FILE_READ_ATTRIBUTES|DELETE,
+            FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT,nullptr);
+        require(mutation!=INVALID_HANDLE_VALUE,"Open only exact owned rename handle");
+        struct Close {HANDLE value;~Close(){CloseHandle(value);}} close{mutation};
+        require(exactOwnedHandle(mutation,file.path,file.identity,false)==S_OK,"Owned rename handle FileID");
+        const auto name=target.native();
+        require(name.size()<32768,"Owned rename target length");
+        std::vector<BYTE> storage(sizeof(FILE_RENAME_INFO)+name.size()*sizeof(wchar_t),0);
+        auto* rename=reinterpret_cast<FILE_RENAME_INFO*>(storage.data());
+        rename->ReplaceIfExists=FALSE;rename->RootDirectory=nullptr;
+        rename->FileNameLength=static_cast<DWORD>(name.size()*sizeof(wchar_t));
+        std::memcpy(rename->FileName,name.c_str(),name.size()*sizeof(wchar_t));
+        const auto renamed=SetFileInformationByHandle(mutation,FileRenameInfo,rename,static_cast<DWORD>(storage.size()));
+        const auto error=renamed?ERROR_SUCCESS:GetLastError();
+        if(!renamed)std::cout<<"NativeBackground pathIdentityControl renameWin32="<<error<<'\n'<<std::flush;
+        require(renamed!=FALSE,"Rename only exact owned native file handle without replacement");
+        file.path=target;
+        require(exactOwnedHandle(directory,root,directoryIdentity,true)==S_OK,"Owned rename final parent FileID");
+        require(exactOwnedHandle(file.handle,file.path,file.identity,false)==S_OK,"Owned rename final retained FileID");
+    }
+    ~OwnedPathIdentityControl() noexcept {
+        if(!created)return;
+        if(!captured||directory==INVALID_HANDLE_VALUE)namespaceFatal("owned path-control cleanup has no captured directory identity",E_ACCESSDENIED);
+        const auto parent=exactOwnedHandle(directory,root,directoryIdentity,true);
+        if(parent!=S_OK)namespaceFatal("owned path-control cleanup directory identity",parent);
+        for(auto& file:files)if(file.handle!=INVALID_HANDLE_VALUE) {
+            if(!file.captured||file.path.parent_path()!=root)namespaceFatal("owned path-control cleanup child ownership",E_ACCESSDENIED);
+            const auto status=exactOwnedHandle(file.handle,file.path,file.identity,false);
+            if(status!=S_OK)namespaceFatal("owned path-control cleanup child FileID",status);
+            // Keep native parsing free of a persistent DELETE-access handle.
+            // Acquire it only for cleanup, then revalidate its exact FileID.
+            const auto deletion=CreateFileW(file.path.c_str(),FILE_READ_ATTRIBUTES|DELETE,
+                FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT,nullptr);
+            if(deletion==INVALID_HANDLE_VALUE)namespaceFatal("open exact owned path-control deletion handle",HRESULT_FROM_WIN32(GetLastError()));
+            const auto deletionStatus=exactOwnedHandle(deletion,file.path,file.identity,false);
+            if(deletionStatus!=S_OK)namespaceFatal("owned path-control deletion-handle FileID",deletionStatus);
+            FILE_DISPOSITION_INFO disposition{TRUE};
+            if(!SetFileInformationByHandle(deletion,FileDispositionInfo,&disposition,sizeof(disposition)))
+                namespaceFatal("delete exact owned path-control file handle",HRESULT_FROM_WIN32(GetLastError()));
+            if(!CloseHandle(file.handle))namespaceFatal("close deleted owned path-control file",HRESULT_FROM_WIN32(GetLastError()));
+            file.handle=INVALID_HANDLE_VALUE;
+            if(!CloseHandle(deletion))namespaceFatal("close exact owned path-control deletion handle",HRESULT_FROM_WIN32(GetLastError()));
+        }
+        const auto finalParent=exactOwnedHandle(directory,root,directoryIdentity,true);
+        if(finalParent!=S_OK)namespaceFatal("owned path-control final directory FileID",finalParent);
+        const auto deletion=CreateFileW(root.c_str(),FILE_READ_ATTRIBUTES|DELETE,
+            FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT,nullptr);
+        if(deletion==INVALID_HANDLE_VALUE)namespaceFatal("open exact owned path-control directory deletion handle",HRESULT_FROM_WIN32(GetLastError()));
+        const auto deletionStatus=exactOwnedHandle(deletion,root,directoryIdentity,true);
+        if(deletionStatus!=S_OK)namespaceFatal("owned path-control directory deletion-handle FileID",deletionStatus);
+        FILE_DISPOSITION_INFO disposition{TRUE};
+        if(!SetFileInformationByHandle(deletion,FileDispositionInfo,&disposition,sizeof(disposition)))
+            namespaceFatal("delete exact empty owned path-control directory handle",HRESULT_FROM_WIN32(GetLastError()));
+        if(!CloseHandle(directory))namespaceFatal("close deleted owned path-control directory",HRESULT_FROM_WIN32(GetLastError()));
+        if(!CloseHandle(deletion))namespaceFatal("close exact owned path-control directory deletion handle",HRESULT_FROM_WIN32(GetLastError()));
+    }
+};
+
+void nativeOwnedDisplayPathIdentityAdmission() {
+    const auto clipboard=GetClipboardSequenceNumber();
+    OwnedPathIdentityControl owned;owned.initialize();
+    const auto originalPath=owned.files[0].path,otherPath=owned.files[1].path;
+    const auto immutable=owned.files[0].identity,wrongIdentity=owned.files[1].identity;
+    require(!NativeBackgroundView::sameIdentity(immutable,wrongIdentity),"Two genuinely owned files must have distinct full native FileIDs");
+    const auto same=NativeBackgroundView::readOwnedReportedPathIdentity(originalPath,originalPath,immutable);
+    require(same.accepted&&same.originalRead==S_OK&&same.reportedRead==S_OK&&same.finalOriginalRead==S_OK,
+        "Exact owned path identity was rejected");
+    const auto wrong=NativeBackgroundView::readOwnedReportedPathIdentity(originalPath,otherPath,immutable);
+    require(!wrong.accepted&&wrong.originalRead==S_OK&&wrong.reportedRead==S_OK&&wrong.finalOriginalRead==E_PENDING&&
+        !NativeBackgroundView::sameIdentity(wrong.reported,immutable),"Different owned FileID was admitted as the native reported row");
+    auto original=item(originalPath);PIDLIST_ABSOLUTE rawExpected=nullptr;
+    const auto expectedRead=SHGetIDListFromObject(original.Get(),&rawExpected);NativeBackgroundView::Pidl expected(rawExpected);
+    require(expectedRead==S_OK&&expected,"Capture actual original owned full PIDL");
+    const auto verifyAlias=[&](const fs::path& aliasPath,const char* label) {
+        const auto alias=item(aliasPath);PIDLIST_ABSOLUTE rawActual=nullptr;
+        const auto actualRead=SHGetIDListFromObject(alias.Get(),&rawActual);NativeBackgroundView::Pidl actual(rawActual);
+        require(actualRead==S_OK&&actual&&ILIsEqual(actual.get(),expected.get()),"Native owned alias changed the exact original full PIDL");
+        int order=1;const auto canonical=original->Compare(alias.Get(),SICHINT_CANONICAL,&order);
+        require(canonical==S_OK&&order==0,"Actual owned alias lost its independent native canonical Shell identity");
+        const auto admitted=NativeBackgroundView::readOwnedReportedPathIdentity(originalPath,aliasPath,immutable);
+        require(admitted.accepted&&admitted.originalRead==S_OK&&admitted.reportedRead==S_OK&&admitted.finalOriginalRead==S_OK,
+            "Distinct native spelling of the same immutable owned file was rejected");
+        std::cout<<"NativeBackground pathIdentityControl alias="<<label<<" actualAliasCovered=1 spellingDiffers="<<(aliasPath!=originalPath)
+            <<" originalPathUnits="<<originalPath.native().size()<<" aliasPathUnits="<<aliasPath.native().size()<<" exactFullPIDL=1 canonicalS_OKOrder0=1 full128FileID=1\n";
+    };
+    std::array<wchar_t,32768> aliasPath{};
+    for(const bool shortName:{true,false}) {
+        SetLastError(ERROR_SUCCESS);
+        const auto length=shortName?GetShortPathNameW(originalPath.c_str(),aliasPath.data(),static_cast<DWORD>(aliasPath.size())):
+            GetLongPathNameW(originalPath.c_str(),aliasPath.data(),static_cast<DWORD>(aliasPath.size()));
+        const auto error=GetLastError();
+        require(length<aliasPath.size(),"Owned native alias query exceeded bounded buffer");
+        require(length!=0||error==ERROR_NOT_SUPPORTED||error==ERROR_INVALID_FUNCTION,"Unexpected native owned alias query failure");
+        const bool distinct=length!=0&&fs::path(aliasPath.data())!=originalPath;
+        const char* label=shortName?"actual-native-8dot3":"actual-native-long-path";
+        if(distinct)verifyAlias(fs::path(aliasPath.data()),label);
+        else std::cout<<"UNAVAILABLE: NativeBackground pathIdentityControl alias="<<label<<" noDistinctNativeAlias=1 queryLength="<<length<<" Win32="<<error<<'\n';
+    }
+    PWSTR rawReported=nullptr;const auto pathRead=original->GetDisplayName(SIGDN_FILESYSPATH,&rawReported);
+    std::unique_ptr<wchar_t,decltype(&CoTaskMemFree)> reported(rawReported,CoTaskMemFree);
+    require(pathRead==S_OK&&reported,"Read actual owned native filesystem display path");
+    verifyAlias(fs::path(reported.get()),"actual-native-display-path");
+    original.Reset(); // End native parsed-item aliases before the owned replacement control.
+    // Rename the still-open original inside the owned parent, then move the
+    // already-existing distinct file to its former path. Keeping the old
+    // handle alive proves the old FileID without delete-pending name reuse.
+    const auto retired=owned.root/L"retained original document.txt";
+    require(OwnedPathIdentityControl::exactOwnedHandle(owned.files[0].handle,originalPath,immutable,false)==S_OK&&
+        OwnedPathIdentityControl::exactOwnedHandle(owned.files[1].handle,otherPath,wrongIdentity,false)==S_OK,
+        "Replacement control lost original owned path/FileID authority");
+    owned.renameOwned(owned.files[0],retired);
+    require(OwnedPathIdentityControl::exactOwnedHandle(owned.files[0].handle,retired,immutable,false)==S_OK,
+        "Retained original identity changed after owned rename");
+    owned.renameOwned(owned.files[1],originalPath);
+    const auto replaced=NativeBackgroundView::readOwnedReportedPathIdentity(originalPath,originalPath,immutable);
+    require(!replaced.accepted&&replaced.originalRead==S_OK&&replaced.reportedRead==E_PENDING&&replaced.finalOriginalRead==E_PENDING&&
+        NativeBackgroundView::sameIdentity(replaced.original,wrongIdentity),"Replacement source was admitted under its retired immutable FileID");
+    require(OwnedPathIdentityControl::exactOwnedHandle(owned.files[0].handle,retired,immutable,false)==S_OK&&
+        OwnedPathIdentityControl::exactOwnedHandle(owned.files[1].handle,originalPath,wrongIdentity,false)==S_OK,
+        "Owned replacement changed either retained original full FileID");
+    require(GetClipboardSequenceNumber()==clipboard,"Path identity control changed the shared clipboard");
+    std::cout<<"NativeBackground pathIdentityControl wrongFileRejected=1 replacedOriginalRejected=1 reportedPathReadSkipped=1 full128FileID=1\n"<<std::flush;
+}
 
 struct CastFileSnapshot {
     FILE_ID_INFO identity{};
@@ -2626,6 +2858,7 @@ int runNamespaceActionTests() {
         {"actual standard-GIT lookup cancellation and initialized final release",[]{onPrivateNamespaceDesktop(realGitLookupCancellationLifetime);}},
         {"exact target registration reuse, standalone ownership and native marshal reentry",[]{onPrivateNamespaceDesktop(exactTargetRegistrationReuseAndReentry);}},
         {"async original 100001-item Kind authority, native failures, cancellation and known-zero guard",[]{onPrivateNamespaceDesktop(asyncCustomKindAuthorityAndFailures);}},
+        {"actual native reported path identity, available short/long aliases and wrong/replaced FileID rejection",[]{onPrivateNamespaceDesktop(nativeOwnedDisplayPathIdentityAdmission);}},
         {"async actual native Kind, full media counterexample and unchanged original view/CIDA",[]{onPrivateNamespaceDesktop(asyncNativeKindAndOriginalView);}},
         {"full 100001-item aggregate attributes, provider site and activation guards",[]{onPrivateNamespaceDesktop(aggregateLargeSelectionAndProviderGuards);}},
         {"real native 100001-item arrays with final file, link and virtual counterexamples",[]{onPrivateNamespaceDesktop(nativeLargeArrayTailCounterexamples);}},
