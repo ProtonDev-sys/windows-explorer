@@ -10,6 +10,7 @@
 #include <propvarutil.h>
 #include <wrl/implements.h>
 #include <array>
+#include <algorithm>
 #include <atomic>
 #include <cwctype>
 #include <chrono>
@@ -20,6 +21,7 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <memory>
 #include <set>
 #include <span>
 #include <stdexcept>
@@ -91,12 +93,160 @@ public:
     HRESULT STDMETHODCALLTYPE OnNavigationFailed(PCIDLIST_ABSOLUTE) override { finished = true; status = E_FAIL; return S_OK; }
 };
 struct HiddenView {
+    struct PidlDelete {
+        using pointer=LPITEMIDLIST;
+        void operator()(pointer value)const noexcept {CoTaskMemFree(value);}
+    };
+    using OwnedPidl=std::unique_ptr<ITEMIDLIST,PidlDelete>;
+    struct ReadyMember {fs::path path;OwnedPidl pidl;FILE_ID_INFO identity{};};
     HWND owner = nullptr;
     ComPtr<IExplorerBrowser> browser;
     ComPtr<IShellView> view;
     ComPtr<NavigationEvents> events;
     DWORD cookie = 0;
-    explicit HiddenView(IShellItem* folder) {
+    ULONGLONG initializationDeadline=0;
+    ComPtr<IShellItem> readinessFolder;
+    OwnedPidl readinessFolderId;
+    std::vector<ReadyMember> readinessMembers;
+    static HRESULT readReadyIdentity(const fs::path& path,FILE_ID_INFO& identity) {
+        struct File {HANDLE value=INVALID_HANDLE_VALUE;~File(){if(value!=INVALID_HANDLE_VALUE)CloseHandle(value);}}file;
+        file.value=CreateFileW(path.c_str(),FILE_READ_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
+            nullptr,OPEN_EXISTING,FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT,nullptr);
+        if(file.value==INVALID_HANDLE_VALUE)return HRESULT_FROM_WIN32(GetLastError());
+        return GetFileInformationByHandleEx(file.value,FileIdInfo,&identity,sizeof(identity))?S_OK:HRESULT_FROM_WIN32(GetLastError());
+    }
+    static bool sameReadyIdentity(const FILE_ID_INFO& first,const FILE_ID_INFO& second) {
+        return first.VolumeSerialNumber==second.VolumeSerialNumber&&
+            std::memcmp(first.FileId.Identifier,second.FileId.Identifier,sizeof(first.FileId.Identifier))==0;
+    }
+    void waitForOwnedMembers(IShellItem* originalFolder,PCIDLIST_ABSOLUTE originalFolderId,const std::vector<ReadyMember>& expected) {
+        require(originalFolder&&originalFolderId&&expected.size()==3&&browser&&view&&initializationDeadline,
+            "Equivalence readiness requires exactly three original sources and its actual initialized view");
+        ComPtr<IFolderView2> folderView;succeeded(view.As(&folderView),"Read original equivalence readiness folder view");
+        const auto current=[&](const char* phase=nullptr) {
+            const auto desktop=PrivateDesktop::current();
+            const auto privateRead=desktop?desktop->verifyIsolation():E_ACCESSDENIED;
+            ComPtr<IShellItem> actualFolder;const auto folderRead=folderView->GetFolder(IID_PPV_ARGS(&actualFolder));
+            int order=1;const auto compare=folderRead==S_OK&&actualFolder?actualFolder->Compare(originalFolder,SICHINT_CANONICAL,&order):E_NOINTERFACE;
+            PIDLIST_ABSOLUTE rawFolder=nullptr;
+            const auto folderPidlRead=folderRead==S_OK&&actualFolder?SHGetIDListFromObject(actualFolder.Get(),&rawFolder):E_NOINTERFACE;
+            OwnedPidl folderPidl(rawFolder);
+            HWND nativeWindow=nullptr;const auto windowRead=view->GetWindow(&nativeWindow);
+            DWORD nativeProcess=0,ownerProcess=0;
+            const auto nativeThread=nativeWindow?GetWindowThreadProcessId(nativeWindow,&nativeProcess):0;
+            const auto ownerThread=owner?GetWindowThreadProcessId(owner,&ownerProcess):0;
+            ComPtr<IShellView> actualView;const auto viewRead=browser->GetCurrentView(IID_PPV_ARGS(&actualView));
+            const auto privateAfter=desktop?desktop->verifyIsolation():E_ACCESSDENIED;
+            const bool exact=privateRead==S_OK&&privateAfter==S_OK&&viewRead==S_OK&&actualView.Get()==view.Get()&&folderRead==S_OK&&
+                compare==S_OK&&order==0&&folderPidlRead==S_OK&&folderPidl&&ILIsEqual(folderPidl.get(),originalFolderId)&&
+                windowRead==S_OK&&nativeWindow&&IsChild(owner,nativeWindow)&&nativeThread==GetCurrentThreadId()&&
+                ownerThread==GetCurrentThreadId()&&nativeProcess==GetCurrentProcessId()&&ownerProcess==GetCurrentProcessId()&&!IsWindowVisible(owner);
+            if(phase)std::cout<<"NativeMenu readiness source phase="<<phase<<" privateHRESULT="<<static_cast<unsigned long>(privateRead)
+                <<" privateAfterHRESULT="<<static_cast<unsigned long>(privateAfter)
+                <<" viewHRESULT="<<static_cast<unsigned long>(viewRead)<<" sameView="<<(actualView.Get()==view.Get())
+                <<" folderHRESULT="<<static_cast<unsigned long>(folderRead)<<" folderCompareHRESULT="<<static_cast<unsigned long>(compare)
+                <<" folderOrder="<<order<<" folderPIDLHRESULT="<<static_cast<unsigned long>(folderPidlRead)
+                <<" exactFolderPIDL="<<(folderPidl&&ILIsEqual(folderPidl.get(),originalFolderId))
+                <<" windowHRESULT="<<static_cast<unsigned long>(windowRead)<<" viewHWND="<<reinterpret_cast<ULONG_PTR>(nativeWindow)
+                <<" viewPID="<<nativeProcess<<" viewTID="<<nativeThread<<" ownerHWND="<<reinterpret_cast<ULONG_PTR>(owner)
+                <<" ownerPID="<<ownerProcess<<" ownerTID="<<ownerThread<<" sourceCurrent="<<exact<<'\n'<<std::flush;
+            return exact;
+        };
+        const auto counts=[&](const char* phase) {
+            int all=-1,selected=-1;
+            const auto allRead=folderView->ItemCount(SVGIO_ALLVIEW,&all);
+            const auto selectedRead=folderView->ItemCount(SVGIO_SELECTION,&selected);
+            const bool sourceCurrent=current(phase);
+            std::cout<<"NativeMenu readiness counts phase="<<phase<<" allHRESULT="<<static_cast<unsigned long>(allRead)
+                <<" all="<<all<<" selectionHRESULT="<<static_cast<unsigned long>(selectedRead)<<" selected="<<selected
+                <<" sourceCurrent="<<sourceCurrent<<" elapsedMs="<<(GetTickCount64()-(initializationDeadline-5000))<<'\n'<<std::flush;
+        };
+        counts("before-first-provider");
+        unsigned observations=0;int previousCount=-2;HRESULT previousRead=E_PENDING;
+        std::array<bool,3> identityLogged{};
+        const auto ready=[&] {
+            if(GetTickCount64()>=initializationDeadline)return false;
+            require(current(),"Equivalence readiness lost the original private folder/view");
+            int count=-1;const auto countRead=folderView->ItemCount(SVGIO_ALLVIEW,&count);++observations;
+            if(countRead!=previousRead||count!=previousCount) {
+                std::cout<<"NativeMenu readiness observed allHRESULT="<<static_cast<unsigned long>(countRead)<<" all="<<count
+                    <<" expected="<<expected.size()<<" observations="<<observations
+                    <<" elapsedMs="<<(GetTickCount64()-(initializationDeadline-5000))<<'\n'<<std::flush;
+                previousCount=count;previousRead=countRead;
+            }
+            if(countRead!=S_OK||count!=static_cast<int>(expected.size()))return false;
+            std::array<bool,3> matched{};
+            for(int index=0;index<count;++index) {
+                if(GetTickCount64()>=initializationDeadline||!current())return false;
+                PITEMID_CHILD rawChild=nullptr;const auto childRead=folderView->Item(index,&rawChild);OwnedPidl child(rawChild);
+                if(childRead!=S_OK||!child)return false;
+                const auto found=std::find_if(expected.begin(),expected.end(),[&](const ReadyMember& member){
+                    return ILIsEqual(child.get(),ILFindLastID(member.pidl.get()));});
+                if(found==expected.end())return false;
+                const auto memberIndex=static_cast<size_t>(found-expected.begin());
+                if(matched[memberIndex])return false;
+                ComPtr<IShellItem> row;const auto rowRead=folderView->GetItem(index,IID_PPV_ARGS(&row));
+                if(rowRead!=S_OK||!row||!current())return false;
+                PIDLIST_ABSOLUTE rawRow=nullptr;const auto rowPidlRead=SHGetIDListFromObject(row.Get(),&rawRow);OwnedPidl rowPidl(rawRow);
+                if(rowPidlRead!=S_OK||!rowPidl||!ILIsEqual(rowPidl.get(),found->pidl.get())||!current())return false;
+                PWSTR rawPath=nullptr;const auto pathRead=row->GetDisplayName(SIGDN_FILESYSPATH,&rawPath);
+                std::unique_ptr<wchar_t,decltype(&CoTaskMemFree)> path(rawPath,CoTaskMemFree);
+                if(pathRead!=S_OK||!path||!*path||!current()||GetTickCount64()>=initializationDeadline)return false;
+                FILE_ID_INFO originalIdentity{},nativeIdentity{};
+                const auto originalRead=readReadyIdentity(found->path,originalIdentity);
+                if(originalRead!=S_OK||!sameReadyIdentity(originalIdentity,found->identity)||!current())return false;
+                // Only exact owned child/full PIDLs and the unchanged source
+                // authorize this actual row's reported filesystem path.
+                const auto nativeRead=readReadyIdentity(fs::path(path.get()),nativeIdentity);
+                if(nativeRead!=S_OK||!sameReadyIdentity(nativeIdentity,found->identity)||!current())return false;
+                if(!identityLogged[memberIndex]) {
+                    identityLogged[memberIndex]=true;
+                    std::array<char,33> encoded{};constexpr char hex[]="0123456789abcdef";
+                    for(size_t byte=0;byte<16;++byte){encoded[2*byte]=hex[nativeIdentity.FileId.Identifier[byte]>>4];encoded[2*byte+1]=hex[nativeIdentity.FileId.Identifier[byte]&15];}
+                    std::cout<<"NativeMenu readiness member="<<memberIndex<<" row="<<index<<" exactChildAndFullPIDL=1"
+                        <<" originalIdentityHRESULT="<<static_cast<unsigned long>(originalRead)<<" nativeIdentityHRESULT="<<static_cast<unsigned long>(nativeRead)
+                        <<" exactImmutableFileID=1 volume="<<nativeIdentity.VolumeSerialNumber<<" FileID="<<encoded.data()<<'\n'<<std::flush;
+                }
+                matched[memberIndex]=true;
+            }
+            return std::all_of(matched.begin(),matched.end(),[](bool value){return value;})&&current()&&GetTickCount64()<initializationDeadline;
+        };
+        bool completed=ready();
+        while(!completed&&GetTickCount64()<initializationDeadline) {
+            MSG message{};
+            while(GetTickCount64()<initializationDeadline&&PeekMessageW(&message,nullptr,0,0,PM_REMOVE)){TranslateMessage(&message);DispatchMessageW(&message);}
+            completed=ready();
+            if(!completed&&GetTickCount64()<initializationDeadline)Sleep(1);
+        }
+        counts(completed?"ready-before-first-provider":"failed-before-first-provider");
+        require(completed&&current()&&GetTickCount64()<initializationDeadline,
+            "Original complete owned menu view membership did not become ready within initialization budget");
+        std::cout<<"NativeMenu readiness completeOwnedFileIDs=3 beforeFirstProvider=1 observations="<<observations<<'\n'<<std::flush;
+    }
+    void waitForOwnedMembers() {
+        require(readinessFolder&&readinessFolderId&&readinessMembers.size()==3,
+            "Opt-in equivalence readiness has no complete original source snapshot");
+        waitForOwnedMembers(readinessFolder.Get(),readinessFolderId.get(),readinessMembers);
+    }
+    explicit HiddenView(IShellItem* folder,std::span<const fs::path> ownedPaths={}) {
+        auto& expected=readinessMembers;
+        auto& originalFolderId=readinessFolderId;
+        if(!ownedPaths.empty()) {
+            require(ownedPaths.size()==3,"Equivalence readiness must retain all three owned source members");
+            readinessFolder=folder;
+            PIDLIST_ABSOLUTE raw=nullptr;const auto folderRead=SHGetIDListFromObject(folder,&raw);originalFolderId.reset(raw);
+            succeeded(folderRead,"Retain exact original equivalence readiness folder PIDL");require(originalFolderId!=nullptr,"Original readiness folder has no PIDL");
+            for(const auto& path:ownedPaths) {
+                ReadyMember member;member.path=path;
+                const auto native=item(path);
+                raw=nullptr;const auto itemRead=SHGetIDListFromObject(native.Get(),&raw);member.pidl.reset(raw);
+                succeeded(itemRead,"Retain exact original equivalence readiness member PIDL");require(member.pidl!=nullptr,"Original readiness member has no PIDL");
+                succeeded(readReadyIdentity(path,member.identity),"Retain full original owned readiness FileID");
+                require(std::none_of(expected.begin(),expected.end(),[&](const ReadyMember& prior){return sameReadyIdentity(prior.identity,member.identity);}),
+                    "Original readiness members have duplicate native FileIDs");
+                expected.push_back(std::move(member));
+            }
+        }
         owner = CreateWindowExW(0,L"STATIC",L"headless native command fixture",WS_POPUP,
             0,0,800,600,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
         require(owner && !IsWindowVisible(owner),"Create exclusively hidden owned provider host");
@@ -109,8 +259,8 @@ struct HiddenView {
         require(events != nullptr,"Create native navigation observer");
         succeeded(browser->Advise(events.Get(),&cookie),"Observe hidden native view navigation");
         succeeded(browser->BrowseToObject(folder,SBSP_ABSOLUTE),"Browse owned fixture without displaying a window");
-        const auto deadline = GetTickCount64()+5000;
-        while (!events->finished && GetTickCount64()<deadline) {
+        initializationDeadline=GetTickCount64()+5000;
+        while (!events->finished && GetTickCount64()<initializationDeadline) {
             MSG message{};
             while (PeekMessageW(&message,nullptr,0,0,PM_REMOVE)) { TranslateMessage(&message); DispatchMessageW(&message); }
             Sleep(1);
@@ -1212,7 +1362,9 @@ void nativeLeafStateMenuEquivalence(std::span<const DWORD> counts, unsigned mixt
         const auto clipboard=GetClipboardSequenceNumber();
         const auto clipboardOwnerBefore=GetClipboardOwner();
         const auto folder=item(fixture.root),text=item(fixture.text),directory=item(fixture.directory);
-        HiddenView host(folder.Get());
+        const std::array<fs::path,3> readyPaths{fixture.text,fixture.archive,fixture.directory};
+        HiddenView host(folder.Get(),readyPaths);
+        host.waitForOwnedMembers();
         struct Identities {
             PIDLIST_ABSOLUTE text=nullptr,directory=nullptr,parent=nullptr;
             ~Identities(){CoTaskMemFree(text);CoTaskMemFree(directory);CoTaskMemFree(parent);}

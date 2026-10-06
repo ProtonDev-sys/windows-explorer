@@ -619,7 +619,76 @@ struct NativeBackgroundView {
                     if(rowRead!=S_OK||!row){reject(5,"native-row-read",index,rowRead,row!=nullptr);return false;}
                     PWSTR rawPath=nullptr;const auto pathRead=row->GetDisplayName(SIGDN_FILESYSPATH,&rawPath);
                     std::unique_ptr<wchar_t,decltype(&CoTaskMemFree)> path(rawPath,CoTaskMemFree);
-                    if(pathRead!=S_OK||!path||fs::path(path.get())!=found->path){reject(6,"native-display-path",index,pathRead,path!=nullptr);return false;}
+                    if(pathRead!=S_OK||!path||fs::path(path.get())!=found->path) {
+                        const bool first=!rejectionLogged[6];
+                        reject(6,"native-display-path",index,pathRead,path!=nullptr);
+                        // The original literal-path rejection remains final.
+                        // Only its first already-owned row gets extra evidence.
+                        if(first&&pathRead==S_OK&&path)try {
+                            const auto expectedText=found->path.native();
+                            const std::wstring nativeText(path.get());
+                            const auto sensitive=CompareStringOrdinal(expectedText.c_str(),-1,nativeText.c_str(),-1,FALSE);
+                            const auto insensitive=CompareStringOrdinal(expectedText.c_str(),-1,nativeText.c_str(),-1,TRUE);
+                            const auto prefix=[](const std::wstring& text,const wchar_t* start) {
+                                const size_t length=wcslen(start);
+                                return text.size()>=length&&CompareStringOrdinal(text.data(),static_cast<int>(length),start,
+                                    static_cast<int>(length),TRUE)==CSTR_EQUAL;
+                            };
+                            const bool sourceBefore=sourceCurrent(folderView.Get(),"display-path-rejection-before");
+                            FILE_ID_INFO originalIdentity{},nativeIdentity{};
+                            const auto originalRead=sourceBefore&&GetTickCount64()<deadline?readIdentity(found->path,originalIdentity):E_ABORT;
+                            const bool originalMatches=originalRead==S_OK&&sameIdentity(originalIdentity,found->identity);
+                            const bool byteMatches=ILIsEqual(child.get(),ILFindLastID(found->pidl.get()));
+                            // Exact byte membership, the original source ID and
+                            // the retained private folder/view authorize only
+                            // this real native row's reported path read.
+                            const bool nativeAuthorized=originalMatches&&byteMatches&&sourceCurrent(folderView.Get())&&GetTickCount64()<deadline;
+                            const auto nativeRead=nativeAuthorized?readIdentity(fs::path(nativeText),nativeIdentity):E_ACCESSDENIED;
+                            std::wcout<<L"NativeBackground displayPathDiagnostic expectedPath=["<<expectedText
+                                <<L"] nativePath=["<<nativeText<<L"]\n";
+                            const auto units=[](const char* label,const std::wstring& text) {
+                                constexpr char hex[]="0123456789abcdef";
+                                std::cout<<"NativeBackground displayPathDiagnostic "<<label<<"Length="<<text.size()<<" utf16=";
+                                for(const auto character:text) {
+                                    const auto value=static_cast<unsigned short>(character);
+                                    const std::array<char,4> encoded{hex[(value>>12)&15],hex[(value>>8)&15],hex[(value>>4)&15],hex[value&15]};
+                                    std::cout.write(encoded.data(),static_cast<std::streamsize>(encoded.size()));
+                                }
+                                std::cout<<'\n';
+                            };
+                            units("expectedPath",expectedText);units("nativePath",nativeText);
+                            std::cout<<"NativeBackground displayPathDiagnostic diagnosticOnly=1 row="<<index
+                                <<" expectedMember="<<memberIndex<<" ordinalSensitive="<<sensitive<<" ordinalInsensitive="<<insensitive
+                                <<" expectedExtendedPrefix="<<prefix(expectedText,L"\\\\?\\")<<" nativeExtendedPrefix="<<prefix(nativeText,L"\\\\?\\")
+                                <<" expectedUNCPrefix="<<prefix(expectedText,L"\\\\")<<" nativeUNCPrefix="<<prefix(nativeText,L"\\\\")
+                                <<" exactChildByteMatch="<<byteMatches<<" sourceBefore="<<sourceBefore
+                                <<" originalIdentityHRESULT="<<static_cast<unsigned long>(originalRead)<<" originalImmutableFileIDMatches="<<originalMatches
+                                <<" nativePathReadAuthorized="<<nativeAuthorized<<" nativeIdentityHRESULT="<<static_cast<unsigned long>(nativeRead)
+                                <<" nativeImmutableFileIDMatches="<<(nativeRead==S_OK&&sameIdentity(nativeIdentity,found->identity))<<'\n';
+                            printIdentity("display-path-rejection","original-owned-path",memberIndex,originalRead,originalIdentity);
+                            printIdentity("display-path-rejection","native-reported-owned-row-path",memberIndex,nativeRead,nativeIdentity);
+                            PIDLIST_ABSOLUTE rawRow=nullptr;
+                            const auto rowPidlRead=nativeAuthorized&&sourceCurrent(folderView.Get())&&GetTickCount64()<deadline?
+                                SHGetIDListFromObject(row.Get(),&rawRow):E_ABORT;
+                            Pidl rowPidl(rawRow);
+                            ComPtr<IShellFolder> nativeFolder;
+                            const auto nativeFolderRead=sourceCurrent(folderView.Get())&&GetTickCount64()<deadline?
+                                folderView->GetFolder(IID_PPV_ARGS(&nativeFolder)):E_ABORT;
+                            const auto canonical=sourceCurrent(folderView.Get())&&nativeFolderRead==S_OK&&nativeFolder&&GetTickCount64()<deadline?
+                                nativeFolder->CompareIDs(SHCIDS_CANONICALONLY,child.get(),ILFindLastID(found->pidl.get())):E_ABORT;
+                            const bool sourceAfter=sourceCurrent(folderView.Get(),"display-path-rejection-after");
+                            std::cout<<"NativeBackground displayPathDiagnostic rowFullPIDLHRESULT="<<static_cast<unsigned long>(rowPidlRead)
+                                <<" rowFullPIDLPresent="<<(rowPidl!=nullptr)<<" rowFullPIDLBytes="<<(rowPidl?ILGetSize(rowPidl.get()):0)
+                                <<" expectedFullPIDLBytes="<<ILGetSize(found->pidl.get())
+                                <<" exactFullPIDLByteMatch="<<(rowPidl&&ILIsEqual(rowPidl.get(),found->pidl.get()))
+                                <<" nativeFolderHRESULT="<<static_cast<unsigned long>(nativeFolderRead)
+                                <<" nativeCanonicalHRESULT="<<static_cast<unsigned long>(canonical)
+                                <<" nativeCanonicalSucceeded="<<SUCCEEDED(canonical)
+                                <<" nativeCanonicalOrder="<<(SUCCEEDED(canonical)?static_cast<short>(HRESULT_CODE(canonical)):0)
+                                <<" sourceAfter="<<sourceAfter<<" deadlineReached="<<(GetTickCount64()>=deadline)<<'\n'<<std::flush;
+                        }catch(...) {std::cout<<"NativeBackground displayPathDiagnostic diagnosticException=1\n"<<std::flush;}
+                        return false;
+                    }
                     FILE_ID_INFO identity{};const auto identityRead=readIdentity(found->path,identity);
                     if(identityRead!=S_OK||!sameIdentity(identity,found->identity)){reject(7,"owned-file-identity",index,identityRead,true);return false;}
                     matched[memberIndex]=true;targetAvailable=targetAvailable||ILIsEqual(child.get(),ILFindLastID(targetId.get()));
