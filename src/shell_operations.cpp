@@ -288,7 +288,7 @@ HRESULT ShellOperations::copyToClipboard(HWND, IShellItemArray* selection, bool 
     hr = selection->BindToHandler(nullptr, BHID_DataObject, IID_PPV_ARGS(&data));
     if (FAILED(hr)) return hr;
     hr = setEffect(data.Get(), CFSTR_PREFERREDDROPEFFECT,
-                   cut ? DROPEFFECT_MOVE : DROPEFFECT_COPY);
+                   cut ? DROPEFFECT_MOVE : (DROPEFFECT_COPY | DROPEFFECT_LINK));
     if (SUCCEEDED(hr)) hr = publishClipboard(data.Get());
     if (SUCCEEDED(hr) && published) *published = data.Detach();
     return hr;

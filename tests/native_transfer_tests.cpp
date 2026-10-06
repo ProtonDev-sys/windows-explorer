@@ -738,7 +738,7 @@ struct Publication {
         succeeded(nativeCall("ShellOperations.copyToClipboard", [&] { return explorer::ShellOperations::copyToClipboard(owner, selection.Get(), cut, &producer); }, cut ? "cut" : "copy"), "Publish actual normal Shell copy/cut producer");
         require(producer && nativeCall("OleIsCurrentClipboard", [&] { return OleIsCurrentClipboard(producer.Get()); }) == S_OK, "Actual producer owns the clipboard");
         verifyCida(producer.Get(), sources);
-        const DWORD expectedEffect = cut ? static_cast<DWORD>(DROPEFFECT_MOVE) : static_cast<DWORD>(DROPEFFECT_COPY);
+        const DWORD expectedEffect = cut ? static_cast<DWORD>(DROPEFFECT_MOVE) : static_cast<DWORD>(DROPEFFECT_COPY | DROPEFFECT_LINK);
         require(effectData(producer.Get(), CFSTR_PREFERREDDROPEFFECT) == expectedEffect,
             "Normal copy/cut preferred effect differs");
         ComPtr<IDataObject> consumer; succeeded(nativeCall("OleGetClipboard", [&] { return OleGetClipboard(&consumer); }, "helper-consumer"), "Read actual clipboard consumer wrapper");
@@ -872,7 +872,7 @@ struct ShortcutState {
     bool viewBackgroundEnabled = false;
 };
 ShortcutState describeShortcutState(Browser& browser, IDataObject* producer, const Source& source,
-                                    const char* phase, bool formats, DWORD expectedPreference = DROPEFFECT_COPY) {
+                                    const char* phase, bool formats, DWORD expectedPreference = DROPEFFECT_COPY | DROPEFFECT_LINK) {
     // Inspect the normal registered leaf and independently created, fully
     // populated native folder background menu. Neither route invokes a leaf.
     ShortcutState result;
@@ -951,7 +951,7 @@ ShortcutState describeShortcutState(Browser& browser, IDataObject* producer, con
     return result;
 }
 
-void waitShortcutEnabled(Browser& browser, Publication& clipboard, const Source& source) {
+ShortcutState waitShortcutEnabled(Browser& browser, Publication& clipboard, const Source& source) {
     const auto started = GetTickCount64();
     const auto initial = describeShortcutState(browser, clipboard.producer.Get(), source, "published", true);
     bool enabled = SUCCEEDED(initial.registeredStatus) && initial.registered.enabled;
@@ -968,12 +968,21 @@ void waitShortcutEnabled(Browser& browser, Publication& clipboard, const Source&
     }
     const auto settled = describeShortcutState(browser, clipboard.producer.Get(), source, "settled", !enabled);
     std::cout << "Native shortcut readiness samples=" << samples << " elapsedMs=" << GetTickCount64() - started << std::endl;
-    require(SUCCEEDED(settled.registeredStatus) && settled.registered.enabled,
-        "Native Paste Shortcut remained disabled after normal clipboard/view dispatch");
-    require(SUCCEEDED(settled.backgroundStatus) && settled.backgroundMatches == 1 && settled.backgroundEnabled,
-        "Native registered Paste Shortcut differs from the unique enabled folder-background leaf");
+    std::cout << "EXPERIMENT copyPreference=5 registeredHRESULT=" << static_cast<ULONG>(settled.registeredStatus)
+        << " registeredEnabled=" << settled.registered.enabled << " registeredId=" << settled.registered.commandId
+        << " registeredRoute=" << static_cast<unsigned>(settled.registered.route)
+        << " registeredSubmenu=" << settled.registered.submenu
+        << " viewHRESULT=" << static_cast<ULONG>(settled.viewBackgroundStatus)
+        << " viewMatches=" << settled.viewBackgroundMatches << " viewEnabled=" << settled.viewBackgroundEnabled
+        << " folderHRESULT=" << static_cast<ULONG>(settled.backgroundStatus)
+        << " folderMatches=" << settled.backgroundMatches << " folderEnabled=" << settled.backgroundEnabled << std::endl;
+    require(SUCCEEDED(settled.registeredStatus) && settled.registered.enabled &&
+        !settled.registered.submenu && settled.registered.commandId &&
+        settled.registered.route == explorer::NamespaceInvocationRoute::CommandStoreMenu,
+        "Native Paste Shortcut remained disabled or lacked one exact registered leaf after normal clipboard/view dispatch");
     require(SUCCEEDED(settled.viewBackgroundStatus) && settled.viewBackgroundMatches == 1 && settled.viewBackgroundEnabled,
         "Native registered Paste Shortcut differs from the unique enabled actual view-background leaf");
+    return settled;
 }
 
 bool ownedClipboardWindow(HWND window) {
@@ -1329,10 +1338,17 @@ void run(bool dropsOnly) {
     originalViewCopyControl(browser, fixture);
     {
         Publication clipboard(browser.owner); clipboard.publish({&fixture.sources[3]}, false);
-        waitShortcutEnabled(browser, clipboard, fixture.sources[3]);
+        const auto shortcutState = waitShortcutEnabled(browser, clipboard, fixture.sources[3]);
         OperationLease operation;
         browser.invoke(L"Windows.pastelink"); clipboard.waitComplete(); waitMembership(browser, fixture.root / L"Shortcut", 1);
         verifyShortcut(fixture.sources[3], children(fixture.root / L"Shortcut").front()); fixture.verifySources({2}); operation.complete(); clipboard.clear();
+        // Retain the independent folder-background assertion, after the one
+        // real link output is verified so an absent oracle cannot hide it.
+        std::cout << "EXPERIMENT copyPreference=5 actualShortcutOutputVerified=1 sourceIdentityContentPreserved=1"
+            << " folderHRESULT=" << static_cast<ULONG>(shortcutState.backgroundStatus)
+            << " folderMatches=" << shortcutState.backgroundMatches << " folderEnabled=" << shortcutState.backgroundEnabled << std::endl;
+        require(SUCCEEDED(shortcutState.backgroundStatus) && shortcutState.backgroundMatches == 1 && shortcutState.backgroundEnabled,
+            "Native registered Paste Shortcut differs from the unique enabled folder-background leaf");
         std::cout << "PASS native Copy/Paste shortcut: one actual IShellLink target, source identity/content and native view\n";
     }
     }
