@@ -1,3 +1,4 @@
+#include "explorer/native_apartment.hpp"
 #include "explorer/context_menu.hpp"
 #include "explorer/namespace_actions.hpp"
 #include "explorer/headless_visual.hpp"
@@ -510,13 +511,14 @@ int main() {
     if (FAILED(desktop.initialize()) || FAILED(desktop.verifyIsolation())) {
         std::cerr << "Cannot initialize isolated native-history desktop\n"; return 1;
     }
-    const HRESULT initialized = OleInitialize(nullptr);
+    explorer::NativeApartmentOwner nativeApartment;
+    const HRESULT initialized = nativeApartment.initializeOle();
     if (FAILED(initialized)) { std::cerr << "Cannot initialize native-history STA\n"; return 1; }
     int result = 0;
     try { runNativeHistory(); }
     catch (const std::exception& error) { std::cerr << "FAIL: CI-only native Undo/Redo: " << error.what() << '\n'; result = 1; }
     catch (...) { std::cerr << "FAIL: CI-only native Undo/Redo: unknown exception\n"; result = 1; }
-    OleUninitialize();
+    nativeApartment.finishOrTerminate();
     if (FAILED(desktop.verifyIsolation())) result = 1;
     return result;
 }

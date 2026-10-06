@@ -1,3 +1,4 @@
+#include "explorer/native_apartment.hpp"
 #include "explorer/theme.hpp"
 #include "explorer/ribbon.hpp"
 #include "explorer/headless_visual.hpp"
@@ -353,7 +354,8 @@ int main(int argc, char** argv) {
     // No COM, HWND, or theme activation precedes the private desktop transition.
     explorer::PrivateDesktop desktop;
     if (FAILED(desktop.initialize())) return 2;
-    const auto initialized = OleInitialize(nullptr);
+    explorer::NativeApartmentOwner nativeApartment;
+    const auto initialized = nativeApartment.initializeOle();
     if (FAILED(initialized)) return 3;
     int result = 0;
     try {
@@ -361,6 +363,6 @@ int main(int argc, char** argv) {
         if (nativeTests(desktop, layout)) startupDarkRoundTrip(layout);
         else result = 77;
     } catch (const std::exception& error) { std::cerr << "FAIL: " << error.what() << '\n'; result = 1; }
-    OleUninitialize();
+    nativeApartment.finishOrTerminate();
     return result;
 }

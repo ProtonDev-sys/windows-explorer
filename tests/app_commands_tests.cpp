@@ -1,3 +1,4 @@
+#include "explorer/native_apartment.hpp"
 #include "explorer/app_commands.hpp"
 #include "explorer/search.hpp"
 #include "explorer/library.hpp"
@@ -558,7 +559,7 @@ void onPrivateDesktop(const std::function<void()>& body, bool registerGuard = tr
     std::atomic<bool> complete{false};
     std::thread worker([&] {
         explorer::PrivateDesktop desktop;
-        bool initialized=false;
+        bool initialized=false;explorer::NativeApartmentOwner nativeApartment;
         try {
             if (registerGuard) {
                 succeeded(desktop.initialize(),"Attach guarded private provider desktop before native initialization");
@@ -571,13 +572,13 @@ void onPrivateDesktop(const std::function<void()>& body, bool registerGuard = tr
                 require(explorer::PrivateDesktop::current() == nullptr,
                         "Negative-control thread unexpectedly registered a guard");
             }
-            succeeded(OleInitialize(nullptr),"Initialize private provider STA");initialized=true;
+            succeeded(nativeApartment.initializeOle(),"Initialize private provider STA");initialized=true;
             body();
         } catch (...) { failure=std::current_exception(); }
         if(initialized){
             try{succeeded(drainStaWorkers(10000),"Drain actual STA provider/desktop leases before apartment shutdown");}
             catch(...){if(!failure)failure=std::current_exception();}
-            OleUninitialize();
+            nativeApartment.finishOrTerminate();
         }
         complete.store(true);
     });
@@ -826,7 +827,8 @@ void cancelledStateSiteApartmentLifetime() {
         std::atomic<bool> retained{false},cancelled{false},drained{false},closed{false};
         HRESULT status=E_PENDING;
         std::thread creator([&] {
-            status=CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);
+            explorer::NativeApartmentOwner nativeApartment;
+            status=nativeApartment.initializeSta();
             if(FAILED(status))return;
             {
                 ComPtr<IShellItem> folder;
@@ -853,7 +855,7 @@ void cancelledStateSiteApartmentLifetime() {
             }
             const auto drain=drainStaWorkers(10000);
             if(SUCCEEDED(status)&&FAILED(drain))status=drain;
-            CoUninitialize();closed=true;
+            nativeApartment.finishOrTerminate();closed=true;
         });
         creator.join();
         succeeded(status,"Start real native pending state on an independent owning STA");
@@ -1026,14 +1028,14 @@ void nativeSearchLocationDelegatesAndTargets() {
     std::atomic<bool> complete{false};
     std::thread worker([&] {
         HDESK previous = GetThreadDesktop(GetCurrentThreadId()),desktop = nullptr;
-        bool initialized = false;
+        bool initialized = false;explorer::NativeApartmentOwner nativeApartment;
         try {
             GUID id{}; succeeded(CoCreateGuid(&id),"Private Search-location desktop identity");
             wchar_t name[40]{};
             require(StringFromGUID2(id,name,40) != 0,"Format private Search-location desktop identity");
             desktop = CreateDesktopW((std::wstring(L"ExplorerSearchLocation-")+name).c_str(),nullptr,nullptr,0,GENERIC_ALL,nullptr);
             require(desktop && SetThreadDesktop(desktop),"Attach private Search-location desktop before native initialization");
-            succeeded(OleInitialize(nullptr),"Initialize private Search-location STA");
+            succeeded(nativeApartment.initializeOle(),"Initialize private Search-location STA");
             initialized = true;
             {
                 Fixture fixture;
@@ -1138,7 +1140,7 @@ void nativeSearchLocationDelegatesAndTargets() {
                 require(!IsWindowVisible(host.owner),"Read-only Search providers displayed the owned host");
             }
         } catch (...) { failure = std::current_exception(); }
-        if (initialized) OleUninitialize();
+        if (initialized) nativeApartment.finishOrTerminate();
         if (desktop && SetThreadDesktop(previous)) CloseDesktop(desktop);
         complete.store(true);
     });
@@ -1703,6 +1705,40 @@ void nativeLeafStateMenuEquivalence(std::span<const DWORD> counts, unsigned mixt
                     release();
                     diagnosticBoundary(stage,operation,"after",S_OK);
                 };
+                const auto diagnosticMenuCreate=[&](const char* stage,const auto& create) {
+                    if(!registered)return create(nullptr);
+                    NativeContextMenuCreateObserver observer;
+                    auto record=[&](const NativeContextMenuCreateBoundary& event) {
+                        std::cout<<"Native creation boundary diagnosticOnly=1 stage="<<stage
+                            <<" operation="<<event.operation<<" edge="<<(event.after?"after":"before")
+                            <<" nativeCallAttempted="<<event.attempted
+                            <<" rawHRESULT="<<static_cast<ULONG>(event.operationResult)
+                            <<" generation="<<event.generation<<" sequence="<<event.sequence
+                            <<" sourceCurrentBeforeObserver="<<event.sourceCurrent<<std::endl;
+                        diagnosticBoundary(stage,event.operation,event.after?"after":"before",event.operationResult);
+                    };
+                    observer.state=&record;
+                    observer.record=+[](void* state,const NativeContextMenuCreateBoundary& event) {
+                        (*static_cast<decltype(record)*>(state))(event);
+                    };
+                    const HRESULT hr=create(&observer);
+                    const auto& receipt=observer.receipt;
+                    std::cout<<"Native creation receipt diagnosticOnly=1 stage="<<stage
+                        <<" creationHRESULT="<<static_cast<ULONG>(receipt.creationResult)
+                        <<" diagnosticHRESULT="<<static_cast<ULONG>(receipt.diagnosticResult)
+                        <<" observerThrew="<<receipt.observerThrew<<" sourceCurrentAtReturn="<<receipt.sourceCurrent
+                        <<" lastOperation="<<(receipt.last.operation?receipt.last.operation:"none")
+                        <<" lastEdge="<<(receipt.last.after?"after":"before")
+                        <<" lastAttempted/rawHRESULT="<<receipt.last.attempted<<"/"<<static_cast<ULONG>(receipt.last.operationResult)
+                        <<" lastNativeFailureOperation="<<(receipt.lastNativeFailure.operation?receipt.lastNativeFailure.operation:"none")
+                        <<" lastNativeFailureAttempted/rawHRESULT="<<receipt.lastNativeFailure.attempted
+                        <<"/"<<static_cast<ULONG>(receipt.lastNativeFailure.operationResult)
+                        <<" firstDiagnosticFailureOperation="<<(receipt.firstDiagnosticFailure.operation?receipt.firstDiagnosticFailure.operation:"none")
+                        <<" firstDiagnosticFailureEdge="<<(receipt.firstDiagnosticFailure.after?"after":"before")
+                        <<" firstDiagnosticFailureAttempted/rawHRESULT="<<receipt.firstDiagnosticFailure.attempted
+                        <<"/"<<static_cast<ULONG>(receipt.firstDiagnosticFailure.operationResult)<<std::endl;
+                    return hr;
+                };
                 const auto createContext=[&](IContextMenu** result) {
                     if(!registered)return selected->BindToHandler(nullptr,BHID_SFUIObject,IID_IContextMenu,reinterpret_cast<void**>(result));
                     DEFCONTEXTMENU definition{};definition.pidlFolder=identities.parent;definition.psf=parent.Get();
@@ -1713,7 +1749,7 @@ void nativeLeafStateMenuEquivalence(std::span<const DWORD> counts, unsigned mixt
                 diagnosticBoundary("full","queryAndSite","before");
                 const auto normalStarted=std::chrono::steady_clock::now();
                 const UINT nativeFlags=CMF_EXTENDEDVERBS|(registered?0:CMF_ITEMMENU);
-                NativeContextMenu normal;const auto normalRead=normal.create(nullptr,full.Get(),host.view.Get(),nativeFlags);
+                NativeContextMenu normal;const auto normalRead=diagnosticMenuCreate("full",[&](NativeContextMenuCreateObserver* observer){return observer?normal.create(nullptr,full.Get(),host.view.Get(),nativeFlags,*observer):normal.create(nullptr,full.Get(),host.view.Get(),nativeFlags);});
                 const auto normalMicros=std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-normalStarted).count();
                 diagnosticBoundary("full","queryAndSite","after",normalRead);
                 succeeded(normalRead,"Read native synchronous-cascade comparison truth without invocation");
@@ -1772,7 +1808,7 @@ void nativeLeafStateMenuEquivalence(std::span<const DWORD> counts, unsigned mixt
                         const auto contextRead=diagnosticCall("freshUnrestricted","providerCreation",[&]{return createContext(&freshContext);});
                         NativeContextMenu freshMenu;
                         const auto queryRead=SUCCEEDED(contextRead)&&freshContext?
-                            diagnosticCall("freshUnrestricted","queryAndSite",[&]{return freshMenu.create(nullptr,freshContext.Get(),diagnosticView.Get(),nativeFlags);}):E_NOINTERFACE;
+                            diagnosticCall("freshUnrestricted","queryAndSite",[&]{return diagnosticMenuCreate("freshUnrestricted",[&](NativeContextMenuCreateObserver* observer){return observer?freshMenu.create(nullptr,freshContext.Get(),diagnosticView.Get(),nativeFlags,*observer):freshMenu.create(nullptr,freshContext.Get(),diagnosticView.Get(),nativeFlags);});}):E_NOINTERFACE;
                         std::vector<ContextMenuEntry> freshEntries;
                         const auto snapshotRead=SUCCEEDED(queryRead)?diagnosticCall("freshUnrestricted","snapshot",[&]{return freshMenu.enumerate(freshEntries,false);}):E_PENDING;
                         const auto freshLeaves=leaves(freshEntries);
@@ -1796,7 +1832,7 @@ void nativeLeafStateMenuEquivalence(std::span<const DWORD> counts, unsigned mixt
                 ComPtr<IContextMenu> stateContext;succeeded(diagnosticCall("leafState","providerCreation",[&]{return createContext(&stateContext);}),"Create fresh original-target native leaf-state menu");
                 diagnosticBoundary("leafState","queryAndSite","before");
                 const auto stateStarted=std::chrono::steady_clock::now();
-                NativeContextMenu state;const auto stateRead=state.createLeafState(stateContext.Get(),host.view.Get(),nativeFlags);
+                NativeContextMenu state;const auto stateRead=diagnosticMenuCreate("leafState",[&](NativeContextMenuCreateObserver* observer){return observer?state.createLeafState(stateContext.Get(),host.view.Get(),nativeFlags,false,*observer):state.createLeafState(stateContext.Get(),host.view.Get(),nativeFlags);});
                 const auto stateMicros=std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-stateStarted).count();
                 diagnosticBoundary("leafState","queryAndSite","after",stateRead);
                 succeeded(stateRead,"Read same native target/site without forcing cascade population");
@@ -1818,7 +1854,7 @@ void nativeLeafStateMenuEquivalence(std::span<const DWORD> counts, unsigned mixt
                 diagnosticRelease("leafState","providerRelease",[&]{stateContext.Reset();});
                 ComPtr<IContextMenu> restrictedContext;succeeded(diagnosticCall("noResource","providerCreation",[&]{return createContext(&restrictedContext);}),
                     "Retain the same full native array/site for the no-resource state comparison");
-                NativeContextMenu restricted;succeeded(diagnosticCall("noResource","queryAndSiteAndRestrictions",[&]{return restricted.createLeafState(restrictedContext.Get(),host.view.Get(),nativeFlags,true);}),
+                NativeContextMenu restricted;succeeded(diagnosticCall("noResource","queryAndSiteAndRestrictions",[&]{return diagnosticMenuCreate("noResource",[&](NativeContextMenuCreateObserver* observer){return observer?restricted.createLeafState(restrictedContext.Get(),host.view.Get(),nativeFlags,true,*observer):restricted.createLeafState(restrictedContext.Get(),host.view.Get(),nativeFlags,true);});}),
                     "Read native association/dynamic leaf truth without unrelated built-in operations");
                 std::vector<ContextMenuEntry> restrictedEntries;succeeded(diagnosticCall("noResource","snapshot",[&]{return restricted.enumerate(restrictedEntries,false);}),
                     "Read actual restricted native leaves without invoking or populating cascades");

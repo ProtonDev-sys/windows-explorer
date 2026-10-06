@@ -1,3 +1,4 @@
+#include "explorer/native_apartment.hpp"
 #include "explorer/core.hpp"
 #include "explorer/headless_visual.hpp"
 #include "explorer/namespace_actions.hpp"
@@ -399,7 +400,8 @@ int main() {
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX);
     explorer::PrivateDesktop desktop;
     if (FAILED(desktop.initialize())) return 2;
-    if (FAILED(OleInitialize(nullptr))) return 3;
+    explorer::NativeApartmentOwner nativeApartment;
+    if (FAILED(nativeApartment.initializeOle())) return 3;
     int result = 0;
     try {
         verifyIsolation(desktop);
@@ -554,6 +556,6 @@ int main() {
         std::cerr << "FAIL: " << error.what() << '\n';
         result = 1;
     }
-    OleUninitialize();
+    nativeApartment.finishOrTerminate();
     return result;
 }

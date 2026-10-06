@@ -1,8 +1,10 @@
+#include "explorer/native_apartment.hpp"
 #include "explorer/ribbon.hpp"
 #include "explorer/commands.hpp"
 #include "explorer/namespace_actions.hpp"
 #include "explorer/headless_visual.hpp"
 #include "state_file_security_fixture.hpp"
+#include "native_icon_reference.hpp"
 #include <UIRibbonPropertyHelpers.h>
 #include <propvarutil.h>
 #include <commctrl.h>
@@ -33,105 +35,10 @@ void succeeded(HRESULT result,const char* message){if(FAILED(result))throw std::
 void pump(){const auto end=GetTickCount64()+150;do{MSG message{};while(PeekMessageW(&message,nullptr,0,0,PM_REMOVE)){TranslateMessage(&message);DispatchMessageW(&message);}MsgWaitForMultipleObjectsEx(0,nullptr,5,QS_ALLINPUT,MWMO_INPUTAVAILABLE);}while(GetTickCount64()<end);}
 struct Window{HWND handle=nullptr;~Window(){if(handle)DestroyWindow(handle);}};
 struct Variant{PROPVARIANT value{};~Variant(){PropVariantClear(&value);}};
-struct Icon {
-    HICON handle=nullptr;
-    ~Icon(){if(handle)DestroyIcon(handle);}
-};
-struct IconRaster {
-    HBITMAP bitmap=nullptr;
-    HDC dc=nullptr;
-    HGDIOBJ previous=nullptr;
-    ~IconRaster(){
-        if(dc){if(previous&&previous!=HGDI_ERROR)SelectObject(dc,previous);DeleteDC(dc);}
-        if(bitmap)DeleteObject(bitmap);
-    }
-};
-std::vector<BYTE> bitmapPixels(HBITMAP bitmap,UINT pixels) {
-    require(GdiFlush()!=FALSE,"Flush native icon raster before reading pixels");
-    DIBSECTION section{};
-    require(bitmap&&GetObjectW(bitmap,sizeof(section),&section)==sizeof(section),"Read actual native icon DIB section");
-    const auto& actual=section.dsBm;
-    require(actual.bmWidth==static_cast<LONG>(pixels)&&actual.bmHeight==static_cast<LONG>(pixels)&&actual.bmBitsPixel==32&&actual.bmPlanes==1&&
-        actual.bmWidthBytes==static_cast<LONG>(pixels*4)&&actual.bmBits&&section.dsBmih.biBitCount==32&&
-        section.dsBmih.biCompression==BI_RGB&&section.dsBmih.biPlanes==1&&
-        (section.dsBmih.biHeight==static_cast<LONG>(pixels)||section.dsBmih.biHeight==-static_cast<LONG>(pixels)),
-        "Native icon DIB dimensions, stride, orientation, or format changed");
-    BITMAPINFO info{};info.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);info.bmiHeader.biWidth=static_cast<LONG>(pixels);
-    info.bmiHeader.biHeight=-static_cast<LONG>(pixels);info.bmiHeader.biPlanes=1;info.bmiHeader.biBitCount=32;
-    info.bmiHeader.biCompression=BI_RGB;
-    IconRaster readback;readback.dc=CreateCompatibleDC(nullptr);
-    require(readback.dc!=nullptr,"Create native icon readback DC");
-    std::vector<BYTE> bytes(static_cast<size_t>(pixels)*pixels*4);
-    require(GetDIBits(readback.dc,bitmap,0,pixels,bytes.data(),&info,DIB_RGB_COLORS)==static_cast<int>(pixels),
-        "Read every native icon bitmap scanline");
-    const auto* stored=static_cast<const BYTE*>(actual.bmBits);
-    std::vector<BYTE> raw(bytes.size());
-    // Both the production ownership-transferred bitmap and this independent
-    // raster are created with negative height. GetObject reports positive
-    // height on the observed native implementation, so do not infer storage
-    // orientation from that returned sign. Require its actual raw RGB rows to
-    // equal the independently requested top-down GetDIBits rows before using
-    // all four stored bytes, including alpha, for the exact comparison.
-    std::memcpy(raw.data(),stored,raw.size());
-    for(size_t pixel=0;pixel<raw.size();pixel+=4)
-        require(std::memcmp(bytes.data()+pixel,raw.data()+pixel,3)==0,"Native top-down GetDIBits RGB readback differs from stored pixels");
-    return raw;
-}
-std::vector<BYTE> iconPixels(HICON icon,UINT pixels) {
-    BITMAPINFO info{};info.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);info.bmiHeader.biWidth=static_cast<LONG>(pixels);
-    info.bmiHeader.biHeight=-static_cast<LONG>(pixels);info.bmiHeader.biPlanes=1;info.bmiHeader.biBitCount=32;
-    info.bmiHeader.biCompression=BI_RGB;
-    IconRaster raster;void* bits=nullptr;
-    raster.bitmap=CreateDIBSection(nullptr,&info,DIB_RGB_COLORS,&bits,nullptr,0);
-    require(raster.bitmap&&bits,"Create independent native icon raster");
-    raster.dc=CreateCompatibleDC(nullptr);require(raster.dc!=nullptr,"Create independent native icon drawing DC");
-    raster.previous=SelectObject(raster.dc,raster.bitmap);
-    require(raster.previous&&raster.previous!=HGDI_ERROR,"Select independent native icon raster");
-    std::memset(bits,0,static_cast<size_t>(pixels)*pixels*4);
-    require(DrawIconEx(raster.dc,0,0,icon,static_cast<int>(pixels),static_cast<int>(pixels),0,nullptr,DI_NORMAL)!=FALSE,
-        "Draw independently extracted native icon");
-    const auto restored=SelectObject(raster.dc,raster.previous);
-    require(restored&&restored!=HGDI_ERROR,"Deselect independent native icon raster before reading pixels");
-    raster.previous=nullptr;
-    return bitmapPixels(raster.bitmap,pixels);
-}
-struct NativeIconReference {
-    HRESULT extraction=S_OK;
-    bool iconPresent=false;
-    std::vector<BYTE> pixels;
-    HRESULT imageStatus()const noexcept {
-        return FAILED(extraction)?extraction:iconPresent?S_OK:E_FAIL;
-    }
-};
-NativeIconReference singleIconReference(const std::wstring& path,int resource,UINT pixels) {
-    Icon icon;
-    const auto packedSize=MAKELONG(pixels,0);
-    NativeIconReference reference;
-    reference.extraction=SHDefExtractIconW(path.c_str(),resource,0,&icon.handle,nullptr,packedSize);
-    reference.iconPresent=icon.handle!=nullptr;
-    if(SUCCEEDED(reference.imageStatus()))reference.pixels=iconPixels(icon.handle,pixels);
-    const auto module=std::filesystem::path(path).filename().string();
-    std::cout<<"Native single icon contract module="<<module<<" resourceIndex="<<resource
-        <<" requestedPixels="<<pixels<<" flags=0 packedSize="<<packedSize
-        <<" HRESULT="<<static_cast<ULONG>(reference.extraction)<<" iconPresent="<<reference.iconPresent
-        <<" imageHRESULT="<<static_cast<ULONG>(reference.imageStatus())<<'\n';
-    return reference;
-}
-std::vector<BYTE> ribbonImagePixels(IUIImage* image,UINT pixels) {
-    require(image!=nullptr,"Actual Ribbon cached native image is missing");
-    HBITMAP bitmap=nullptr;succeeded(image->GetBitmap(&bitmap),"Get actual Ribbon cached bitmap");
-    return bitmapPixels(bitmap,pixels);
-}
-size_t requireImageContract(HRESULT status,IUIImage* image,const NativeIconReference& reference,UINT pixels) {
-    require(status==reference.imageStatus(),"Actual Ribbon image changed the original single-size normalized HRESULT");
-    if(FAILED(reference.imageStatus())) {
-        require(image==nullptr,"Failed native Ribbon image returned an output");
-        return 0;
-    }
-    const auto bytes=ribbonImagePixels(image,pixels);
-    require(bytes==reference.pixels,"Actual native Ribbon image differs from original single-size RGBA pixels");
-    return bytes.size();
-}
+using native_icon_reference::Icon;
+using native_icon_reference::iconPixels;
+using native_icon_reference::singleIconReference;
+using native_icon_reference::requireImageContract;
 void nativeIconCacheEquivalence(explorer::NativeRibbon& ribbon,HWND window) {
     // All extraction and image/cache calls stay on the fixture's creator STA.
     const auto* desktop=explorer::PrivateDesktop::current();
@@ -994,7 +901,8 @@ int main(int argc,char** argv){
     SetErrorMode(SEM_FAILCRITICALERRORS|SEM_NOOPENFILEERRORBOX);
     explorer::PrivateDesktop desktop;
     if(FAILED(desktop.initialize()))return 2;
-    const auto initialized=OleInitialize(nullptr);if(FAILED(initialized))return 3;
+    explorer::NativeApartmentOwner nativeApartment;
+    const auto initialized=nativeApartment.initializeOle();if(FAILED(initialized))return 3;
     int result=0;
     bool stock=false,iconOnly=false;
     for(int index=1;index<argc;++index) {
@@ -1088,7 +996,7 @@ int main(int argc,char** argv){
         succeeded(ribbon.initialize(window.handle,GetModuleHandleW(nullptr),std::move(callbacks),stock?explorer::RibbonLayout::InstalledWindows10:explorer::RibbonLayout::Authored),"Native framework initialization");
         if(stock&&ribbon.layout()!=explorer::RibbonLayout::InstalledWindows10) {
             std::cout<<"SKIP: installed Windows 10 build19045 layout is unavailable, HRESULT="<<static_cast<ULONG>(ribbon.installedLayoutStatus())<<'\n';
-            ribbon.reset();DestroyWindow(window.handle);window.handle=nullptr;OleUninitialize();return 77;
+            ribbon.reset();DestroyWindow(window.handle);window.handle=nullptr;nativeApartment.finishOrTerminate();return 77;
         }
         require(ribbon.valid()&&ribbon.height()>20&&heightEvents>0,"Native Ribbon view/height callback");
         require(!IsWindowVisible(window.handle),"Host was shown");
@@ -1096,7 +1004,7 @@ int main(int argc,char** argv){
         if(iconOnly) {
             bool visibleInput=true;succeeded(desktop.visibleWindowsOnInputDesktop(visibleInput),"Icon-only input desktop window guard");
             require(!visibleInput,"Native icon comparison created a visible input desktop window");
-            ribbon.reset();DestroyWindow(window.handle);window.handle=nullptr;OleUninitialize();return 0;
+            ribbon.reset();DestroyWindow(window.handle);window.handle=nullptr;nativeApartment.finishOrTerminate();return 0;
         }
         // Render solely on the non-input private desktop. This cannot surface
         // a window on the user's desktop and supplies normal native paint/layout.
@@ -1770,5 +1678,5 @@ int main(int argc,char** argv){
         std::error_code ignored;std::filesystem::remove_all(temporary,ignored);
         std::cout<<"PASS: native Windows 10 Ribbon, exact command resources, all view modes, context, QAT, persistence, isolation\n";
     }catch(const std::exception& error){std::cerr<<"FAIL: "<<error.what()<<'\n';result=1;}
-    OleUninitialize();return result;
+    nativeApartment.finishOrTerminate();return result;
 }

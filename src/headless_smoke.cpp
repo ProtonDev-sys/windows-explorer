@@ -4933,16 +4933,37 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report, bool library
                     return child->folderView_&&child->folderView_->GetSelection(FALSE,&selected)==S_OK&&selected&&selected->GetCount(&count)==S_OK&&
                         count==expected.size()&&nativeArrayIdentities(selected.Get(),actual)==S_OK&&actual==expected;
                 };
-                // Pause only this owned polling timer, never the provider or
-                // COM pump, so the real ready task can be inspected directly.
+                const auto sameNativeKindSource=[&] {
+                    return !child->closing_&&!child->navigating_&&child->selectionKindsSourceCurrent()&&
+                        child->view_.Get()==nativeView.Get()&&child->folderView_.Get()==nativeFolder.Get()&&
+                        child->navigationCount_==nativeKindNavigation&&child->currentPidl_&&nativeLocation&&
+                        ILGetSize(child->currentPidl_.get())==ILGetSize(nativeLocation.get())&&
+                        std::memcmp(child->currentPidl_.get(),nativeLocation.get(),ILGetSize(nativeLocation.get()))==0;
+                };
+                // A native call can pump and publish before this waiter sees
+                // the completed task. Both actual states retain their source.
                 const auto realKindReady=[&](DWORD count) {
                     if(child->selectionStateDirty_||child->namespaceDirty_)child->updateCommands();
-                    child->startPendingSelectionKinds();KillTimer(child->window_,4);
-                    return !child->navigating_&&!child->selectionStateDirty_&&!child->namespaceDirty_&&
-                        child->selectionKindsRequest_.countKnown&&child->selectionKindsRequest_.count==count&&
-                        child->selectionKindsRequest_.pending&&child->selectionKindsRequest_.task&&child->selectionKindsRequest_.task->completed();
+                    child->startPendingSelectionKinds();
+                    const auto& request=child->selectionKindsRequest_;
+                    const bool completed=request.pending&&request.status==E_PENDING&&request.task&&request.task->completed();
+                    const bool published=!request.pending&&!request.task&&request.status==S_OK&&child->selectionKinds_.count==count&&
+                        ((count==257&&child->selectionKinds_.music&&!child->selectionKinds_.video)||
+                            (count==258&&!child->selectionKinds_.music&&!child->selectionKinds_.video));
+                    return sameNativeKindSource()&&request.countKnown&&request.count==count&&(completed||published);
                 };
-                const bool musicReady=seed==S_OK&&pumpUntil([&]{return realKindReady(257);},5000)&&selectedIds(musicIds);
+                const auto coherentNativeKindSelection=[&](DWORD count,const std::set<NativeFileIdentity>& expected,bool requirePublished=false) {
+                    const auto generation=child->selectionKindsRequest_.generation,revision=child->selectionKindsRequest_.sourceRevision;
+                    const auto selection=child->selectionKindsRequest_.selection.Get();const auto requestedAt=child->selectionKindsRequest_.requestedAt;
+                    const auto unchanged=[&] {const auto& request=child->selectionKindsRequest_;
+                        return sameNativeKindSource()&&request.generation==generation&&request.sourceRevision==revision&&
+                            request.selection.Get()==selection&&request.requestedAt==requestedAt&&request.countKnown&&request.count==count&&
+                            (!requirePublished||(!request.pending&&!request.task&&request.status==S_OK&&child->selectionKinds_.count==count&&
+                                ((count==257&&child->selectionKinds_.music&&!child->selectionKinds_.video)||
+                                    (count==258&&!child->selectionKinds_.music&&!child->selectionKinds_.video))));};
+                    return unchanged()&&selectedIds(expected)&&unchanged();
+                };
+                const bool musicReady=seed==S_OK&&pumpUntil([&]{return realKindReady(257);},5000)&&coherentNativeKindSelection(257,musicIds);
                 const bool nativeMenuUnfinished=child->selectionStateBatch_&&!child->selectionStateBatch_->completed();
                 const bool actualCommandResultsUnpublished=child->commandStatesPending();
                 const bool commandResultsUnpublished=musicReady&&actualCommandResultsUnpublished;
@@ -4954,7 +4975,7 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report, bool library
                 };
                 const bool musicPublished=musicReady&&!child->selectionKindsRequest_.pending&&child->selectionKindsRequest_.status==S_OK&&
                     child->selectionKinds_.count==257&&child->selectionKinds_.music&&!child->selectionKinds_.video&&
-                    contextMatches(RibbonContext::Music,true)&&contextMatches(RibbonContext::Video,false)&&selectedIds(musicIds);
+                    contextMatches(RibbonContext::Music,true)&&contextMatches(RibbonContext::Video,false)&&coherentNativeKindSelection(257,musicIds,true);
                 std::wstring kindFailureDiagnostic;
                 if(!musicPublished||!commandResultsUnpublished) {
                     // Snapshot the request before any native readback can pump
@@ -5071,38 +5092,76 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report, bool library
                         std::to_wstring(generation)+L"/"+std::to_wstring(revision)+L"; native count HRESULT/count="+
                         hresultMessage(countRead)+L"/"+std::to_wstring(nativeCount);
                 };
-                // A fresh actual Music selection supplies the old completion.
+                struct ClearKindObservers {
+                    ExplorerApp& app;
+                    ~ClearKindObservers(){app.headlessBeforeKindsPublication_={};app.headlessAfterKindsSourceCapture_={};}
+                };
+                // Arm at genuine source capture before reselection. The old
+                // real worker must enter its publication hook; accepting an
+                // already-published old result cannot exercise its rejection.
                 auto reseed=musicPublished?child->execute(SelectNone):E_UNEXPECTED;
                 HRESULT oldEmptySelectionRead=E_PENDING;
                 const bool oldEmpty=reseed==S_OK&&observeEmptyKind(oldEmptySelectionRead);
                 if(reseed==S_OK&&!oldEmpty)reseed=E_UNEXPECTED;
-                if(oldEmpty)reseed=nativeFolder->SelectAndPositionItems(static_cast<UINT>(musicChildren.size()),musicChildren.data(),nullptr,
-                    SVSI_SELECT|SVSI_NOTAKEFOCUS);
-                const bool oldReady=reseed==S_OK&&pumpUntil([&]{return realKindReady(257);},5000)&&selectedIds(musicIds);
-                const auto oldGeneration=child->namespaceGeneration_;
-                NamespaceCommandStateTask* newTask=nullptr;UINT64 newGeneration=0;bool changed=false,newPending=false;
-                if(oldReady) {
-                    child->headlessBeforeKindsPublication_=[&] {
+                bool oldReady=false,changed=false,newPending=false,newPublished=false;
+                UINT64 oldGeneration=0,oldRevision=0,newGeneration=0,newRevision=0;
+                IShellItemArray* newSelection=nullptr;double newRequestedAt=0;
+                NamespaceCommandStateTask* newTask=nullptr;HRESULT oldCompletion=E_PENDING;
+                const auto rejectedBeforeReseed=child->headlessRejectedKindsCompletions_;
+                const auto reseedDeadline=GetTickCount64()+5000;
+                if(oldEmpty) {
+                    const auto completedOldMusic=[&](HRESULT status,const NamespaceSelectionKinds& kinds,UINT64 generation,UINT64 revision) {
+                        child->headlessAfterKindsSourceCapture_={};oldCompletion=status;oldGeneration=generation;oldRevision=revision;
+                        const auto originalSelection=child->selectionKindsRequest_.selection.Get();
+                        const auto originalRequestedAt=child->selectionKindsRequest_.requestedAt;
+                        const auto original=[&] {const auto& request=child->selectionKindsRequest_;
+                            return sameNativeKindSource()&&request.generation==generation&&request.sourceRevision==revision&&
+                                request.selection.Get()==originalSelection&&request.requestedAt==originalRequestedAt&&
+                                request.pending&&!request.task&&request.status==E_PENDING&&request.countKnown&&request.count==257;};
+                        oldReady=status==S_OK&&kinds.count==257&&kinds.music&&!kinds.video&&original()&&selectedIds(musicIds)&&original()&&GetTickCount64()<reseedDeadline;
+                        if(!oldReady)return;
                         const auto changedRead=child->execute(SelectAll);
                         changed=changedRead==S_OK&&selectedIds(allIds);
-                        child->updateCommands();child->startPendingSelectionKinds();KillTimer(child->window_,4);
-                        newGeneration=child->namespaceGeneration_;newTask=child->selectionKindsRequest_.task.get();
-                        newPending=child->selectionKindsRequest_.pending;
+                        child->updateCommands();child->startPendingSelectionKinds();
+                        const auto& request=child->selectionKindsRequest_;
+                        newGeneration=request.generation;newRevision=request.sourceRevision;newSelection=request.selection.Get();newRequestedAt=request.requestedAt;
+                        newTask=request.task.get();newPending=request.pending&&request.status==E_PENDING&&newTask;
+                        newPublished=!request.pending&&!request.task&&request.status==S_OK&&child->selectionKinds_.count==258&&
+                            !child->selectionKinds_.music&&!child->selectionKinds_.video;
                     };
-                    child->pollSelectionKinds();
+                    ClearKindObservers clearOldObservers{*child};
+                    child->headlessAfterKindsSourceCapture_=[&] {const auto& request=child->selectionKindsRequest_;
+                        if(request.countKnown&&request.count==257&&request.pending&&child->view_.Get()==nativeView.Get()&&child->folderView_.Get()==nativeFolder.Get())
+                            child->headlessBeforeKindsPublication_=completedOldMusic;};
+                    reseed=nativeFolder->SelectAndPositionItems(static_cast<UINT>(musicChildren.size()),musicChildren.data(),nullptr,SVSI_SELECT|SVSI_NOTAKEFOCUS);
+                    const auto now=GetTickCount64();
+                    if(reseed==S_OK&&now<reseedDeadline)pumpUntil([&] {
+                        if(child->selectionStateDirty_||child->namespaceDirty_)child->updateCommands();
+                        child->startPendingSelectionKinds();child->pollSelectionKinds();return oldCompletion!=E_PENDING;
+                    },static_cast<DWORD>(reseedDeadline-now));
+                    child->headlessAfterKindsSourceCapture_={};child->headlessBeforeKindsPublication_={};
                 }
-                const bool oldDiscarded=oldReady&&changed&&newGeneration>oldGeneration&&newPending&&newTask&&
-                    child->namespaceGeneration_==newGeneration&&child->selectionKindsRequest_.task.get()==newTask&&
-                    child->selectionKindsRequest_.pending&&child->selectionKindsRequest_.status==E_PENDING&&
-                    !child->selectionKinds_.music&&!child->selectionKinds_.video&&selectedIds(allIds);
+                const auto survivingMixedSource=[&] {const auto& request=child->selectionKindsRequest_;
+                    if(!sameNativeKindSource()||request.generation!=newGeneration||request.sourceRevision!=newRevision||
+                       request.selection.Get()!=newSelection||request.requestedAt!=newRequestedAt||!request.countKnown||request.count!=258)return false;
+                    const bool pending=request.pending&&request.status==E_PENDING&&request.task&&request.task.get()==newTask;
+                    const bool published=!request.pending&&!request.task&&request.status==S_OK&&child->selectionKinds_.count==258&&
+                        !child->selectionKinds_.music&&!child->selectionKinds_.video;
+                    return (pending||published)&&!child->selectionKinds_.music&&!child->selectionKinds_.video;
+                };
+                const bool oldDiscarded=oldReady&&changed&&newGeneration>oldGeneration&&(newPending||newPublished)&&
+                    child->headlessRejectedKindsCompletions_==rejectedBeforeReseed+1&&
+                    child->headlessRejectedKindsGeneration_==oldGeneration&&child->headlessRejectedKindsRevision_==oldRevision&&
+                    survivingMixedSource()&&selectedIds(allIds)&&survivingMixedSource()&&GetTickCount64()<reseedDeadline;
                 const bool mixedReady=oldDiscarded&&pumpUntil([&]{return realKindReady(258);},5000);
                 if(mixedReady)child->pollSelectionKinds();
                 const bool mixedPublished=mixedReady&&child->selectionKindsRequest_.status==S_OK&&child->selectionKinds_.count==258&&
                     !child->selectionKinds_.music&&!child->selectionKinds_.video&&contextMatches(RibbonContext::Music,false)&&
-                    contextMatches(RibbonContext::Video,false)&&selectedIds(allIds);
+                    contextMatches(RibbonContext::Video,false)&&coherentNativeKindSelection(258,allIds,true);
                 check("async_kind_reentrant_new_native_selection_keeps_new_task_and_final_counterexample",oldDiscarded&&mixedPublished,
                     L"old/new generation="+std::to_wstring(oldGeneration)+L"/"+std::to_wstring(newGeneration)+L"; source changed="+
                     std::to_wstring(changed)+L"; new pending/task="+std::to_wstring(newPending)+L"/"+std::to_wstring(newTask!=nullptr)+
+                    L"; actual new already published="+std::to_wstring(newPublished)+L"; actual old completion="+hresultMessage(oldCompletion)+
                     L"; old empty/ready="+std::to_wstring(oldEmpty)+L"/"+std::to_wstring(oldReady)+
                     L"; old native empty selection="+hresultMessage(oldEmptySelectionRead)+
                     L"; old discarded="+std::to_wstring(oldDiscarded)+L"; native mixed result="+std::to_wstring(mixedPublished)+
@@ -5115,24 +5174,118 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report, bool library
                 HRESULT leavingEmptySelectionRead=E_PENDING;
                 const bool leavingEmpty=beforeLeave==S_OK&&observeEmptyKind(leavingEmptySelectionRead);
                 if(beforeLeave==S_OK&&!leavingEmpty)beforeLeave=E_UNEXPECTED;
-                if(leavingEmpty)beforeLeave=nativeFolder->SelectAndPositionItems(static_cast<UINT>(musicChildren.size()),musicChildren.data(),nullptr,
-                    SVSI_SELECT|SVSI_NOTAKEFOCUS);
-                const bool leavingReady=beforeLeave==S_OK&&pumpUntil([&]{return realKindReady(257);},5000);
-                auto leave=leavingReady?child->navigate(leaveRoot.wstring()):E_UNEXPECTED;
-                if(leavingReady)child->pollCommandStates();
+                bool leavingReady=false,oldPublicationDiscarded=false,nativeNavigationInvalidated=false;
+                UINT64 leavingGeneration=0,leavingRevision=0;
+                const auto rejectedBeforeLeave=child->headlessRejectedKindsCompletions_;
+                UINT64 rejectedAfterLeave=rejectedBeforeLeave,lastRejectedGeneration=0,lastRejectedRevision=0;
+                HRESULT leave=E_UNEXPECTED,leavingCompletion=E_PENDING;
+                if(leavingEmpty) {
+                    const auto leavingDeadline=GetTickCount64()+5000;
+                    child->headlessKindsPublicationDiagnostics_=std::make_unique<HeadlessKindsPublicationDiagnostics>();
+                    // Arm before selecting: a cached real worker may complete
+                    // and be polled by COM pumping inside the native selection
+                    // or refresh call. Inspect its actual result at the existing
+                    // one-shot publication boundary, then navigate there. No
+                    // pending-task timing window or fabricated result is needed.
+                    const auto completedMusic=[&](HRESULT status,const NamespaceSelectionKinds& kinds,UINT64 generation,UINT64 revision) {
+                        leavingCompletion=status;
+                        child->headlessAfterKindsSourceCapture_={};
+                        leavingGeneration=generation;leavingRevision=revision;
+                        const auto& request=child->selectionKindsRequest_;
+                        const auto originalSelection=request.selection.Get();
+                        const auto originalRequestedAt=request.requestedAt;
+                        const auto originalRequestNavigation=request.navigation;
+                        const auto originalSource=[&] {
+                            return request.generation==generation&&request.sourceRevision==revision&&
+                                request.selection.Get()==originalSelection&&request.requestedAt==originalRequestedAt&&
+                                request.navigation==originalRequestNavigation&&request.pending&&!request.task&&
+                                request.countKnown&&request.count==257&&request.status==E_PENDING&&
+                                child->selectionKindsSourceCurrent()&&child->view_.Get()==nativeView.Get()&&
+                                child->folderView_.Get()==nativeFolder.Get()&&child->navigationCount_==nativeKindNavigation&&
+                                child->currentPidl_&&nativeLocation&&ILGetSize(child->currentPidl_.get())==ILGetSize(nativeLocation.get())&&
+                                std::memcmp(child->currentPidl_.get(),nativeLocation.get(),ILGetSize(nativeLocation.get()))==0;
+                        };
+                        leavingReady=status==S_OK&&kinds.count==257&&kinds.music&&!kinds.video&&
+                            originalSource()&&selectedIds(musicIds)&&originalSource()&&GetTickCount64()<leavingDeadline;
+                        if(leavingReady) {
+                            child->recordHeadlessKindsPublicationBoundary(HeadlessKindsPublicationBoundary::BeforeNavigate,
+                                generation,revision,originalRequestNavigation);
+                            leave=child->navigate(leaveRoot.wstring());
+                            child->recordHeadlessKindsPublicationBoundary(HeadlessKindsPublicationBoundary::AfterNavigate,
+                                generation,revision,originalRequestNavigation);
+                            // Browse acceptance can precede OnNavigationPending.
+                            // Keep the real old publication callback active until
+                            // genuine owned native navigation invalidates it.
+                            const auto now=GetTickCount64();
+                            if(leave==S_OK&&now<leavingDeadline)nativeNavigationInvalidated=pumpUntil([&] {
+                                return !child->closing_&&(child->navigating_||child->view_.Get()!=nativeView.Get()||
+                                    child->folderView_.Get()!=nativeFolder.Get()||child->navigationCount_!=nativeKindNavigation);
+                            },static_cast<DWORD>(leavingDeadline-now));
+                            nativeNavigationInvalidated=nativeNavigationInvalidated&&GetTickCount64()<leavingDeadline&&!originalSource();
+                        }
+                    };
+                    ClearKindObservers clearLeavingObservers{*child};
+                    child->headlessAfterKindsSourceCapture_=[&] {
+                        const auto& request=child->selectionKindsRequest_;
+                        if(request.countKnown&&request.count==257&&request.pending&&
+                            child->view_.Get()==nativeView.Get()&&child->folderView_.Get()==nativeFolder.Get())
+                            child->headlessBeforeKindsPublication_=completedMusic;
+                    };
+                    beforeLeave=nativeFolder->SelectAndPositionItems(static_cast<UINT>(musicChildren.size()),musicChildren.data(),nullptr,
+                        SVSI_SELECT|SVSI_NOTAKEFOCUS);
+                    const auto leavingNow=GetTickCount64();
+                    if(beforeLeave==S_OK&&leavingNow<leavingDeadline)pumpUntil([&] {
+                        if(child->selectionStateDirty_||child->namespaceDirty_)child->updateCommands();
+                        child->startPendingSelectionKinds();child->pollSelectionKinds();
+                        return leavingCompletion!=E_PENDING;
+                    },static_cast<DWORD>(leavingDeadline-leavingNow));
+                    // These plain receipts identify the actual original request
+                    // rejection even if navigation itself pumped destination work.
+                    rejectedAfterLeave=child->headlessRejectedKindsCompletions_;
+                    lastRejectedGeneration=child->headlessRejectedKindsGeneration_;
+                    lastRejectedRevision=child->headlessRejectedKindsRevision_;
+                    oldPublicationDiscarded=leavingReady&&leave==S_OK&&nativeNavigationInvalidated&&
+                        child->headlessRejectedKindsCompletions_==rejectedBeforeLeave+1&&
+                        child->headlessRejectedKindsGeneration_==leavingGeneration&&
+                        child->headlessRejectedKindsRevision_==leavingRevision;
+                    child->headlessAfterKindsSourceCapture_={};child->headlessBeforeKindsPublication_={};
+                }
                 const bool left=leave==S_OK&&pumpUntil([&]{int count=-1;return !child->navigating_&&child->folderView_&&
                     child->folderView_->ItemCount(SVGIO_ALLVIEW,&count)==S_OK&&count==0;},5000);
                 child->updateCommands();child->startPendingCommandStates();
                 const bool noStaleContext=left&&!child->selectionKinds_.music&&!child->selectionKinds_.video&&
                     contextMatches(RibbonContext::Music,false)&&contextMatches(RibbonContext::Video,false)&&
                     child->view_.Get()!=nativeView.Get()&&child->navigationCount_>nativeKindNavigation;
-                check("async_kind_real_navigation_discards_old_music_completion",nativeContextPreserved&&leavingReady&&noStaleContext,
+                check("async_kind_real_navigation_discards_old_music_completion",nativeContextPreserved&&leavingReady&&oldPublicationDiscarded&&noStaleContext,
                     L"native leave="+hresultMessage(leave)+L"; previous source/history intact="+std::to_wstring(nativeContextPreserved)+
                     L"; old empty/ready="+std::to_wstring(leavingEmpty)+L"/"+std::to_wstring(leavingReady)+
                     L"; old native empty selection="+hresultMessage(leavingEmptySelectionRead)+
+                    L"; actual old completion="+hresultMessage(leavingCompletion)+
+                    L"; actual native navigation invalidated inside old callback="+std::to_wstring(nativeNavigationInvalidated)+
+                    L"; actual original-request rejection receipt="+std::to_wstring(oldPublicationDiscarded)+
+                    L"; global rejected count before/after="+std::to_wstring(rejectedBeforeLeave)+L"/"+std::to_wstring(rejectedAfterLeave)+
+                    L"; original generation/revision="+std::to_wstring(leavingGeneration)+L"/"+std::to_wstring(leavingRevision)+
+                    L"; last rejected generation/revision="+std::to_wstring(lastRejectedGeneration)+L"/"+std::to_wstring(lastRejectedRevision)+
                     L"; actual empty destination/no stale context="+std::to_wstring(noStaleContext)+
                     (!leavingReady?reseedFailureDiagnostic():L""));
-                child->headlessBeforeKindsPublication_={};child.reset();
+                if(child->headlessKindsPublicationDiagnostics_) {
+                    const auto& diagnostics=*child->headlessKindsPublicationDiagnostics_;
+                    std::fprintf(stderr,"headless Kind publication diagnostics rows=%zu dropped=%zu\n",diagnostics.count,diagnostics.dropped);
+                    for(size_t index=0;index<diagnostics.count;++index) {
+                        const auto& row=diagnostics.rows[index];
+                        std::fprintf(stderr,"headless Kind boundary #%zu stage=%u captured=%llu/%llu/%u request=%llu/%llu/%u owner=%llu/%llu/%u rejected=%llu last=%llu/%llu pending/task/current=%d/%d/%d refresh/cancel/navigating=%d/%d/%d dirty/ns/selection=%d/%d callback=%d\n",
+                            index,static_cast<unsigned>(row.boundary),static_cast<unsigned long long>(row.capturedGeneration),
+                            static_cast<unsigned long long>(row.capturedRevision),row.capturedNavigation,
+                            static_cast<unsigned long long>(row.requestGeneration),static_cast<unsigned long long>(row.requestRevision),row.requestNavigation,
+                            static_cast<unsigned long long>(row.namespaceGeneration),static_cast<unsigned long long>(row.sourceRevision),row.currentNavigation,
+                            static_cast<unsigned long long>(row.rejections),static_cast<unsigned long long>(row.lastRejectedGeneration),
+                            static_cast<unsigned long long>(row.lastRejectedRevision),row.pending,row.task,row.current,row.refresh,row.cancel,row.navigating,
+                            row.namespaceDirty,row.selectionDirty,row.callback);
+                    }
+                    std::fflush(stderr);
+                }
+                child->headlessBeforeKindsPublication_={};child->headlessAfterKindsSourceCapture_={};
+                child->headlessKindsPublicationDiagnostics_.reset();child.reset();
                 bool sourcesPreserved=true;
                 for(size_t index=0;index<mediaPaths.size();++index) {
                     FILE_ID_INFO after{};const auto read=nativeFileIdentity(mediaPaths[index],after);
@@ -7017,7 +7170,10 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report, bool library
             if (ready) hr = folderView_->SelectItem(0, SVSI_SELECT | SVSI_DESELECTOTHERS);
             if (ready && SUCCEEDED(hr)) hr = execute(OpenFileLocation);
             ready = ready && SUCCEEDED(hr) && pumpUntil([&] {
-                if (navigating_ || !atLocation(fixture)) return false;
+                // Exact selection can be observable before the next native
+                // owner pass clears the pending selection transaction. Wait
+                // for that real completion as well as the exact item below.
+                if (navigating_ || !atLocation(fixture) || searchBackground_ || selectionChild_) return false;
                 ComPtr<IShellItemArray> chosen;
                 DWORD selectedCount = 0;
                 ComPtr<IShellItem> chosenItem;

@@ -346,7 +346,7 @@ ExplorerApp::ExplorerApp(HINSTANCE instance, bool headless, RibbonLayout ribbonL
 }
 
 ExplorerApp::~ExplorerApp() {
-    destroying_=true;
+    destroying_=true;retireOwnedCloseHook();
     if(searchBackings_)closing_=true;
     if(FAILED(shutdownPreview())) { TerminateProcess(GetCurrentProcess(),8); std::_Exit(8); }
     if(searchAutocomplete_)searchAutocomplete_->Enable(FALSE);
@@ -358,7 +358,11 @@ ExplorerApp::~ExplorerApp() {
     ribbon_.reset();
     destroyBrowser();
     if(searchBackings_&&FAILED(closeSearchBackings())) {TerminateProcess(GetCurrentProcess(),8);std::_Exit(8);}
-    if (window_ && IsWindow(window_)) DestroyWindow(window_);
+    if (window_ && IsWindow(window_)) {
+        const auto original=window_;
+        if(!DestroyWindow(original)&&IsWindow(original)) {TerminateProcess(GetCurrentProcess(),8);std::_Exit(8);}
+    }
+    ribbon_.finishOwnerWindowRetirement();
     namespaceActions_.reset(true);
     forgetRibbonTheme(ribbon_.framework());
     ribbon_.reset();
@@ -634,6 +638,7 @@ HRESULT ExplorerApp::create(const std::wstring& location) {
     hr = preparedSearchWindowTarget_?browser_->BrowseToIDList(preparedSearchWindowTarget_.get(),SBSP_ABSOLUTE):
         navigate(location.empty() ? (preferences_.useWindowsStartup ? windowsDefaultStartupLocation() : preferences_.startupLocation) : location);
     preparedSearchWindowTarget_.reset();
+    if(SUCCEEDED(hr))hr=installOwnedCloseHook();
     if (FAILED(hr)) DestroyWindow(window_);
     return hr;
 }
@@ -662,6 +667,68 @@ HRESULT ExplorerApp::createBrowser() {
     if (FAILED(hr)) { destroyBrowser(); return hr; }
     return S_OK;
 }
+void ExplorerApp::finishWindowDestruction() {
+    // Reserve once before providers/workers can pump nested cleanup.
+    if(windowDestructionCleanupStarted_)return;
+    windowDestructionCleanupStarted_=true;
+    cancelLiveSearch();
+    if(window_)RemoveClipboardFormatListener(window_);cancelCommandStates();
+    closing_=true;if(window_)KillTimer(window_,1);cancelFrequentPlaces();
+    if(breadcrumbTask_) {breadcrumbTask_->cancel();breadcrumbTask_.reset();}
+    shutdownStatus_=shutdownPreview();
+    if(SUCCEEDED(shutdownStatus_)) {
+        DWORD remaining=5000;
+        if(searchBackings_) {
+            if(!searchTeardownDeadline_)searchTeardownDeadline_=GetTickCount64()+5000;
+            const auto now=GetTickCount64();remaining=static_cast<DWORD>(searchTeardownDeadline_>now?searchTeardownDeadline_-now:0);
+        }
+        shutdownStatus_=drainStaWorkers(remaining);
+    }
+    if(SUCCEEDED(shutdownStatus_)) {
+        // The native frequent-place pin callback can arrive on Destroy.
+        // Keep its original Shell view site alive until that callback ends.
+        forgetRibbonTheme(ribbon_.framework());resetRibbonForClose();destroyBrowser();
+        if(searchBackings_&&SUCCEEDED(shutdownStatus_))shutdownStatus_=closeSearchBackings();
+    }
+#if defined(EXPLORER_HOSTED_PIN_PERSISTENCE_FIXTURE)
+    if (!headless_) {
+        PostQuitMessage(0);
+        if(hostedPinReceiptsEnabled_) {
+            ++hostedNormalPostQuitCount_;
+            // Missing-WM_DESTROY reconciliation legitimately retired window_.
+            // Record the original actual installed owner, never reuse its HWND.
+            hostedNormalPostQuitOwner_=hostedPinCreatedOwner_;
+            hostedNormalPostQuitThread_=GetCurrentThreadId();
+        }
+    }
+#else
+    if (!headless_) PostQuitMessage(0);
+#endif
+}
+
+void ExplorerApp::reconcileMissingWindowDestruction() {
+    // Called only from the original admitted close after its actual HWND was
+    // observed gone. Retire plain HWND authority before any provider release;
+    // never send a message, write userdata or call a procedure on that handle.
+    window_=nullptr;ownedCloseAttached_=false;ownedCloseRetired_=true;
+    ownedCloseWindow_=nullptr;ownedCloseNext_=nullptr;++ownedCloseGeneration_;
+    nav_=address_=breadcrumbs_=search_=addressActions_=nullptr;
+    ribbonCollapse_=ribbonCollapseTooltip_=nullptr;
+    previewPane_=previewRender_=previewText_=previewGrip_=nullptr;
+    previewLayout_.window=previewLayout_.parent=previewLayout_.frame=nullptr;
+    // The original parent and its owned child are gone. Retire the drop
+    // target's raw child authority before its normal provider cleanup pumps.
+    if(breadcrumbDrop_) {
+        const auto retired=breadcrumbDrop_->retireDestroyedWindow();
+        if(FAILED(retired)){shutdownStatus_=retired;return;}
+    }
+    // Moving owned COM references does not call providers. The common cleanup
+    // reserves its once-only stage before these references can release/pump.
+    auto autocomplete=std::move(searchAutocomplete_);auto suggestions=std::move(searchSuggestions_);
+    finishWindowDestruction();
+    autocomplete.Reset();suggestions.Reset();
+}
+
 void ExplorerApp::destroyBrowser() {
     const auto detached=resetPreviewLayout();
     if(FAILED(detached)){shutdownStatus_=detached;TerminateProcess(GetCurrentProcess(),8);std::_Exit(8);}
@@ -1335,7 +1402,26 @@ HRESULT ExplorerApp::createControls() {
     callbacks.query = [this](UINT command) { return ribbonState(command); };
     callbacks.items = [this](UINT command) { return ribbonItems(command); };
     callbacks.executeItem = [this](UINT command, UINT item) { auto hr = executeRibbonItem(command, item); showError(hr, L"Command"); return hr; };
-    callbacks.pinItem=[this](UINT item,bool pinned){const auto hr=pinFrequentPlace(item,pinned);showError(hr,L"Pin frequent place");return hr;};
+    callbacks.pinItem=[this](UINT item,bool pinned){
+#if defined(EXPLORER_HOSTED_PIN_PERSISTENCE_FIXTURE)
+        HostedNormalPinReturn diagnostic;
+        if(hostedPinReceiptsEnabled_&&!headless_) {
+            diagnostic.index=item;diagnostic.requested=pinned;diagnostic.closingEntry=closing_;
+            diagnostic.owner=window_;diagnostic.site=view_.Get();diagnostic.generation=namespaceGeneration_;
+            diagnostic.navigation=navigationCount_;diagnostic.revision=displayedFrequentPlacesRevision_;
+            diagnostic.item=item<displayedFrequentPlaces_.size()?displayedFrequentPlaces_[item].item.Get():nullptr;
+        }
+#endif
+        const auto hr=pinFrequentPlace(item,pinned);showError(hr,L"Pin frequent place");
+#if defined(EXPLORER_HOSTED_PIN_PERSISTENCE_FIXTURE)
+        if(hostedPinReceiptsEnabled_&&!headless_) {
+            diagnostic.result=hr;diagnostic.closingAfter=closing_;
+            if(hostedNormalPinReturnCount_<hostedNormalPinReturns_.size())hostedNormalPinReturns_[hostedNormalPinReturnCount_++]=diagnostic;
+            else hostedPinReceiptOverflow_=true;
+        }
+#endif
+        return hr;
+    };
     callbacks.heightChanged = [this](UINT) { layout(); };
     auto hr = ribbon_.initialize(window_, instance_, std::move(callbacks),requestedRibbonLayout_);
     if (FAILED(hr)) return hr;
@@ -1537,6 +1623,9 @@ void ExplorerApp::updateNamespaceImpl() {
     kinds.pending=!knownEmpty&&target.selection;
     kinds.status=knownEmpty?S_OK:kinds.pending?E_PENDING:FAILED(selectionRead)?selectionRead:selectedRead;
     kinds.requestedAt=commandTimingNow();selectionKindsRequest_=std::move(kinds);
+    if(headless_&&headlessAfterKindsSourceCapture_) {
+        const auto captured=headlessAfterKindsSourceCapture_;captured();
+    }
     if(headless_)commandTimings_.selectionKindsStatus=selectionKindsRequest_.status;
     const auto catalogCompleted=commandTimingNow();
     if(headless_)commandTimings_.providerCatalogMs+=catalogCompleted-catalogStarted;
@@ -2361,7 +2450,8 @@ HRESULT ExplorerApp::buildSearchTarget(const std::wstring& query, const std::vec
 HRESULT ExplorerApp::closeSearchBackings() {
     if(!searchBackings_)return S_FALSE;
     if(searchBackingTeardownActive_)return HRESULT_FROM_WIN32(ERROR_BUSY);
-    // Posted close waits for the dispatch stack's local native item/lease.
+    // Posted close still waits for App-native stack/worker teardown. Store
+    // retirement closes its cache handles and never deletes published paths.
     if(!closing_||liveSearchDispatchActive_||searchNativeCallsActive_||browser_||view_||folderView_)
         return HRESULT_FROM_WIN32(ERROR_BUSY);
     searchBackingTeardownActive_=true;
@@ -3547,8 +3637,11 @@ LRESULT CALLBACK ExplorerApp::editProc(HWND window, UINT message, WPARAM wparam,
     return DefSubclassProc(window, message, wparam, lparam);
 }
 LRESULT ExplorerApp::onMessage(UINT message, WPARAM wparam, LPARAM lparam) {
+    const bool originalCloseMessage=message==WM_CLOSE&&consumeOwnedCloseContinuation();
+    observeShutdownWindowMessage(message,originalCloseMessage);
     // Message handlers may retain a native search view across provider calls.
-    // Keep their stack alive until a pumped close can reclaim backing files.
+    // Keep their stack alive until a pumped close can release App cache handles.
+    // Persistent backing paths survive native item/PIDL consumers beyond App close.
     std::optional<SearchNativeCallScope> searchDispatch;
     if(searchBackings_&&message!=WM_CLOSE&&message!=WM_DESTROY&&message!=WM_NCDESTROY)
         searchDispatch.emplace(*this);
@@ -3810,7 +3903,7 @@ LRESULT ExplorerApp::onMessage(UINT message, WPARAM wparam, LPARAM lparam) {
         }
         return 0;
     case WM_CLOSE:
-        if(closing_&&!previewClosePending_&&!searchClosePending_)return 0;
+        if(closing_&&!previewClosePending_&&!searchClosePending_&&!originalCloseMessage)return 0;
         cancelLiveSearch();
         if(liveSearchDispatchActive_||searchNativeCallsActive_) {closing_=true;searchClosePending_=true;return 0;}
         searchClosePending_=false;
@@ -3823,29 +3916,9 @@ LRESULT ExplorerApp::onMessage(UINT message, WPARAM wparam, LPARAM lparam) {
         if(FAILED(shutdownPreview())) {PostQuitMessage(8);return 0;}
         DestroyWindow(window_);return 0;
     case WM_DESTROY:
-        cancelLiveSearch();
-        RemoveClipboardFormatListener(window_);cancelCommandStates();
-        closing_=true;KillTimer(window_,1);cancelFrequentPlaces();
-        if(breadcrumbTask_) {breadcrumbTask_->cancel();breadcrumbTask_.reset();}
-        shutdownStatus_=shutdownPreview();
-        if(SUCCEEDED(shutdownStatus_)) {
-            DWORD remaining=5000;
-            if(searchBackings_) {
-                if(!searchTeardownDeadline_)searchTeardownDeadline_=GetTickCount64()+5000;
-                const auto now=GetTickCount64();remaining=static_cast<DWORD>(searchTeardownDeadline_>now?searchTeardownDeadline_-now:0);
-            }
-            shutdownStatus_=drainStaWorkers(remaining);
-        }
-        if(SUCCEEDED(shutdownStatus_)) {
-            // The native frequent-place pin callback can arrive on Destroy.
-            // Keep its original Shell view site alive until that callback ends.
-            forgetRibbonTheme(ribbon_.framework());ribbon_.reset();destroyBrowser();
-            if(searchBackings_&&SUCCEEDED(shutdownStatus_))shutdownStatus_=closeSearchBackings();
-        }
-        if (!headless_) PostQuitMessage(0);
-        return 0;
+        finishWindowDestruction();return 0;
     case WM_NCDESTROY: {
-        const auto old=window_;SetWindowLongPtrW(old,GWLP_USERDATA,0);window_=nullptr;
+        const auto old=window_;detachOwnedCloseHook();SetWindowLongPtrW(old,GWLP_USERDATA,0);window_=nullptr;
         return DefWindowProcW(old,message,wparam,lparam);
     }
     }

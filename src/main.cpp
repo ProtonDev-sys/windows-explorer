@@ -1,3 +1,4 @@
+#include "explorer/native_apartment.hpp"
 #include "explorer/app.hpp"
 #include "explorer/shell_operations.hpp"
 #include "explorer/theme.hpp"
@@ -264,7 +265,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     }
     if (benchmark) startup.desktopReadyMs = startupElapsed();
     if (FAILED(explorer::initializeProcessTheme(theme))) { finishPreviewLowDesktop(); return 6; }
-    const auto hr = OleInitialize(nullptr);
+    explorer::NativeApartmentOwner nativeApartment;
+    const auto hr = nativeApartment.initializeOle();
     if (FAILED(hr)) { finishPreviewLowDesktop(); return 3; }
     INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_WIN95_CLASSES | ICC_STANDARD_CLASSES};
     InitCommonControlsEx(&controls);
@@ -284,7 +286,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
         std::fprintf(stderr, "Documents Library display restricted before App creation; protected metadata HRESULT=0x%08lX.\n",
             static_cast<unsigned long>(verified));
         source.reset(); // Release every native interface and the lease before COM.
-        OleUninitialize();
+        nativeApartment.finishOrTerminate();
         return SUCCEEDED(isolated) && SUCCEEDED(observed) && !restricted.visibleInputDesktopWindows &&
             SUCCEEDED(reported) && (SUCCEEDED(verified) || restricted.documentsLibrarySource.unavailable) ? 9 : 7;
     }
@@ -333,7 +335,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     if (auto owner = GetClipboardOwner()) GetWindowThreadProcessId(owner, &clipboardProcess);
     if (clipboardProcess == GetCurrentProcessId()) OleFlushClipboard();
     app->Release();
-    OleUninitialize();
+    nativeApartment.finishOrTerminate();
     if (headless && FAILED(privateDesktop.verifyIsolation())) result = 5;
     if (FAILED(finishPreviewLowDesktop())) result = 5;
     if (startupDesktopChild) {

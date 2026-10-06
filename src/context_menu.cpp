@@ -124,22 +124,39 @@ void NativeContextMenu::reset() noexcept {
 
 HRESULT NativeContextMenu::create(HWND owner, IContextMenu* context, IUnknown* site,
                                   UINT flags) {
-    return createImpl(owner, context, site, flags, false);
+    return createImpl<false>(owner, context, site, flags, false);
 }
 
 HRESULT NativeContextMenu::createLeafState(IContextMenu* context, IUnknown* site, UINT flags,
                                          bool omitResourceVerbs) {
-    return createImpl(nullptr, context, site, flags, true, omitResourceVerbs);
+    return createImpl<false>(nullptr, context, site, flags, true, omitResourceVerbs);
 }
 
 HRESULT NativeContextMenu::createForPlanning(HWND owner, IContextMenu* context,
                                             IUnknown* site, UINT flags) {
-    return createImpl(owner, context, site, flags, false, false, false);
+    return createImpl<false>(owner, context, site, flags, false, false, false);
 }
 
+HRESULT NativeContextMenu::create(HWND owner, IContextMenu* context, IUnknown* site,
+                                  UINT flags, NativeContextMenuCreateObserver& observer) {
+    observer.receipt = {};
+    const HRESULT hr = createImpl<true>(owner, context, site, flags, false, false, true, &observer);
+    observer.receipt.creationResult = hr;
+    return hr;
+}
+
+HRESULT NativeContextMenu::createLeafState(IContextMenu* context, IUnknown* site, UINT flags,
+                                         bool omitResourceVerbs, NativeContextMenuCreateObserver& observer) {
+    observer.receipt = {};
+    const HRESULT hr = createImpl<true>(nullptr, context, site, flags, true, omitResourceVerbs, true, &observer);
+    observer.receipt.creationResult = hr;
+    return hr;
+}
+
+template<bool Observed>
 HRESULT NativeContextMenu::createImpl(HWND owner, IContextMenu* context, IUnknown* site,
                                      UINT flags, bool leafStateOnly, bool omitResourceVerbs,
-                                     bool synchronousCascades) {
+                                     bool synchronousCascades, [[maybe_unused]] NativeContextMenuCreateObserver* observer) {
     // Retain inputs first: a caller may rebuild using this object's current menu.
     ComPtr<IContextMenu> retained = context;
     ComPtr<IUnknown> retainedSite = site;
@@ -150,21 +167,124 @@ HRESULT NativeContextMenu::createImpl(HWND owner, IContextMenu* context, IUnknow
     thread_ = GetCurrentThreadId();
     leafStateOnly_ = leafStateOnly;
     context_ = retained;
-    context_.As(&context2_);
-    context_.As(&context3_);
-    context_.As(&objectWithSite_);
+    [[maybe_unused]] IContextMenu* const originalProvider = retained.Get();
+    [[maybe_unused]] const auto current = [&] { return generation == generation_ && context_.Get() == originalProvider; };
+    // The unobserved specialization has no diagnostic invocation or retention.
+    // Before/after diagnostics may pump. Freeze each native result before the
+    // callback, then check the original generation/provider again afterwards.
+    [[maybe_unused]] const auto boundary = [&]([[maybe_unused]] const char* operation, [[maybe_unused]] bool after,
+        [[maybe_unused]] HRESULT hr, [[maybe_unused]] bool attempted) {
+        if constexpr (!Observed) return S_OK;
+        else {
+            auto& receipt = observer->receipt;
+            receipt.last = {operation, after, attempted, hr, generation, current(), receipt.last.sequence + 1};
+            if (after && attempted && FAILED(hr)) receipt.lastNativeFailure = receipt.last;
+            HRESULT diagnostic = S_OK;
+            bool threw = false;
+            try {
+                if (observer->record) observer->record(observer->state, receipt.last);
+            } catch (const std::bad_alloc&) { diagnostic = E_OUTOFMEMORY; threw = true; }
+              catch (...) { diagnostic = E_FAIL; threw = true; }
+            receipt.sourceCurrent = current();
+            receipt.last.sourceCurrent = receipt.sourceCurrent;
+            if (SUCCEEDED(diagnostic) && !receipt.sourceCurrent) diagnostic = E_ABORT;
+            if (FAILED(diagnostic) && SUCCEEDED(receipt.diagnosticResult)) {
+                receipt.firstDiagnosticFailure = receipt.last;
+                receipt.diagnosticResult = diagnostic;
+            }
+            receipt.observerThrew = receipt.observerThrew || threw;
+            return diagnostic;
+        }
+    };
+    struct CallResult { HRESULT native; HRESULT diagnostic; bool attempted; };
+    const auto call = [&]([[maybe_unused]] const char* operation, const auto& nativeCall,
+        [[maybe_unused]] bool restore = false) {
+        if constexpr (!Observed) return CallResult{nativeCall(), S_OK, true};
+        else {
+            const HRESULT before = boundary(operation, false, E_PENDING, false);
+            // Restoring this same retained provider is required even if a
+            // diagnostic throws or invalidates the wrapper. Never skip cleanup.
+            if (FAILED(before) && !restore) return CallResult{E_PENDING, before, false};
+            const HRESULT hr = nativeCall();
+            const HRESULT after = boundary(operation, true, hr, true);
+            return CallResult{hr, FAILED(before) ? before : after, true};
+        }
+    };
+    const auto fail = [&](HRESULT hr) {
+        // A pumped callback may have rebuilt this instance. Never reset the new
+        // generation as cleanup for this abandoned creation.
+        if constexpr (Observed) {
+            if (current()) reset();
+            observer->receipt.sourceCurrent = current();
+        }
+        else reset();
+        return hr;
+    };
+    [[maybe_unused]] ComPtr<IContextMenu2> queried2;
+    [[maybe_unused]] const auto query2 = call("QI.IContextMenu2", [&] {
+        if constexpr (Observed) {
+            const HRESULT hr = retained.As(&queried2);
+            if (current()) context2_.Swap(queried2);
+            return hr;
+        } else return context_.As(&context2_);
+    });
+    if constexpr (Observed) { if (FAILED(query2.diagnostic)) return fail(query2.diagnostic); }
+    [[maybe_unused]] ComPtr<IContextMenu3> queried3;
+    [[maybe_unused]] const auto query3 = call("QI.IContextMenu3", [&] {
+        if constexpr (Observed) {
+            const HRESULT hr = retained.As(&queried3);
+            if (current()) context3_.Swap(queried3);
+            return hr;
+        } else return context_.As(&context3_);
+    });
+    if constexpr (Observed) { if (FAILED(query3.diagnostic)) return fail(query3.diagnostic); }
+    [[maybe_unused]] ComPtr<IObjectWithSite> queriedSite;
+    [[maybe_unused]] const auto querySite = call("QI.IObjectWithSite", [&] {
+        if constexpr (Observed) {
+            const HRESULT hr = retained.As(&queriedSite);
+            if (current()) objectWithSite_.Swap(queriedSite);
+            return hr;
+        } else return context_.As(&objectWithSite_);
+    });
+    if constexpr (Observed) { if (FAILED(querySite.diagnostic)) return fail(querySite.diagnostic); }
     if (generation != generation_) return E_ABORT;
     if (retainedSite && objectWithSite_) {
-        const HRESULT hr = objectWithSite_->SetSite(retainedSite.Get());
+        [[maybe_unused]] ComPtr<IObjectWithSite> siteTarget;
+        if constexpr (Observed) siteTarget = objectWithSite_;
+        const auto attached = call("SetSite.attach", [&] {
+            if constexpr (Observed) {
+                const HRESULT hr = siteTarget->SetSite(retainedSite.Get());
+                // Publish successful attachment before an after observer can
+                // reset the wrapper, so reset detaches the original site.
+                if (SUCCEEDED(hr) && current()) siteAttached_ = true;
+                return hr;
+            } else return objectWithSite_->SetSite(retainedSite.Get());
+        });
+        const HRESULT hr = attached.native;
         if (generation != generation_) return E_ABORT;
-        if (FAILED(hr)) { reset(); return hr; }
+        if (FAILED(hr) && attached.attempted) return fail(hr);
+        if constexpr (Observed) { if (FAILED(attached.diagnostic)) return fail(attached.diagnostic); }
         siteAttached_ = true;
     }
     ComPtr<IDefaultFolderMenuInitialize> configuration;
     DEFAULT_FOLDER_MENU_RESTRICTIONS previous = DFMR_DEFAULT;
     bool restrictedResources = false;
+    const auto restoreRestrictions = [&] {
+        return call("SetMenuRestrictions.restore", [&] { return configuration->SetMenuRestrictions(previous); }, true);
+    };
+    [[maybe_unused]] const auto failRestricted = [&](HRESULT hr) {
+        if (restrictedResources) restoreRestrictions();
+        return fail(hr);
+    };
     if (leafStateOnly && omitResourceVerbs) {
-        HRESULT restriction = context_.As(&configuration);
+        const auto queried = call("QI.IDefaultFolderMenuInitialize", [&] {
+            if constexpr (Observed) return retained.As(&configuration);
+            else return context_.As(&configuration);
+        });
+        if constexpr (Observed) {
+            if (FAILED(queried.diagnostic)) return fail(queried.attempted && FAILED(queried.native) && queried.native != E_NOINTERFACE ? queried.native : queried.diagnostic);
+        }
+        HRESULT restriction = queried.native;
         if (restriction != E_NOINTERFACE) {
             // Preserve every documented restriction. Only unrelated built-in
             // operation entries are omitted; association and dynamic native
@@ -174,39 +294,87 @@ HRESULT NativeContextMenu::createImpl(HWND owner, IContextMenu* context, IUnknow
                 DFMR_OPTIN_HANDLERS_ONLY | DFMR_RESOURCE_AND_FOLDER_VERBS_ONLY |
                 DFMR_USE_SPECIFIED_HANDLERS | DFMR_USE_SPECIFIED_VERBS | DFMR_NO_ASYNC_VERBS |
                 DFMR_NO_NATIVECPU_VERBS | DFMR_NO_NONWOW_VERBS);
-            if (SUCCEEDED(restriction)) restriction = configuration->GetMenuRestrictions(mask,&previous);
-            if (SUCCEEDED(restriction) && !(previous & DFMR_NO_RESOURCE_VERBS)) {
-                restriction = configuration->SetMenuRestrictions(
-                    static_cast<DEFAULT_FOLDER_MENU_RESTRICTIONS>(previous | DFMR_NO_RESOURCE_VERBS));
-                restrictedResources = SUCCEEDED(restriction);
+            if (SUCCEEDED(restriction)) {
+                const auto read = call("GetMenuRestrictions", [&] { return configuration->GetMenuRestrictions(mask,&previous); });
+                restriction = read.native;
+                if constexpr (Observed) {
+                    if (FAILED(read.diagnostic)) return fail(read.attempted && FAILED(restriction) ? restriction : read.diagnostic);
+                }
             }
-            if (FAILED(restriction)) { reset(); return restriction; }
+            if (SUCCEEDED(restriction) && !(previous & DFMR_NO_RESOURCE_VERBS)) {
+                const auto changed = call("SetMenuRestrictions.omitResource", [&] {
+                    return configuration->SetMenuRestrictions(
+                        static_cast<DEFAULT_FOLDER_MENU_RESTRICTIONS>(previous | DFMR_NO_RESOURCE_VERBS));
+                });
+                restriction = changed.native;
+                restrictedResources = changed.attempted && SUCCEEDED(restriction);
+                if constexpr (Observed) {
+                    if (FAILED(changed.diagnostic)) return failRestricted(changed.attempted && FAILED(restriction) ? restriction : changed.diagnostic);
+                }
+            }
+            if (FAILED(restriction)) return fail(restriction);
         }
     }
-    menu_ = CreatePopupMenu();
+    const auto popupCreation = call("CreatePopupMenu", [&] {
+        menu_ = CreatePopupMenu();
+        return menu_ ? S_OK : menuError();
+    });
+    if constexpr (Observed) {
+        if (FAILED(popupCreation.diagnostic)) return failRestricted(popupCreation.attempted && FAILED(popupCreation.native) ? popupCreation.native : popupCreation.diagnostic);
+    }
     if (!menu_) {
-        const HRESULT hr = menuError();
-        if (restrictedResources) configuration->SetMenuRestrictions(previous);
-        reset(); return hr;
+        const HRESULT hr = popupCreation.native;
+        if (restrictedResources) restoreRestrictions();
+        return fail(hr);
     }
     popup_ = menu_;
     // Ordinary popups retain synchronous cascades. Exact planning and the
     // read-only leaf worker inspect native metadata before any branch request.
     const UINT nativeFlags = leafStateOnly || !synchronousCascades
         ? flags & ~CMF_SYNCCASCADEMENU : flags | CMF_SYNCCASCADEMENU;
-    const HRESULT hr = retained->QueryContextMenu(menu_, 0, firstCommand_, lastCommand_,
-                                                 nativeFlags);
+    const HMENU originalMenu = menu_;
+    const auto queried = call("QueryContextMenu", [&] {
+        return retained->QueryContextMenu(originalMenu, 0, firstCommand_, lastCommand_,
+                                          nativeFlags);
+    });
+    const HRESULT hr = queried.native;
     // A custom namespace can retain this same provider for a later normal
     // popup. Restrict only this query; canonical readback below must still use
     // the native menu that was just created, with the provider's original flags.
-    const HRESULT restored = restrictedResources ? configuration->SetMenuRestrictions(previous) : S_OK;
+    const auto restoration = restrictedResources ? restoreRestrictions() : CallResult{S_OK, S_OK, false};
+    const HRESULT restored = restoration.native;
     if (generation != generation_) return E_ABORT;
-    if (FAILED(hr)) { reset(); return hr; }
-    if (FAILED(restored)) { reset(); return restored; }
-    commandCount_ = HRESULT_CODE(hr);
-    if (commandCount_ > lastCommand_ - firstCommand_ + 1) {
-        reset();
-        return E_UNEXPECTED;
+    if (FAILED(hr) && queried.attempted) return fail(hr);
+    if (FAILED(restored)) return fail(restored);
+    if constexpr (Observed) {
+        if (FAILED(queried.diagnostic)) return fail(queried.diagnostic);
+        if (FAILED(restoration.diagnostic)) return fail(restoration.diagnostic);
+    }
+    if constexpr (Observed) {
+        const UINT commands = HRESULT_CODE(hr);
+        if (commands > lastCommand_ - firstCommand_ + 1) return fail(E_UNEXPECTED);
+        // Release the same original temporaries in their ordinary destruction
+        // order before accepting success. Release itself can pump. The raw
+        // original-provider address is only compared, never dereferenced here.
+        configuration.Reset();
+        queriedSite.Reset();
+        queried3.Reset();
+        queried2.Reset();
+        retainedSite.Reset();
+        retained.Reset();
+        observer->receipt.sourceCurrent = current();
+        if (!observer->receipt.sourceCurrent) {
+            if (SUCCEEDED(observer->receipt.diagnosticResult)) {
+                observer->receipt.diagnosticResult = E_ABORT;
+                observer->receipt.firstDiagnosticFailure = {
+                    "completionFence", false, false, E_PENDING, generation, false, observer->receipt.last.sequence + 1};
+            }
+            return E_ABORT;
+        }
+        commandCount_ = commands;
+    } else {
+        commandCount_ = HRESULT_CODE(hr);
+        if (commandCount_ > lastCommand_ - firstCommand_ + 1) return fail(E_UNEXPECTED);
     }
     return S_OK;
 }

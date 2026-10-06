@@ -254,6 +254,28 @@ private:
     void cancelFrequentPlaces();
     void pollFrequentPlaces();
     HRESULT pinFrequentPlace(UINT item,bool pinned);
+    struct ShutdownPinTransaction;
+    struct OwnedCloseFrame;
+    HRESULT installOwnedCloseHook() noexcept;
+    void detachOwnedCloseHook() noexcept;
+    bool retireOwnedCloseHook() noexcept;
+    static LRESULT CALLBACK ownedCloseProc(HWND,UINT,WPARAM,LPARAM);
+    LRESULT dispatchOwnedClose(HWND,WPARAM,LPARAM,WNDPROC) noexcept;
+    bool ownedCloseContinuation() const noexcept;
+    bool consumeOwnedCloseContinuation() noexcept;
+    void observeShutdownWindowMessage(UINT,bool originalCloseMessage) noexcept;
+    bool captureShutdownPins(ShutdownPinTransaction&);
+    HRESULT commitShutdownPin(ShutdownPinTransaction&,UINT,bool);
+    void resetRibbonForClose() noexcept;
+    bool shutdownPinSourceCurrent(const ShutdownPinTransaction& transaction) const noexcept;
+    HRESULT pinShutdownFrequentPlace(ShutdownPinTransaction& transaction,UINT item,bool pinned);
+    HRESULT resolveFrequentPlacePin(HWND owner,IShellItem* item,IShellView* site,bool pinned,
+        const std::function<bool()>& current,
+        const std::function<HRESULT(IShellItem*,const ContextMenuEntry&)>* resolved = nullptr);
+    friend struct ShutdownPinsNativeFixture;
+#if defined(EXPLORER_HOSTED_PIN_PERSISTENCE_FIXTURE)
+    friend struct HostedPinPersistenceFixture;
+#endif
     void pollCommandStates();
     void completeCommandState(UINT command,HRESULT status,const NamespaceCommandState* native);
     void initializeBreadcrumbDrop();
@@ -331,6 +353,8 @@ private:
     void refreshAddressHistoryPolicy();
     HRESULT createBrowser();
     void destroyBrowser();
+    void finishWindowDestruction();
+    void reconcileMissingWindowDestruction();
     HRESULT recreateBrowser(UINT toggleCommand);
     HRESULT browseHistory(int offset);
     HRESULT browseHistoryLocation(PCIDLIST_ABSOLUTE location, int originalIndex);
@@ -360,6 +384,7 @@ private:
     // Declared only by an owned private headless fixture before any HWND exists.
     std::optional<bool> headlessDirectionOverride_;
     bool closing_ = false;
+    bool windowDestructionCleanupStarted_=false;
     bool browserInitialized_ = false;
     bool addressEditing_ = false;
     bool navigating_ = false;
@@ -478,6 +503,113 @@ private:
     struct FrequentPlace {ComPtr<IShellItem> item;std::wstring label;std::wstring description;bool pinned=false;};
     std::vector<FrequentPlace> frequentPlaces_;
     std::vector<FrequentPlace> displayedFrequentPlaces_;
+    std::uint64_t displayedFrequentPlacesRevision_=0,shutdownPinCloseEntry_=0;
+    ShutdownPinTransaction* shutdownPinTransaction_=nullptr; // original owned close/reset stack only
+    OwnedCloseFrame* ownedCloseFrame_=nullptr;
+    HWND ownedCloseWindow_=nullptr;
+    DWORD ownedCloseThread_=0;
+    WNDPROC ownedCloseNext_=nullptr;
+    std::uint64_t ownedCloseGeneration_=0;
+    bool ownedCloseAttached_=false,ownedCloseRetired_=false;
+    // Opt-in owned headless fixture only: after the production final-pin gate
+    // and genuine Shell menu resolution, before any provider Invoke.
+    std::function<HRESULT(UINT,IShellItem*,IShellView*,bool,const ContextMenuEntry&)> headlessShutdownPinResolved_;
+    // Fixed diagnostic receipts after the complete production callback returns.
+    struct HeadlessShutdownPinFacts {
+        std::uint64_t epoch=0,closeEntry=0,displayRevision=0,hookGeneration=0;
+        ULONGLONG ownedCloseEntryTick=0;
+        bool hookAttached=false,hookTop=false,closeFrame=false,originalClose=false,originalReset=false,sourceRevoked=false;
+        bool capturing=false,nativeCloseScope=false;
+        UINT64 generation=0;
+        unsigned navigation=0;
+        UINT displayedCount=0;
+        bool closing=false,destroying=false,navigating=false,commandRefresh=false;
+        bool window=false,browser=false,view=false,folder=false,location=false,transaction=false;
+    };
+    HeadlessShutdownPinFacts headlessShutdownPinFacts() const noexcept;
+    ULONGLONG headlessOwnedCloseEntryTick_=0;
+    // Fixture-only controlled reentry after plain source capture, before its
+    // first provider AddRef. Empty in ordinary App operation. No fake provider.
+    std::function<void()> headlessBeforeShutdownPinRetain_;
+    UINT headlessShutdownPinRetains_=0,headlessShutdownPinCaptureProbes_=0;
+    UINT headlessShutdownOriginalLowerCalls_=0,headlessShutdownPlainCloseCalls_=0,headlessShutdownGoneCloseCalls_=0;
+    UINT headlessShutdownDeferredCloseCalls_=0; // plain same-original active-native close observation
+    ULONGLONG headlessShutdownDispatchTick_=0;
+    std::uintptr_t headlessShutdownSavedLower_=0,headlessShutdownActualReceiver_=0;
+    bool headlessShutdownCaptureDenied_=false,headlessShutdownCaptureReady_=false;
+    // Fixed plain diagnostics of the original native close return/catch and
+    // the existing short-circuit class-continuation gate. No provider retention.
+    struct HeadlessOwnedCloseState {
+        bool original=false,forwarded=false,destroyForwarded=false,hookAttached=false,hookRetired=false;
+        std::uint64_t frameGeneration=0,hookGeneration=0;
+        std::uintptr_t originalWindow=0,currentWindow=0,ownedWindow=0,originalFrame=0,activeFrame=0;
+        DWORD creator=0,process=0;
+    };
+    bool headlessShutdownNativeCloseEntered_=false,headlessShutdownNativeCloseReturned_=false;
+    bool headlessShutdownCaughtAfterDispatch_=false,headlessShutdownPostLowerGateReached_=false;
+    UINT headlessShutdownPostLowerGateEvaluated_=0,headlessShutdownPostLowerGatePassed_=0;
+    HeadlessOwnedCloseState headlessShutdownPostLowerState_,headlessShutdownCaughtState_;
+    UINT headlessShutdownMissingWindowDestructions_=0;
+    bool headlessShutdownMissingWindowCleanupCompleted_=false;
+    // Admission: 0 no reset entry, 1 entered, 2 thread denied, 3 clone failed,
+    // 4 captured fence denied, 5 override installed, 6 returned, 7 exception.
+    UINT headlessShutdownPinAdmission_=0;
+    HeadlessShutdownPinFacts headlessShutdownPinAdmissionFacts_{};
+    struct HeadlessShutdownPinResult {
+        UINT index=UI_COLLECTION_INVALIDINDEX;HRESULT result=E_PENDING;
+        bool pinned=false;HeadlessShutdownPinFacts entry{},returned{};
+    };
+    std::array<HeadlessShutdownPinResult,64> headlessShutdownPinResults_{};
+    UINT headlessShutdownPinResultCount_=0;
+    bool headlessShutdownPinResultOverflow_=false;
+    // Explicit fixture-only timing observation of the ordinary guarded path.
+    // Never authorizes a headless action or bypasses the shutdown-only sink.
+    bool headlessNormalPinDiagnostics_=false;
+    UINT headlessNormalPinPhase_=0;
+    struct HeadlessNormalPinResult {
+        UINT index=UI_COLLECTION_INVALIDINDEX,phase=0;
+        bool pinned=false;
+        HRESULT result=E_PENDING;
+        ULONGLONG entryTick=0,returnTick=0;
+        HeadlessShutdownPinFacts entry{},returned{};
+    };
+    std::array<HeadlessNormalPinResult,64> headlessNormalPinResults_{};
+    UINT headlessNormalPinResultCount_=0;
+    bool headlessNormalPinResultOverflow_=false;
+#if defined(EXPLORER_HOSTED_PIN_PERSISTENCE_FIXTURE)
+    // Fixed, non-callback receipts in the separate Hosted fixture binary only.
+    // Neither this switch nor the receipts authorize or replace a provider call.
+    bool hostedPinReceiptsEnabled_=false;
+    // Restrictive owned-only test authority. Populated from the verified GUID
+    // target before normal App create; it never grants ordinary invocation.
+    ComPtr<IShellItem> hostedPinOwnedTarget_;
+    FILE_ID_INFO hostedPinOwnedFile_{};
+    HWND hostedPinCreatedOwner_=nullptr;
+    struct HostedPinReturn {
+        UINT index=UI_COLLECTION_INVALIDINDEX; bool before=false,requested=false,currentAfter=false;
+        HRESULT result=E_PENDING; HWND owner=nullptr; IShellItem* item=nullptr; IShellView* site=nullptr;
+        UINT64 generation=0; unsigned navigation=0; std::uint64_t revision=0,closeEntry=0;
+    };
+    struct HostedPinInvoke {
+        IShellItemArray* array=nullptr; IShellItem* item=nullptr; IShellView* site=nullptr;
+        ComPtr<IShellItemArray> retainedArray;
+        HWND owner=nullptr; UINT menuId=0; bool requested=false; HRESULT result=E_PENDING;
+        wchar_t verb[32]{};
+    };
+    struct HostedNormalPinReturn {
+        UINT index=UI_COLLECTION_INVALIDINDEX;bool requested=false,closingEntry=false,closingAfter=false;
+        HRESULT result=E_PENDING;HWND owner=nullptr;IShellItem* item=nullptr;IShellView* site=nullptr;
+        UINT64 generation=0;unsigned navigation=0;std::uint64_t revision=0;
+    };
+    std::array<HostedPinReturn,64> hostedPinReturns_{};
+    std::array<HostedPinInvoke,64> hostedPinInvokes_{};
+    std::array<HostedNormalPinReturn,64> hostedNormalPinReturns_{};
+    UINT hostedPinReturnCount_=0,hostedPinInvokeCount_=0,hostedNormalPinReturnCount_=0;
+    bool hostedPinReceiptOverflow_=false;
+    UINT hostedNormalPostQuitCount_=0;
+    HWND hostedNormalPostQuitOwner_=nullptr;
+    DWORD hostedNormalPostQuitThread_=0;
+#endif
     ULONGLONG frequentPlacesReadAt_=0;
     NativeNamespaceActions* activeNamespaceMenu_ = nullptr;
     bool archiveFolder_ = false;
@@ -515,7 +647,32 @@ private:
     } selectionKindsRequest_;
     // One-shot isolated native regression callback after real Kind worker
     // release and before its captured-source publication fence.
-    std::function<void()> headlessBeforeKindsPublication_;
+    std::function<void(HRESULT,const NamespaceSelectionKinds&,UINT64,UINT64)> headlessBeforeKindsPublication_;
+    // Owned fixture arms a completion observer after real source cancellation
+    // and capture, before its first task can finish through native COM pumping.
+    std::function<void()> headlessAfterKindsSourceCapture_;
+    UINT64 headlessRejectedKindsCompletions_=0,headlessRejectedKindsGeneration_=0,headlessRejectedKindsRevision_=0;
+    enum class HeadlessKindsPublicationBoundary : unsigned {
+        BeforeCallback,AfterCallback,BeforeNavigate,AfterNavigate,
+        BeforeRejectRequest,AfterRejectRequest,BeforeRejectSource,AfterRejectSource,BeforePublish
+    };
+    struct HeadlessKindsPublicationFact {
+        HeadlessKindsPublicationBoundary boundary{};
+        UINT64 capturedGeneration=0,capturedRevision=0,requestGeneration=0,requestRevision=0;
+        UINT64 namespaceGeneration=0,sourceRevision=0,rejections=0,lastRejectedGeneration=0,lastRejectedRevision=0;
+        unsigned capturedNavigation=0,requestNavigation=0,currentNavigation=0;
+        bool pending=false,task=false,current=false,refresh=false,cancel=false,navigating=false;
+        bool namespaceDirty=false,selectionDirty=false,callback=false;
+    };
+    struct HeadlessKindsPublicationDiagnostics {
+        std::array<HeadlessKindsPublicationFact,64> rows{};
+        size_t count=0,dropped=0;
+    };
+    // Allocated only by the isolated genuine Kind fixture. Recording reads
+    // plain owner fields and PIDL bytes; it performs no native calls or actions.
+    std::unique_ptr<HeadlessKindsPublicationDiagnostics> headlessKindsPublicationDiagnostics_;
+    void recordHeadlessKindsPublicationBoundary(HeadlessKindsPublicationBoundary,
+        UINT64 generation,UINT64 revision,unsigned navigation) noexcept;
     UINT64 commandSourceRevision_ = 0;
     std::map<UINT, AppCommandCapability> commandCapabilities_;
     std::map<UINT,std::unique_ptr<NamespaceCommandStateTask>> commandStateTasks_;

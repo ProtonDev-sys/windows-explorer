@@ -1,3 +1,4 @@
+#include "explorer/native_apartment.hpp"
 #include "explorer/app.hpp"
 #include "search_backing_fixture.hpp"
 #include <cstdlib>
@@ -275,7 +276,7 @@ struct SearchBackingNativeFixture {
     static void run(RibbonLayout requested) {
         using namespace backing_test;
         deadline=GetTickCount64()+60000;
-        Fixture fixture(true);const auto owned=originalSources(fixture);auto shallow=rules(fixture,false,true);
+        Fixture fixture(true);DescriptorFiles descriptors;const auto owned=originalSources(fixture);auto shallow=rules(fixture,false,true);
         const auto query=L"System.FileName:~<\""+fixture.prefix+L"\"";
         const auto refined=L"System.FileName:=\""+fixture.directFile.filename().native()+L"\"";
         const std::set<Id> full{fixture.directId,fixture.extraId},single{fixture.directId};
@@ -288,6 +289,7 @@ struct SearchBackingNativeFixture {
         exact(app->prepareSearchWindowContext(context),"new App prepares live backed search");
         exact(app->create(fixture.scope.native()),"create private hidden App");requireLayout(*app.Get(),requested);await(*app.Get(),fixture,query,shallow,owned,full);
         auto backing=currentBacking(*app.Get());const auto oldPath=backing->path();const auto oldId=identity(oldPath);const auto oldBytes=bytes(oldPath);
+        descriptors.note(oldPath,backing->identity());descriptors.observe(*app->searchBackings_);
         const auto count=app->searchBackings_->retainedCount();backing.reset();
         exact(app->startSearch(query,true),"exact repeated query App route");await(*app.Get(),fixture,query,shallow,owned,full);
         require(app->searchBackings_->retainedCount()==count&&identity(oldPath)==oldId,"App repeat replaced backing");
@@ -303,7 +305,7 @@ struct SearchBackingNativeFixture {
         // actual direct search history entries before testing Back/Forward.
         exact(app->startSearch(query,true),"direct search retains query travel entry");await(*app.Get(),fixture,query,shallow,owned,full);
         exact(app->startSearch(refined,true),"direct refinement retains native travel entry");await(*app.Get(),fixture,refined,shallow,owned,single);
-        const auto refinedHistory=history(*app.Get());const auto refinedIndex=app->historyIndex_;
+        auto refinedHistory=history(*app.Get());const auto refinedIndex=app->historyIndex_;
         exact(app->execute(Back),"actual native Back");await(*app.Get(),fixture,query,shallow,owned,full);
         require(sameHistory(*app.Get(),refinedHistory,refinedIndex-1),"Back changed original complete history identities");
         exact(app->execute(Forward),"actual native Forward");await(*app.Get(),fixture,refined,shallow,owned,single);
@@ -319,14 +321,16 @@ struct SearchBackingNativeFixture {
         ComPtr<ExplorerApp> child;child.Attach(new ExplorerApp(GetModuleHandleW(nullptr),true,requested));
         exact(child->prepareSearchWindowContext(childContext),"fresh child prepares own descriptor");exact(child->create(fixture.scope.native()),"create independent private child App");
         requireLayout(*child.Get(),requested);await(*child.Get(),fixture,refined,shallow,owned,single);
-        auto childBacking=currentBacking(*child.Get());const auto childPath=childBacking->path();childBacking.reset();
+        auto childBacking=currentBacking(*child.Get());const auto childPath=childBacking->path();const auto childId=identity(childPath);
+        descriptors.note(childPath,childBacking->identity());childBacking.reset();
         require(childPath!=oldPath&&identity(childPath)!=oldId,"new window borrowed parent backing ownership");
-        close(child,fixture);require(!std::filesystem::exists(childPath)&&identity(oldPath)==oldId,"child cleanup removed parent descriptor");
+        close(child,fixture);require(identity(childPath)==childId&&identity(oldPath)==oldId,"child close changed child/parent persistent descriptor");
         for(const bool duringRecreation:{false,true}) {
             ComPtr<ExplorerApp> reader;reader.Attach(new ExplorerApp(GetModuleHandleW(nullptr),true,requested));
             exact(reader->prepareSearchWindowContext(childContext),"prepare independent native lifetime fixture");
             exact(reader->create(fixture.scope.native()),"create native lifetime fixture");requireLayout(*reader.Get(),requested);await(*reader.Get(),fixture,refined,shallow,owned,single);
-            auto readback=currentBacking(*reader.Get());const auto readerPath=readback->path();readback.reset();
+            auto readback=currentBacking(*reader.Get());const auto readerPath=readback->path();const auto readerId=identity(readerPath);
+            descriptors.note(readerPath,readback->identity());readback.reset();
             const auto readerDirectory=reader->searchBackings_->directory();unsigned closed=0;
             const auto reenterClose=[&] {
                 ++closed;require(reader->searchNativeCallsActive_&&std::filesystem::exists(readerPath),"native retained-view lifetime guard missing");
@@ -344,7 +348,8 @@ struct SearchBackingNativeFixture {
                         "native readback close published obsolete window context");
             }
             require(closed==1&&!reader->searchNativeCallsActive_&&std::filesystem::exists(readerPath),"native lifetime callback/source release mismatch");
-            close(reader,fixture);require(!std::filesystem::exists(readerDirectory),"native readback/recreate close failed exact cleanup");
+            close(reader,fixture);require(std::filesystem::exists(readerDirectory)&&identity(readerPath)==readerId,
+                    "native readback/recreate close changed original persistent descriptor");
         }
         // Actual reentry callback advances the current interaction. The old
         // native item must not browse or overwrite the newer edit afterward.
@@ -360,25 +365,88 @@ struct SearchBackingNativeFixture {
         require(app->startSearch(query,true)==S_FALSE&&app->closing_&&app->searchClosePending_,"factory-close failed to defer backing deletion");
         require(std::filesystem::exists(oldPath),"factory callback deleted active backing");
         const auto directory=app->searchBackings_->directory();close(app,fixture);
-        require(!std::filesystem::exists(directory),"App full close failed owned backing cleanup");
-        source(fixture);fixture.remove=true;
+        require(std::filesystem::exists(directory)&&identity(oldPath)==oldId&&bytes(oldPath)==oldBytes,
+                "App close changed original persistent descriptor");
+        source(fixture);original.reset();refinedHistory.clear();
+        context={};childContext={};shallow.clear();nativeIds={};
+        descriptors.removeExplicitFixtureFiles();fixture.remove=true;
     }
+    static void runResidentStress() {
+        using namespace backing_test;
+        deadline=GetTickCount64()+60000;
+        Fixture fixture(true);DescriptorFiles descriptors;const auto owned=originalSources(fixture);
+        auto shallow=rules(fixture,false,true);const std::set<Id> expected{fixture.directId,fixture.extraId};
+        const auto queryFor=[&](size_t index){return L"System.FileName:~<\""+fixture.prefix+
+            L"\" AND System.Size:<="+std::to_wstring(1048576+index);};
+        SearchWindowContext context;context.query=queryFor(0);context.recursive=true;context.rules=shallow;
+        context.primaryScope=shallow.front().folder;context.closeOrigin=item(fixture.scope);
+        std::array<PCIDLIST_ABSOLUTE,2> scopeIds{};std::array<Pidl,2> nativeIds;
+        for(size_t index=0;index<shallow.size();++index) {
+            PIDLIST_ABSOLUTE raw=nullptr;const auto hr=SHGetIDListFromObject(shallow[index].folder.Get(),&raw);nativeIds[index].reset(raw);
+            exact(hr,"own stress original scope PIDL");require(nativeIds[index]!=nullptr,"stress scope identity missing");scopeIds[index]=nativeIds[index].get();
+        }
+        exact(SHCreateShellItemArrayFromIDLists(2,scopeIds.data(),&context.scopes),"actual stress original ordered scope array");
+        ComPtr<ExplorerApp> app;app.Attach(new ExplorerApp(GetModuleHandleW(nullptr),true,RibbonLayout::Authored));
+        exact(app->prepareSearchWindowContext(context),"actual App initial stress request");
+        exact(app->create(fixture.scope.native()),"create one private App for130 lifetime requests");
+        requireLayout(*app.Get(),RibbonLayout::Authored);await(*app.Get(),fixture,queryFor(0),shallow,owned,expected);
+        auto first=currentBacking(*app.Get());const auto firstPath=first->path();const auto firstId=identity(firstPath);const auto firstBytes=bytes(firstPath);
+        descriptors.note(firstPath,first->identity());descriptors.observe(*app->searchBackings_);
+        DelayedNativeReader external;ComPtr<IShellItem> originalItem;
+        exact(SHCreateItemFromIDList(app->currentPidl_.get(),IID_PPV_ARGS(&originalItem)),"retain actual first App accepted native item");
+        external.capture(originalItem.Get());originalItem.Reset();first.reset();
+        for(size_t index=1;index<130;++index) {
+            source(fixture);exact(app->startSearch(queryFor(index),true),"actual distinct App search intent beyond old128 cap");
+            await(*app.Get(),fixture,queryFor(index),shallow,owned,expected);
+            require(app->searchBackings_->retainedCount()==std::min(index+1,SearchBackingStore::maximumResidentBackings),
+                    "actual App Store resident cache exceeded128");
+            require(app->history_.size()<=100,"actual App history exceeded existing100-entry bound");
+            require(identity(firstPath)==firstId&&bytes(firstPath)==firstBytes,"actual App eviction/pruning changed old backing");
+        }
+        require(descriptors.files.size()==130&&app->searchBackings_->retainedCount()==128,"one actual App did not accept130 distinct native requests");
+        auto travel=history(*app.Get());const auto travelIndex=app->historyIndex_;
+        auto last=currentBacking(*app.Get());const auto lastPath=last->path();const auto lastId=identity(lastPath);
+        exact(app->execute(Back),"actual Back after130 App search intents");await(*app.Get(),fixture,queryFor(128),shallow,owned,expected);
+        require(sameHistory(*app.Get(),travel,travelIndex-1),"Back changed retained original travel PIDLs after eviction");
+        exact(app->execute(Forward),"actual Forward after130 App search intents");await(*app.Get(),fixture,queryFor(129),shallow,owned,expected);
+        require(sameHistory(*app.Get(),travel,travelIndex)&&identity(lastPath)==lastId,"Forward changed retained original descriptor/travel identity");
+        const auto resident=app->searchBackings_->retainedCount();
+        exact(app->startSearch(queryFor(129),true),"exact latest App query reuses current verified cache lease");
+        await(*app.Get(),fixture,queryFor(129),shallow,owned,expected);
+        require(descriptors.files.size()==130&&app->searchBackings_->retainedCount()==resident&&identity(lastPath)==lastId,
+                "identical current App query allocated/replaced immutable backing");
+        app->pruneSearchCaches(1);source(fixture);
+        require(identity(firstPath)==firstId&&bytes(firstPath)==firstBytes,"App history metadata pruning deleted old external target");
+        const auto directory=app->searchBackings_->directory();close(app,fixture);
+        require(fs::exists(directory)&&identity(firstPath)==firstId&&bytes(firstPath)==firstBytes,"App close removed original external native path");
+        external.verify(expected);source(fixture);descriptors.unchanged();external.release();
+        // The final native history PIDLs and scope/context aliases are cleared
+        // before explicit fixture cleanup; none is used as a last-user proof.
+        last.reset();travel.clear();context={};shallow.clear();nativeIds={};
+        descriptors.removeExplicitFixtureFiles();fixture.remove=true;
+    }
+
 };
 } // namespace explorer
 
 int wmain(int argc,wchar_t** argv) {
     auto requested=explorer::RibbonLayout::Authored;
+    bool residentStress=false;
     if(argc==2&&std::wcscmp(argv[1],L"--installed")==0)requested=explorer::RibbonLayout::InstalledWindows10;
+    else if(argc==2&&std::wcscmp(argv[1],L"--resident-stress")==0)residentStress=true;
     else if(argc!=1)return 2;
     const auto* layoutLabel=requested==explorer::RibbonLayout::InstalledWindows10?"installed-windows10":"authored";
     explorer::PrivateDesktop desktop;if(desktop.initialize()!=S_OK)return 3;
-    const auto initialized=OleInitialize(nullptr);if(FAILED(initialized))return 4;
+    explorer::NativeApartmentOwner nativeApartment;
+    const auto initialized=nativeApartment.initializeOle();if(FAILED(initialized))return 4;
     int failure=0;
-    try{explorer::SearchBackingNativeFixture::run(requested);std::cout<<"PASS: real App backed search/refinement/history/recreation/child/reentry/close layout="<<layoutLabel<<'\n';}
+    try{if(residentStress)explorer::SearchBackingNativeFixture::runResidentStress();
+        else explorer::SearchBackingNativeFixture::run(requested);
+        std::cout<<"PASS: real App backed search mode="<<(residentStress?"130-intent-resident-stress":"original-lifetime")<<" layout="<<layoutLabel<<'\n';}
     catch(const std::exception& error){failure=1;std::cerr<<"FAIL: actual App backed search layout="<<layoutLabel<<": "<<error.what()<<'\n';}
     const auto drained=explorer::drainStaWorkers(5000);
     if(FAILED(drained)){std::cerr<<"FAIL: actual final native worker drain\n";std::cerr.flush();TerminateProcess(GetCurrentProcess(),8);std::_Exit(8);}
     bool input=false,visible=true;
     if(desktop.verifyIsolation(&input)!=S_OK||!input||desktop.visibleWindowsOnInputDesktop(visible)!=S_OK||visible)failure=1;
-    OleUninitialize();return failure;
+    nativeApartment.finishOrTerminate();return failure;
 }

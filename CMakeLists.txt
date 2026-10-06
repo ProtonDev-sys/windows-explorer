@@ -10,6 +10,7 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 add_library(explorer_core STATIC src/core.cpp src/shell_operations.cpp src/search.cpp src/search_backing.cpp src/input.cpp src/item_actions.cpp src/context_menu.cpp src/quick_access.cpp src/saved_search.cpp src/library.cpp src/headless_visual.cpp src/namespace_actions.cpp src/theme.cpp src/chrome.cpp src/breadcrumb.cpp)
 target_include_directories(explorer_core PUBLIC include)
 target_sources(explorer_core PRIVATE src/app_commands.cpp src/search_history.cpp src/address_history.cpp src/typed_address.cpp src/live_search.cpp src/search_presentation_store.cpp src/selection.cpp src/ribbon_features.cpp src/worker_sta.cpp)
+target_sources(explorer_core PRIVATE src/native_apartment.cpp)
 target_sources(explorer_core PRIVATE src/state_file.cpp src/search_refinement.cpp src/search_window.cpp src/ui_strings.cpp src/ui_direction.cpp)
 target_sources(explorer_core PRIVATE src/focus_keyboard.cpp src/startup_desktop.cpp)
 target_compile_definitions(explorer_core PUBLIC UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
@@ -61,6 +62,81 @@ if(MSVC)
 endif()
 include(CTest)
 if(BUILD_TESTING)
+  # Default-OFF bounded, owned read-only resource diagnosis. Exit 0 is not parity.
+  option(EXPLORER_ENABLE_NATIVE_RESOURCE_ORACLE "Owned installed first-current/metadata/theme diagnostic" OFF)
+  if(EXPLORER_ENABLE_NATIVE_RESOURCE_ORACLE)
+    add_executable(native_resource_oracle tests/native_resource_oracle.cpp "${RIBBON_GENERATED_DIR}/ribbon.rc")
+    add_dependencies(native_resource_oracle explorer_ribbon_resources)
+    target_include_directories(native_resource_oracle PRIVATE "${RIBBON_GENERATED_DIR}")
+    target_link_libraries(native_resource_oracle PRIVATE explorer_ribbon explorer_core comctl32)
+    if(MSVC)
+      target_compile_options(native_resource_oracle PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    endif()
+    add_test(NAME installed_native_resource_oracle COMMAND native_resource_oracle --owned-read-only)
+    set_tests_properties(installed_native_resource_oracle PROPERTIES TIMEOUT 90 RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
+  endif()
+  add_executable(ribbon_image_provenance_tests
+    tests/ribbon_image_provenance_tests.cpp src/headless_crash.cpp "${RIBBON_GENERATED_DIR}/ribbon.rc")
+  add_dependencies(ribbon_image_provenance_tests explorer_ribbon_resources)
+  target_include_directories(ribbon_image_provenance_tests PRIVATE "${RIBBON_GENERATED_DIR}")
+  target_link_libraries(ribbon_image_provenance_tests PRIVATE explorer_ribbon explorer_core comctl32)
+  if(MSVC)
+    target_compile_options(ribbon_image_provenance_tests PRIVATE /W4 /permissive- /utf-8 /EHsc)
+  endif()
+  add_test(NAME installed_native_image_provenance COMMAND ribbon_image_provenance_tests)
+  # Null-current/unavailable native evidence is a skip, not parity coverage.
+  set_tests_properties(installed_native_image_provenance PROPERTIES
+    TIMEOUT 90 RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
+  # Actual App close integration; the only allowed test action is a read-only
+  # post-resolution sink. No pin provider invocation or profile persistence.
+  add_executable(app_shutdown_pins_tests tests/app_shutdown_pins_tests.cpp src/app.cpp src/app_preview.cpp
+    src/preview_host.cpp src/ribbon_app.cpp src/headless_smoke.cpp src/preview_diagnostics.cpp
+    src/headless_window_isolation.cpp src/headless_benchmark.cpp src/headless_crash.cpp
+    resources/app.rc "${RIBBON_GENERATED_DIR}/ribbon.rc")
+  add_dependencies(app_shutdown_pins_tests explorer_ribbon_resources)
+  target_include_directories(app_shutdown_pins_tests PRIVATE "${RIBBON_GENERATED_DIR}")
+  target_link_libraries(app_shutdown_pins_tests PRIVATE explorer_core explorer_ribbon uxtheme mpr psapi)
+  if(MSVC)
+    target_compile_options(app_shutdown_pins_tests PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    target_compile_options(app_shutdown_pins_tests PRIVATE "$<$<CONFIG:Release>:/Zi>")
+    target_link_options(app_shutdown_pins_tests PRIVATE /MANIFEST:NO)
+    target_link_options(app_shutdown_pins_tests PRIVATE "$<$<CONFIG:Release>:/DEBUG:FULL>"
+      "$<$<CONFIG:Release>:/OPT:REF>" "$<$<CONFIG:Release>:/OPT:ICF>"
+      "$<$<CONFIG:Release>:/INCREMENTAL:NO>"
+      "/PDBALTPATH:$<TARGET_PDB_FILE_NAME:app_shutdown_pins_tests>")
+  endif()
+  # Explicit opt-in prevents an accidental CTest run from opening native UIA.
+  option(EXPLORER_ENABLE_APP_SHUTDOWN_PIN_RESOLUTION_TESTS "Owned private-desktop final-pin resolution tests (no provider Invoke)" OFF)
+  if(EXPLORER_ENABLE_APP_SHUTDOWN_PIN_RESOLUTION_TESTS)
+    add_test(NAME native_app_shutdown_pin_resolution COMMAND app_shutdown_pins_tests --owned-read-only)
+    set_tests_properties(native_app_shutdown_pin_resolution PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
+    if(CMAKE_HOST_SYSTEM_VERSION MATCHES "^10\\.0\\.19045")
+      add_test(NAME native_app_shutdown_pin_resolution_installed COMMAND app_shutdown_pins_tests --owned-read-only --installed)
+      set_tests_properties(native_app_shutdown_pin_resolution_installed PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
+    endif()
+  endif()
+  # Separate disposable GitHub-hosted job only. OFF excludes target and test.
+  option(EXPLORER_ENABLE_HOSTED_APP_PIN_PERSISTENCE_TESTS "Fresh Hosted VM owned App pin persistence mutation fixture" OFF)
+  if(EXPLORER_ENABLE_HOSTED_APP_PIN_PERSISTENCE_TESTS)
+    add_executable(app_pin_persistence_hosted_tests tests/app_pin_persistence_hosted_tests.cpp
+      src/app.cpp src/app_preview.cpp src/preview_host.cpp src/ribbon_app.cpp src/headless_smoke.cpp
+      src/preview_diagnostics.cpp src/headless_window_isolation.cpp src/headless_benchmark.cpp
+      src/headless_crash.cpp resources/app.rc "${RIBBON_GENERATED_DIR}/ribbon.rc")
+    add_dependencies(app_pin_persistence_hosted_tests explorer_ribbon_resources)
+    target_include_directories(app_pin_persistence_hosted_tests PRIVATE "${RIBBON_GENERATED_DIR}")
+    target_compile_definitions(app_pin_persistence_hosted_tests PRIVATE EXPLORER_HOSTED_PIN_PERSISTENCE_FIXTURE=1)
+    target_link_libraries(app_pin_persistence_hosted_tests PRIVATE explorer_core explorer_ribbon uxtheme mpr psapi)
+    if(MSVC)
+      target_compile_options(app_pin_persistence_hosted_tests PRIVATE /W4 /permissive- /utf-8 /EHsc)
+      target_link_options(app_pin_persistence_hosted_tests PRIVATE /MANIFEST:NO)
+    endif()
+    add_test(NAME hosted_app_pin_persistence_owned COMMAND app_pin_persistence_hosted_tests
+      --fresh-hosted-owned-pin-persistence "$ENV{EXPLORER_HOSTED_PIN_ADMISSION}" --authored --normal-flow)
+    add_test(NAME hosted_app_final_pin_persistence_owned COMMAND app_pin_persistence_hosted_tests
+      --fresh-hosted-owned-pin-persistence "$ENV{EXPLORER_HOSTED_PIN_ADMISSION}" --authored --final-destroy-only)
+    set_tests_properties(hosted_app_pin_persistence_owned hosted_app_final_pin_persistence_owned PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE
+      LABELS "hosted-profile-mutation;explicit-opt-in")
+  endif()
   add_executable(search_app_backing_tests tests/app_search_backing_tests.cpp src/app.cpp src/app_preview.cpp
     src/preview_host.cpp src/ribbon_app.cpp src/headless_smoke.cpp src/preview_diagnostics.cpp
     src/headless_window_isolation.cpp src/headless_benchmark.cpp src/headless_crash.cpp
@@ -74,6 +150,12 @@ if(BUILD_TESTING)
   endif()
   add_test(NAME native_app_search_backing_lifetime COMMAND search_app_backing_tests)
   set_tests_properties(native_app_search_backing_lifetime PROPERTIES TIMEOUT 90)
+  # Additional real App 130-intent test; original lifetime/test bounds remain.
+  option(EXPLORER_ENABLE_SEARCH_BACKING_RESIDENT_STRESS_TESTS "130 real App queries and delayed native binding" OFF)
+  if(EXPLORER_ENABLE_SEARCH_BACKING_RESIDENT_STRESS_TESTS)
+    add_test(NAME native_app_search_backing_resident_cache COMMAND search_app_backing_tests --resident-stress)
+    set_tests_properties(native_app_search_backing_resident_cache PROPERTIES TIMEOUT 90 RUN_SERIAL TRUE)
+  endif()
   add_executable(search_backing_tests tests/search_backing_tests.cpp)
   target_link_libraries(search_backing_tests PRIVATE explorer_core)
   if(MSVC)
@@ -149,7 +231,7 @@ if(BUILD_TESTING)
   set_tests_properties(native_video_cast_state PROPERTIES TIMEOUT 30)
   # Includes bounded native Details/Preview realization and actual UIA teardown.
   set_tests_properties(hidden_shell_host PROPERTIES TIMEOUT 150)
-  # Isolated QAT candidate regression: two real layouts, one private process.
+  # Isolated QAT regression: authored everywhere, both layouts on Windows 10 19045.
   add_executable(native_quick_access_tests tests/native_quick_access_tests.cpp "${RIBBON_GENERATED_DIR}/ribbon.rc")
   add_dependencies(native_quick_access_tests explorer_ribbon_resources)
   target_include_directories(native_quick_access_tests PRIVATE "${RIBBON_GENERATED_DIR}")
@@ -157,11 +239,29 @@ if(BUILD_TESTING)
   if(MSVC)
     target_compile_options(native_quick_access_tests PRIVATE /W4 /permissive- /utf-8 /EHsc)
   endif()
-  add_test(NAME native_quick_access_preservation COMMAND native_quick_access_tests)
+  set(QAT_LAYOUT_TEST_ARGS)
+  if(NOT CMAKE_HOST_SYSTEM_VERSION MATCHES "^10\\.0\\.19045($|\\.)")
+    list(APPEND QAT_LAYOUT_TEST_ARGS --authored-only)
+  endif()
+  add_test(NAME native_quick_access_preservation COMMAND native_quick_access_tests ${QAT_LAYOUT_TEST_ARGS})
   # Internal30s is admission only; synchronous COM cleanup has this outer bound.
   set_tests_properties(native_quick_access_preservation PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE)
-  add_test(NAME native_quick_access_settings_envelope COMMAND native_quick_access_tests --settings-envelope-control)
+  add_test(NAME native_quick_access_settings_envelope COMMAND native_quick_access_tests --settings-envelope-control ${QAT_LAYOUT_TEST_ARGS})
   set_tests_properties(native_quick_access_settings_envelope PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE)
+  # Experimental real native context-menu gesture mode. Existing tests unchanged.
+  option(WINDOWSEXPLORER_QAT_GESTURE_TESTS "Enable owned native QAT context gestures" OFF)
+  if(WINDOWSEXPLORER_QAT_GESTURE_TESTS)
+    add_test(NAME native_quick_access_gestures_authored
+      COMMAND native_quick_access_tests --native-context-gesture --authored-only)
+    set_tests_properties(native_quick_access_gestures_authored
+      PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE SKIP_RETURN_CODE 77 LABELS "experimental;native;qat-gesture")
+    if(CMAKE_HOST_SYSTEM_VERSION MATCHES "^10\\.0\\.19045($|\\.)")
+      add_test(NAME native_quick_access_gestures_installed
+        COMMAND native_quick_access_tests --native-context-gesture --installed-only)
+      set_tests_properties(native_quick_access_gestures_installed
+        PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE SKIP_RETURN_CODE 77 LABELS "experimental;native;qat-gesture")
+    endif()
+  endif()
   add_executable(explorer_ribbon_tests tests/ribbon_tests.cpp "${RIBBON_GENERATED_DIR}/ribbon.rc")
   add_dependencies(explorer_ribbon_tests explorer_ribbon_resources)
   target_include_directories(explorer_ribbon_tests PRIVATE "${RIBBON_GENERATED_DIR}")
@@ -257,3 +357,20 @@ set(CPACK_GENERATOR ZIP)
 set(CPACK_PACKAGE_NAME windows-explorer)
 set(CPACK_PACKAGE_VERSION ${PROJECT_VERSION})
 include(CPack)
+
+if(BUILD_TESTING)
+  # Own real creator apartments and exact loaded-code release after uninitialize.
+  add_executable(native_apartment_tests tests/native_apartment_tests.cpp "${RIBBON_GENERATED_DIR}/ribbon.rc")
+  add_dependencies(native_apartment_tests explorer_ribbon_resources)
+  target_include_directories(native_apartment_tests PRIVATE "${RIBBON_GENERATED_DIR}")
+  target_link_libraries(native_apartment_tests PRIVATE explorer_core explorer_ribbon)
+  if(MSVC)
+    target_compile_options(native_apartment_tests PRIVATE /W4 /permissive- /utf-8 /EHsc)
+  endif()
+  add_test(NAME native_apartment_contract COMMAND native_apartment_tests)
+  set_tests_properties(native_apartment_contract PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE)
+  if(CMAKE_HOST_SYSTEM_VERSION MATCHES "^10[.]0[.]19045([.]|$)")
+    add_test(NAME native_apartment_module_lifetime COMMAND native_apartment_tests --module)
+    set_tests_properties(native_apartment_module_lifetime PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
+  endif()
+endif()

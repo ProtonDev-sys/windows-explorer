@@ -1,3 +1,4 @@
+#include "explorer/native_apartment.hpp"
 #include "explorer/core.hpp"
 #include "explorer/headless_visual.hpp"
 #include "explorer/worker_sta.hpp"
@@ -281,11 +282,12 @@ int main(int argc, char** argv) {
             mode == "--menu-state-stress-files-registered" ? NativeMenuStateBucket::StressFilesRegistered :
             mode == "--menu-state-stress-mixed-native" ? NativeMenuStateBucket::StressMixedNative :
             mode == "--menu-state-stress-mixed-registered" ? NativeMenuStateBucket::StressMixedRegistered : NativeMenuStateBucket::Stress;
-        const auto initialized = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        explorer::NativeApartmentOwner nativeApartment;
+        const auto initialized = nativeApartment.initializeSta();
         if (FAILED(initialized)) return 1;
         const auto failures = runNativeMenuStateTests(bucket);
         drainCreatorBeforeShutdown();
-        CoUninitialize();
+        nativeApartment.finishOrTerminate();
         return failures ? 1 : 0;
     }
     if (argc == 2 && (std::string_view(argv[1]) == "--search-only" || std::string_view(argv[1]) == "--namespace-only" ||
@@ -294,7 +296,8 @@ int main(int argc, char** argv) {
                      std::string_view(argv[1]) == "--saved-search-only" || std::string_view(argv[1]) == "--library-only" ||
                      std::string_view(argv[1]) == "--app-commands-only" ||
                      std::string_view(argv[1]) == "--direction-only")) {
-        const auto initialized = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        explorer::NativeApartmentOwner nativeApartment;
+        const auto initialized = nativeApartment.initializeSta();
         if (FAILED(initialized)) return 1;
         auto failures = mode == "--search-only" ? runSearchTests() :
             mode == "--namespace-only" ? runNamespaceActionTests() :
@@ -313,19 +316,21 @@ int main(int argc, char** argv) {
                 std::cerr << "FAIL: final dedicated native suite private-desktop/input-window isolation\n";
             }
         }
-        CoUninitialize();
+        nativeApartment.finishOrTerminate();
         return failures ? 1 : 0;
     }
     if (argc == 2 && std::string_view(argv[1]) == "--worker-after-autocomplete") {
-        const auto initialized = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        explorer::NativeApartmentOwner nativeApartment;
+        const auto initialized = nativeApartment.initializeSta();
         if (FAILED(initialized)) return 1;
         const auto failures = runSearchHistoryTests() + runStaWorkerTests();
         drainCreatorBeforeShutdown();
-        CoUninitialize();
+        nativeApartment.finishOrTerminate();
         return failures ? 1 : 0;
     }
     if (argc != 1 && !coreOnly) return 2;
-    const HRESULT initialized = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    explorer::NativeApartmentOwner nativeApartment;
+    const HRESULT initialized = nativeApartment.initializeSta();
     if (FAILED(initialized)) {
         std::cerr << "FAIL: Cannot initialize COM for headless shell tests\n";
         return 1;
@@ -381,7 +386,7 @@ int main(int argc, char** argv) {
         ++failures;
         std::cerr << "FAIL: final core private-desktop/input-window isolation\n";
     }
-    CoUninitialize();
+    nativeApartment.finishOrTerminate();
     std::cout << "Core suite elapsed_ms=" << GetTickCount64() - suiteStarted
               << " failures=" << failures << '\n';
     return failures == 0 ? 0 : 1;

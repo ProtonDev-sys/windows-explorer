@@ -1,5 +1,6 @@
 #include "explorer/search_backing.hpp"
 #include <shlobj.h>
+#include <shlguid.h>
 #include <array>
 #include <algorithm>
 #include <cstring>
@@ -102,7 +103,7 @@ struct SearchBackingStore::Impl {
     void* createdFileObserverContext=nullptr;
     struct Record {std::wstring query;std::vector<RuleKey> rules;std::shared_ptr<SearchBackingLease> lease;};
     std::vector<Record> records;
-    explicit Impl(std::filesystem::path p):parent(std::move(p)){records.reserve(maximumBackings);}
+    explicit Impl(std::filesystem::path p):parent(std::move(p)){records.reserve(maximumResidentBackings);}
     HRESULT currentDirectory() {
         auto pathHandle=openMetadata(root,FILE_READ_ATTRIBUTES,true);if(!pathHandle)return nativeError();
         FILE_ID_INFO id{};FILE_BASIC_INFO basic{};const auto hr=metadata(pathHandle.value,id,basic);
@@ -115,8 +116,10 @@ struct SearchBackingStore::Impl {
         // a successor GUID on each edit. A failed native setup stays failed.
         if(!root.empty())return FAILED(initializationFailure)?initializationFailure:E_ACCESSDENIED;
         if(parent.empty()) {
-            std::array<wchar_t,32768> temp{};const auto size=GetTempPathW(static_cast<DWORD>(temp.size()),temp.data());
-            if(!size||size>=temp.size())return nativeError();parent=temp.data();
+            PWSTR raw=nullptr;const auto located=SHGetKnownFolderPath(FOLDERID_LocalAppData,KF_FLAG_DEFAULT,nullptr,&raw);
+            struct Text {PWSTR value;~Text(){CoTaskMemFree(value);}} owned{raw};
+            if(FAILED(located))return located;if(located!=S_OK||!raw||!*raw)return E_UNEXPECTED;
+            parent=raw;
         }
         if(!parent.is_absolute()||parent.native().find(L'\0')!=std::wstring::npos)return E_INVALIDARG;
         auto original=openMetadata(parent,FILE_READ_ATTRIBUTES,true);if(!original)return nativeError();
@@ -128,7 +131,7 @@ struct SearchBackingStore::Impl {
         if(!CreateDirectoryW(next.c_str(),nullptr))return nativeError();
         // From here the exact created root is retained even on failure. No
         // recursive path delete and no cleanup of a colliding existing name.
-        root=std::move(next);directory=openMetadata(root,FILE_READ_ATTRIBUTES|DELETE,true);
+        root=std::move(next);directory=openMetadata(root,FILE_READ_ATTRIBUTES,true);
         if(!directory){initializationFailure=nativeError();return initializationFailure;}
         FILE_BASIC_INFO basic{};hr=metadata(directory.value,directoryId,basic);
         initializationFailure=FAILED(hr)?hr:(basic.FileAttributes&FILE_ATTRIBUTE_DIRECTORY)?S_OK:E_ACCESSDENIED;
@@ -157,25 +160,35 @@ HRESULT SearchBackingStore::build(const std::wstring& query,const std::vector<Se
         if(FAILED(hr))return hr;if(!required)return E_INVALIDARG;
         if(FAILED(hr=validateSearchDescriptorQuery(query)))return hr;
         std::vector<RuleKey> key;if(FAILED(hr=captureKey(descriptorRules,key)))return hr;
-        for(const auto& record:state.records) if(record.lease&&record.lease->impl_->read&&record.query==query&&record.rules==key) {
+        for(size_t index=0;index<state.records.size();++index) {
+            const auto& record=state.records[index];
+            if(!record.lease||!record.lease->impl_->read||record.query!=query||record.rules!=key)continue;
+            // Own the lease independently before the genuine native parse.
+            // Store mutation/close is rejected while this build is on-stack.
+            const auto lease=record.lease;
             if(FAILED(hr=state.currentDirectory()))return hr;
             FILE_ID_INFO id{};FILE_BASIC_INFO basic{};hr=metadata(record.lease->impl_->read.value,id,basic);
             if(FAILED(hr))return hr;if(!sameId(id,record.lease->impl_->id)||!sameBasic(basic,record.lease->impl_->basic))return E_ACCESSDENIED;
             if(FAILED(hr=record.lease->impl_->currentPath()))return hr;
-            SearchFolderBuild next;next.backing=record.lease;
+            SearchFolderBuild next;next.backing=lease;
             if(FAILED(hr=parseOwned(next.backing->path(),next.item)))return hr;
             if(state.closed||FAILED(hr=state.currentDirectory()))return state.closed?E_ABORT:hr;
-            if(FAILED(hr=record.lease->impl_->currentPath()))return hr;
+            if(FAILED(hr=lease->impl_->currentPath()))return hr;
+            // MRU only after exact native path/source admission succeeds.
+            std::rotate(state.records.begin()+index,state.records.begin()+index+1,state.records.end());
             *result=std::move(next);return S_OK;
         }
-        if(state.records.size()>=maximumBackings)return HRESULT_FROM_WIN32(ERROR_TOO_MANY_NAMES);
         if(FAILED(hr=state.initialize()))return hr;
         auto owned=std::make_unique<SearchBackingLease::Impl>();
-        owned->path=state.root/(L"query-"+std::to_wstring(state.records.size())+L".search-ms");
+        GUID descriptor{};if(FAILED(hr=CoCreateGuid(&descriptor)))return hr;
+        wchar_t descriptorText[40]{};if(!StringFromGUID2(descriptor,descriptorText,40))return E_UNEXPECTED;
+        // Cache positions never become names. CREATE_NEW is authoritative if
+        // a GUID collision occurs; no path is reused, overwritten or adopted.
+        owned->path=state.root/(std::wstring(L"query-")+descriptorText+L".search-ms");
         auto lease=std::shared_ptr<SearchBackingLease>(new SearchBackingLease(std::move(owned)));
-        // Reserve before any writer COM callback. Failed/obsolete published
-        // files are conservatively retained too; nothing deletes under a view.
-        state.records.push_back({query,std::move(key),lease});
+        // Allocate the complete cache key before any writer callback. A
+        // failed/notified file persists, but consumes no resident cache slot.
+        Impl::Record pending{query,std::move(key),lease};
         SearchCreatedFileProof proof;
         hr=saveSearchForScopeRules(query,descriptorRules,lease->path(),SearchSaveMode::CreateNew,nullptr,nullptr,&proof);
         if(FAILED(hr))return hr;
@@ -200,6 +213,11 @@ HRESULT SearchBackingStore::build(const std::wstring& query,const std::vector<Se
         if(FAILED(hr=parseOwned(backing.path,next.item)))return hr;
         if(state.closed||FAILED(hr=state.currentDirectory()))return state.closed?E_ABORT:hr;
         if(FAILED(hr=backing.currentPath()))return hr;
+        // Eviction releases cache ownership only, never an App/history lease
+        // or a descriptor path. Misses reconstruct a fresh native descriptor;
+        // old native items/PIDLs still name their untouched original files.
+        if(state.records.size()==maximumResidentBackings)state.records.erase(state.records.begin());
+        state.records.push_back(std::move(pending));
         *result=std::move(next);return S_OK;
     }catch(const std::bad_alloc&){return E_OUTOFMEMORY;}
     catch(const std::filesystem::filesystem_error&){return E_INVALIDARG;}
@@ -209,32 +227,17 @@ HRESULT SearchBackingStore::closeAfterNativeTeardown() noexcept {
     auto& state=*impl_;
     if(GetCurrentThreadId()!=state.creator)return RPC_E_WRONG_THREAD;
     if(state.busy)return HRESULT_FROM_WIN32(ERROR_BUSY);
-    for(const auto& record:state.records)if(record.lease.use_count()!=1)return HRESULT_FROM_WIN32(ERROR_BUSY);
+    if(state.closed)return S_FALSE;
     state.closed=true;
+    // Preserve the actual root error; even failure grants no deletion/adoption
+    // authority. No catalog scan, file disposition, alias count or native
+    // consumer guess is involved in retiring this bounded cache.
+    HRESULT result=S_OK;
     try {
-        if(!state.directory)return state.root.empty()?S_OK:E_ACCESSDENIED;
-        auto hr=state.currentDirectory();if(FAILED(hr))return hr;
-        for(auto& record:state.records) {
-            auto& lease=*record.lease->impl_;
-            if(!lease.read) {
-                // Failed pre-publication records may have no file. Even a
-                // writer identity is insufficient without a matching retained
-                // read lease; never adopt the current replacement as owned.
-                const auto attrs=GetFileAttributesW(lease.path.c_str());
-                if(attrs==INVALID_FILE_ATTRIBUTES&&GetLastError()==ERROR_FILE_NOT_FOUND)continue;
-                return E_ACCESSDENIED;
-            }
-            auto removal=openMetadata(lease.path,FILE_READ_ATTRIBUTES|DELETE);if(!removal)return nativeError();
-            FILE_ID_INFO id{};FILE_BASIC_INFO basic{};hr=metadata(removal.value,id,basic);
-            if(FAILED(hr))return hr;if(!sameId(id,lease.id)||!sameBasic(basic,lease.basic))return E_ACCESSDENIED;
-            FILE_DISPOSITION_INFO disposition{TRUE};
-            if(!SetFileInformationByHandle(removal.value,FileDispositionInfo,&disposition,sizeof(disposition)))return nativeError();
-            lease.read.reset();removal.reset();
-        }
-        FILE_DISPOSITION_INFO disposition{TRUE};
-        if(!SetFileInformationByHandle(state.directory.value,FileDispositionInfo,&disposition,sizeof(disposition)))return nativeError();
-        state.directory.reset();state.records.clear();return S_OK;
-    }catch(...){return E_FAIL;}
+        if(state.directory)result=state.currentDirectory();
+        else if(!state.root.empty())result=FAILED(state.initializationFailure)?state.initializationFailure:E_ACCESSDENIED;
+    }catch(...){result=E_FAIL;}
+    state.records.clear();state.directory.reset();return result;
 }
 
 HRESULT buildSearchFolder(const std::wstring& query,const std::vector<SearchScopeRule>& rules,

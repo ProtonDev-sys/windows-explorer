@@ -1,3 +1,4 @@
+#include "explorer/native_apartment.hpp"
 #include "explorer/headless_visual.hpp"
 #include "explorer/ribbon.hpp"
 
@@ -321,7 +322,8 @@ int main(int argc, char** argv) {
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX);
     explorer::PrivateDesktop desktop;
     if (FAILED(desktop.initialize())) return 2;
-    const auto initialized = OleInitialize(nullptr);
+    explorer::NativeApartmentOwner nativeApartment;
+    const auto initialized = nativeApartment.initializeOle();
     if (FAILED(initialized)) return 3;
     int result = 0;
     try {
@@ -345,6 +347,6 @@ int main(int argc, char** argv) {
         std::cerr << "FAIL: " << error.what() << '\n';
         result = 1;
     }
-    OleUninitialize();
+    nativeApartment.finishOrTerminate();
     return result;
 }

@@ -1,3 +1,4 @@
+#include "explorer/native_apartment.hpp"
 #include "explorer/breadcrumb.hpp"
 #include "explorer/context_menu.hpp"
 #include "explorer/headless_visual.hpp"
@@ -1499,7 +1500,8 @@ int main(int argc, char** argv) {
     std::unique_ptr<NativeCallWatchdog> watchdog;
     try { watchdog = std::make_unique<NativeCallWatchdog>(); }
     catch (...) { std::cerr << "FAIL: start owned native-call watchdog\n"; return 1; }
-    const auto initialized = nativeCall("OleInitialize", [] { return OleInitialize(nullptr); });
+    explorer::NativeApartmentOwner nativeApartment;
+    const auto initialized = nativeCall("OleInitialize", [&] { return nativeApartment.initializeOle(); });
     if (FAILED(initialized)) { std::cerr << "FAIL: initialize isolated transfer STA\n"; return 1; }
     int result = 0;
     try { run(dropsOnly); }
@@ -1512,7 +1514,7 @@ int main(int argc, char** argv) {
         if (!TerminateProcess(GetCurrentProcess(), 1)) std::_Exit(1);
         std::_Exit(1);
     }
-    nativeCall("OleUninitialize", [] { OleUninitialize(); });
+    nativeCall("OleUninitialize", [&] { nativeApartment.finishOrTerminate(); });
     if (FAILED(desktop.verifyIsolation())) result = 1;
     return result;
 }

@@ -2,6 +2,7 @@
 
 #include "explorer/context_menu.hpp"
 
+#include <array>
 #include <memory>
 #include <span>
 #include <string_view>
@@ -98,6 +99,28 @@ struct NamespaceCommandMetadata {
     // Actual provider/registered Icon specification, e.g. imageres.dll,-5344. The caller
     // resolves the resource at its current DPI rather than replacing the glyph.
     std::wstring icon;
+};
+
+// Opt-in bounded plain receipts over the existing native metadata route.
+// status is the actual native/registry HRESULT; returned is the existing
+// apartment-wrapper HRESULT. attempted distinguishes real E_PENDING output
+// from a native method that was never admitted. Text truncation is diagnostic.
+struct NamespaceMetadataTextReceipt {
+    HRESULT status=E_PENDING,returned=E_PENDING;
+    bool attempted=false,present=false,truncated=false;
+    std::array<wchar_t,1024> text{};
+};
+struct NamespaceCommandMetadataDiagnostics {
+    DWORD creatorThread=0;
+    HRESULT metadataRegistryOpen=E_PENDING,providerRegistryOpen=E_PENDING;
+    HRESULT handlerRead=E_PENDING,handlerParse=E_PENDING,providerCreate=E_PENDING,nativeProviderCreate=E_PENDING,objectQuery=E_PENDING;
+    HRESULT initializerQuery=E_PENDING,propertyBagOpen=E_PENDING,initialize=E_PENDING,nativeInitialize=E_PENDING;
+    HRESULT siteQuery=E_PENDING,siteAttach=E_PENDING,nativeSiteAttach=E_PENDING,siteDetach=E_PENDING,nativeSiteDetach=E_PENDING;
+    HRESULT providerLoad=E_PENDING,returned=E_PENDING;
+    CLSID handler=CLSID_NULL;
+    bool initialized=false,siteSupplied=false,siteAttached=false,diagnosticException=false;
+    NamespaceMetadataTextReceipt muiVerb,defaultVerb,description,icon,handlerText;
+    std::array<NamespaceMetadataTextReceipt,3> providerFields{}; // Title, Icon, ToolTip
 };
 
 struct NamespaceSubcommandMetadata {
@@ -276,6 +299,11 @@ std::wstring_view namespaceActionLabel(NamespaceAction action) noexcept;
 HRESULT namespaceCommandMetadata(std::wstring_view command,
                                  NamespaceCommandMetadata* result,
                                  IShellItemArray* selection = nullptr,IUnknown* site = nullptr);
+// Same calls/order/precedence as namespaceCommandMetadata. The receipt is
+// borrowed synchronously through actual provider retirement on the creator STA.
+HRESULT namespaceCommandMetadataWithDiagnostics(std::wstring_view command,
+    NamespaceCommandMetadata* result,IShellItemArray* selection,IUnknown* site,
+    NamespaceCommandMetadataDiagnostics* diagnostics) noexcept;
 // Reads IExplorerCommand::EnumSubCommands/GetTitle/GetIcon/GetState(FALSE) only.
 // Windows.IconSize exposes the OS's eight localized View gallery items here.
 // Enumeration order is native; GUID_NULL is retained when a provider has no ID.

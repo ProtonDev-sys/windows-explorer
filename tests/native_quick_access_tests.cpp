@@ -1,3 +1,4 @@
+#include "explorer/native_apartment.hpp"
 #include "explorer/ribbon.hpp"
 #include "explorer/commands.hpp"
 #include "explorer/headless_visual.hpp"
@@ -9,6 +10,13 @@
 #include <wrl/client.h>
 #include <bcrypt.h>
 #include <ocidl.h>
+#include <UIAutomation.h>
+#include <oleacc.h>
+#include <chrono>
+#include <future>
+#include <thread>
+#include <memory>
+#include "qat_gesture_context_dispatch.hpp"
 #include <algorithm>
 #include <array>
 #include <cstdlib>
@@ -283,6 +291,8 @@ void edit(explorer::NativeRibbon& ribbon, const explorer::RibbonQuickAccessSnaps
           explorer::RibbonQuickAccessEditKind kind, UINT command, UINT index, UINT destination) {
     exact(ribbon.editQuickAccess(captured, {kind, command, index, destination}), "One targeted actual native QAT edit");
 }
+
+#include "native_qat_gesture_fixture.hpp"
 
 void runLayout(explorer::RibbonLayout layout, const Directory& files, ULONGLONG deadline) {
     using namespace explorer;
@@ -673,21 +683,40 @@ void runSettingsEnvelopeLayout(explorer::RibbonLayout layout, ULONGLONG deadline
     std::cout << "PASS QAT settings envelope layout=" << static_cast<UINT>(layout) << " ordered20=1 opaqueLegacy=1 corruptBeforeMutation=10"
         << " exactSetCountRollback=1 atomicFailure=1 metadataFence=1 sourceReentry=1 newerLoadEdit=1 retiredGeneration=1" << std::endl;
 }
-int runSettingsEnvelopeControls(ULONGLONG deadline) {
-    runSettingsEnvelopeLayout(explorer::RibbonLayout::Authored, deadline);
-    runSettingsEnvelopeLayout(explorer::RibbonLayout::InstalledWindows10, deadline);
-    std::cout << "PASS QAT settings envelope actual layouts=2 assertions=" << assertions << std::endl; return 0;
+int runSettingsEnvelopeControls(ULONGLONG deadline, bool authoredOnly) {
+    UINT actualLayouts = 0;
+    runSettingsEnvelopeLayout(explorer::RibbonLayout::Authored, deadline); ++actualLayouts;
+    if (!authoredOnly) { runSettingsEnvelopeLayout(explorer::RibbonLayout::InstalledWindows10, deadline); ++actualLayouts; }
+    std::cout << "PASS QAT settings envelope actual layouts=" << actualLayouts << " assertions=" << assertions << std::endl; return 0;
 }
 } // namespace
 
 int main(int argc, char** argv) {
-    const bool settingsControl = argc == 2 && std::string_view(argv[1]) == "--settings-envelope-control";
-    if (argc != 1 && !settingsControl) { std::cerr << "Usage: native_quick_access_tests [--settings-envelope-control]" << std::endl; return 2; }
+    bool settingsControl = false, authoredOnly = false, nativeGesture = false, installedOnly = false;
+    for (int index = 1; index < argc; ++index) {
+        const std::string_view argument(argv[index]);
+        if (argument == "--native-context-gesture" && !nativeGesture) nativeGesture = true;
+        else if (argument == "--installed-only" && !installedOnly) installedOnly = true;
+        else if (argument == "--settings-envelope-control" && !settingsControl) settingsControl = true;
+        else if (argument == "--authored-only" && !authoredOnly) authoredOnly = true;
+        else { std::cerr << "Usage: native_quick_access_tests [--settings-envelope-control | --native-context-gesture] [--authored-only | --installed-only]" << std::endl; return 2; }
+    }
+    if ((nativeGesture && settingsControl) || (authoredOnly && installedOnly) || (installedOnly && !nativeGesture) ||
+        (nativeGesture && !authoredOnly && !installedOnly)) return 2;
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX);
     explorer::PrivateDesktop desktop;
     const auto guard = desktop.initialize();
     if (guard != S_OK) { std::cerr << "FAIL private desktop HRESULT=" << static_cast<ULONG>(guard) << std::endl; return 2; }
-    const auto apartment = OleInitialize(nullptr);
+    if (nativeGesture) {
+        SetLastError(ERROR_SUCCESS);
+        const auto changed = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        const auto error = GetLastError();
+        const bool exactDpi = AreDpiAwarenessContextsEqual(GetThreadDpiAwarenessContext(), DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) != FALSE;
+        std::cout << "QAT gesture PMv2 set=" << changed << " error=" << error << " exactReadback=" << exactDpi << std::endl;
+        if (!exactDpi) { std::cerr << "UNAVAILABLE owned PMv2 gesture coordinates" << std::endl; return 77; }
+    }
+    explorer::NativeApartmentOwner nativeApartment;
+    const auto apartment = nativeApartment.initializeOle();
     if (FAILED(apartment)) { std::cerr << "FAIL native STA HRESULT=" << static_cast<ULONG>(apartment) << std::endl; return 3; }
     int result = 0;
     try {
@@ -697,15 +726,30 @@ int main(int argc, char** argv) {
         WNDCLASSW host{}; host.lpfnWndProc = DefWindowProcW; host.hInstance = GetModuleHandleW(nullptr);
         host.lpszClassName = L"WindowsExplorerNativeQATRegression";
         require(RegisterClassW(&host) != 0, "Register exact private native QAT owner class");
-        if (settingsControl) result = runSettingsEnvelopeControls(deadline);
+        UINT actualLayouts = 0;
+        if (nativeGesture) {
+            require(authoredOnly || installedOnly, "Gesture mode requires one explicit layout per fresh process");
+            std::array<BYTE, 256> originalKeys{};
+            require(GetKeyboardState(originalKeys.data()) != FALSE, "Read original creator key state");
+            const HWND originalActive = GetActiveWindow(), originalFocus = GetFocus();
+            runGestureLayout(installedOnly ? explorer::RibbonLayout::InstalledWindows10 : explorer::RibbonLayout::Authored, deadline);
+            std::array<BYTE, 256> finalKeys{};
+            require(GetKeyboardState(finalKeys.data()) != FALSE && finalKeys == originalKeys, "Native gestures changed creator256 key state");
+            require(!GetActiveWindow() && !GetFocus() && !originalActive && !originalFocus, "Gesture host teardown retained focus/active HWND");
+            exact(desktop.verifyIsolation(), "Final gesture private desktop identity");
+            bool exposed = true; exact(desktop.visibleWindowsOnInputDesktop(exposed), "Final gesture input desktop observation");
+            require(!exposed, "Native gesture exposed a visible own window on input desktop");
+        }
+        else if (settingsControl) result = runSettingsEnvelopeControls(deadline, authoredOnly);
         else {
             Directory files;
-            runLayout(explorer::RibbonLayout::Authored, files, deadline);
-            runLayout(explorer::RibbonLayout::InstalledWindows10, files, deadline);
+            runLayout(explorer::RibbonLayout::Authored, files, deadline); ++actualLayouts;
+            if (!authoredOnly) { runLayout(explorer::RibbonLayout::InstalledWindows10, files, deadline); ++actualLayouts; }
         }
         require(UnregisterClassW(host.lpszClassName, host.hInstance) != FALSE, "Release owned QAT host class");
-        if (!settingsControl) std::cout << "PASS native QAT real framework regression assertions=" << assertions << std::endl;
-    } catch (const std::exception& error) { std::cerr << "FAIL " << error.what() << std::endl; result = 1; }
-    OleUninitialize();
+        if (!settingsControl && !nativeGesture) std::cout << "PASS native QAT real framework regression actual layouts=" << actualLayouts << " assertions=" << assertions << std::endl;
+    } catch (const GestureUnavailable& error) { std::cerr << "UNAVAILABLE " << error.what() << std::endl; result = 77; }
+    catch (const std::exception& error) { std::cerr << "FAIL " << error.what() << std::endl; result = 1; }
+    nativeApartment.finishOrTerminate();
     return result;
 }

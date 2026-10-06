@@ -25,6 +25,38 @@ struct ContextMenuEntry {
     bool enabled() const noexcept { return (state & (MFS_DISABLED | MFS_GRAYED)) == 0; }
 };
 
+// Optional external diagnostics for the real create/createLeafState native calls.
+// The callback can pump or throw. A failed callback aborts creation; it cannot
+// turn an actual native failure or an invalidated generation into success.
+// operationResult is raw, and is E_PENDING/unattempted on a before boundary.
+// The observer and its state must remain alive for the entire synchronous call.
+// Do not reuse one observer for a reentrant or concurrent creation.
+struct NativeContextMenuCreateBoundary {
+    const char* operation = nullptr;
+    bool after = false;
+    bool attempted = false;
+    HRESULT operationResult = E_PENDING;
+    std::uint64_t generation = 0;
+    bool sourceCurrent = false;
+    unsigned sequence = 0;
+};
+
+struct NativeContextMenuCreateReceipt {
+    NativeContextMenuCreateBoundary last;
+    NativeContextMenuCreateBoundary lastNativeFailure;
+    NativeContextMenuCreateBoundary firstDiagnosticFailure;
+    HRESULT diagnosticResult = S_OK;
+    HRESULT creationResult = E_PENDING;
+    bool observerThrew = false;
+    bool sourceCurrent = false;
+};
+
+struct NativeContextMenuCreateObserver {
+    void* state = nullptr;
+    void (*record)(void*, const NativeContextMenuCreateBoundary&) = nullptr;
+    NativeContextMenuCreateReceipt receipt;
+};
+
 // Owns a native Shell menu for one STA interaction. Keep it alive while tracking
 // the popup and invoking its result. Returned HMENUs are borrowed; never destroy
 // or reparent a submenu. This class never displays a menu or invokes a default.
@@ -66,6 +98,13 @@ public:
     // path, so a retained provider remains suitable for a later normal menu.
     HRESULT createLeafState(IContextMenu* context, IUnknown* site = nullptr,
                             UINT flags = CMF_NORMAL, bool omitResourceVerbs = false);
+    // Explicit opt-in overloads share the production implementation. Ordinary
+    // calls instantiate its compile-time unobserved path, with no callbacks,
+    // diagnostic receipt writes, diagnostic allocations or extra COM retention.
+    HRESULT create(HWND owner, IContextMenu* context, IUnknown* site, UINT flags,
+                   NativeContextMenuCreateObserver& observer);
+    HRESULT createLeafState(IContextMenu* context, IUnknown* site, UINT flags,
+                            bool omitResourceVerbs, NativeContextMenuCreateObserver& observer);
     void reset() noexcept;
 
     HMENU menu() const noexcept { return menu_; }
@@ -101,9 +140,11 @@ public:
     bool handleMessage(UINT message, WPARAM wParam, LPARAM lParam, LRESULT& result);
 
 private:
+    template<bool Observed>
     HRESULT createImpl(HWND owner, IContextMenu* context, IUnknown* site, UINT flags,
                        bool leafStateOnly, bool omitResourceVerbs = false,
-                       bool synchronousCascades = true);
+                       bool synchronousCascades = true,
+                       NativeContextMenuCreateObserver* observer = nullptr);
     HRESULT enumerateMenu(HMENU menu, UINT position, unsigned depth, unsigned& budget,
                           std::vector<ContextMenuEntry>& entries, bool populate,
                           bool strictMessages = false);

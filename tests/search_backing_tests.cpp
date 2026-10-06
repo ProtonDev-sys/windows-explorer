@@ -1,15 +1,6 @@
 #include "search_backing_fixture.hpp"
 #include <cstdlib>
 
-namespace explorer {
-struct SearchBackingOwnershipNativeFixture {
-    static void observe(SearchBackingStore& store,
-        void (*callback)(const std::filesystem::path&,const FILE_ID_INFO&,void*),void* context) {
-        store.setCreatedFileObserverForNativeTest(callback,context);
-    }
-};
-} // namespace explorer
-
 namespace {
 using namespace backing_test;
 Id proofIdentity(const FILE_ID_INFO& native){
@@ -41,9 +32,9 @@ void writerOwnershipAndNotificationBoundary(bool replace){
     {
         explorer::SearchBackingStore store(fixture.root);
         boundary.store=&store;boundary.rules=&scopeRules;boundary.query=query;boundary.replace=replace;
-        // The store deliberately retains DELETE access on its directory.
-        // Park outside that held directory, in this fresh GUID-owned root;
-        // a target-directory sharing error must not substitute for replacement.
+        // Park in this fresh GUID-owned fixture root. No store deletion
+        // authority or target-directory sharing error substitutes for the
+        // actual replacement/same-object-rewrite control.
         boundary.parked=fixture.root/(fixture.prefix+L"-writer-original.search-ms");
         explorer::SearchBackingOwnershipNativeFixture::observe(store,
             [](const fs::path& path,const FILE_ID_INFO& proof,void* context){
@@ -77,14 +68,14 @@ void writerOwnershipAndNotificationBoundary(bool replace){
                         "replacement/rewrite full FileID is not the actual expected object");
             },&boundary);
         SearchFolderBuild output;output.item=item(fixture.scope);const auto preserved=output.item.Get();
-        require(store.build(query,scopeRules,&output)==E_ACCESSDENIED&&output.item.Get()==preserved&&!output.backing&&store.retainedCount()==1,
+        require(store.build(query,scopeRules,&output)==E_ACCESSDENIED&&output.item.Get()==preserved&&!output.backing&&store.retainedCount()==0,
                 "writer-path replacement gained publication/ownership or changed output");
         require(boundary.entered&&identity(boundary.path)==boundary.replacement&&
                 bytes(boundary.path)=="owned replacement must survive refused publication/cleanup"&&
                 (!replace||(identity(boundary.parked)==boundary.original&&bytes(boundary.parked)==boundary.originalBytes)),
                 "actual writer/replacement truth was lost after refused build");
         output={};exact(explorer::drainStaWorkers(5000),"notification-boundary original native drain");
-        require(store.closeAfterNativeTeardown()==E_ACCESSDENIED&&identity(boundary.path)==boundary.replacement&&
+        require(store.closeAfterNativeTeardown()==S_OK&&identity(boundary.path)==boundary.replacement&&
                 (!replace||identity(boundary.parked)==boundary.original),
                 "unproved replacement gained native cleanup authority");
     }
@@ -98,7 +89,8 @@ void writerOwnershipAndNotificationBoundary(bool replace){
 void writerOwnershipReplacement(){writerOwnershipAndNotificationBoundary(true);}
 void writerOwnershipRewrite(){writerOwnershipAndNotificationBoundary(false);}
 void routingAndLifetime(){
-    Fixture fixture;explorer::SearchBackingStore store(fixture.root);
+    Fixture fixture;DescriptorFiles descriptors;explorer::SearchBackingStore store(fixture.root);
+    descriptors.observe(store);
     const auto query=L"System.FileName:~<\""+fixture.prefix+L"\"";
     auto shallow=rules(fixture,false,true),deep=rules(fixture,true,false);
     bool required=false;exact(explorer::searchScopeRulesRequireBacking(shallow,&required),"classify mixed shallow");require(required,"mixed shallow lacks native descriptor route");
@@ -115,7 +107,9 @@ void routingAndLifetime(){
     require(store.retainedCount()==2&&second.backing->path()!=firstPath,"different depths reused wrong native identity");awaitResults(second.item.Get(),{fixture.directId,fixture.nestedId});
     SearchFolderBuild refined;const auto precise=L"System.FileName:=\""+fixture.directFile.filename().native()+L"\"";
     exact(explorer::buildSearchFolder(precise,deep,&store,&refined),"refine same exact native rules");awaitResults(refined.item.Get(),{fixture.directId});
-    require(store.closeAfterNativeTeardown()==HRESULT_FROM_WIN32(ERROR_BUSY)&&fs::exists(firstPath),"active leases allowed backing deletion");
+    // Keep the Store accepting searches here; final close below proves
+    // persistent paths after Store ownership and all ordinary aliases end.
+    require(fs::exists(firstPath),"active native descriptor disappeared");
     const auto writer=CreateFileW(firstPath.c_str(),GENERIC_WRITE,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,0,nullptr);
     const auto writeError=writer==INVALID_HANDLE_VALUE?GetLastError():ERROR_SUCCESS;if(writer!=INVALID_HANDLE_VALUE)CloseHandle(writer);
     require(writeError==ERROR_SHARING_VIOLATION,"live backing lease admitted competing bytes write");
@@ -125,31 +119,68 @@ void routingAndLifetime(){
     normal={};first={};repeated={};second={};refined={};imported={};shallow.clear();deep.clear();
     exact(explorer::drainStaWorkers(5000),"native creator worker drain");
     const auto directory=store.directory();exact(store.closeAfterNativeTeardown(),"close only after real native aliases/drain");
-    require(!fs::exists(directory),"owned native backing cleanup leaked files");fixture.remove=true;
+    require(fs::exists(directory)&&identity(firstPath)==firstId&&bytes(firstPath)==originalBytes&&store.retainedCount()==0,
+            "Store close removed or changed published native descriptor");
+    descriptors.removeExplicitFixtureFiles();fixture.remove=true;
 }
-void boundAndFailurePreservation(){
-    Fixture fixture;explorer::SearchBackingStore store(fixture.root);auto scopeRules=rules(fixture,false,false);
+void residentAndFailurePreservation(){
+    Fixture fixture;DescriptorFiles descriptors;explorer::SearchBackingStore store(fixture.root);
+    descriptors.observe(store);auto scopeRules=rules(fixture,false,false);
     SearchFolderBuild output;const auto invalid=std::wstring(L"bad\0query",9);
-    require(explorer::buildSearchFolder(invalid,scopeRules,&store,&output)==E_INVALIDARG&&store.retainedCount()==0&&store.directory().empty(),"invalid query created backing files");
+    require(explorer::buildSearchFolder(invalid,scopeRules,&store,&output)==E_INVALIDARG&&store.retainedCount()==0&&store.directory().empty(),
+            "invalid query created backing files");
     auto excluded=scopeRules;excluded[0].excluded=true;
-    require(explorer::buildSearchFolder(L"name",excluded,&store,&output)==HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED)&&store.retainedCount()==0,"unsupported virtual exclusion was silently dropped");
-    fs::path firstPath;Id firstId;std::string firstBytes;
-    for(size_t index=0;index<explorer::SearchBackingStore::maximumBackings;++index){
-        SearchFolderBuild build;const auto query=L"System.FileName:=\""+fixture.prefix+L"-bound-"+std::to_wstring(index)+L".txt\"";
-        exact(explorer::buildSearchFolder(query,scopeRules,&store,&build),"create bounded actual descriptors");
-        if(index==0){firstPath=build.backing->path();firstId=identity(firstPath);firstBytes=bytes(firstPath);output=std::move(build);}
+    require(explorer::buildSearchFolder(L"name",excluded,&store,&output)==HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED)&&store.retainedCount()==0,
+            "unsupported virtual exclusion was silently dropped");
+    DelayedNativeReader external;fs::path firstPath;Id firstId;std::string firstBytes;
+    const auto queryFor=[&](size_t index){return L"System.FileName:=\""+fixture.directFile.filename().native()+
+        L"\" AND System.Size:<="+std::to_wstring(1048576+index);};
+    for(size_t index=0;index<explorer::SearchBackingStore::maximumResidentBackings+2;++index){
+        SearchFolderBuild build;exact(explorer::buildSearchFolder(queryFor(index),scopeRules,&store,&build),"create distinct native descriptor beyond old lifetime cap");
+        require(build.item&&build.backing,"actual distinct descriptor not paired with lease/item");
+        awaitResults(build.item.Get(),{fixture.directId});
+        require(store.retainedCount()==std::min(index+1,explorer::SearchBackingStore::maximumResidentBackings),"resident cache exceeded exact128 bound");
+        if(index==0){firstPath=build.backing->path();firstId=identity(firstPath);firstBytes=bytes(firstPath);external.capture(build.item.Get());}
+        if(index==129)output=std::move(build);
     }
-    require(store.retainedCount()==explorer::SearchBackingStore::maximumBackings,"bounded native descriptor count mismatch");
-    const auto original=output.backing.get();
-    require(explorer::buildSearchFolder(L"System.FileName:=\"overflow-new-query\"",scopeRules,&store,&output)==HRESULT_FROM_WIN32(ERROR_TOO_MANY_NAMES)&&
-            output.backing.get()==original&&identity(firstPath)==firstId&&bytes(firstPath)==firstBytes,"reached bound changed active file/output");
-    SearchFolderBuild reused;const auto firstQuery=L"System.FileName:=\""+fixture.prefix+L"-bound-0.txt\"";
-    exact(explorer::buildSearchFolder(firstQuery,scopeRules,&store,&reused),"reuse exact existing descriptor at capacity");
-    require(reused.backing.get()==original&&store.retainedCount()==explorer::SearchBackingStore::maximumBackings,"capacity reuse changed identity/count");
-    fixture.unchanged();output={};reused={};scopeRules.clear();excluded.clear();
-    exact(explorer::drainStaWorkers(5000),"bounded fixture native drain");const auto directory=store.directory();
-    exact(store.closeAfterNativeTeardown(),"close bounded owned descriptors");require(!fs::exists(directory),"bounded cleanup incomplete");fixture.remove=true;
+    require(descriptors.files.size()==130&&store.retainedCount()==128,"130 lifetime intents did not complete with bounded128 cache");
+    require(identity(firstPath)==firstId&&bytes(firstPath)==firstBytes,"LRU eviction changed first original backing");
+    const auto latest=output.backing.get();const auto latestPath=output.backing->path();
+    const auto latestId=identity(latestPath);const auto latestBytes=bytes(latestPath);
+    require(explorer::buildSearchFolder(invalid,scopeRules,&store,&output)==E_INVALIDARG&&output.backing.get()==latest&&
+        identity(latestPath)==latestId&&bytes(latestPath)==latestBytes,"real validation failure changed active output");
+    SearchFolderBuild reused;exact(explorer::buildSearchFolder(queryFor(129),scopeRules,&store,&reused),"reuse actual MRU at capacity");
+    require(reused.backing.get()==latest&&store.retainedCount()==128&&descriptors.files.size()==130,"exact current key failed native cache reuse");
+    SearchFolderBuild miss;exact(explorer::buildSearchFolder(queryFor(0),scopeRules,&store,&miss),"reconstruct evicted query under a fresh immutable identity");
+    require(miss.backing->path()!=firstPath&&identity(miss.backing->path())!=firstId&&descriptors.files.size()==131&&store.retainedCount()==128,
+            "evicted-key reconstruction reused or replaced original published identity");
+    awaitResults(miss.item.Get(),{fixture.directId});
+    // Hit the oldest remaining resident entry, then insert a new query. The
+    // promoted original must survive that eviction; the following oldest key
+    // must genuinely miss and receive a different identity.
+    SearchFolderBuild promoted;exact(explorer::buildSearchFolder(queryFor(3),scopeRules,&store,&promoted),"promote actual oldest resident native query");
+    require(promoted.backing->path()==descriptors.files[3].path&&identity(promoted.backing->path())==descriptors.files[3].id,
+            "older resident hit reconstructed instead of reusing its original FileID");
+    SearchFolderBuild newer;exact(explorer::buildSearchFolder(queryFor(130),scopeRules,&store,&newer),"insert after actual older-key MRU promotion");
+    SearchFolderBuild promotedAgain;exact(explorer::buildSearchFolder(queryFor(3),scopeRules,&store,&promotedAgain),"verify older-key promotion survives next native eviction");
+    require(promotedAgain.backing.get()==promoted.backing.get()&&descriptors.files.size()==132&&store.retainedCount()==128,
+            "older resident promotion did not preserve original native lease identity");
+    SearchFolderBuild nextEvicted;exact(explorer::buildSearchFolder(queryFor(4),scopeRules,&store,&nextEvicted),"reconstruct actual next-oldest evicted query");
+    require(nextEvicted.backing->path()!=descriptors.files[4].path&&identity(nextEvicted.backing->path())!=descriptors.files[4].id&&
+            descriptors.files.size()==133&&store.retainedCount()==128,"actual MRU order evicted the wrong original resident query");
+    awaitResults(newer.item.Get(),{fixture.directId});awaitResults(nextEvicted.item.Get(),{fixture.directId});
+    fixture.unchanged();descriptors.unchanged();
+    output={};reused={};miss={};promoted={};newer={};promotedAgain={};nextEvicted={};scopeRules.clear();excluded.clear();
+    exact(explorer::drainStaWorkers(5000),"actual creator drain before Store close");
+    const auto directory=store.directory();exact(store.closeAfterNativeTeardown(),"retire only bounded Store cache ownership");
+    require(store.retainedCount()==0&&fs::exists(directory)&&identity(firstPath)==firstId&&bytes(firstPath)==firstBytes,
+            "Store close removed or rewrote independently retained original descriptor");
+    // All independent native references, including the enumerator and PIDL,
+    // remain usable while the plain originating Store has already closed.
+    external.verify({fixture.directId});descriptors.unchanged();external.release();
+    descriptors.removeExplicitFixtureFiles();fixture.remove=true;
 }
+
 } // namespace
 
 int wmain(int argc,wchar_t**){
@@ -159,7 +190,7 @@ int wmain(int argc,wchar_t**){
     int failures=0;
     for(const auto& test:std::array<std::pair<const char*,void(*)()>,4>{{
         {"actual native backed search routing, reuse, depth, refinement and lifetime",routingAndLifetime},
-        {"128 actual descriptors, reached-bound and failure preservation",boundAndFailurePreservation},
+        {"130 distinct native descriptors, 128-resident eviction and delayed native binding after close",residentAndFailurePreservation},
         {"actual writer FileID, post-notification native replacement/reentry and refused cleanup",writerOwnershipReplacement},
         {"actual same-FileID post-notification rewrite and refused cleanup",writerOwnershipRewrite}}}){
         try{test.second();std::cout<<"PASS: "<<test.first<<'\n';}

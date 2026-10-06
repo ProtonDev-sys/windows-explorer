@@ -4,8 +4,9 @@
 
 namespace explorer {
 
-// Plain creator-STA lease. The owning store, not cache/history pruning, keeps
-// every published descriptor read-leased until explicit final native teardown.
+// Plain creator-STA read lease. Current/history/call owners retain their
+// lease independently of the bounded Store cache. Releasing a lease closes
+// its handle; it never deletes the published descriptor.
 class SearchBackingLease final {
 public:
     ~SearchBackingLease();
@@ -26,21 +27,26 @@ struct SearchFolderBuild {
 
 class SearchBackingStore final {
 public:
-    static constexpr size_t maximumBackings = 128;
-    // Empty uses GetTempPathW. Tests may supply an exclusively owned parent.
+    static constexpr size_t maximumResidentBackings = 128;
+    // Empty uses verified FOLDERID_LocalAppData, with one fresh session root.
+    // Published descriptors survive cache eviction, close and destruction.
+    // No old session is adopted/swept and no lifetime query quota applies.
+    // Tests may supply an exclusively owned parent.
     explicit SearchBackingStore(std::filesystem::path ownedParent = {});
     ~SearchBackingStore();
     SearchBackingStore(const SearchBackingStore&) = delete;
     SearchBackingStore& operator=(const SearchBackingStore&) = delete;
     HRESULT build(const std::wstring& query, const std::vector<SearchScopeRule>& rules,
                   SearchFolderBuild* result);
+    // Cache-owned exact-key/lease records only (<=128). App/current/history
+    // aliases can retain independent leases beyond this cache working set.
     size_t retainedCount() const noexcept;
     std::filesystem::path directory() const;
-    // Caller must first release all browser/view/history source interfaces,
-    // drain original native workers and drop all returned backing leases.
-    // Outstanding leases return BUSY. Any ownership/sharing/deletion failure
-    // preserves the unremoved object and returns its actual error. Destruction
-    // alone closes handles and NEVER removes files under an unknown provider.
+    // Caller retains the existing App native-stack/worker teardown gates.
+    // This releases only Store cache/root handles; independent leases remain
+    // valid and ALL created descriptor paths persist. It never establishes
+    // last foreign native use and performs no file deletion or use_count test.
+    // A native directory identity error remains an error, with no removal.
     HRESULT closeAfterNativeTeardown() noexcept;
 private:
     struct Impl;

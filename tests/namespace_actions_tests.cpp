@@ -1,3 +1,4 @@
+#include "explorer/native_apartment.hpp"
 #include "explorer/namespace_actions.hpp"
 #include "explorer/headless_visual.hpp"
 #include "explorer/worker_sta.hpp"
@@ -65,11 +66,11 @@ struct NamespaceDrainGuard {
 void onPrivateNamespaceDesktop(const std::function<void()>& body) {
     std::exception_ptr failure;
     std::thread worker([&] {
-        explorer::PrivateDesktop desktop;bool initialized=false;
+        explorer::PrivateDesktop desktop;bool initialized=false;explorer::NativeApartmentOwner nativeApartment;
         try {
             succeeded(desktop.initialize(),"Attach private namespace desktop before native initialization");
             succeeded(desktop.verifyIsolation(),"Verify private namespace desktop isolation");
-            succeeded(OleInitialize(nullptr),"Initialize private namespace STA");initialized=true;
+            succeeded(nativeApartment.initializeOle(),"Initialize private namespace STA");initialized=true;
             body();
             bool visible=true;
             succeeded(desktop.visibleWindowsOnInputDesktop(visible),"Inspect namespace fixture input-desktop visibility");
@@ -78,7 +79,7 @@ void onPrivateNamespaceDesktop(const std::function<void()>& body) {
         } catch(...) { failure=std::current_exception(); }
         if(initialized) {
             drainNamespaceWorkers("worker drain before apartment/private-desktop shutdown");
-            OleUninitialize();
+            nativeApartment.finishOrTerminate();
         }
     });
     HANDLE kernel=nullptr;
@@ -2415,27 +2416,107 @@ void asyncNativeKindAndOriginalView() {
     ComPtr<IShellItemArray> selected;succeeded(view->GetSelection(FALSE,&selected),"Retain original native selected array");
     ComPtr<IDataObject> data;succeeded(selected->BindToHandler(nullptr,BHID_DataObject,IID_PPV_ARGS(&data)),"Read complete selected native CIDA without clipboard publication");
     verifyCastCida(data.Get(),sourceBefore);
+
+    // Explicit diagnostic opt-in only. No acceptance, retries, selection,
+    // refresh, worker hooks or replacement identities originate here.
+    wchar_t kindDiagnosticValue[2]{};
+    const bool kindBoundaryEnabled=GetEnvironmentVariableW(L"EXPLORER_NATIVE_KIND_BOUNDARY_DIAGNOSTICS",
+        kindDiagnosticValue,static_cast<DWORD>(std::size(kindDiagnosticValue)))==1&&kindDiagnosticValue[0]==L'1';
+    const auto kindBoundary=[&](const char* phase,explorer::NamespaceCommandStateTask* observedTask=nullptr,bool useCapturedSelection=false,
+            HRESULT capturedSelectionStatus=E_PENDING,IShellItemArray* capturedSelection=nullptr) {
+        if(!kindBoundaryEnabled)return;
+        const auto diagnosticStarted=GetTickCount64(),diagnosticDeadline=diagnosticStarted+1000;
+        const bool boundarySourceBefore=host.sourceCurrent(view.Get());
+        const auto mayRead=[&]{return boundarySourceBefore&&GetTickCount64()<diagnosticDeadline;};
+        int all=-1,countBefore=-1,countAfter=-1;
+        DWORD retainedCount=MAXDWORD,liveCount=MAXDWORD;
+        HRESULT allStatus=E_PENDING,countBeforeStatus=E_PENDING,countAfterStatus=E_PENDING;
+        HRESULT retainedStatus=E_PENDING,selectionStatus=E_PENDING,liveCountStatus=E_PENDING;
+        HRESULT folderStatus=E_PENDING,folderPidlStatus=E_PENDING,viewStatus=E_PENDING;
+        bool sameView=false,sameFolderBytes=false;
+        UINT originalFolderBytes=ILGetSize(folderId.get()),actualFolderBytes=0;
+        ComPtr<IShellItemArray> liveSelection;
+        ComPtr<IShellItem> actualFolder;
+        ComPtr<IShellView> actualView;
+        Pidl actualFolderId;
+        if(mayRead())allStatus=view->ItemCount(SVGIO_ALLVIEW,&all);
+        if(mayRead())countBeforeStatus=view->ItemCount(SVGIO_SELECTION,&countBefore);
+        if(mayRead())retainedStatus=selected->GetCount(&retainedCount);
+        if(useCapturedSelection)selectionStatus=capturedSelectionStatus;
+        else if(mayRead())selectionStatus=view->GetSelection(FALSE,&liveSelection);
+        IShellItemArray* observed=useCapturedSelection?capturedSelection:liveSelection.Get();
+        const bool liveArrayPresent=observed!=nullptr;
+        if(observed&&mayRead())liveCountStatus=observed->GetCount(&liveCount);
+        if(mayRead())folderStatus=view->GetFolder(IID_PPV_ARGS(&actualFolder));
+        if(actualFolder&&mayRead()) {
+            PIDLIST_ABSOLUTE raw=nullptr;folderPidlStatus=SHGetIDListFromObject(actualFolder.Get(),&raw);
+            actualFolderId.reset(raw);
+            if(folderPidlStatus==S_OK&&actualFolderId) {
+                actualFolderBytes=ILGetSize(actualFolderId.get());
+                sameFolderBytes=actualFolderBytes==originalFolderBytes&&actualFolderBytes&&
+                    std::memcmp(actualFolderId.get(),folderId.get(),actualFolderBytes)==0;
+            }
+        }
+        if(mayRead())viewStatus=host.browser->GetCurrentView(IID_PPV_ARGS(&actualView));
+        sameView=actualView.Get()==host.view.Get();
+        if(mayRead())countAfterStatus=view->ItemCount(SVGIO_SELECTION,&countAfter);
+        // Explicit temporary interface releases precede the final source and
+        // time receipts. A captured final array remains owned by the unchanged
+        // original assertion; this diagnostic never substitutes/retries it.
+        actualView.Reset();actualFolder.Reset();liveSelection.Reset();actualFolderId.reset();
+        const bool boundarySourceAfter=host.sourceCurrent(view.Get());
+        const auto diagnosticFinished=GetTickCount64();
+        std::cout<<"KindBoundary diagnosticOnly=1 phase="<<phase<<" creatorPID/TID="<<GetCurrentProcessId()<<'/'<<GetCurrentThreadId()
+            <<" owner/view="<<reinterpret_cast<uintptr_t>(host.owner)<<'/'<<reinterpret_cast<uintptr_t>(host.view.Get())
+            <<" sourceBefore/After="<<boundarySourceBefore<<'/'<<boundarySourceAfter
+            <<" allHRESULT/count="<<static_cast<unsigned long>(allStatus)<<'/'<<all
+            <<" selectionBeforeHRESULT/count="<<static_cast<unsigned long>(countBeforeStatus)<<'/'<<countBefore
+            <<" retainedOriginalArrayHRESULT/count="<<static_cast<unsigned long>(retainedStatus)<<'/'<<retainedCount
+            <<" selectionCaptured="<<useCapturedSelection<<" GetSelectionHRESULT="<<static_cast<unsigned long>(selectionStatus)
+            <<" liveArrayPresent="<<liveArrayPresent<<" liveArrayCountHRESULT/count="<<static_cast<unsigned long>(liveCountStatus)<<'/'<<liveCount
+            <<" folderHRESULT/PIDLHRESULT/originalBytes/actualBytes/exactBytes="<<static_cast<unsigned long>(folderStatus)<<'/'
+            <<static_cast<unsigned long>(folderPidlStatus)<<'/'<<originalFolderBytes<<'/'<<actualFolderBytes<<'/'<<sameFolderBytes
+            <<" currentViewHRESULT/same="<<static_cast<unsigned long>(viewStatus)<<'/'<<sameView
+            <<" selectionAfterHRESULT/count="<<static_cast<unsigned long>(countAfterStatus)<<'/'<<countAfter
+            <<" taskPresent/completed="<<(observedTask!=nullptr)<<'/'<<(observedTask&&observedTask->completed())
+            <<" elapsedMs="<<diagnosticFinished-diagnosticStarted<<" withinDiagnosticBudget="<<(diagnosticFinished<diagnosticDeadline)
+            <<" evidence=PASSIVE_ONLY\n"<<std::flush;
+    };
+
     explorer::NativeNamespaceActions actions;
+    kindBoundary("before-actions-initialize");
     succeeded(actions.initialize(host.owner,{folder,selected,host.view}),"Initialize exact original native media array and site");
+    kindBoundary("after-actions-initialize");
     std::unique_ptr<explorer::NamespaceCommandStateTask> task;
     succeeded(actions.startSelectionKindsTask(&task),"Start native selected Kind using cached original-array registration");
+    kindBoundary("after-first-start",task.get());
     require(pumpPrivateNamespaceUntil([&]{return task->completed();},4000),"Native Kind exceeded independent readiness wait");
+    kindBoundary("after-first-worker-complete",task.get());
     explorer::NamespaceSelectionKinds actual,expected;
     succeeded(explorer::namespaceSelectionKinds(selected.Get(),&expected),"Read independent native selected Kind intersection");
+    kindBoundary("after-first-creator-property-read",task.get());
     require(task->pollSelectionKinds(&actual)==S_OK&&sameKinds(actual,expected)&&actual.count==1&&actual.music&&!actual.video,
             "Worker Kind differs from the actual original native selection property store");
     task.reset();
+    kindBoundary("after-first-task-release",task.get());
     std::vector<PCIDLIST_ABSOLUTE> identities(258,musicId.get());identities.back()=textId.get();
     ComPtr<IShellItemArray> full;
     succeeded(SHCreateShellItemArrayFromIDLists(static_cast<UINT>(identities.size()),identities.data(),&full),
               "Create actual full native media array with final nonmedia counterexample");
+    kindBoundary("after-full-array-create",task.get());
     succeeded(explorer::NamespaceCommandStateTask::startSelectionKinds(full.Get(),host.view.Get(),&task),"Start complete native large-array Kind without menu reconstruction");
+    kindBoundary("after-full-start",task.get());
     require(pumpPrivateNamespaceUntil([&]{return task->completed();},4000),"Complete native large-array Kind exceeded bounded readiness");
+    kindBoundary("after-full-worker-complete",task.get());
     succeeded(explorer::namespaceSelectionKinds(full.Get(),&expected),"Read original complete native large-array property intersection");
+    kindBoundary("after-full-creator-property-read",task.get());
     require(task->pollSelectionKinds(&actual)==S_OK&&sameKinds(actual,expected)&&actual.count==258&&!actual.music&&!actual.video,
             "Async native Kind omitted its final nonmedia identity or reused stale Music context");
     task.reset();drainNamespaceWorkers("native Kind completion before original view preservation proof");
-    ComPtr<IShellItemArray> after;succeeded(view->GetSelection(FALSE,&after),"Read preserved original native selected array");
+    kindBoundary("after-full-task-release-and-drain",task.get());
+    ComPtr<IShellItemArray> after;const auto preservedSelectionStatus=view->GetSelection(FALSE,&after);
+    kindBoundary("preserved-original-selection-return",task.get(),true,preservedSelectionStatus,after.Get());
+    succeeded(preservedSelectionStatus,"Read preserved original native selected array");
     ComPtr<IDataObject> afterData;succeeded(after->BindToHandler(nullptr,BHID_DataObject,IID_PPV_ARGS(&afterData)),"Read preserved actual selected CIDA");
     verifyCastCida(afterData.Get(),sourceBefore);
     ComPtr<IShellItem> actualFolder;succeeded(view->GetFolder(IID_PPV_ARGS(&actualFolder)),"Read original native Kind folder after worker teardown");
@@ -2454,6 +2535,7 @@ void asyncNativeKindAndOriginalView() {
             textBefore.standard.EndOfFile.QuadPart==textAfter.standard.EndOfFile.QuadPart&&read(source)==sourceBytes&&read(fixture.text)==textBytes&&
             GetClipboardSequenceNumber()==clipboard,"Native Kind worker changed original selection/view/source or private clipboard");
     actions.reset();
+    kindBoundary("after-actions-final-release",task.get());
 }
 
 void aggregateLargeSelectionAndProviderGuards() {

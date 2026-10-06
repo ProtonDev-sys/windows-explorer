@@ -1,66 +1,55 @@
 # Windows 10 feature matrix
 
-Latest scoped General results pass authored 298/298 in v126 (64.52 seconds)
-and installed 303/303 in v125 (74.17 seconds). The equivalent-query comparison
-uses actual scopes for implicit rules without changing its assertions. A v125
-authored saved-search Back failure and eleven cascading checks remain retained;
-the diagnostic v126 pass does not establish their cause or repeatability.
-These separate processes are not a new complete suite or hosted-workflow pass.
+This inventory compares the [Windows 10 22H2 baseline](windows-10-research.md)
+with the current source. A binding does not establish behavioral or visual parity.
+**Wired** means explicit host code exists; **Shell** means an actual Windows
+provider/API is used with its native availability and state; **Partial** identifies
+a production or verification limit; **Gap** identifies missing behavior;
+**Unproven** identifies an unestablished comparison.
 
-The preceding v124 full App/search run fails two of six targets in 236.54 seconds,
-with no skips: authored/installed General each fail only the original
-direct-literal equivalence check (297/298 and 302/303 pass). Both original
-Content handoff and strict nonzero LTR/RTL footer checks now pass; both
-backed-search and both dedicated Library targets pass. The remaining metadata
-equivalence correction compiles warning-free in v125; its serial General rerun
-is recorded in the scoped results above. Its separate QAT/RecentItems run passes all
-four targets in 25.15 seconds with unchanged source and recorded RecentItems
-executable: QAT across both real layouts passes 5,158 strict assertions plus
-10,682 envelope assertions, and both RecentItems layouts pass four original
-native cases plus two genuine Destroy reentry cases. Successful replacement
-framework initialization during Destroy remains untested. A source audit finds
-the App's closing guard rejects the final pin callback; direct Ribbon fixture
-passes do not establish this production integration. The earlier v121
-wrong-mock-pin regressions are preserved; v108/v110/v113 native raw-order
-failures and v112 pre-Save/Load setup failure remain historical negatives.
+Source audit: 2026-10-06. The latest complete local suite, v127, passed 34 targets,
+failed installed General, and correctly skipped five disposable-profile targets.
+The v136 authored and installed General processes pass, including the actual
+asynchronous Kind/navigation rejection and Open File Location checks. The
+870d5c5 hosted main job failed five
+of 34 targets; its separate actual transfer/drop processes passed. Current source
+changes need new hosted evidence.
 
-Real authored/installed App backed searches pass v120 in 5.94/7.84 seconds;
-the v116-r2 store's four owned groups pass in 1.94. The 128-descriptor limit
-still counts lifetime-total reservations, and safe reclamation remains a design
-gap. The v123 namespace/registered-menu/Video quartet passes in 14.60 seconds,
-including 22/22 namespace groups and 2,732 assertions. These are exact targeted
-local receipts, not a new complete suite or hosted fix.
+The default v155 image target passes with production apartment ownership and
+184 exact first-current matches. Home and actual Computer association overrides
+pass both-size checks. The dynamic gallery supplies SmallImage callbacks only;
+both public association-cache sizes pass independent raster comparisons.
+Normal OLE teardown completes without the temporary module-retention switch.
+The apartment contract and its separate actual two-creator module target pass.
+Both actual installed Ribbon hosts retain one already-loaded code reference per
+creator through their matching COM/OLE teardown and release it exactly once.
+The latest complete screenshot run, v134, has six passed comparisons,
+nine failures, three restricted references and one failed Search capture. The
+subsequent focused Search comparison passes. Exact UI parity and
+the final 24-run performance comparison remain unestablished.
 
-The historical v122 authored full App fails its original Content handoff check while both
-strict native LTR/RTL footer shrink, drag and teardown checks pass. The current
-implicit-scope metadata correction passes Content handoff in v124; the original
-direct-literal equivalence assertion now fails in both layouts. Latest complete
-local all-target success remains v102-r2: thirty active targets pass and five
-disposable-profile targets skip in 567.41 seconds. The latest e7d5d1 hosted main
-job has five failures among thirty tests and two skips; its separate actual
-transfer/drop processes pass. Earlier f322 Paste timeout and unconditional
-COPY5 final-oracle failure remain negatives. Registered-menu boundary readbacks
-identify a narrower count-loss interval, without proving a native cause; later
-canonical-alias diagnostics add COM calls and do not demonstrate a production fix.
-
-The latest complete strict visual run is still v108-r2: nineteen native captures
-pass, seven strict comparisons pass (including Video), nine fail and three
-references remain restricted. Installed native-current image availability is
-unknown pending an actual owned probe. Final 24-run performance A/B and the old
-slow 1,000-item navigation issue remain open. Exact receipts, historical
-negatives and limits are in [verification](verification.md).
-
-This inventory compares the [Windows 10 22H2 baseline](windows-10-research.md) with the current source. A binding does not establish behavioral or visual parity. **Wired** means explicit host code exists; **Shell** means an actual Windows provider/API is used, with its native availability/state; **Partial** identifies a production or verification limit; **Gap** identifies missing behavior; **Unproven** identifies an unestablished comparison. Acceptance criteria are requirements until test reports establish them.
-
-Source audit: 2026-10-06. The current v124 full App/search run fails only direct-literal equivalence in both General layouts; the backed-search, Library and QAT/RecentItems passes above are exact targeted scopes. The historical complete four-process App checkpoint is v107, distinct from a complete all-target run. The latest complete local run with every active target passing is v102-r2: thirty active targets passed and five disposable-CI-only targets skipped in 567.41 seconds. Historically, v94 authored App completed 289 checks with one failure in 101.875 seconds (102.306 seconds including CTest). Complete native two-column Sort/Group state, genuine expanded Ribbon checked rows, independent group direction, exact fixture restoration and all four original-array Kind publication checks passed. Preview failed its creator source/Ready gate with E_FAIL before foreign UIA or pixel capture; that run did not measure blank Preview pixels. Later v98 establishes native rendering for both sources, and v101/v102 also validate the focus/splitter and Library partition fixtures.
-
-The v93 combined core run crashes after 112.335 seconds while enumerating Play-to during an explicit isolated Cast plan. The separate v95 namespace-only process has no access violation and passes 20/21 groups with 2,395 assertions in about seven seconds; its isolated Cast snapshot reports ERROR_NOT_SUPPORTED, no owner/site and no native parent ordinal. Neither result is a passing complete core suite. Earlier v91/v92 evidence remains in [verification](verification.md): collapsed-toggle checks and blank Preview were measured on those older snapshots, and the v92 crash occurred during unrelated Rotate-right planning. Guarding the complete native activation/focus destination previously made production reverse-focus checks pass in both layouts under neutral keys and held Shift, preserving exact selection, focused FileIDs, history, all 256 keyboard bytes and the 1,006-file corpus. A passing earlier focus check does not certify Preview or later edits.
-
-The v83 authored and installed Ribbon both pass strict disabled/re-enabled Extract-to rows, twelve refresh generations and exact original-index invocation after removing the unreachable nested Ribbon source path. Native popup cascades remain intact. The v79 combined core target times out at its unchanged 120-second bound; v81 then passes in 110.69 seconds, with phase timings identifying native Library and saved-search checks as the main cost. Earlier passes do not certify subsequent changes. The historical complete installed visual run v64 at `artifacts/visual/run-20261005-195124-4045f61663d24dda83be3f01a05df76a`, passes nineteen native captures, with six strict comparisons passed, ten failed and three restricted. The v83 focused Share capture passes isolation but still fails strict pixels; the actual selection menu contains neither canonical Specific people nor Remove access leaf. Whole-application functional and visual parity remains unproven.
-
-The newer installed Library run at `artifacts/visual/run-20261006-020708-bc845b714606407eac0c2c940598f6b1` passes native two-stage Save then Load/Add/Commit, all seven fixture gates and the owned capture. Actual parent stopwatches record 12.508/21.254 seconds with exit zero and no timeout/kill for either process. This capture-only run performs no reference comparison; the strict comparison assets, tool and thresholds remain unchanged.
-
-Current runtime evidence is tracked by [verification](verification.md), the [visual report](headless-visual.md), [performance report](performance.md), [search provider report](search-options-verification.md), and [theme compatibility report](theme-compatibility.md). The [older CI run at ce231210](https://github.com/ProtonDev-sys/windows-explorer/actions/runs/37169510842) verified only its earlier two-test/72-check baseline. Visible desktop/device/recipient tests are excluded.
+Read-only App pin-close fixtures now capture the actual batch at the earliest
+owned WM_CLOSE boundary. The v155 reset, initialize-entry and replacement cases
+complete. The v157 reentered WM_CLOSE assertions also complete, but the next
+immediate-owner-destruction case still crashes in native UIRibbon processing;
+the complete App close target is not accepted. Earlier
+evidence showed the native procedure destroying the original HWND without App
+cleanup. Actual App profile persistence needs a separate
+disposable fixture. Search descriptors now use a bounded 128-entry resident
+cache without a lifetime quota and survive eviction and App close. Actual
+130-query stress targets pass in v143, consuming the retained original native
+cursor for the first time after close and independently rebinding the retained
+item and PIDL. Both v158 native QAT gestures open the real enabled Add popup
+through an owned native right-click. Popup path ownership is rejected before
+Invoke, so Add/Remove behavior remains unverified. Their rooted native Legacy
+identity bridge passes despite empty runtime IDs and distinct accessibility
+wrapper objects. The native resource oracle completes
+its read-only diagnosis, while missing first-image and equivalent label inputs
+remain unavailable and Explorer-host palette parity remains unproved.
+Exact test scopes and
+retained negatives are in [verification](verification.md),
+with [visual](headless-visual.md), [performance](performance.md),
+[search](search-options-verification.md) and [theme](theme-compatibility.md) details.
 
 ## Window, navigation, and views
 
@@ -69,7 +58,7 @@ Current runtime evidence is tracked by [verification](verification.md), the [vis
 | Native desktop process | Wired | Unicode x64 C++20 Win32/COM host, native Shell view, no web runtime | Warning-free build; hidden ownership/lifetime |
 | Home / Share / View / Computer / Network ribbon | Shell | Normal installed ExplorerFrame Ribbon through public LoadUI and exact command adapter; authored fallback; Computer/Network modes follow canonical namespace | Native control/property readback for both resources and declared online-reference comparisons |
 | Quick Access Toolbar | Partial | Targeted edits preserve actual whole rows, bindings and docking; the twenty-command chooser uses an owned checksummed order envelope around opaque native settings. Legacy raw streams retain native order; imported separators and context-menu gestures are untested | v119-r2 both-layout strict 5,153 and envelope 10,682 assertions pass; v124 rerun passes 5,158/10,682. Corruption, exact ID-set/count rollback, atomic failure, source/reentry and retired-generation checks pass; earlier raw-order/setup negatives remain retained |
-| Ribbon RecentItems pin commit | Partial | Ribbon permits one captured original pin transaction during synchronous Destroy with creator/window/atomic-entry fences; App closing guard still rejects its final pin callback | v124 direct Ribbon authored/installed each pass four original native cases and two genuine Destroy reentry cases; v121 wrong-pin failures retained. Production App close integration and successful replacement initialization during Destroy remain untested |
+| Ribbon RecentItems pin commit | Partial | Ribbon permits one captured original pin transaction during synchronous Destroy with creator/window/atomic-entry fences; App close integration uses a captured original-item transaction; actual close-time batch delivery is unproven | v124 direct Ribbon authored/installed each pass four original native cases and two genuine Destroy reentry cases; v121 wrong-pin failures retained. Read-only App close fixtures currently fail: native ordinary commits precede close and are correctly denied headlessly. Actual profile persistence and strict App close matrix remain unverified |
 | Minimize ribbon | Wired | Actual native minimized property, close-time readback and settings restoration | Hidden geometry/state and reopen persistence |
 | Contextual pages | Wired | Picture, Drive, Compressed, Search, Library, Recycle, Application, Shortcut, Music, Video and Disk Image pages | Actual item/context creation/removal and provider states |
 | Exact caption / address / search layout | Partial | Native caption/Ribbon plus host navigation controls; online-reference capture work tracked separately | Matched source dimensions/DPI; scene-specific pixel results |
@@ -143,13 +132,13 @@ Current runtime evidence is tracked by [verification](verification.md), the [vis
 
 | Feature | State | Current source / limit | Headless acceptance |
 | --- | --- | --- | --- |
-| Native AQS / scoped search | Partial | Localized native parser/search folder; supported filesystem and exact known-folder shallow/deep/mixed scopes use native factories or leased descriptors. Lifetime-total descriptor capacity is 128; arbitrary virtual descendants remain unproven. Filename word-prefix and named string conditions retain actual native semantics | Owned scalar/phrase/date/operator membership, explicit prefix live/save/import/re-save FileIDs and outside-scope exclusion |
+| Native AQS / scoped search | Partial | Localized native parser/search folder; supported filesystem and exact known-folder shallow/deep/mixed scopes use native factories or leased descriptors. The cache retains at most 128 records; published descriptors persist after eviction and close. Arbitrary virtual descendants remain unproven. Filename word-prefix and named string conditions retain actual native semantics | Owned scalar/phrase/date/operator membership, explicit prefix live/save/import/re-save FileIDs and outside-scope exclusion |
 | Kind / date / size / other refinements | Wired | All installed Kind values have validated native expressions; eight localized Date presets and seven canonical size ranges remain. Full-query replacement removes whole pure-category AND factors, preserving unrelated OR/NOT and unresolved dates; entangled categories refuse atomically. Cached selected state derives from the full predicate and is restored after lazy native row publication | v21 helper passes typed/imported/live/save/re-save exact IDs, all twenty-three Kind fields, compound/absolute-date and atomic-output cases. v23 both App layouts pass actual SelectedItem/full ItemsSource/checked rows, exact FileIDs and metadata/history/re-save. Existing Date parent/preset/day-range checks pass. The public provider exposes no ninth calendar command ([version evidence](windows10-ribbon-icons.md)) |
 | Search again This PC / native view site / Close | Wired | Host reruns actual query with This PC scope; native OpenSearchViewSite leaf retains current-query provider state; Close returns to committed origin | Query/scope/identity and failure rollback; native site state/menu without associated-window launch |
 | Contents / system / compressed / indexing | Shell | Actual registered native states/options; real Indexing Options public component | Genuine disposable-hosted native option/result/restoration pass; [native semantics report](search-options-verification.md). Absent host flags alone prove no defect |
 | Search suggestions / recent searches | Wired | Native IAutoComplete suggestion provider, policy-aware app history load/save and MRU updates; displayed Ribbon/popup query snapshots | Both App layouts prove failed disk clearing preserves MRU/source/popup and accepted bytes, while successful owned clearing empties all sources and disables rows; exact results after MRU reordering, no private history text in logs |
-| Save search | Partial | Documented bounded writer preserves normalized generic conditions, relative dates, filesystem/library and exact known-folder locations, per-location depth, supported recursive exclusions and native kind values. Exact known-folder shallow/mixed live App searches use leased immutable native descriptors; lifetime-total capacity remains 128. Native SearchSave was disabled in the probed factory view | [Exact live/native/import/re-save identities](saved-search-verification.md), including four scope-rule and five kind-union fixtures. v111 metadata groups pass; v116-r2 store and v120 both-layout real App targets verify stated native depth/refinement/history/recreation/child/reentry/close cases and exact FileIDs. Arbitrary virtual descendants and safe capacity reclamation remain unproven |
-| Reopen external saved query | Partial | Editable metadata retains supported include/exclude rules, exact known-folder identities/depth, normalized conditions and schema-proven public Boolean leaves with omitted propertyType. Exact protective path guards cover supported shallow/equal-root/direct-child physical exclusions; affected shallow/mixed scopes use leased native backing descriptors, with the lifetime-total 128 capacity limit | Earlier v25 metadata/v26 writer groups retain their original evidence. The v111 core passes all ten native Search groups; v116-r2/v120 later pass the stated store and real App backing-lifetime cases in both layouts. Unguarded unsafe scopes, repeated all-item kind sentinels and unsupported virtual combinations remain native-view-only |
+| Save search | Partial | Documented bounded writer preserves normalized generic conditions, relative dates, filesystem/library and exact known-folder locations, per-location depth, supported recursive exclusions and native kind values. Exact known-folder shallow/mixed live App searches use leased immutable native descriptors; the resident cache holds at most 128 records while published paths persist. Native SearchSave was disabled in the probed factory view | [Exact live/native/import/re-save identities](saved-search-verification.md), including four scope-rule and five kind-union fixtures. v111 metadata groups pass; v116-r2 store and v120 both-layout real App targets verify stated native depth/refinement/history/recreation/child/reentry/close cases and exact FileIDs. Arbitrary virtual descendants and safe capacity reclamation remain unproven |
+| Reopen external saved query | Partial | Editable metadata retains supported include/exclude rules, exact known-folder identities/depth, normalized conditions and schema-proven public Boolean leaves with omitted propertyType. Exact protective path guards cover supported shallow/equal-root/direct-child physical exclusions; affected shallow/mixed scopes use leased native backing descriptors, with a 128-record resident cache and persistent published descriptors | Earlier v25 metadata/v26 writer groups retain their original evidence. The v111 core passes all ten native Search groups; v116-r2/v120 later pass the stated store and real App backing-lifetime cases in both layouts. Unguarded unsafe scopes, repeated all-item kind sentinels and unsupported virtual combinations remain native-view-only |
 | Open file location | Shell | Actual full selected-result array/site and registered SearchOpenLocation parent; strict validated native VerbList leaves provide read-only composite state; no single-filesystem eligibility guess | Actual owned Search 0/1/2-same-parent/3-mixed results and static virtual targets match native menu availability; provider failures preserved; no normal associated-window launch in tests |
 | Keyboard / F6 / F11 | Partial | Native Ribbon keytips plus host shortcuts; Windows 10 content/header/native-status/toolbar/tree F6 ring, enabled toolbar button/edit Tab traversal and guarded Enter; auxiliary windows retain their keyboard messages | Exhaustive focus availability subsets, actual native provider focus/readback, reverse/disabled/icon-view checks, address/search access, private-desktop isolation and geometry; full accessibility remains incomplete |
 | Ribbon keytips | Shell | Actual compiled native Framework accelerator/keytip system | Native command discovery/accessibility; no visible desktop input |

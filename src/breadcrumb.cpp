@@ -453,6 +453,13 @@ HRESULT BreadcrumbDropTarget::registerWindow() {
     return hr;
 }
 
+HRESULT BreadcrumbDropTarget::retireDestroyedWindow() noexcept {
+    const HRESULT hr = checkThread();
+    if (FAILED(hr)) return hr;
+    owner_ = nullptr; registered_ = false; windowRetired_ = true;
+    return S_OK;
+}
+
 HRESULT BreadcrumbDropTarget::revokeWindow() {
     const HRESULT hr = checkThread();
     if (FAILED(hr)) return hr;
@@ -518,6 +525,9 @@ void BreadcrumbDropTarget::limitEffect(DWORD* effect,DWORD source) const noexcep
 }
 
 HRESULT BreadcrumbDropTarget::route(DWORD keys,POINTL point,DWORD* effect,bool dropping) {
+    // A retained OLE interface must not call the former App's hit-test closure
+    // after the original destroyed owner has irrevocably retired.
+    if (windowRetired_) { *effect = DROPEFFECT_NONE; return E_ACCESSDENIED; }
     ComPtr<IShellItem> destination;
     const HRESULT hit = options_.hitTest(point,&destination);
     if (FAILED(hit)) { leaveTarget(); *effect = DROPEFFECT_NONE; return hit; }

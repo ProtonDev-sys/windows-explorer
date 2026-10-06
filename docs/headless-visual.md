@@ -1,28 +1,41 @@
 # Native headless visual verification
 
-The latest complete installed-layout comparison is v108-r2 on October 6,
-2026, at `artifacts/visual/run-20261006-052127-3809128d3528448588964474186ea939`.
-All nineteen native captures pass at actual 96 DPI. Seven strict comparisons
-pass (Home, View, Picture, Search, Application, Music and Video), nine fail,
-and DiskImage, Library and Shortcut retain their documented source restrictions.
-All 24 pinned online references were verified; masks and thresholds were
-unchanged. Executable SHA-256 is
-`063f67b4da66f29540fbed8baa95a92527418fac0f1ed134df2292e1e6544afd`,
+The latest complete installed-layout run is v134 on October 6, 2026, at
+`artifacts/visual/run-20261006-091029-e05919ac9d8a4d03bc6de9668456ddb8`.
+Eighteen native captures pass at actual 96 DPI. Six strict comparisons pass
+(Home, View, Picture, Application, Music and Video), nine fail, and DiskImage,
+Library and Shortcut retain their documented source restrictions. Search
+capture fails its preserved-scope fixture predicate. All 24 pinned online
+references were verified; masks and thresholds were unchanged. Executable
+SHA-256 is
+`3449cdb6cd1d615d36980827ce24c95a929b3a6489ea0dcea8609cfdebf62843`,
 reference manifest `a49f3266a436bd794daface43799ae99b351237497f3ee07ab173486cb92af73`,
 and comparator `51a9a5840ce7dc563f80527e1fd7a8571f2a18752911ed5e035dc49a1e20876b`.
-Video's strict pixel agreement is 0.980325 with edge F1 0.948908. This supersedes
-its earlier failing comparison without certifying another binary or hardware.
-Later functional/source changes have no new strict screenshot result. The
-installed-image audit shows the host replacement policy in source, but actual
-first native-current image availability and displaced artwork remain unknown
-until an owned native probe; it does not change these comparison counts.
+The focused Search run at
+`artifacts/visual/run-20261006-093237-19bc1b9b29174981bf45d8d5769d9fa6`
+passes native capture and the unchanged strict comparison: RGB error 0.987026,
+pixel agreement 0.982421 and edge F1 0.988886. Its executable is
+`eb1e09a1e10f718bb5a30f6967aa8e16c271724de1b61620f37885c529773eac`.
+The fixture now derives the physical query's implicit rule from its actual
+retained scope before comparing it with explicit imported saved-search rules;
+the production metadata and all source/identity predicates are unchanged.
+
+The v140 native image probe records 184 exact comparable first-current images
+and zero differences. Its added association/restoration scenario fails and
+then crashes during COM teardown. Four visibly mismatching commands have
+genuine null first images and use fallback resources, so those differences are
+outside the 184-image result. Whole-application visual parity remains unproved.
 
 The current reference audit finds no embedded ICC profile in the pinned Tech
 JPEGs or PC Assist/Microsoft Press PNGs. Untagged web images use sRGB; inventing
 an AdobeRGB transform is unsupported. [W3C color contract](https://www.w3.org/TR/css-color-4/#untagged).
 Computer and Compressed references have the same blue File interior as the
-native framework. Tech's teal File interior and colored bottom frame have
-unrecorded build/accent provenance. Its Share screenshot has one selected
+native framework. Tech's teal File interior has unrecorded build/accent
+provenance. The current full-frame crop includes one row of desktop wallpaper
+below the visible frame: all 856 pixels differ. The source-only v134 audit
+records the exact boundary and remaining color/status residuals. That is a
+comparison-protocol defect requiring a reviewed bounds correction; the current
+results remain failures. Its Share screenshot has one selected
 item/62 bytes, whereas the existing Quick Access control has no selection;
 that state mismatch cannot prove a command-eligibility defect. The command band
 and dynamic count are already masked, so it does not explain the remaining
@@ -108,7 +121,7 @@ python -m pip install -r scripts/requirements-visual.txt
 ./scripts/visual-check.ps1
 ```
 
-The script creates an owned, deterministic filesystem fixture and captures sixteen Home, Share, View and contextual command pages, including Network, Shortcut and Disk Image Tools, in separate private-desktop processes. It also captures `ModernHome`, `ModernShare` and `ModernView` at the newer reference's complete 856-by-513 visible frame. Their chrome comparisons preserve the QAT, caption buttons, static navigation/address/search glyphs and borders, status shortcuts and outer frame; the manifest documents each mask for dynamic route data, separately measured command bands and article annotations. Home also has a read-only source-state fixture in the native Desktop namespace, selecting the actual UsersFilesFolder item so Windows supplies its command eligibility. Computer compares the actual native Computer namespace; Drive selects the real volume containing the owned fixture there. Network browses the actual native Network namespace, whose device names remain private. These fixtures' full screenshots and inventory can contain personal Desktop item names and drive labels: they stay in `artifacts/visual/<run>/private-source`, must be excluded from publication, and are marked nonpublishable in the summary. A pilot capture measures the actual visible frame; the final capture changes the HWND dimensions to match the reference dimensions. PNGs are never resized to manufacture a match. `-Scenes Home,View` restricts the run to those pages when called directly from PowerShell. `-CaptureOnly` verifies native rendering and desktop isolation without claiming a comparison to online screenshots. The executable is copied once into the run directory and hashed so every scene uses the same immutable build.
+The script creates an owned, deterministic filesystem fixture and captures sixteen Home, Share, View and contextual command pages, including Network, Shortcut and Disk Image Tools, in separate private-desktop processes. It also captures `ModernHome`, `ModernShare` and `ModernView` at the newer reference's complete 856-by-512 visible frame. The original 513-row crop included one desktop-wallpaper row below the window; only that source/capture boundary was corrected, without changing masks or comparison thresholds. Their chrome comparisons preserve the QAT, caption buttons, static navigation/address/search glyphs and borders, status shortcuts and outer frame; the manifest documents each mask for dynamic route data, separately measured command bands and article annotations. Home also has a read-only source-state fixture in the native Desktop namespace, selecting the actual UsersFilesFolder item so Windows supplies its command eligibility. Computer compares the actual native Computer namespace; Drive selects the real volume containing the owned fixture there. Network browses the actual native Network namespace, whose device names remain private. These fixtures' full screenshots and inventory can contain personal Desktop item names and drive labels: they stay in `artifacts/visual/<run>/private-source`, must be excluded from publication, and are marked nonpublishable in the summary. A pilot capture measures the actual visible frame; the final capture changes the HWND dimensions to match the reference dimensions. PNGs are never resized to manufacture a match. `-Scenes Home,View` restricts the run to those pages when called directly from PowerShell. `-CaptureOnly` verifies native rendering and desktop isolation without claiming a comparison to online screenshots. The executable is copied once into the run directory and hashed so every scene uses the same immutable build.
 
 The reference manifest is [windows10-reference.json](../tests/visual/windows10-reference.json). It pins source URLs, source file hashes, PDF page/image identifiers, screenshot hashes, crops, masks and thresholds. References include original Microsoft Press screenshots, Microsoft Support's Windows 10 images, and stock Windows 10 Ribbon screenshots published in 2024. The modern Share band crop excludes the article's red annotation border using explicit coordinates. Downloaded source PDFs, screenshots, comparisons and differences stay under ignored `artifacts`; they are research intermediates and are not distributed in the repository or release. [Microsoft Press PDF](https://download.microsoft.com/download/7/3/8/7381E0E8-CE72-4366-9849-13B2BAFBBA3C/Microsoft_Press_ebook_Windows_10_Tools_8.5x11.pdf), [Microsoft Support, Windows 10 section](https://support.microsoft.com/en-gb/windows/experience/fileexplorer/file-explorer-in-windows?nochrome=true), [2024 stock Ribbon screenshots](https://techpilipinas.com/get-help-file-explorer-windows/)
 

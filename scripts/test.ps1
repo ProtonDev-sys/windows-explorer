@@ -3,7 +3,8 @@ param(
     [ValidateSet('Debug', 'Release', 'RelWithDebInfo', 'MinSizeRel')]
     [string]$Configuration = 'Release',
     [string]$BuildDirectory = '',
-    [switch]$SkipBuild
+    [switch]$SkipBuild,
+    [switch]$RequireAppSearchResidentStress
 )
 
 $ErrorActionPreference = 'Stop'
@@ -21,7 +22,7 @@ $installedSmokeReport = Join-Path $artifactDirectory 'headless-smoke-installed.j
 $nativeInstalledSmokeReport = Join-Path $BuildDirectory 'headless-smoke-installed.json'
 $environmentReport = Join-Path $artifactDirectory 'test-environment.json'
 Set-Content -LiteralPath $testLog -Value '' -Encoding utf8
-if (-not $SkipBuild) { & (Join-Path $PSScriptRoot 'build.ps1') -Configuration $Configuration -BuildDirectory $BuildDirectory }
+if (-not $SkipBuild) { & (Join-Path $PSScriptRoot 'build.ps1') -Configuration $Configuration -BuildDirectory $BuildDirectory -AppSearchResidentStress:$RequireAppSearchResidentStress }
 
 $ctestCommand = Get-Command ctest -ErrorAction SilentlyContinue
 if ($ctestCommand) { $ctestPath = $ctestCommand.Source }
@@ -40,6 +41,10 @@ $configuredTestsText = & $ctestPath --test-dir $BuildDirectory -C $Configuration
 if ($LASTEXITCODE -ne 0) { throw 'Could not inventory configured headless tests.' }
 $configuredTests = ($configuredTestsText -join "`n") | ConvertFrom-Json
 $installedHostConfigured = @($configuredTests.tests | Where-Object { $_.name -eq 'installed_shell_host' }).Count -eq 1
+$appSearchResidentStressConfigured = @($configuredTests.tests | Where-Object { $_.name -eq 'native_app_search_backing_resident_cache' }).Count -eq 1
+if ($RequireAppSearchResidentStress -and -not $appSearchResidentStressConfigured) {
+    throw 'The required App130 regression must be configured exactly once. Build with -AppSearchResidentStress first.'
+}
 $executable = Join-Path (Join-Path $BuildDirectory $Configuration) 'WindowsExplorer.exe'
 if (-not (Test-Path -LiteralPath $executable)) { throw "Application executable was not found: $executable" }
 $executableSha256 = (Get-FileHash -LiteralPath $executable -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -92,6 +97,7 @@ $searchOptionsStatus = Get-NativeTestStatus 'native_search_options'
 $viewPersistenceStatus = Get-NativeTestStatus 'native_view_persistence'
 $transferStatus = Get-NativeTestStatus 'native_shell_transfer'
 $dropsStatus = Get-NativeTestStatus 'native_shell_drops'
+$appSearchResidentStressStatus = Get-NativeTestStatus 'native_app_search_backing_resident_cache'
 $disposableRunner = $env:GITHUB_ACTIONS -ceq 'true'
 $historyOptIn = Test-ConfiguredOptIn 'native_shell_history' 'WINDOWSEXPLORER_NATIVE_HISTORY_TEST'
 $searchOptIn = Test-ConfiguredOptIn 'native_search_options' 'WINDOWSEXPLORER_SEARCH_OPTIONS_TEST'
@@ -120,6 +126,9 @@ $transferOptIn = $env:WINDOWSEXPLORER_NATIVE_TRANSFER_TEST -ceq '1'
     nativeViewPersistenceTestStatus = $viewPersistenceStatus
     nativeTransferTestStatus = $transferStatus
     nativeDropsTestStatus = $dropsStatus
+    appSearchResidentStressRequired = [bool]$RequireAppSearchResidentStress
+    appSearchResidentStressConfigured = $appSearchResidentStressConfigured
+    appSearchResidentStressTestStatus = $appSearchResidentStressStatus
     installedHostConfigured = $installedHostConfigured
     junitFresh = $junitFresh
     hostReportFreshness = @($hostReports | ForEach-Object { @{ layout = $_.layout; scope = $_.scope; fresh = $_.fresh; source = $_.source } })
@@ -134,6 +143,9 @@ foreach ($hostReport in $hostReports) {
 }
 if ($testExit -ne 0) { throw "Headless checks failed: CTest=$testExit. Reports: $artifactDirectory" }
 if (-not $executableUnchanged -or -not $junitFresh) { throw 'Headless executable changed or CTest did not produce a fresh result.' }
+if ($RequireAppSearchResidentStress -and $appSearchResidentStressStatus -ne 'passed') {
+    throw "The required App130 regression must actually pass; skip is not verification: $appSearchResidentStressStatus."
+}
 if ($disposableRunner) {
     foreach ($nativeGate in @(
         @{ name = 'native_shell_history'; optedIn = $historyOptIn; status = $historyStatus },
