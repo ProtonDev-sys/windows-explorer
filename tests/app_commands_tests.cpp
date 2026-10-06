@@ -108,6 +108,10 @@ struct HiddenView {
     ComPtr<IShellItem> readinessFolder;
     OwnedPidl readinessFolderId;
     std::vector<ReadyMember> readinessMembers;
+    DWORD diagnosticCreatorProcess=GetCurrentProcessId(),diagnosticCreatorThread=GetCurrentThreadId();
+    HWND diagnosticOriginalWindow=nullptr;
+    ComPtr<IFolderView2> diagnosticOriginalFolderView;
+    bool diagnosticBoundaryEnabled=false;
     static HRESULT readReadyIdentity(const fs::path& path,FILE_ID_INFO& identity) {
         struct File {HANDLE value=INVALID_HANDLE_VALUE;~File(){if(value!=INVALID_HANDLE_VALUE)CloseHandle(value);}}file;
         file.value=CreateFileW(path.c_str(),FILE_READ_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
@@ -222,13 +226,212 @@ struct HiddenView {
         require(completed&&current()&&GetTickCount64()<initializationDeadline,
             "Original complete owned menu view membership did not become ready within initialization budget");
         std::cout<<"NativeMenu readiness completeOwnedFileIDs=3 beforeFirstProvider=1 observations="<<observations<<'\n'<<std::flush;
+        if(diagnosticBoundaryEnabled)diagnosticOriginalFolderView=folderView;
     }
     void waitForOwnedMembers() {
         require(readinessFolder&&readinessFolderId&&readinessMembers.size()==3,
             "Opt-in equivalence readiness has no complete original source snapshot");
         waitForOwnedMembers(readinessFolder.Get(),readinessFolderId.get(),readinessMembers);
     }
-    explicit HiddenView(IShellItem* folder,std::span<const fs::path> ownedPaths={}) {
+    void recordRegisteredMenuBoundary(const char* stage,const char* operation,const char* edge,
+        IShellItemArray* originalSelection,DWORD expectedSelection,bool mixed,HRESULT operationRead=E_PENDING) {
+        // Diagnostic-only single pass: these reads can themselves enter/pump
+        // native COM. Fence every read against the original source and a new
+        // 1000-ms diagnostic budget; do not retry, refresh or extend any test
+        // deadline. A changed source must fail, never replace strict leaf truth.
+        const auto started=GetTickCount64(),deadline=started+1000;
+        const auto originalView=view;
+        const auto originalBrowser=browser;
+        const auto folderView=diagnosticOriginalFolderView;
+        const auto prefix=[&] {
+            std::cout<<"NativeMenu boundary diagnosticOnly=1 stage="<<stage<<" operation="<<operation<<" edge="<<edge
+                <<" inputCount="<<expectedSelection<<" mixed="<<mixed<<" operationHRESULT="<<static_cast<ULONG>(operationRead);
+        };
+        const auto fail=[&](const char* reason) {
+            prefix();std::cout<<" rejected="<<reason<<" elapsedMs="<<(GetTickCount64()-started)
+                <<" originalStrictFailurePreserved=1"<<std::endl;
+            throw std::runtime_error("Registered menu boundary diagnostic lost original source or diagnostic budget; strict comparison cannot continue");
+        };
+        if(!originalView||!originalBrowser||!readinessFolder||!readinessFolderId||readinessMembers.size()!=3||
+            !originalSelection||!diagnosticOriginalWindow||!owner||GetCurrentProcessId()!=diagnosticCreatorProcess||
+            GetCurrentThreadId()!=diagnosticCreatorThread)fail("original-source-unavailable");
+        const auto fence=[&](const char* point,bool emit=false) {
+            if(GetTickCount64()>=deadline)fail("diagnostic-deadline");
+            const auto desktop=PrivateDesktop::current();
+            bool inputUnchanged=false;
+            const auto privateRead=desktop?desktop->verifyIsolation(&inputUnchanged):E_ACCESSDENIED;
+            ComPtr<IShellItem> currentFolder;
+            const auto folderRead=folderView?folderView->GetFolder(IID_PPV_ARGS(&currentFolder)):E_NOINTERFACE;
+            int order=1;
+            const auto compareRead=currentFolder?currentFolder->Compare(readinessFolder.Get(),SICHINT_CANONICAL,&order):E_NOINTERFACE;
+            PIDLIST_ABSOLUTE rawFolder=nullptr;
+            const auto folderPidlRead=currentFolder?SHGetIDListFromObject(currentFolder.Get(),&rawFolder):E_NOINTERFACE;
+            OwnedPidl folderPidl(rawFolder);
+            HWND nativeWindow=nullptr;
+            const auto windowRead=originalView->GetWindow(&nativeWindow);
+            DWORD nativeProcess=0,ownerProcess=0;
+            const auto nativeThread=nativeWindow?GetWindowThreadProcessId(nativeWindow,&nativeProcess):0;
+            const auto ownerThread=GetWindowThreadProcessId(owner,&ownerProcess);
+            ComPtr<IShellView> currentView;
+            const auto currentViewRead=originalBrowser->GetCurrentView(IID_PPV_ARGS(&currentView));
+            ComPtr<IUnknown> originalIdentity,currentIdentity;
+            const auto originalIdentityRead=originalView.As(&originalIdentity);
+            const auto currentIdentityRead=currentView?currentView.As(&currentIdentity):E_NOINTERFACE;
+            bool inputAfter=false;
+            const auto privateAfter=desktop?desktop->verifyIsolation(&inputAfter):E_ACCESSDENIED;
+            const bool same=privateRead==S_OK&&privateAfter==S_OK&&inputUnchanged&&inputAfter&&
+                originalView.Get()==view.Get()&&originalBrowser.Get()==browser.Get()&&currentViewRead==S_OK&&
+                originalIdentityRead==S_OK&&currentIdentityRead==S_OK&&originalIdentity&&currentIdentity&&
+                originalIdentity.Get()==currentIdentity.Get()&&folderRead==S_OK&&compareRead==S_OK&&!order&&
+                folderPidlRead==S_OK&&folderPidl&&ILIsEqual(folderPidl.get(),readinessFolderId.get())&&
+                windowRead==S_OK&&nativeWindow==diagnosticOriginalWindow&&IsWindow(nativeWindow)&&IsWindow(owner)&&
+                IsChild(owner,nativeWindow)&&nativeProcess==diagnosticCreatorProcess&&ownerProcess==diagnosticCreatorProcess&&
+                nativeThread==diagnosticCreatorThread&&ownerThread==diagnosticCreatorThread&&!IsWindowVisible(owner)&&
+                GetCurrentProcessId()==diagnosticCreatorProcess&&GetCurrentThreadId()==diagnosticCreatorThread;
+            if(emit||!same) {
+                prefix();std::cout<<" probe="<<point<<" sourceCurrent="<<same
+                    <<" creatorPID/TID="<<diagnosticCreatorProcess<<"/"<<diagnosticCreatorThread
+                    <<" browser/view="<<reinterpret_cast<ULONG_PTR>(originalBrowser.Get())<<"/"<<reinterpret_cast<ULONG_PTR>(originalView.Get())
+                    <<" currentViewHRESULT/identityHRESULTs/same="<<static_cast<ULONG>(currentViewRead)<<"/"
+                    <<static_cast<ULONG>(originalIdentityRead)<<","<<static_cast<ULONG>(currentIdentityRead)<<"/"
+                    <<(originalIdentity&&currentIdentity&&originalIdentity.Get()==currentIdentity.Get())
+                    <<" folderHRESULT/compareHRESULT/order/PIDLHRESULT/exact="<<static_cast<ULONG>(folderRead)<<"/"
+                    <<static_cast<ULONG>(compareRead)<<"/"<<order<<"/"<<static_cast<ULONG>(folderPidlRead)<<"/"
+                    <<(folderPidl&&ILIsEqual(folderPidl.get(),readinessFolderId.get()))
+                    <<" originalFolderPIDLBytes="<<ILGetSize(readinessFolderId.get())
+                    <<" viewWindowHRESULT/HWND/PID/TID="<<static_cast<ULONG>(windowRead)<<"/"<<reinterpret_cast<ULONG_PTR>(nativeWindow)
+                    <<"/"<<nativeProcess<<"/"<<nativeThread<<" originalHWND="<<reinterpret_cast<ULONG_PTR>(diagnosticOriginalWindow)
+                    <<" ownerHWND/PID/TID/visible="<<reinterpret_cast<ULONG_PTR>(owner)<<"/"<<ownerProcess<<"/"<<ownerThread<<"/"<<IsWindowVisible(owner)
+                    <<" privateHRESULT/afterHRESULT/inputUnchanged="<<static_cast<ULONG>(privateRead)<<"/"<<static_cast<ULONG>(privateAfter)
+                    <<"/"<<(inputUnchanged&&inputAfter)<<" elapsedMs="<<(GetTickCount64()-started)<<std::endl;
+            }
+            if(!same)fail("original-source-changed");
+            if(GetTickCount64()>=deadline)fail("diagnostic-deadline");
+        };
+        // Retain the interface obtained by the original readiness QI. Do not
+        // add a new un-fenced native interface query before source validation.
+        const auto folderViewRead=folderView?S_OK:E_NOINTERFACE;
+        if(!folderView)fail("folder-view-unavailable");
+        fence("begin",true);
+        DWORD flags=0;FOLDERVIEWMODE mode=FVM_AUTO;int iconSize=-1,all=-1,selected=-1;
+        fence("flags-before");const auto flagsRead=folderView->GetCurrentFolderFlags(&flags);fence("flags-after");
+        fence("mode-before");const auto modeRead=folderView->GetViewModeAndIconSize(&mode,&iconSize);fence("mode-after");
+        fence("all-count-before");const auto allRead=folderView->ItemCount(SVGIO_ALLVIEW,&all);fence("all-count-after");
+        fence("selected-count-before");const auto selectedRead=folderView->ItemCount(SVGIO_SELECTION,&selected);fence("selected-count-after");
+        DWORD arrayCount=0;
+        fence("array-count-before");const auto arrayCountRead=originalSelection->GetCount(&arrayCount);fence("array-count-after");
+        if(arrayCountRead!=S_OK||arrayCount!=expectedSelection||!arrayCount)fail("original-full-selection-changed");
+        for(const auto arrayRow:std::array<DWORD,2>{0,arrayCount-1}) {
+            fence("array-item-before");ComPtr<IShellItem> arrayItem;
+            const auto arrayItemRead=originalSelection->GetItemAt(arrayRow,&arrayItem);fence("array-item-after");
+            PIDLIST_ABSOLUTE rawItem=nullptr;
+            const auto arrayPidlRead=arrayItem?SHGetIDListFromObject(arrayItem.Get(),&rawItem):E_NOINTERFACE;
+            OwnedPidl arrayPidl(rawItem);fence("array-pidl-after");
+            const size_t expectedMember=mixed&&arrayRow==arrayCount-1?2:0;
+            const bool exact=arrayItemRead==S_OK&&arrayPidlRead==S_OK&&arrayPidl&&
+                ILIsEqual(arrayPidl.get(),readinessMembers[expectedMember].pidl.get());
+            prefix();std::cout<<" arrayRow="<<arrayRow<<" expectedOwnedMember="<<expectedMember
+                <<" itemHRESULT/PIDLHRESULT/exactFullPIDL="<<static_cast<ULONG>(arrayItemRead)<<"/"<<static_cast<ULONG>(arrayPidlRead)<<"/"<<exact<<std::endl;
+            arrayItem.Reset();fence("array-item-release-after");
+            if(!exact)fail("original-full-selection-identity-changed");
+        }
+        std::array<BYTE,256> keyboard{};
+        fence("keyboard-before");const auto keyboardRead=GetKeyboardState(keyboard.data());const auto keyboardError=keyboardRead?ERROR_SUCCESS:GetLastError();
+        const auto active=GetActiveWindow(),focus=GetFocus(),foreground=GetForegroundWindow();
+        const auto layout=GetKeyboardLayout(0);fence("keyboard-after");
+        bool visibleInput=false;
+        fence("private-visible-before");const auto desktop=PrivateDesktop::current();
+        const auto visibleRead=desktop?desktop->visibleWindowsOnInputDesktop(visibleInput):E_ACCESSDENIED;fence("private-visible-after");
+        prefix();std::cout<<" folderViewHRESULT="<<static_cast<ULONG>(folderViewRead)
+            <<" flagsHRESULT/value="<<static_cast<ULONG>(flagsRead)<<"/"<<flags
+            <<" modeHRESULT/value/iconSize="<<static_cast<ULONG>(modeRead)<<"/"<<static_cast<int>(mode)<<"/"<<iconSize
+            <<" allHRESULT/count="<<static_cast<ULONG>(allRead)<<"/"<<all
+            <<" selectedHRESULT/count="<<static_cast<ULONG>(selectedRead)<<"/"<<selected
+            <<" arrayHRESULT/count="<<static_cast<ULONG>(arrayCountRead)<<"/"<<arrayCount
+            <<" active/focus/foreground/HKL="<<reinterpret_cast<ULONG_PTR>(active)<<"/"<<reinterpret_cast<ULONG_PTR>(focus)<<"/"
+            <<reinterpret_cast<ULONG_PTR>(foreground)<<"/"<<reinterpret_cast<ULONG_PTR>(layout)
+            <<" keyboardRead/error="<<keyboardRead<<"/"<<keyboardError
+            <<" shift/ctrl/alt/caps/num/scroll="<<static_cast<unsigned>(keyboard[VK_SHIFT])<<"/"<<static_cast<unsigned>(keyboard[VK_CONTROL])<<"/"
+            <<static_cast<unsigned>(keyboard[VK_MENU])<<"/"<<static_cast<unsigned>(keyboard[VK_CAPITAL])<<"/"
+            <<static_cast<unsigned>(keyboard[VK_NUMLOCK])<<"/"<<static_cast<unsigned>(keyboard[VK_SCROLL])
+            <<" inputVisibilityHRESULT/visible="<<static_cast<ULONG>(visibleRead)<<"/"<<visibleInput<<std::endl;
+        if(visibleRead!=S_OK||visibleInput)fail("private-input-isolation-changed");
+        std::array<int,3> rows{-1,-1,-1};
+        std::array<FILE_ID_INFO,3> nativeIds{};
+        std::array<HRESULT,3> nativeReads{E_PENDING,E_PENDING,E_PENDING};
+        // Never inspect an unowned row's display name or filesystem path. A
+        // complete native count of three is required for bounded row matching.
+        if(allRead==S_OK&&all==static_cast<int>(readinessMembers.size()))for(int rowIndex=0;rowIndex<all;++rowIndex) {
+            fence("owned-child-before");PITEMID_CHILD rawChild=nullptr;
+            const auto childRead=folderView->Item(rowIndex,&rawChild);OwnedPidl child(rawChild);fence("owned-child-after");
+            const auto member=child?std::find_if(readinessMembers.begin(),readinessMembers.end(),[&](const ReadyMember& value){
+                return ILIsEqual(child.get(),ILFindLastID(value.pidl.get()));}):readinessMembers.end();
+            if(childRead!=S_OK||member==readinessMembers.end()) {
+                prefix();std::cout<<" row="<<rowIndex<<" childHRESULT="<<static_cast<ULONG>(childRead)
+                    <<" ownedChild=0 pathReadSkipped=1"<<std::endl;continue;
+            }
+            const auto memberIndex=static_cast<size_t>(member-readinessMembers.begin());
+            fence("owned-row-before");ComPtr<IShellItem> row;
+            const auto rowRead=folderView->GetItem(rowIndex,IID_PPV_ARGS(&row));fence("owned-row-after");
+            PIDLIST_ABSOLUTE rawRow=nullptr;
+            const auto rowPidlRead=row?SHGetIDListFromObject(row.Get(),&rawRow):E_NOINTERFACE;
+            OwnedPidl rowPidl(rawRow);fence("owned-full-pidl-after");
+            const bool exact=rowRead==S_OK&&rowPidlRead==S_OK&&rowPidl&&ILIsEqual(rowPidl.get(),member->pidl.get());
+            prefix();std::cout<<" row="<<rowIndex<<" ownedMember="<<memberIndex<<" childHRESULT="<<static_cast<ULONG>(childRead)
+                <<" rowHRESULT/fullPIDLHRESULT/exactChildAndFullPIDL="<<static_cast<ULONG>(rowRead)<<"/"<<static_cast<ULONG>(rowPidlRead)
+                <<"/"<<exact<<" fullPIDLBytes="<<(rowPidl?ILGetSize(rowPidl.get()):0)<<std::endl;
+            if(exact) {
+                fence("owned-path-before");PWSTR rawPath=nullptr;
+                const auto pathRead=row->GetDisplayName(SIGDN_FILESYSPATH,&rawPath);
+                std::unique_ptr<wchar_t,decltype(&CoTaskMemFree)> path(rawPath,CoTaskMemFree);fence("owned-path-after");
+                const bool pathOwned=pathRead==S_OK&&path&&*path&&
+                    CompareStringOrdinal(path.get(),-1,member->path.c_str(),-1,TRUE)==CSTR_EQUAL;
+                prefix();std::cout<<" ownedMember="<<memberIndex<<" pathHRESULT="<<static_cast<ULONG>(pathRead)
+                    <<" exactOwnedPath="<<pathOwned<<" pathTextLogged=0"<<std::endl;
+                if(pathOwned) {
+                    fence("owned-native-id-before");nativeReads[memberIndex]=readReadyIdentity(fs::path(path.get()),nativeIds[memberIndex]);
+                    fence("owned-native-id-after");
+                } else nativeReads[memberIndex]=pathRead==S_OK?E_ACCESSDENIED:pathRead;
+                if(rows[memberIndex]!=-1)fail("duplicate-owned-native-member");
+                rows[memberIndex]=rowIndex;
+            }
+            row.Reset();fence("owned-row-release-after");
+        }
+        for(size_t memberIndex=0;memberIndex<readinessMembers.size();++memberIndex) {
+            const auto& member=readinessMembers[memberIndex];FILE_ID_INFO sourceId{};
+            fence("owned-source-id-before");const auto sourceRead=readReadyIdentity(member.path,sourceId);fence("owned-source-id-after");
+            const bool sourceExact=sourceRead==S_OK&&sameReadyIdentity(sourceId,member.identity);
+            const bool nativeExact=nativeReads[memberIndex]==S_OK&&sameReadyIdentity(nativeIds[memberIndex],member.identity);
+            const auto encode=[](const FILE_ID_INFO& identity) {
+                std::array<char,33> encoded{};constexpr char hex[]="0123456789abcdef";
+                for(size_t byte=0;byte<16;++byte){encoded[2*byte]=hex[identity.FileId.Identifier[byte]>>4];encoded[2*byte+1]=hex[identity.FileId.Identifier[byte]&15];}
+                return encoded;
+            };
+            const auto expectedId=encode(member.identity),observedSourceId=encode(sourceId),nativeId=encode(nativeIds[memberIndex]);
+            prefix();std::cout<<" ownedMember="<<memberIndex<<" nativeRow="<<rows[memberIndex]<<" expectedFullPIDLBytes="<<ILGetSize(member.pidl.get())
+                <<" sourceHRESULT/exactImmutableFileID="<<static_cast<ULONG>(sourceRead)<<"/"<<sourceExact
+                <<" expectedVolume/FileID="<<member.identity.VolumeSerialNumber<<"/"<<expectedId.data()
+                <<" sourceVolume/FileID="<<sourceId.VolumeSerialNumber<<"/"<<observedSourceId.data()
+                <<" nativeHRESULT/exactImmutableFileID="<<static_cast<ULONG>(nativeReads[memberIndex])<<"/"<<nativeExact
+                <<" nativeVolume/FileID="<<nativeIds[memberIndex].VolumeSerialNumber<<"/"<<nativeId.data()<<std::endl;
+            if(!sourceExact)fail("original-owned-file-identity-changed");
+        }
+        int allAfter=-1,selectedAfter=-1;
+        fence("all-count-final-before");const auto allAfterRead=folderView->ItemCount(SVGIO_ALLVIEW,&allAfter);fence("all-count-final-after");
+        fence("selected-count-final-before");const auto selectedAfterRead=folderView->ItemCount(SVGIO_SELECTION,&selectedAfter);fence("selected-count-final-after");
+        prefix();std::cout<<" allAfterHRESULT/count="<<static_cast<ULONG>(allAfterRead)<<"/"<<allAfter
+            <<" selectedAfterHRESULT/count="<<static_cast<ULONG>(selectedAfterRead)<<"/"<<selectedAfter
+            <<" countChangedDuringDiagnostic="<<(allRead!=allAfterRead||all!=allAfter||selectedRead!=selectedAfterRead||selected!=selectedAfter)<<std::endl;
+        fence("end",true);
+        prefix();std::cout<<" complete=1 nativeMembershipComplete="<<(allRead==S_OK&&all==3&&allAfterRead==S_OK&&allAfter==all&&
+            selectedRead==selectedAfterRead&&selected==selectedAfter&&
+            std::all_of(rows.begin(),rows.end(),[](int row){return row>=0;})&&
+            std::all_of(nativeReads.begin(),nativeReads.end(),[](HRESULT hr){return hr==S_OK;})&&
+            sameReadyIdentity(nativeIds[0],readinessMembers[0].identity)&&sameReadyIdentity(nativeIds[1],readinessMembers[1].identity)&&
+            sameReadyIdentity(nativeIds[2],readinessMembers[2].identity))<<" elapsedMs="<<(GetTickCount64()-started)<<std::endl;
+    }
+    explicit HiddenView(IShellItem* folder,std::span<const fs::path> ownedPaths={},bool registeredBoundaryDiagnostics=false) {
+        diagnosticBoundaryEnabled=registeredBoundaryDiagnostics;
         auto& expected=readinessMembers;
         auto& originalFolderId=readinessFolderId;
         if(!ownedPaths.empty()) {
@@ -269,8 +472,13 @@ struct HiddenView {
         succeeded(events->status,"Native hidden provider completed navigation");
         succeeded(browser->GetCurrentView(IID_PPV_ARGS(&view)),"Read actual native IShellView site");
         require(!IsWindowVisible(owner),"Native view initialization displayed its owner");
+        if(diagnosticBoundaryEnabled) {
+            const auto windowRead=view->GetWindow(&diagnosticOriginalWindow);
+            if(windowRead!=S_OK||!diagnosticOriginalWindow)throw std::runtime_error("Registered menu diagnostic could not retain original view HWND");
+        }
     }
     ~HiddenView() {
+        diagnosticOriginalFolderView.Reset();
         view.Reset();
         if (browser) { if (cookie) browser->Unadvise(cookie); browser->Destroy(); browser.Reset(); }
         events.Reset();
@@ -1363,7 +1571,7 @@ void nativeLeafStateMenuEquivalence(std::span<const DWORD> counts, unsigned mixt
         const auto clipboardOwnerBefore=GetClipboardOwner();
         const auto folder=item(fixture.root),text=item(fixture.text),directory=item(fixture.directory);
         const std::array<fs::path,3> readyPaths{fixture.text,fixture.archive,fixture.directory};
-        HiddenView host(folder.Get(),readyPaths);
+        HiddenView host(folder.Get(),readyPaths,(registrationMask&2u)!=0);
         host.waitForOwnedMembers();
         struct Identities {
             PIDLIST_ABSOLUTE text=nullptr,directory=nullptr,parent=nullptr;
@@ -1420,20 +1628,37 @@ void nativeLeafStateMenuEquivalence(std::span<const DWORD> counts, unsigned mixt
             require(retained==count,"Native root-leaf comparison truncated its original selection");
             for(const bool registered:{false,true}) {
                 if(!(registrationMask&(registered?2u:1u)))continue;
+                const auto diagnosticBoundary=[&](const char* stage,const char* operation,const char* edge,HRESULT hr=E_PENDING) {
+                    if(registered)host.recordRegisteredMenuBoundary(stage,operation,edge,selected.Get(),count,mixed,hr);
+                };
+                const auto diagnosticCall=[&](const char* stage,const char* operation,const auto& call) {
+                    diagnosticBoundary(stage,operation,"before");
+                    const HRESULT hr=call();
+                    diagnosticBoundary(stage,operation,"after",hr);
+                    return hr;
+                };
+                const auto diagnosticRelease=[&](const char* stage,const char* operation,const auto& release) {
+                    diagnosticBoundary(stage,operation,"before");
+                    release();
+                    diagnosticBoundary(stage,operation,"after",S_OK);
+                };
                 const auto createContext=[&](IContextMenu** result) {
                     if(!registered)return selected->BindToHandler(nullptr,BHID_SFUIObject,IID_IContextMenu,reinterpret_cast<void**>(result));
                     DEFCONTEXTMENU definition{};definition.pidlFolder=identities.parent;definition.psf=parent.Get();
                     definition.cidl=count;definition.apidl=children.data();definition.cKeys=1;definition.aKeys=&registry.key;
                     return SHCreateDefaultContextMenu(&definition,IID_IContextMenu,reinterpret_cast<void**>(result));
                 };
-                ComPtr<IContextMenu> full;succeeded(createContext(&full),"Create original full-array native comparison menu");
+                ComPtr<IContextMenu> full;succeeded(diagnosticCall("full","providerCreation",[&]{return createContext(&full);}),"Create original full-array native comparison menu");
+                diagnosticBoundary("full","queryAndSite","before");
                 const auto normalStarted=std::chrono::steady_clock::now();
                 const UINT nativeFlags=CMF_EXTENDEDVERBS|(registered?0:CMF_ITEMMENU);
-                NativeContextMenu normal;succeeded(normal.create(nullptr,full.Get(),host.view.Get(),nativeFlags),
-                    "Read native synchronous-cascade comparison truth without invocation");
+                NativeContextMenu normal;const auto normalRead=normal.create(nullptr,full.Get(),host.view.Get(),nativeFlags);
                 const auto normalMicros=std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-normalStarted).count();
-                std::vector<ContextMenuEntry> original;succeeded(normal.enumerate(original,false),"Read original actual native leaf states");
-                normal.reset();full.Reset();
+                diagnosticBoundary("full","queryAndSite","after",normalRead);
+                succeeded(normalRead,"Read native synchronous-cascade comparison truth without invocation");
+                std::vector<ContextMenuEntry> original;succeeded(diagnosticCall("full","snapshot",[&]{return normal.enumerate(original,false);}),"Read original actual native leaf states");
+                diagnosticRelease("full","menuRelease",[&]{normal.reset();});
+                diagnosticRelease("full","providerRelease",[&]{full.Reset();});
                 const auto diagnoseMismatch=[&](const char* stage) {
                     // Failure-only evidence. This never repairs or retries the
                     // captured comparison and cannot replace its strict failure.
@@ -1483,12 +1708,12 @@ void nativeLeafStateMenuEquivalence(std::span<const DWORD> counts, unsigned mixt
                         };
                         describeView("beforeFreshUnrestricted");
                         ComPtr<IContextMenu> freshContext;
-                        const auto contextRead=createContext(&freshContext);
+                        const auto contextRead=diagnosticCall("freshUnrestricted","providerCreation",[&]{return createContext(&freshContext);});
                         NativeContextMenu freshMenu;
                         const auto queryRead=SUCCEEDED(contextRead)&&freshContext?
-                            freshMenu.create(nullptr,freshContext.Get(),diagnosticView.Get(),nativeFlags):E_NOINTERFACE;
+                            diagnosticCall("freshUnrestricted","queryAndSite",[&]{return freshMenu.create(nullptr,freshContext.Get(),diagnosticView.Get(),nativeFlags);}):E_NOINTERFACE;
                         std::vector<ContextMenuEntry> freshEntries;
-                        const auto snapshotRead=SUCCEEDED(queryRead)?freshMenu.enumerate(freshEntries,false):E_PENDING;
+                        const auto snapshotRead=SUCCEEDED(queryRead)?diagnosticCall("freshUnrestricted","snapshot",[&]{return freshMenu.enumerate(freshEntries,false);}):E_PENDING;
                         const auto freshLeaves=leaves(freshEntries);
                         const auto originalLeaves=leaves(original);
                         std::cout<<"Native mismatch fresh unrestricted stage="<<stage<<" count="<<count<<" mixed="<<mixed<<" registered="<<registered
@@ -1496,7 +1721,8 @@ void nativeLeafStateMenuEquivalence(std::span<const DWORD> counts, unsigned mixt
                             <<" queryHRESULT/snapshotHRESULT="<<static_cast<ULONG>(queryRead)<<"/"<<static_cast<ULONG>(snapshotRead)
                             <<" fullLeafRows="<<freshLeaves.size()<<" exactOriginalComparison="<<(snapshotRead==S_OK&&freshLeaves==originalLeaves)<<std::endl;
                         if(snapshotRead==S_OK)emitDifferences("freshUnrestrictedVsOriginal",count,mixed,registered,originalLeaves,freshLeaves);
-                        freshMenu.reset();freshContext.Reset();
+                        diagnosticRelease("freshUnrestricted","menuRelease",[&]{freshMenu.reset();});
+                        diagnosticRelease("freshUnrestricted","providerRelease",[&]{freshContext.Reset();});
                         describeView("afterFreshUnrestrictedAndRelease");
                     } catch(const std::exception& error) {
                         std::cerr<<"Native mismatch diagnostic failed stage="<<stage<<" detail="<<error.what()
@@ -1506,12 +1732,14 @@ void nativeLeafStateMenuEquivalence(std::span<const DWORD> counts, unsigned mixt
                             <<"; original strict comparison remains failed"<<std::endl;
                     }
                 };
-                ComPtr<IContextMenu> stateContext;succeeded(createContext(&stateContext),"Create fresh original-target native leaf-state menu");
+                ComPtr<IContextMenu> stateContext;succeeded(diagnosticCall("leafState","providerCreation",[&]{return createContext(&stateContext);}),"Create fresh original-target native leaf-state menu");
+                diagnosticBoundary("leafState","queryAndSite","before");
                 const auto stateStarted=std::chrono::steady_clock::now();
-                NativeContextMenu state;succeeded(state.createLeafState(stateContext.Get(),host.view.Get(),nativeFlags),
-                    "Read same native target/site without forcing cascade population");
+                NativeContextMenu state;const auto stateRead=state.createLeafState(stateContext.Get(),host.view.Get(),nativeFlags);
                 const auto stateMicros=std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-stateStarted).count();
-                std::vector<ContextMenuEntry> snapshot;succeeded(state.enumerate(snapshot,false),"Read unpopulated actual native leaf states");
+                diagnosticBoundary("leafState","queryAndSite","after",stateRead);
+                succeeded(stateRead,"Read same native target/site without forcing cascade population");
+                std::vector<ContextMenuEntry> snapshot;succeeded(diagnosticCall("leafState","snapshot",[&]{return state.enumerate(snapshot,false);}),"Read unpopulated actual native leaf states");
                 if(registered) {
                     const auto all=leaves(original),lazy=leaves(snapshot);
                     const auto range=all.equal_range(L"windows.removeproperties"),other=lazy.equal_range(L"windows.removeproperties");
@@ -1525,12 +1753,13 @@ void nativeLeafStateMenuEquivalence(std::span<const DWORD> counts, unsigned mixt
                     <<" synchronousQuery_us="<<normalMicros<<" stateQuery_us="<<stateMicros<<'\n';
                 require(state.invoke(state.firstCommand())==E_ACCESSDENIED,
                     "Read-only root state comparison could activate a native command");
-                state.reset();stateContext.Reset();
-                ComPtr<IContextMenu> restrictedContext;succeeded(createContext(&restrictedContext),
+                diagnosticRelease("leafState","menuRelease",[&]{state.reset();});
+                diagnosticRelease("leafState","providerRelease",[&]{stateContext.Reset();});
+                ComPtr<IContextMenu> restrictedContext;succeeded(diagnosticCall("noResource","providerCreation",[&]{return createContext(&restrictedContext);}),
                     "Retain the same full native array/site for the no-resource state comparison");
-                NativeContextMenu restricted;succeeded(restricted.createLeafState(restrictedContext.Get(),host.view.Get(),nativeFlags,true),
+                NativeContextMenu restricted;succeeded(diagnosticCall("noResource","queryAndSiteAndRestrictions",[&]{return restricted.createLeafState(restrictedContext.Get(),host.view.Get(),nativeFlags,true);}),
                     "Read native association/dynamic leaf truth without unrelated built-in operations");
-                std::vector<ContextMenuEntry> restrictedEntries;succeeded(restricted.enumerate(restrictedEntries,false),
+                std::vector<ContextMenuEntry> restrictedEntries;succeeded(diagnosticCall("noResource","snapshot",[&]{return restricted.enumerate(restrictedEntries,false);}),
                     "Read actual restricted native leaves without invoking or populating cascades");
                 const auto nonResource=[&](const std::vector<ContextMenuEntry>& values) {
                     auto result=leaves(values);
@@ -1551,20 +1780,20 @@ void nativeLeafStateMenuEquivalence(std::span<const DWORD> counts, unsigned mixt
                     "Native no-resource restriction changed a non-resource canonical leaf's presence, multiplicity, disabled or checked state");
                 require(restricted.invoke(restricted.firstCommand())==E_ACCESSDENIED,
                     "Restricted leaf-state query permitted native invocation");
-                restricted.reset();
+                diagnosticRelease("noResource","menuRelease",[&]{restricted.reset();});
                 if(count==1||count==10000) {
-                    NativeContextMenu followup;succeeded(followup.create(nullptr,restrictedContext.Get(),host.view.Get(),nativeFlags),
+                    NativeContextMenu followup;succeeded(diagnosticCall("retainedNormalFollowup","queryAndSite",[&]{return followup.create(nullptr,restrictedContext.Get(),host.view.Get(),nativeFlags);}),
                         "Reuse the exact restricted native provider for an ordinary complete menu");
-                    std::vector<ContextMenuEntry> restored;succeeded(followup.enumerate(restored,false),
+                    std::vector<ContextMenuEntry> restored;succeeded(diagnosticCall("retainedNormalFollowup","snapshot",[&]{return followup.enumerate(restored,false);}),
                         "Read canonical IDs and resource leaves after native restriction restoration");
                     const auto originalLeaves=leaves(original),restoredLeaves=leaves(restored);
                     emitDifferences("normalFollowup",count,mixed,registered,originalLeaves,restoredLeaves);
                     if(originalLeaves!=restoredLeaves)diagnoseMismatch("normalFollowup");
                     require(originalLeaves==restoredLeaves,
                         "Retained provider normal-menu followup lost native resource or non-resource canonical states");
-                    followup.reset();
+                    diagnosticRelease("retainedNormalFollowup","menuRelease",[&]{followup.reset();});
                 }
-                restrictedContext.Reset();
+                diagnosticRelease("noResource","providerRelease",[&]{restrictedContext.Reset();});
                 if(!registered) {
                     // Exercise the real worker, full CIDA and actual site for
                     // every catalog static fallback (including absent aliases),
