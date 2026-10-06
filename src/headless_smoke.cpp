@@ -30,6 +30,7 @@
 #include <future>
 #include <iostream>
 #include <iterator>
+#include <limits>
 #include <set>
 #include <sstream>
 #include <thread>
@@ -38,6 +39,308 @@
 namespace explorer {
 namespace {
 bool visibleWindowObserved = false;
+// This test oracle reads the public current-view HWND and its independently
+// owned parent/frame geometry. It never uses the product's cached layout slot.
+struct NativePaneGeometry {
+    HRESULT read = E_PENDING, viewRead = E_PENDING, serviceRead = E_PENDING;
+    HRESULT statusRead = E_PENDING, accessibleRead = E_PENDING, roleRead = E_PENDING;
+    HRESULT locationRead = E_PENDING, boundsRead = E_PENDING, ownerRead = E_PENDING;
+    HRESULT childCountRead = E_PENDING, childrenRead = E_PENDING, childQueryRead = E_PENDING, finalViewRead = E_PENDING;
+    HRESULT finalBoundsRead = E_PENDING, directionRead = E_PENDING, finalFooterRead = E_PENDING;
+    HRESULT paneHitRead = E_PENDING, gripHitRead = E_PENDING;
+    HRESULT rootStyleRead = E_PENDING, paneStyleRead = E_PENDING, gripStyleRead = E_PENDING;
+    HWND view = nullptr, parent = nullptr, frame = nullptr, footerWindow = nullptr;
+    HWND expectedGrip = nullptr, paneHit = nullptr, gripHit = nullptr;
+    DWORD paneHitError = ERROR_SUCCESS, gripHitError = ERROR_SUCCESS;
+    DWORD rootStyleError = ERROR_SUCCESS, paneStyleError = ERROR_SUCCESS, gripStyleError = ERROR_SUCCESS;
+    LONG_PTR rootStyle = 0, paneStyle = 0, gripStyle = 0;
+    BOOL rootVisible = FALSE, paneVisible = FALSE, gripVisible = FALSE;
+    RECT rootClient{}, parentClient{}, frameClient{}, content{}, pane{}, grip{}, gripWindow{}, footer{};
+    unsigned nodes = 0, candidates = 0;
+    bool complete = true, found = false, footerFull = false, partition = false, inputReachable = false;
+    bool paneOwned = false, gripOwned = false, visibilityConsistent = false;
+};
+bool paneGeometryOwned(HWND window, HWND root) noexcept {
+    DWORD process = 0;
+    return window && IsWindow(window) && GetWindowThreadProcessId(window, &process) == GetCurrentThreadId() &&
+        process == GetCurrentProcessId() && (window == root || IsChild(root, window));
+}
+HRESULT paneGeometryError() noexcept {
+    const auto error = GetLastError();
+    return HRESULT_FROM_WIN32(error ? error : ERROR_GEN_FAILURE);
+}
+bool paneGeometryPositive(const RECT& value) noexcept {
+    return value.right > value.left && value.bottom > value.top;
+}
+bool paneGeometryDisjoint(const RECT& first, const RECT& second) noexcept {
+    RECT intersection{}; return !IntersectRect(&intersection, &first, &second);
+}
+NativePaneGeometry readNativePaneGeometry(IShellView* retainedView, HWND root, HWND pane,
+    const RECT& logicalGrip, bool preview, ULONGLONG deadline, const std::function<bool()>& current, HWND gripController = nullptr) {
+    NativePaneGeometry result;
+    result.expectedGrip = gripController;
+    const auto desktop = PrivateDesktop::current();
+    if (!desktop || desktop->verifyIsolation() != S_OK) { result.read = E_ACCESSDENIED; return result; }
+    const auto live = [&] { return GetTickCount64() < deadline && PrivateDesktop::current() == desktop && current() && paneGeometryOwned(root, root); };
+    const auto bounds = [&](HWND window, bool client, RECT& value) -> HRESULT {
+        if (!live() || !paneGeometryOwned(window, root)) return E_ABORT;
+        SetLastError(ERROR_SUCCESS);
+        const auto native = client ? GetClientRect(window, &value) : GetWindowRect(window, &value);
+        if (!native) return paneGeometryError();
+        const auto mapped = client ? mapUiRect(window, nullptr, value, &value) : S_OK;
+        return mapped == S_OK && !live() ? E_ABORT : mapped;
+    };
+    if (!retainedView || !live()) { result.read = E_ABORT; return result; }
+    result.viewRead = retainedView->GetWindow(&result.view);
+    if (result.viewRead != S_OK || !live() || !paneGeometryOwned(result.view, root) || result.view == root) {
+        result.read = result.viewRead == S_OK ? E_ABORT : result.viewRead; return result;
+    }
+    result.parent = GetAncestor(result.view, GA_PARENT); result.frame = result.view;
+    unsigned depth = 0;
+    while (GetAncestor(result.frame, GA_PARENT) != root) {
+        if (++depth > 16) { result.read = HRESULT_FROM_WIN32(ERROR_MORE_DATA); return result; }
+        result.frame = GetAncestor(result.frame, GA_PARENT);
+        if (!paneGeometryOwned(result.frame, root) || result.frame == root) { result.read = E_ACCESSDENIED; return result; }
+    }
+    if (!paneGeometryOwned(result.parent, root) || result.frame == result.view ||
+        !(result.parent == result.frame || IsChild(result.frame, result.parent))) { result.read = E_ACCESSDENIED; return result; }
+    result.boundsRead = bounds(root, true, result.rootClient);
+    if (result.boundsRead == S_OK) result.boundsRead = bounds(result.parent, true, result.parentClient);
+    if (result.boundsRead == S_OK) result.boundsRead = bounds(result.frame, true, result.frameClient);
+    if (result.boundsRead == S_OK) result.boundsRead = bounds(result.view, false, result.content);
+    if (result.boundsRead == S_OK && preview) result.boundsRead = bounds(pane, false, result.pane);
+    if (result.boundsRead == S_OK && preview) result.boundsRead = mapUiRect(root, nullptr, logicalGrip, &result.grip);
+    if (result.boundsRead != S_OK || !live()) { result.read = result.boundsRead == S_OK ? E_ABORT : result.boundsRead; return result; }
+    bool rtl = false; result.directionRead = windowUiDirection(root, &rtl);
+    const auto dpi = GetDpiForWindow(root);
+    if (result.directionRead != S_OK || !dpi || !live()) { result.read = E_ABORT; return result; }
+    ComPtr<IShellBrowser> browser;
+    ComPtr<IAccessible> retainedFooter;
+    LONG retainedFooterChild = CHILDID_SELF;
+    result.serviceRead = IUnknown_QueryService(retainedView, SID_STopLevelBrowser, IID_PPV_ARGS(&browser));
+    if (!live()) { result.read = E_ABORT; return result; }
+    if (result.serviceRead == S_OK && browser) {
+        HWND status = nullptr; result.statusRead = browser->GetControlWindow(FCW_STATUS, &status);
+        if (!live()) { result.read = E_ABORT; return result; }
+        if (result.statusRead == S_OK && paneGeometryOwned(status, root) &&
+            (status == result.frame || IsChild(result.frame, status))) {
+            result.locationRead = bounds(status, false, result.footer);
+            if (result.locationRead == S_OK) { result.found = true; result.footerWindow = status; }
+        }
+    }
+    // FCW_STATUS is legitimately NULL on this native frame. Discover only its
+    // public STATUSBAR role, with no item/tree/text/name enumeration.
+    if (!result.found) {
+        ComPtr<IAccessible> accessible;
+        result.accessibleRead = AccessibleObjectFromWindow(result.frame, static_cast<DWORD>(OBJID_CLIENT), IID_PPV_ARGS(&accessible));
+        if (!live()) { result.read = E_ABORT; return result; }
+        std::function<void(IAccessible*, const VARIANT&, unsigned)> walk;
+        walk = [&](IAccessible* object, const VARIANT& child, unsigned level) {
+            if (!result.complete) return;
+            if (!live()) { result.complete = false; result.read = E_ABORT; return; }
+            if (!object || level > 12 || result.nodes >= 256) { result.complete = false; result.read = HRESULT_FROM_WIN32(ERROR_MORE_DATA); return; }
+            ++result.nodes;
+            HWND owner = nullptr; result.ownerRead = WindowFromAccessibleObject(object, &owner);
+            if (!live() || result.ownerRead != S_OK || !paneGeometryOwned(owner, root) ||
+                !(owner == result.frame || IsChild(result.frame, owner))) {
+                result.complete = false; result.read = FAILED(result.ownerRead) ? result.ownerRead : E_ACCESSDENIED; return;
+            }
+            VARIANT role{};
+            struct Role { VARIANT& value; ~Role() { VariantClear(&value); } } releaseRole{role};
+            result.roleRead = object->get_accRole(child, &role);
+            if (!live() || result.roleRead != S_OK || role.vt != VT_I4) {
+                result.complete = false; result.read = FAILED(result.roleRead) ? result.roleRead : E_UNEXPECTED; return;
+            }
+            if (role.lVal == ROLE_SYSTEM_STATUSBAR) {
+                long x = 0, y = 0, width = 0, height = 0;
+                result.locationRead = object->accLocation(&x, &y, &width, &height, child); ++result.candidates;
+                const auto right = static_cast<LONGLONG>(x) + width, bottom = static_cast<LONGLONG>(y) + height;
+                if (!live() || result.locationRead != S_OK || width <= 0 || height <= 0 ||
+                    right > std::numeric_limits<LONG>::max() || bottom > std::numeric_limits<LONG>::max()) {
+                    result.complete = false; result.read = FAILED(result.locationRead) ? result.locationRead : E_UNEXPECTED; return;
+                }
+                const RECT actual{x, y, static_cast<LONG>(right), static_cast<LONG>(bottom)};
+                if (result.found && !EqualRect(&actual, &result.footer)) { result.complete = false; result.read = E_UNEXPECTED; return; }
+                if (child.vt != VT_I4) { result.complete = false; result.read = E_UNEXPECTED; return; }
+                result.found = true; result.footer = actual; result.footerWindow = owner;
+                retainedFooter = object; retainedFooterChild = child.lVal; return;
+            }
+            if (role.lVal == ROLE_SYSTEM_LIST || role.lVal == ROLE_SYSTEM_LISTITEM || role.lVal == ROLE_SYSTEM_OUTLINE ||
+                role.lVal == ROLE_SYSTEM_OUTLINEITEM || role.lVal == ROLE_SYSTEM_CELL || child.vt != VT_I4 || child.lVal != CHILDID_SELF) return;
+            long count = 0; result.childCountRead = object->get_accChildCount(&count);
+            if (!live() || result.childCountRead != S_OK || count < 0 || count > 128) {
+                result.complete = false; result.read = FAILED(result.childCountRead) ? result.childCountRead : E_UNEXPECTED; return;
+            }
+            if (!count) return;
+            std::array<VARIANT, 128> children{};
+            struct Children { std::array<VARIANT,128>& values; ~Children() { for (auto& value : values) VariantClear(&value); } } releaseChildren{children};
+            long received = 0; result.childrenRead = AccessibleChildren(object, 0, count, children.data(), &received);
+            if (!live() || FAILED(result.childrenRead) || received != count) {
+                result.complete = false; result.read = FAILED(result.childrenRead) ? result.childrenRead : E_UNEXPECTED; return;
+            }
+            for (long index = 0; index < received && result.complete; ++index) {
+                const auto& value = children[static_cast<size_t>(index)];
+                if (value.vt == VT_DISPATCH && value.pdispVal) {
+                    ComPtr<IAccessible> descendant; result.childQueryRead = value.pdispVal->QueryInterface(IID_PPV_ARGS(&descendant));
+                    if (!live() || result.childQueryRead != S_OK || !descendant) {
+                        result.complete = false; result.read = FAILED(result.childQueryRead) ? result.childQueryRead : E_NOINTERFACE; return;
+                    }
+                    VARIANT self{}; self.vt = VT_I4; self.lVal = CHILDID_SELF; walk(descendant.Get(), self, level + 1);
+                } else if (value.vt == VT_I4) walk(object, value, level + 1);
+            }
+        };
+        if (result.accessibleRead == S_OK && accessible) { VARIANT self{}; self.vt = VT_I4; self.lVal = CHILDID_SELF; walk(accessible.Get(), self, 0); }
+        else { result.complete = false; result.read = result.accessibleRead == S_OK ? E_NOINTERFACE : result.accessibleRead; }
+    }
+    browser.Reset();
+    if (!result.complete || !result.found) {
+        if (result.read == E_PENDING) result.read = live() ? HRESULT_FROM_WIN32(ERROR_NOT_FOUND) : E_ABORT;
+        return result;
+    }
+    HWND finalView = nullptr;
+    if (live()) result.finalViewRead = retainedView->GetWindow(&finalView);
+    if (!live() || GetAncestor(result.view, GA_PARENT) != result.parent || !paneGeometryOwned(result.parent, root) ||
+        !paneGeometryOwned(result.frame, root) || GetAncestor(result.frame, GA_PARENT) != root ||
+        !(result.parent == result.frame || IsChild(result.frame, result.parent)) || result.finalViewRead != S_OK ||
+        finalView != result.view || desktop->verifyIsolation() != S_OK) {
+        result.read = FAILED(result.finalViewRead) ? result.finalViewRead : E_ABORT; return result;
+    }
+    // The native STATUSBAR may expose a region in its frame's accessibility
+    // object rather than a dedicated HWND. Keep its exact public object/child.
+    RECT finalFooter{};
+    if (retainedFooter) {
+        VARIANT child{}; child.vt = VT_I4; child.lVal = retainedFooterChild;
+        long x = 0, y = 0, width = 0, height = 0;
+        result.finalFooterRead = retainedFooter->accLocation(&x, &y, &width, &height, child);
+        const auto right = static_cast<LONGLONG>(x)+width, bottom = static_cast<LONGLONG>(y)+height;
+        if (result.finalFooterRead == S_OK && width > 0 && height > 0 &&
+            right <= std::numeric_limits<LONG>::max() && bottom <= std::numeric_limits<LONG>::max())
+            finalFooter = {x,y,static_cast<LONG>(right),static_cast<LONG>(bottom)};
+        else if (result.finalFooterRead == S_OK) result.finalFooterRead = E_UNEXPECTED;
+        retainedFooter.Reset();
+    } else if (result.found) result.finalFooterRead = bounds(result.footerWindow, false, finalFooter);
+    if (result.finalFooterRead != S_OK || !EqualRect(&finalFooter, &result.footer) || !live()) {
+        result.read = FAILED(result.finalFooterRead) ? result.finalFooterRead : E_ABORT; return result;
+    }
+    // Service/MSAA calls and Releases may reenter the creator. Verify the exact
+    // geometry again after the last native call, not merely its HWND identity.
+    RECT finalRoot{}, finalParent{}, finalFrame{}, finalContent{}, finalPane{}, finalGrip{};
+    result.finalBoundsRead = bounds(root, true, finalRoot);
+    if (result.finalBoundsRead == S_OK) result.finalBoundsRead = bounds(result.parent, true, finalParent);
+    if (result.finalBoundsRead == S_OK) result.finalBoundsRead = bounds(result.frame, true, finalFrame);
+    if (result.finalBoundsRead == S_OK) result.finalBoundsRead = bounds(result.view, false, finalContent);
+    if (result.finalBoundsRead == S_OK && preview) result.finalBoundsRead = bounds(pane, false, finalPane);
+    if (result.finalBoundsRead == S_OK && preview) result.finalBoundsRead = mapUiRect(root, nullptr, logicalGrip, &finalGrip);
+    bool finalRtl = !rtl; const auto finalDirectionRead = windowUiDirection(root, &finalRtl);
+    if (result.finalBoundsRead != S_OK || finalDirectionRead != S_OK || finalRtl != rtl || GetDpiForWindow(root) != dpi ||
+        !EqualRect(&finalRoot, &result.rootClient) || !EqualRect(&finalParent, &result.parentClient) ||
+        !EqualRect(&finalFrame, &result.frameClient) || !EqualRect(&finalContent, &result.content) ||
+        (preview && (!EqualRect(&finalPane, &result.pane) || !EqualRect(&finalGrip, &result.grip))) || !live()) {
+        result.read = FAILED(result.finalBoundsRead) ? result.finalBoundsRead : E_ABORT; return result;
+    }
+    const auto visibility = [&](HWND window, LONG_PTR& style, BOOL& visible, DWORD& error) -> HRESULT {
+        if (!live() || !paneGeometryOwned(window, root)) return E_ABORT;
+        SetLastError(ERROR_SUCCESS);
+        style = GetWindowLongPtrW(window, GWL_STYLE); error = GetLastError();
+        if (!style && error != ERROR_SUCCESS) return HRESULT_FROM_WIN32(error);
+        visible = IsWindowVisible(window);
+        return live() ? S_OK : E_ABORT;
+    };
+    result.rootStyleRead = visibility(root, result.rootStyle, result.rootVisible, result.rootStyleError);
+    result.paneOwned = pane && paneGeometryOwned(pane, root) && GetAncestor(pane, GA_PARENT) == root;
+    result.gripOwned = gripController && paneGeometryOwned(gripController, root) && GetAncestor(gripController, GA_PARENT) == root;
+    result.paneStyleRead = pane ? visibility(pane, result.paneStyle, result.paneVisible, result.paneStyleError) : S_FALSE;
+    result.gripStyleRead = gripController ? visibility(gripController, result.gripStyle, result.gripVisible, result.gripStyleError) : S_FALSE;
+    // IsWindowVisible includes the parent's state. A shown direct child beneath
+    // the original hidden headless root must retain its own WS_VISIBLE bit;
+    // presented roots still require actual effective child visibility.
+    // https://learn.microsoft.com/windows/win32/api/winuser/nf-winuser-iswindowvisible
+    const bool paneShown = result.paneOwned && result.paneStyleRead == S_OK && (result.paneStyle & WS_VISIBLE) &&
+        (result.paneVisible != FALSE) == (result.rootVisible != FALSE);
+    const bool gripShown = result.gripOwned && result.gripStyleRead == S_OK && (result.gripStyle & WS_VISIBLE) &&
+        (result.gripVisible != FALSE) == (result.rootVisible != FALSE);
+    result.visibilityConsistent = result.rootStyleRead == S_OK && (preview ? paneShown && (!gripController || gripShown) :
+        (!pane || (result.paneOwned && result.paneStyleRead == S_OK && !(result.paneStyle & WS_VISIBLE) && !result.paneVisible)) &&
+        (!gripController || (result.gripOwned && result.gripStyleRead == S_OK && !(result.gripStyle & WS_VISIBLE) && !result.gripVisible)));
+    result.footerFull = result.found && result.complete && paneGeometryPositive(result.footer) &&
+        result.footer.left == result.frameClient.left && result.footer.right == result.frameClient.right &&
+        result.footer.bottom == result.frameClient.bottom && result.footer.top >= result.parentClient.bottom;
+    if (!preview) result.partition = EqualRect(&result.content, &result.parentClient) &&
+        result.visibilityConsistent && IsRectEmpty(&logicalGrip);
+    else result.partition = paneGeometryPositive(result.content) && paneGeometryPositive(result.pane) && paneGeometryPositive(result.grip) &&
+        result.content.top == result.parentClient.top && result.content.bottom == result.parentClient.bottom &&
+        result.pane.top == result.parentClient.top && result.pane.bottom == result.parentClient.bottom &&
+        result.grip.top == result.parentClient.top && result.grip.bottom == result.parentClient.bottom &&
+        (rtl ? result.pane.left == result.parentClient.left && result.pane.right == result.grip.left &&
+            result.grip.right == result.content.left && result.content.right == result.parentClient.right :
+            result.content.left == result.parentClient.left && result.content.right == result.grip.left &&
+            result.grip.right == result.pane.left && result.pane.right == result.parentClient.right) &&
+        paneGeometryDisjoint(result.footer, result.content) && paneGeometryDisjoint(result.footer, result.pane) && paneGeometryDisjoint(result.footer, result.grip);
+    if (preview) {
+        const auto hit = [&](const RECT& rectangle, HWND& window, DWORD& error) -> HRESULT {
+            if (!live() || !paneGeometryPositive(rectangle)) return E_ABORT;
+            const POINT physical{rectangle.left+(rectangle.right-rectangle.left)/2, rectangle.top+(rectangle.bottom-rectangle.top)/2};
+            POINT local{}; const auto mapped = mapUiPoint(nullptr, root, physical, &local);
+            if (mapped != S_OK) return mapped;
+            SetLastError(ERROR_SUCCESS);
+            window = ChildWindowFromPointEx(root, local, CWP_SKIPINVISIBLE); error = GetLastError();
+            return window && live() ? S_OK : window ? E_ABORT : HRESULT_FROM_WIN32(error ? error : ERROR_GEN_FAILURE);
+        };
+        result.paneHitRead = hit(result.pane, result.paneHit, result.paneHitError);
+        result.gripHitRead = hit(result.grip, result.gripHit, result.gripHitError);
+        const bool exactGrip = gripController ? result.gripOwned &&
+            bounds(gripController, false, result.gripWindow) == S_OK && EqualRect(&result.gripWindow, &result.grip) :
+            result.gripHit == root;
+        result.inputReachable = result.paneHitRead == S_OK && result.gripHitRead == S_OK && result.paneHit == pane &&
+            result.gripHit == (gripController ? gripController : root) && exactGrip && result.visibilityConsistent && live();
+        result.partition = result.partition && result.inputReachable;
+    }
+    LONG_PTR finalRootStyle = 0, finalPaneStyle = 0, finalGripStyle = 0;
+    BOOL finalRootVisible = FALSE, finalPaneVisible = FALSE, finalGripVisible = FALSE;
+    DWORD finalStyleError = ERROR_SUCCESS;
+    const auto finalRootStyleRead = visibility(root, finalRootStyle, finalRootVisible, finalStyleError);
+    const auto finalPaneStyleRead = pane ? visibility(pane, finalPaneStyle, finalPaneVisible, finalStyleError) : S_FALSE;
+    const auto finalGripStyleRead = gripController ? visibility(gripController, finalGripStyle, finalGripVisible, finalStyleError) : S_FALSE;
+    if (finalRootStyleRead != result.rootStyleRead || finalRootStyleRead != S_OK ||
+        finalPaneStyleRead != result.paneStyleRead || finalGripStyleRead != result.gripStyleRead ||
+        finalRootStyle != result.rootStyle || finalPaneStyle != result.paneStyle || finalGripStyle != result.gripStyle ||
+        finalRootVisible != result.rootVisible || finalPaneVisible != result.paneVisible || finalGripVisible != result.gripVisible ||
+        (pane && (!paneGeometryOwned(pane, root) || GetAncestor(pane, GA_PARENT) != root)) ||
+        (gripController && (!paneGeometryOwned(gripController, root) || GetAncestor(gripController, GA_PARENT) != root))) {
+        result.read = E_ABORT; result.partition = false; result.inputReachable = false; return result;
+    }
+    if (!live() || GetAncestor(result.view, GA_PARENT) != result.parent || GetAncestor(result.frame, GA_PARENT) != root ||
+        !(result.parent == result.frame || IsChild(result.frame, result.parent)) ||
+        !paneGeometryOwned(result.view, root) || !paneGeometryOwned(result.parent, root) || !paneGeometryOwned(result.frame, root)) result.read = E_ABORT;
+    else if (result.complete) result.read = result.found ? S_OK : HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+    return result;
+}
+std::wstring paneGeometryFacts(const NativePaneGeometry& value) {
+    const auto rect = [](const RECT& r) { return std::to_wstring(r.left)+L","+std::to_wstring(r.top)+L","+std::to_wstring(r.right)+L","+std::to_wstring(r.bottom); };
+    return L"raw geometry view/bounds/service/status/MSAA/role/location/final="+hresultMessage(value.viewRead)+L"/"+
+        hresultMessage(value.boundsRead)+L"/"+hresultMessage(value.serviceRead)+L"/"+hresultMessage(value.statusRead)+L"/"+
+        hresultMessage(value.accessibleRead)+L"/"+hresultMessage(value.roleRead)+L"/"+hresultMessage(value.locationRead)+L"/"+hresultMessage(value.read)+
+        L"; raw MSAA owner/count/children/childQI/finalView="+hresultMessage(value.ownerRead)+L"/"+
+        hresultMessage(value.childCountRead)+L"/"+hresultMessage(value.childrenRead)+L"/"+hresultMessage(value.childQueryRead)+L"/"+hresultMessage(value.finalViewRead)+
+        L"; final geometry/direction/footer="+hresultMessage(value.finalBoundsRead)+L"/"+hresultMessage(value.directionRead)+L"/"+hresultMessage(value.finalFooterRead)+
+        L"; actual pane/grip hit HRESULT="+hresultMessage(value.paneHitRead)+L"/"+hresultMessage(value.gripHitRead)+
+        L"; pane/grip/expectedGrip HWND="+std::to_wstring(reinterpret_cast<UINT_PTR>(value.paneHit))+L"/"+
+        std::to_wstring(reinterpret_cast<UINT_PTR>(value.gripHit))+L"/"+std::to_wstring(reinterpret_cast<UINT_PTR>(value.expectedGrip))+
+        L"; hit native errors/inputReachable="+std::to_wstring(value.paneHitError)+L"/"+std::to_wstring(value.gripHitError)+L"/"+std::to_wstring(value.inputReachable)+
+        L"; root/pane/grip style HRESULT="+hresultMessage(value.rootStyleRead)+L"/"+hresultMessage(value.paneStyleRead)+L"/"+hresultMessage(value.gripStyleRead)+
+        L"; style native errors="+std::to_wstring(value.rootStyleError)+L"/"+std::to_wstring(value.paneStyleError)+L"/"+std::to_wstring(value.gripStyleError)+
+        L"; raw root/pane/grip style="+std::to_wstring(static_cast<DWORD>(value.rootStyle))+L"/"+
+        std::to_wstring(static_cast<DWORD>(value.paneStyle))+L"/"+std::to_wstring(static_cast<DWORD>(value.gripStyle))+
+        L"; effective root/pane/grip visible="+std::to_wstring(value.rootVisible)+L"/"+std::to_wstring(value.paneVisible)+L"/"+std::to_wstring(value.gripVisible)+
+        L"; pane/grip owned/visibilityConsistent="+std::to_wstring(value.paneOwned)+L"/"+std::to_wstring(value.gripOwned)+L"/"+
+        std::to_wstring(value.visibilityConsistent)+L"; actual grip HWND rectangle="+rect(value.gripWindow)+
+        L"; exact public HWND view/parent/frame/footer="+std::to_wstring(reinterpret_cast<UINT_PTR>(value.view))+L"/"+
+        std::to_wstring(reinterpret_cast<UINT_PTR>(value.parent))+L"/"+std::to_wstring(reinterpret_cast<UINT_PTR>(value.frame))+L"/"+
+        std::to_wstring(reinterpret_cast<UINT_PTR>(value.footerWindow))+L"; nodes/candidates/complete/fullFooter/partition="+
+        std::to_wstring(value.nodes)+L"/"+std::to_wstring(value.candidates)+L"/"+std::to_wstring(value.complete)+L"/"+
+        std::to_wstring(value.footerFull)+L"/"+std::to_wstring(value.partition)+L"; physical parent/frame/content/pane/grip/footer="+
+        rect(value.parentClient)+L"/"+rect(value.frameClient)+L"/"+rect(value.content)+L"/"+rect(value.pane)+L"/"+rect(value.grip)+L"/"+rect(value.footer);
+}
 constexpr std::array<const wchar_t*, 8> ViewNames{
     L"Extra large icons", L"Large icons", L"Medium icons", L"Small icons",
     L"List", L"Details", L"Tiles", L"Content"};
@@ -4869,16 +5172,49 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report, bool library
             execute(HiddenItems);
             ready = pumpUntil([&] { int total = 0; return !navigating_ && folderView_ && SUCCEEDED(folderView_->ItemCount(SVGIO_ALLVIEW, &total)) && total == 1003; }, 10000);
             check("show_hidden_items", ready);
+            const auto sampleCurrentPaneGeometry = [&](ULONGLONG geometryDeadline) {
+                const auto geometryView = view_;
+                const auto geometryFolder = folderView_;
+                const auto geometryNavigation = navigationCount_;
+                Pidl geometryLocation(currentPidl_ ? ILCloneFull(currentPidl_.get()) : nullptr);
+                const auto geometryCurrent = [&] {
+                    return !closing_ && !navigating_ && geometryView && geometryFolder && geometryLocation && currentPidl_ &&
+                        view_.Get() == geometryView.Get() && folderView_.Get() == geometryFolder.Get() &&
+                        navigationCount_ == geometryNavigation && ILGetSize(geometryLocation.get()) == ILGetSize(currentPidl_.get()) &&
+                        std::memcmp(geometryLocation.get(), currentPidl_.get(), ILGetSize(geometryLocation.get())) == 0;
+                };
+                return readNativePaneGeometry(geometryView.Get(), window_, previewPane_, previewSplitter_,
+                    preferences_.previewPane, geometryDeadline, geometryCurrent, previewGrip_);
+            };
+            const auto previewPolicyDeadline = GetTickCount64() + 5000;
+            const auto originalPaneFrame = sampleCurrentPaneGeometry(previewPolicyDeadline);
             execute(PreviewPane);
-            ready = pumpUntil([&] { return !navigating_ && folderView_; }, 5000);
+            const auto previewPolicyNow = GetTickCount64();
+            ready = previewPolicyNow < previewPolicyDeadline && pumpUntil([&] { return !navigating_ && folderView_; },
+                static_cast<DWORD>(previewPolicyDeadline - previewPolicyNow));
             EXPLORERPANESTATE pane = EPS_DONTCARE; GetPaneState(EP_PreviewPane, &pane);
             check("preview_pane_policy", ready && preferences_.previewPane && (pane & EPS_DEFAULT_OFF) &&
                 (pane & EPS_FORCE) && previewPane_ && previewRender_ && IsChild(window_,previewPane_) &&
                 GetWindowThreadProcessId(previewPane_,nullptr)==GetCurrentThreadId());
+            const auto previewPolicyGeometry = sampleCurrentPaneGeometry(previewPolicyDeadline);
+            check("native_preview_toggle_preserves_full_native_footer_and_partitions_actual_content_slot",
+                ready && originalPaneFrame.read == S_OK && originalPaneFrame.footerFull && originalPaneFrame.partition &&
+                previewPolicyGeometry.read == S_OK && previewPolicyGeometry.footerFull && previewPolicyGeometry.partition &&
+                EqualRect(&originalPaneFrame.frameClient, &previewPolicyGeometry.frameClient) &&
+                EqualRect(&originalPaneFrame.footer, &previewPolicyGeometry.footer),
+                L"before=" + paneGeometryFacts(originalPaneFrame) + L"; after=" + paneGeometryFacts(previewPolicyGeometry));
+            const auto detailsPolicyDeadline = GetTickCount64() + 5000;
             execute(DetailsPane);
-            ready = pumpUntil([&] { return !navigating_ && folderView_; }, 5000);
+            const auto detailsPolicyNow = GetTickCount64();
+            ready = detailsPolicyNow < detailsPolicyDeadline && pumpUntil([&] { return !navigating_ && folderView_; },
+                static_cast<DWORD>(detailsPolicyDeadline - detailsPolicyNow));
             GetPaneState(EP_PreviewPane, &pane);
             check("panes_mutually_exclusive", ready && preferences_.detailsPane && !preferences_.previewPane && (pane & EPS_DEFAULT_OFF));
+            const auto detailsPolicyGeometry = sampleCurrentPaneGeometry(detailsPolicyDeadline);
+            check("native_details_transition_restores_full_public_view_and_keeps_native_footer",
+                ready && detailsPolicyGeometry.read == S_OK && detailsPolicyGeometry.footerFull && detailsPolicyGeometry.partition &&
+                EqualRect(&originalPaneFrame.frameClient, &detailsPolicyGeometry.frameClient) &&
+                EqualRect(&originalPaneFrame.footer, &detailsPolicyGeometry.footer), paneGeometryFacts(detailsPolicyGeometry));
             {
                 // Small local files avoid cloud recall and shared associations.
                 // The browser selects the actual items. Production hosts their
@@ -5082,6 +5418,117 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report, bool library
                             observed.bounds.top >= frame.top && observed.bounds.bottom <= frame.bottom) break;
                     }
                     if (!nativeFrame || nativeFrame == host || FAILED(windowUiDirection(host, &rtl))) return E_INVALIDARG;
+                    // Observation only: distinguish actual sibling occlusion
+                    // from the native root's printing/composition behavior.
+                    const auto captureDesktop = PrivateDesktop::current();
+                    PrivateWindowSnapshot captureRoot{}, captureContent{}, capturePaneWindow{};
+                    const auto captureRootRead = ownedPreview ? paneWindowSnapshot(host, captureRoot) : E_PENDING;
+                    const auto captureContentRead = ownedPreview ? paneWindowSnapshot(content, captureContent) : E_PENDING;
+                    const auto capturePaneRead = ownedPreview ? paneWindowSnapshot(ownedPreview, capturePaneWindow) : E_PENDING;
+                    const auto captureEpoch = paneApp->previewEpoch_, captureRevision = paneApp->commandSourceRevision_;
+                    const auto captureView = paneApp->view_.Get(); const auto captureFolder = paneApp->folderView_.Get();
+                    const auto captureNavigation = paneApp->navigationCount_; const auto captureLocation = paneApp->currentPidl_.get();
+                    const auto printComposition = [&](const wchar_t* phase, HRESULT printStatus) {
+                        if (!ownedPreview) return;
+                        struct LastErrorRestore { DWORD value = GetLastError(); ~LastErrorRestore() { SetLastError(value); } } lastErrorRestore;
+                        const auto sourceCurrent = [&] {
+                            return !paneApp->closing_ && !paneApp->navigating_ && paneApp->window_ == host &&
+                                paneApp->view_.Get() == captureView && paneApp->folderView_.Get() == captureFolder &&
+                                paneApp->navigationCount_ == captureNavigation && paneApp->currentPidl_.get() == captureLocation &&
+                                paneApp->previewEpoch_ == captureEpoch && paneApp->commandSourceRevision_ == captureRevision &&
+                                GetWindowLongPtrW(host, GWLP_USERDATA) == reinterpret_cast<LONG_PTR>(paneApp.get());
+                        };
+                        const auto tupleCurrent = [&] {
+                            if (!captureDesktop || PrivateDesktop::current() != captureDesktop || !sourceCurrent() ||
+                                captureDesktop->verifyIsolation() != S_OK ||
+                                (observed.observationDeadline && GetTickCount64() >= observed.observationDeadline)) return false;
+                            PrivateWindowSnapshot rootNow{}, contentNow{}, paneNow{};
+                            const auto own = [&](const PrivateWindowSnapshot& value) {
+                                return value.thread == GetCurrentThreadId() && value.process == GetCurrentProcessId() &&
+                                    value.root == host && value.desktopRead == S_OK && std::wstring_view(value.desktop.data()) == captureDesktop->name();
+                            };
+                            return captureRootRead == S_OK && captureContentRead == S_OK && capturePaneRead == S_OK &&
+                                own(captureRoot) && own(captureContent) && own(capturePaneWindow) && capturePaneWindow.parent == host &&
+                                paneWindowSnapshot(host, rootNow) == S_OK && samePaneWindow(captureRoot, rootNow) &&
+                                paneWindowSnapshot(content, contentNow) == S_OK && samePaneWindow(captureContent, contentNow) &&
+                                paneWindowSnapshot(ownedPreview, paneNow) == S_OK && samePaneWindow(capturePaneWindow, paneNow) && sourceCurrent();
+                        };
+                        const bool before = tupleCurrent();
+                        std::wostringstream diagnostic;
+                        diagnostic << L"phase=" << phase << L"; source=" << name << L"; print=" << hresultMessage(printStatus)
+                            << L"; root/content/pane/nativeCaptureFrame=" << reinterpret_cast<UINT_PTR>(host) << L"/"
+                            << reinterpret_cast<UINT_PTR>(content) << L"/" << reinterpret_cast<UINT_PTR>(ownedPreview) << L"/"
+                            << reinterpret_cast<UINT_PTR>(nativeFrame) << L"; tuple reads=" << hresultMessage(captureRootRead) << L"/"
+                            << hresultMessage(captureContentRead) << L"/" << hresultMessage(capturePaneRead) << L"; private/source/tuple before=" << before;
+                        if (before) {
+                            HWND browserFrame = content; unsigned ancestors = 0;
+                            while (browserFrame && GetAncestor(browserFrame, GA_PARENT) != host && ++ancestors <= 16)
+                                browserFrame = GetAncestor(browserFrame, GA_PARENT);
+                            if (ancestors > 16 || !browserFrame || GetAncestor(browserFrame, GA_PARENT) != host) browserFrame = nullptr;
+                            const POINT physical{observed.bounds.left + (observed.bounds.right - observed.bounds.left) / 2,
+                                observed.bounds.top + (observed.bounds.bottom - observed.bounds.top) / 2};
+                            POINT local{}; const auto mapped = mapUiPoint(nullptr, host, physical, &local);
+                            SetLastError(ERROR_SUCCESS);
+                            const auto hit = mapped == S_OK ? ChildWindowFromPointEx(host, local, CWP_SKIPINVISIBLE) : nullptr;
+                            const auto hitError = GetLastError();
+                            diagnostic << L"; actual direct browser frame=" << reinterpret_cast<UINT_PTR>(browserFrame)
+                                << L"; physical/local point=" << physical.x << L"," << physical.y << L"/" << local.x << L"," << local.y
+                                << L"; map=" << hresultMessage(mapped) << L"; CWP_SKIPINVISIBLE hit/error=" << reinterpret_cast<UINT_PTR>(hit)
+                                << L"/" << hitError << L"; hit pane/browserFrame=" << (hit == ownedPreview) << L"/" << (hit == browserFrame);
+                            unsigned rows = 0; HWND child = GetTopWindow(host);
+                            for (; child && rows < 64; child = GetWindow(child, GW_HWNDNEXT), ++rows) {
+                                if (!sourceCurrent() || (observed.observationDeadline && GetTickCount64() >= observed.observationDeadline)) break;
+                                DWORD process = 0; SetLastError(ERROR_SUCCESS);
+                                const auto thread = GetWindowThreadProcessId(child, &process); const auto threadError = GetLastError();
+                                const auto parent = GetAncestor(child, GA_PARENT);
+                                const bool owned = parent == host && thread == GetCurrentThreadId() && process == GetCurrentProcessId();
+                                diagnostic << L"; child[" << rows << L"] HWND/parent/PID/TID/error/creatorOwned=" << reinterpret_cast<UINT_PTR>(child)
+                                    << L"/" << reinterpret_cast<UINT_PTR>(parent) << L"/" << process << L"/" << thread << L"/" << threadError << L"/" << owned;
+                                if (!owned) continue;
+                                std::array<wchar_t, 128> type{}; SetLastError(ERROR_SUCCESS);
+                                const auto classRead = GetClassNameW(child, type.data(), static_cast<int>(type.size())); const auto classError = GetLastError();
+                                SetLastError(ERROR_SUCCESS);
+                                const auto style = GetWindowLongPtrW(child, GWL_STYLE); const auto styleError = GetLastError();
+                                SetLastError(ERROR_SUCCESS);
+                                const auto exStyle = GetWindowLongPtrW(child, GWL_EXSTYLE); const auto exStyleError = GetLastError();
+                                RECT rectangle{}; SetLastError(ERROR_SUCCESS);
+                                const auto rectangleRead = GetWindowRect(child, &rectangle); const auto rectangleError = GetLastError();
+                                diagnostic << L"; class/count/error=[";
+                                if (classRead > 0 && classRead < static_cast<int>(type.size()) - 1) diagnostic.write(type.data(), classRead);
+                                diagnostic << L"]/" << classRead << L"/" << classError << L"; style/exStyle/errors=" << static_cast<UINT_PTR>(style)
+                                    << L"/" << static_cast<UINT_PTR>(exStyle) << L"/" << styleError << L"/" << exStyleError << L"; visible=" << IsWindowVisible(child)
+                                    << L"; rect/read/error=" << rectangle.left << L"," << rectangle.top << L"," << rectangle.right << L"," << rectangle.bottom
+                                    << L"/" << rectangleRead << L"/" << rectangleError;
+                            }
+                            diagnostic << L"; child rows/unreadOrOverflow=" << rows << L"/" << (child != nullptr);
+                        }
+                        diagnostic << L"; fresh private/source/tuple after=" << tupleCurrent()
+                            << L"; returned capture colors/hash=" << captured.inspectionUniqueColors << L"/" << captured.inspectionPixelHash
+                            << L"; failed capture statistics unavailable: captureWindowPng publishes report only on success";
+                        std::cerr << "headless-preview-print-composition " << jsonString(diagnostic.str()) << std::endl;
+                    };
+                    const auto paneHitCurrent = [&] {
+                        if (!ownedPreview) return true;
+                        if (!captureDesktop || PrivateDesktop::current() != captureDesktop || captureDesktop->verifyIsolation() != S_OK ||
+                            (observed.observationDeadline && GetTickCount64() >= observed.observationDeadline) ||
+                            paneApp->closing_ || paneApp->navigating_ || paneApp->window_ != host ||
+                            paneApp->view_.Get() != captureView || paneApp->folderView_.Get() != captureFolder ||
+                            paneApp->navigationCount_ != captureNavigation || paneApp->currentPidl_.get() != captureLocation ||
+                            paneApp->previewEpoch_ != captureEpoch || paneApp->commandSourceRevision_ != captureRevision ||
+                            GetWindowLongPtrW(host, GWLP_USERDATA) != reinterpret_cast<LONG_PTR>(paneApp.get()) ||
+                            !paneGeometryOwned(host, host) || !paneGeometryOwned(ownedPreview, host) ||
+                            GetAncestor(ownedPreview, GA_PARENT) != host) return false;
+                        const POINT physical{observed.bounds.left+(observed.bounds.right-observed.bounds.left)/2,
+                            observed.bounds.top+(observed.bounds.bottom-observed.bounds.top)/2};
+                        POINT local{};
+                        if (mapUiPoint(nullptr, host, physical, &local) != S_OK ||
+                            ChildWindowFromPointEx(host, local, CWP_SKIPINVISIBLE) != ownedPreview) return false;
+                        PrivateWindowSnapshot rootNow{}, paneNow{};
+                        return paneWindowSnapshot(host, rootNow) == S_OK && samePaneWindow(captureRoot, rootNow) &&
+                            paneWindowSnapshot(ownedPreview, paneNow) == S_OK && samePaneWindow(capturePaneWindow, paneNow) &&
+                            captureDesktop->verifyIsolation() == S_OK && paneApp->previewEpoch_ == captureEpoch &&
+                            paneApp->commandSourceRevision_ == captureRevision;
+                    };
                     VisualCaptureOptions options; options.includeFrame = false;
                     options.minimumUniqueColors = 2; options.requireVisibleChildren = false;
                     options.nativeClientCropSource = host;
@@ -5095,10 +5542,15 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report, bool library
                     options.nativeClientCropSourceImage = path.parent_path() / (path.stem().wstring() + L"-root-source.png");
                     // A verified private surface can diagnose semantic failure;
                     // successful rendering still requires observed.matched.
-                    const auto printed = observed.privacyChecked && observed.privateWindows && PrivateDesktop::current() &&
-                        RedrawWindow(host, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN | RDW_UPDATENOW) && GdiFlush() && rendererCurrent() ?
-                        captureWindowPng(*PrivateDesktop::current(), nativeFrame, path, options, captured) : E_UNEXPECTED;
-                    return rendererCurrent() ? printed : E_ACCESSDENIED;
+                    HRESULT printed = E_UNEXPECTED;
+                    if (observed.privacyChecked && observed.privateWindows && PrivateDesktop::current() &&
+                        RedrawWindow(host, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN | RDW_UPDATENOW) && GdiFlush() && rendererCurrent() && paneHitCurrent()) {
+                        printComposition(L"before-root-print", E_PENDING);
+                        printed = captureWindowPng(*PrivateDesktop::current(), nativeFrame, path, options, captured);
+                    }
+                    const bool currentAfterPrint = rendererCurrent() && paneHitCurrent();
+                    printComposition(L"after-renderer-source-guard", printed);
+                    return currentAfterPrint ? printed : E_ACCESSDENIED;
                 };
                 bool paneIsolationPreserved = true;
                 WindowIsolationControlReport paneMessageControls;
@@ -5475,8 +5927,8 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report, bool library
                                 ~PaneFocusKeyboard() { if (!restored) restore(); }
                             } paneFocusKeyboard(paneApp->lastError_);
                             const auto paneFocusRead = paneFocusReadState(paneFocusBefore);
-                            const std::array paneFocusWindows{paneApp->window_, paneApp->previewPane_, paneApp->previewRender_, content};
-                            std::array<std::pair<LONG_PTR, LONG_PTR>, 4> paneFocusStyles{};
+                            const std::array paneFocusWindows{paneApp->window_, paneApp->previewPane_, paneApp->previewRender_, content, paneApp->previewGrip_};
+                            std::array<std::pair<LONG_PTR, LONG_PTR>, 5> paneFocusStyles{};
                             for (size_t paneFocusWindow = 0; paneFocusWindow < paneFocusWindows.size(); ++paneFocusWindow)
                                 paneFocusStyles[paneFocusWindow] = {GetWindowLongPtrW(paneFocusWindows[paneFocusWindow], GWL_STYLE), GetWindowLongPtrW(paneFocusWindows[paneFocusWindow], GWL_EXSTYLE)};
                             const auto paneFocusPreferences = std::tuple{paneApp->preferences_.previewPane, paneApp->preferences_.detailsPane,
@@ -5824,6 +6276,12 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report, bool library
                             L"; read-only diagnostic; native layout mutations=0";
                         diagnostic += L"; " + footerDiagnostic;
                         std::cerr << "headless-native-footer-after-original-pane-observation " << jsonString(footerDiagnostic) << std::endl;
+                        const auto renderedGeometry = readNativePaneGeometry(retainedView.Get(), paneApp->window_, paneApp->previewPane_,
+                            paneApp->previewSplitter_, preview, observations[footerSelection].observationDeadline, footerCurrent, paneApp->previewGrip_);
+                        check(preview ? "native_preview_rendered_file_pane_partitions_content_and_leaves_full_footer" :
+                            "native_details_rendered_file_view_keeps_full_native_footer",
+                            footerAfter && renderedGeometry.read == S_OK && renderedGeometry.footerFull && renderedGeometry.partition &&
+                            footerSourceCurrent(), paneGeometryFacts(renderedGeometry));
                     }
                     if (preview) diagnostic += L"; " + previewTargetDiagnostic + L"; " + previewActivationDiagnostic;
                     for (size_t index = 0; index < observations.size(); ++index) diagnostic += L"; " + std::to_wstring(index) + L": " +
@@ -6148,17 +6606,35 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report, bool library
                         windowUiDirection(splitterApp->window_, &splitterDirection) == S_OK && splitterDirection == splitterRtl &&
                         splitterBefore.members == std::set<NativeFileIdentity>{splitterIdentity(splitterSources[1].identity)} &&
                         splitterBefore.selection == splitterBefore.members && splitterBefore.focused == splitterIdentity(splitterSources[1].identity) && GetCapture() == nullptr;
-                    const auto splitterIntact = [&] {
+                    const auto splitterIntact = [&](bool splitterPaneHidden = false) {
                         SplitterState splitterAfter;
                         if (!splitterSetup || splitterReadState(splitterAfter) != S_OK || !splitterSourcesCurrent() ||
                             splitterAfter.members != splitterBefore.members || splitterAfter.selection != splitterBefore.selection ||
                             splitterAfter.focused != splitterBefore.focused || splitterAfter.focusFlags != splitterBefore.focusFlags ||
                             splitterAfter.folderFlags != splitterBefore.folderFlags || !splitterSamePresentation(splitterAfter.presentation, splitterBefore.presentation) ||
                             splitterPersistence() != splitterReceipts) return false;
-                        for (size_t splitterWindow = 0; splitterWindow < splitterWindows.size(); ++splitterWindow)
-                            if (std::pair{GetWindowLongPtrW(splitterWindows[splitterWindow], GWL_STYLE), GetWindowLongPtrW(splitterWindows[splitterWindow], GWL_EXSTYLE)} != splitterStyles[splitterWindow]) return false;
+                        for (size_t splitterWindow = 0; splitterWindow < splitterWindows.size(); ++splitterWindow) {
+                            auto expectedStyles = splitterStyles[splitterWindow];
+                            if (splitterPaneHidden && splitterWindow == 1) expectedStyles.first &= ~static_cast<LONG_PTR>(WS_VISIBLE);
+                            if (std::pair{GetWindowLongPtrW(splitterWindows[splitterWindow], GWL_STYLE), GetWindowLongPtrW(splitterWindows[splitterWindow], GWL_EXSTYLE)} != expectedStyles) return false;
+                        }
                         const auto splitterDesktop = PrivateDesktop::current();
                         return splitterCurrent() && splitterDesktop && splitterDesktop->verifyIsolation() == S_OK;
+                    };
+                    const auto splitterOriginalGeometry = readNativePaneGeometry(splitterView.Get(), splitterApp->window_,
+                        splitterApp->previewPane_, splitterApp->previewSplitter_, true, splitterDeadline, splitterCurrent, splitterApp->previewGrip_);
+                    bool splitterGeometryPassed = splitterOriginalGeometry.read == S_OK && splitterOriginalGeometry.footerFull &&
+                        splitterOriginalGeometry.partition && splitterIntact();
+                    std::wstring splitterGeometryTrace = L"initial=" + paneGeometryFacts(splitterOriginalGeometry);
+                    const auto splitterGeometryIntact = [&] {
+                        const auto sampled = readNativePaneGeometry(splitterView.Get(), splitterApp->window_,
+                            splitterApp->previewPane_, splitterApp->previewSplitter_, true, splitterDeadline, splitterCurrent, splitterApp->previewGrip_);
+                        const bool geometryPreserved = sampled.read == S_OK && sampled.footerFull && sampled.partition &&
+                            EqualRect(&sampled.frameClient, &splitterOriginalGeometry.frameClient) &&
+                            EqualRect(&sampled.footer, &splitterOriginalGeometry.footer) && splitterIntact();
+                        if (!geometryPreserved) splitterGeometryTrace += L"; failure=" + paneGeometryFacts(sampled);
+                        splitterGeometryPassed = geometryPreserved && splitterGeometryPassed;
+                        return geometryPreserved;
                     };
                     const auto splitterBounds = [&](HWND splitterWindow, RECT& splitterResult) {
                         RECT splitterScreen{};
@@ -6171,6 +6647,46 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report, bool library
                     bool splitterDragsPassed = splitterSetup, splitterBoundsPassed = splitterSetup;
                     unsigned splitterCompletedGrips = 0;
                     std::wstring splitterTrace;
+                    const auto splitterDownAtActualTarget = [&](int x, int y) {
+                        if (!splitterIntact() || GetTickCount64() >= splitterDeadline) return false;
+                        const auto root = splitterApp->window_, expected = splitterApp->previewGrip_;
+                        const auto logicalGrip = splitterApp->previewSplitter_;
+                        RECT physicalGrip{}, actualGrip{};
+                        const POINT requested{x,y}; POINT physical{}, rootLocal{}, targetLocal{};
+                        auto mapped = mapUiRect(root, nullptr, logicalGrip, &physicalGrip);
+                        if (mapped == S_OK) mapped = mapUiPoint(root, nullptr, requested, &physical);
+                        if (mapped == S_OK) mapped = mapUiPoint(nullptr, root, physical, &rootLocal);
+                        SetLastError(ERROR_SUCCESS);
+                        const auto target = mapped == S_OK ? ChildWindowFromPointEx(root, rootLocal, CWP_SKIPINVISIBLE) : nullptr;
+                        const auto hitError = GetLastError();
+                        const bool exact = expected && expected == splitterOriginalGeometry.expectedGrip && target == expected && paneGeometryOwned(expected, root) &&
+                            GetAncestor(expected, GA_PARENT) == root && IsWindowVisible(expected) && PtInRect(&physicalGrip, physical) &&
+                            !(GetWindowLongPtrW(expected, GWL_STYLE) & WS_TABSTOP) && GetDpiForWindow(expected) == splitterDpi &&
+                            GetWindowRect(expected, &actualGrip) && EqualRect(&physicalGrip, &actualGrip) &&
+                            rootLocal.x == requested.x && rootLocal.y == requested.y;
+                        if (mapped == S_OK && exact) mapped = mapUiPoint(root, target, requested, &targetLocal);
+                        const bool current = exact && mapped == S_OK && splitterCurrent() && GetTickCount64() < splitterDeadline &&
+                            root == splitterApp->window_ && expected == splitterApp->previewGrip_ &&
+                            EqualRect(&logicalGrip, &splitterApp->previewSplitter_) &&
+                            targetLocal.x >= std::numeric_limits<short>::min() && targetLocal.x <= std::numeric_limits<short>::max() &&
+                            targetLocal.y >= std::numeric_limits<short>::min() && targetLocal.y <= std::numeric_limits<short>::max();
+                        splitterTrace += L"; actual down target/expected="+std::to_wstring(reinterpret_cast<UINT_PTR>(target))+L"/"+
+                            std::to_wstring(reinterpret_cast<UINT_PTR>(expected))+L"; mapped/error/exact/source="+hresultMessage(mapped)+L"/"+
+                            std::to_wstring(hitError)+L"/"+std::to_wstring(exact)+L"/"+std::to_wstring(current)+L"; target client="+
+                            std::to_wstring(targetLocal.x)+L","+std::to_wstring(targetLocal.y);
+                        if (!current) return false;
+                        // One original press reaches the real hit child. Its
+                        // production forwarding establishes normal root capture.
+                        SendMessageW(target, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(targetLocal.x, targetLocal.y));
+                        return true;
+                    };
+                    const auto splitterMoveToCapturedRoot = [&](int x, int y) {
+                        const auto target = GetCapture();
+                        if (target != splitterApp->window_ || !splitterCurrent() || GetTickCount64() >= splitterDeadline ||
+                            !paneGeometryOwned(target, target)) return false;
+                        SendMessageW(target, WM_MOUSEMOVE, MK_LBUTTON, MAKELPARAM(x,y));
+                        return true;
+                    };
                     RECT splitterOriginalPane{}, splitterOriginalView{};
                     const RECT splitterOriginalGrip = splitterApp->previewSplitter_;
                     splitterDragsPassed = splitterDragsPassed && splitterBounds(splitterApp->previewPane_, splitterOriginalPane) && splitterBounds(splitterViewWindow, splitterOriginalView);
@@ -6180,47 +6696,56 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report, bool library
                         const int splitterX = splitterFarEdge ? splitterGrip.right - 1 : splitterGrip.left + 1;
                         const int splitterY = (splitterGrip.top + splitterGrip.bottom) / 2;
                         const int splitterWidthBefore = splitterApp->preferences_.previewWidth;
-                        SendMessageW(splitterApp->window_, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(splitterX, splitterY));
-                        const bool splitterCaptured = splitterApp->previewResizing_ && GetCapture() == splitterApp->window_;
+                        const bool splitterDispatched = splitterDownAtActualTarget(splitterX, splitterY);
+                        const bool splitterCaptured = splitterDispatched && splitterApp->previewResizing_ && GetCapture() == splitterApp->window_;
                         bool splitterNoJump = false, splitterMoved = false, splitterLimits = false, splitterReturned = false;
                         if (splitterCaptured && splitterIntact()) {
-                            SendMessageW(splitterApp->window_, WM_MOUSEMOVE, MK_LBUTTON, MAKELPARAM(splitterX, splitterY));
+                            const bool splitterStillSent = splitterMoveToCapturedRoot(splitterX, splitterY);
                             RECT splitterPaneStill{}, splitterViewStill{};
-                            splitterNoJump = splitterIntact() && splitterBounds(splitterApp->previewPane_, splitterPaneStill) && splitterBounds(splitterViewWindow, splitterViewStill) &&
+                            splitterNoJump = splitterStillSent && splitterIntact() && splitterBounds(splitterApp->previewPane_, splitterPaneStill) && splitterBounds(splitterViewWindow, splitterViewStill) &&
                                 EqualRect(&splitterPaneStill, &splitterOriginalPane) && EqualRect(&splitterViewStill, &splitterOriginalView) &&
                                 EqualRect(&splitterGrip, &splitterApp->previewSplitter_) && splitterApp->preferences_.previewWidth == splitterWidthBefore;
                         }
                         if (splitterNoJump) {
-                            SendMessageW(splitterApp->window_, WM_MOUSEMOVE, MK_LBUTTON, MAKELPARAM(splitterX - splitterApp->px(40), splitterY));
+                            const bool splitterMoveSent = splitterMoveToCapturedRoot(splitterX - splitterApp->px(40), splitterY);
                             RECT splitterPaneMoved{}, splitterViewMoved{};
-                            splitterMoved = splitterIntact() && splitterBounds(splitterApp->previewPane_, splitterPaneMoved) && splitterBounds(splitterViewWindow, splitterViewMoved) &&
+                            splitterMoved = splitterMoveSent && splitterIntact() && splitterBounds(splitterApp->previewPane_, splitterPaneMoved) && splitterBounds(splitterViewWindow, splitterViewMoved) &&
                                 splitterApp->preferences_.previewWidth == splitterWidthBefore + 40 && splitterPaneMoved.right == splitterOriginalPane.right &&
                                 splitterPaneMoved.left == splitterOriginalPane.left - splitterApp->px(40) && splitterViewMoved.left == splitterOriginalView.left &&
                                 splitterViewMoved.right == splitterOriginalView.right - splitterApp->px(40);
+                            if (splitterMoved) splitterMoved = splitterGeometryIntact();
                         }
                         if (splitterMoved) {
-                            SendMessageW(splitterApp->window_, WM_MOUSEMOVE, MK_LBUTTON, MAKELPARAM(32760, splitterY));
+                            const bool splitterMinimumSent = splitterMoveToCapturedRoot(32760, splitterY);
                             RECT splitterMinimum{};
-                            const bool splitterMinimumPassed = splitterIntact() && splitterBounds(splitterApp->previewPane_, splitterMinimum) &&
+                            const bool splitterMinimumPassed = splitterMinimumSent && splitterIntact() && splitterBounds(splitterApp->previewPane_, splitterMinimum) &&
                                 splitterApp->preferences_.previewWidth == 120 && splitterMinimum.right - splitterMinimum.left == splitterApp->px(120);
                             if (splitterMinimumPassed) {
-                                SendMessageW(splitterApp->window_, WM_MOUSEMOVE, MK_LBUTTON, MAKELPARAM(-32760, splitterY));
-                                RECT splitterMaximum{}, splitterClient{};
-                                splitterLimits = splitterIntact() && GetClientRect(splitterApp->window_, &splitterClient) &&
+                                const bool splitterMaximumSent = splitterMoveToCapturedRoot(-32760, splitterY);
+                                RECT splitterMaximum{};
+                                const auto splitterMaximumGeometry = readNativePaneGeometry(splitterView.Get(), splitterApp->window_,
+                                    splitterApp->previewPane_, splitterApp->previewSplitter_, true, splitterDeadline, splitterCurrent, splitterApp->previewGrip_);
+                                splitterLimits = splitterMaximumSent && splitterIntact() && splitterMaximumGeometry.read == S_OK && splitterMaximumGeometry.footerFull &&
+                                    splitterMaximumGeometry.partition &&
                                     splitterBounds(splitterApp->previewPane_, splitterMaximum) && splitterApp->preferences_.previewWidth == 4096 &&
-                                    splitterMaximum.right - splitterMaximum.left == std::max(splitterApp->px(120), static_cast<int>(splitterClient.right / 2));
+                                    splitterMaximum.right - splitterMaximum.left == std::max(splitterApp->px(120),
+                                        static_cast<int>((splitterMaximumGeometry.parentClient.right - splitterMaximumGeometry.parentClient.left) / 2));
+                                splitterGeometryPassed = splitterLimits && splitterGeometryPassed;
+                                if (!splitterLimits) splitterGeometryTrace += L"; maximum=" + paneGeometryFacts(splitterMaximumGeometry);
                             }
                         }
                         if (splitterLimits) {
-                            SendMessageW(splitterApp->window_, WM_MOUSEMOVE, MK_LBUTTON, MAKELPARAM(splitterX, splitterY));
+                            const bool splitterReturnSent = splitterMoveToCapturedRoot(splitterX, splitterY);
                             RECT splitterPaneReturned{}, splitterViewReturned{};
-                            splitterReturned = splitterIntact() && splitterBounds(splitterApp->previewPane_, splitterPaneReturned) && splitterBounds(splitterViewWindow, splitterViewReturned) &&
+                            splitterReturned = splitterReturnSent && splitterIntact() && splitterBounds(splitterApp->previewPane_, splitterPaneReturned) && splitterBounds(splitterViewWindow, splitterViewReturned) &&
                                 splitterApp->preferences_.previewWidth == splitterWidthBefore && EqualRect(&splitterPaneReturned, &splitterOriginalPane) &&
                                 EqualRect(&splitterViewReturned, &splitterOriginalView) && EqualRect(&splitterGrip, &splitterApp->previewSplitter_);
+                            if (splitterReturned) splitterReturned = splitterGeometryIntact();
                         }
                         // Always release this exact owned capture before any
                         // native view or source can unwind after a failed arm.
-                        if (GetCapture() == splitterApp->window_) SendMessageW(splitterApp->window_, WM_LBUTTONUP, 0, MAKELPARAM(splitterX, splitterY));
+                        if (const auto capturedRoot = GetCapture(); capturedRoot == splitterApp->window_)
+                            SendMessageW(capturedRoot, WM_LBUTTONUP, 0, MAKELPARAM(splitterX, splitterY));
                         const bool splitterReleased = !splitterApp->previewResizing_ && GetCapture() == nullptr;
                         splitterTrace += L"; grip=" + std::to_wstring(splitterFarEdge) + L" capture/nojump/move/limits/return/release=" +
                             std::to_wstring(splitterCaptured) + L"/" + std::to_wstring(splitterNoJump) + L"/" + std::to_wstring(splitterMoved) + L"/" +
@@ -6233,8 +6758,8 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report, bool library
                     if (splitterDragsPassed && splitterIntact()) {
                         const int splitterCancelX = splitterApp->previewSplitter_.left + 1;
                         const int splitterCancelY = (splitterApp->previewSplitter_.top + splitterApp->previewSplitter_.bottom) / 2;
-                        SendMessageW(splitterApp->window_, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(splitterCancelX, splitterCancelY));
-                        const bool splitterCancelCaptured = splitterApp->previewResizing_ && GetCapture() == splitterApp->window_;
+                        const bool splitterCancelDispatched = splitterDownAtActualTarget(splitterCancelX, splitterCancelY);
+                        const bool splitterCancelCaptured = splitterCancelDispatched && splitterApp->previewResizing_ && GetCapture() == splitterApp->window_;
                         const auto splitterCancelWidth = splitterApp->preferences_.previewWidth;
                         if (splitterCancelCaptured && splitterIntact()) {
                             const bool splitterCancelReleased = ReleaseCapture() != FALSE;
@@ -6256,9 +6781,63 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report, bool library
                     check(splitterRtl ? "native_preview_splitter_rtl_exact_grab_bounds_and_source_preservation" :
                         "native_preview_splitter_ltr_exact_grab_bounds_and_source_preservation",
                         splitterRestored && splitterBoundsPassed && splitterCompletedGrips == 2, splitterFacts);
+                    const auto sameFrameInsets = [&](const NativePaneGeometry& geometry) {
+                        const auto insets = [](const RECT& root, const RECT& frame) {
+                            return RECT{frame.left-root.left, frame.top-root.top, root.right-frame.right, root.bottom-frame.bottom};
+                        };
+                        const auto original = insets(splitterOriginalGeometry.rootClient, splitterOriginalGeometry.frameClient);
+                        const auto actual = insets(geometry.rootClient, geometry.frameClient);
+                        return EqualRect(&original, &actual);
+                    };
+                    bool splitterOffRestored = false, splitterNoopRestored = false, splitterResizePassed = false, splitterFinalGeometry = false;
+                    if (splitterRestored && splitterGeometryPassed && splitterIntact()) {
+                        // Same current native view: prove OFF restores its full
+                        // independent parent slot even when SetRect is a no-op.
+                        splitterApp->preferences_.previewPane = false; splitterApp->layout();
+                        const auto off = readNativePaneGeometry(splitterView.Get(), splitterApp->window_, splitterApp->previewPane_,
+                            splitterApp->previewSplitter_, false, splitterDeadline, splitterCurrent, splitterApp->previewGrip_);
+                        splitterOffRestored = off.read == S_OK && off.footerFull && off.partition && sameFrameInsets(off) &&
+                            EqualRect(&off.footer, &splitterOriginalGeometry.footer) && splitterIntact(true);
+                        if (splitterOffRestored) splitterApp->layout();
+                        const auto noop = readNativePaneGeometry(splitterView.Get(), splitterApp->window_, splitterApp->previewPane_,
+                            splitterApp->previewSplitter_, false, splitterDeadline, splitterCurrent, splitterApp->previewGrip_);
+                        splitterNoopRestored = splitterOffRestored && noop.read == S_OK && noop.footerFull && noop.partition &&
+                            EqualRect(&off.content, &noop.content) && EqualRect(&off.footer, &noop.footer) && splitterIntact(true);
+                        splitterGeometryTrace += L"; off=" + paneGeometryFacts(off) + L"; noop=" + paneGeometryFacts(noop);
+                        if (splitterNoopRestored && splitterIntact(true)) { splitterApp->preferences_.previewPane = true; splitterApp->layout(); }
+                        RECT originalRoot{};
+                        if (splitterNoopRestored && GetWindowRect(splitterApp->window_, &originalRoot) && splitterGeometryIntact()) {
+                            SetLastError(ERROR_SUCCESS);
+                            const BOOL resized = SetWindowPos(splitterApp->window_, nullptr, 0, 0,
+                                originalRoot.right-originalRoot.left+40, originalRoot.bottom-originalRoot.top+20,
+                                SWP_NOMOVE|SWP_NOACTIVATE|SWP_NOZORDER|SWP_NOOWNERZORDER);
+                            const auto resizeRead = resized ? S_OK : paneGeometryError();
+                            const auto larger = readNativePaneGeometry(splitterView.Get(), splitterApp->window_, splitterApp->previewPane_,
+                                splitterApp->previewSplitter_, true, splitterDeadline, splitterCurrent, splitterApp->previewGrip_);
+                            splitterResizePassed = resized && larger.read == S_OK && larger.footerFull && larger.partition &&
+                                sameFrameInsets(larger) && larger.frameClient.right-larger.frameClient.left ==
+                                splitterOriginalGeometry.frameClient.right-splitterOriginalGeometry.frameClient.left+40 && splitterIntact();
+                            HRESULT rootRestoreRead = E_ABORT;
+                            if (splitterCurrent()) {
+                                SetLastError(ERROR_SUCCESS);
+                                const auto restored = SetWindowPos(splitterApp->window_, nullptr, 0, 0,
+                                    originalRoot.right-originalRoot.left, originalRoot.bottom-originalRoot.top,
+                                    SWP_NOMOVE|SWP_NOACTIVATE|SWP_NOZORDER|SWP_NOOWNERZORDER);
+                                rootRestoreRead = restored ? S_OK : paneGeometryError();
+                            }
+                            splitterFinalGeometry = rootRestoreRead == S_OK && splitterGeometryIntact() && splitterIntact();
+                            splitterGeometryTrace += L"; root resize/restore HRESULT=" + hresultMessage(resizeRead) + L"/" +
+                                hresultMessage(rootRestoreRead) + L"; resized=" + paneGeometryFacts(larger);
+                        }
+                    }
+                    check(splitterRtl ? "native_preview_rtl_full_footer_partition_off_noop_and_resize" :
+                        "native_preview_ltr_full_footer_partition_off_noop_and_resize",
+                        splitterGeometryPassed && splitterOffRestored && splitterNoopRestored && splitterResizePassed && splitterFinalGeometry,
+                        splitterGeometryTrace);
                     // A failed source/state arm must not be overwritten by
                     // selecting the same source in a second native browser.
-                    splitterMayCreate = splitterRestored && splitterSourcesCurrent();
+                    splitterMayCreate = splitterRestored && splitterGeometryPassed && splitterOffRestored && splitterNoopRestored &&
+                        splitterResizePassed && splitterFinalGeometry && splitterSourcesCurrent();
                 }
                 const auto splitterDesktop = PrivateDesktop::current();
                 const bool splitterMainPreserved = splitterSourcesRead && splitterSourcesCurrent() && view_.Get() == splitterMainView.Get() &&
@@ -6597,22 +7176,32 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report, bool library
                     searchPresentation_.has_value()==beforeCapturePresentation.has_value()&&
                     (!searchPresentation_||samePanePresentation(*searchPresentation_,*beforeCapturePresentation)),hresultMessage(paneCaptureFailure));
                 for(const auto paneCommand:std::array<UINT,4>{NavigationPane,PreviewPane,DetailsPane,HiddenItems}) {
+                    const auto paneGeometryDeadline=GetTickCount64()+5000;
+                    const auto beforePaneGeometry=sampleCurrentPaneGeometry(paneGeometryDeadline);
                     const auto beforePaneNavigation=navigationCount_;
                     const auto paneOperation=paneSetupReady?execute(paneCommand):E_UNEXPECTED;
                     SearchViewPresentation recreatedPresentation;
                     HRESULT recreatedRead=E_PENDING;
-                    const bool paneReady=SUCCEEDED(paneOperation)&&pumpUntil([&] {
+                    const auto paneGeometryNow=GetTickCount64();
+                    const bool paneReady=SUCCEEDED(paneOperation)&&paneGeometryNow<paneGeometryDeadline&&pumpUntil([&] {
                         if(navigating_||navigationCount_<=beforePaneNavigation||!folderView_||searchPresentationPending_||
                            FAILED(searchPresentationStatus_)||!exactScopeMembership())return false;
                         recreatedRead=captureSearchViewPresentation(folderView_.Get(),&recreatedPresentation);
                         return SUCCEEDED(recreatedRead)&&samePanePresentation(recreatedPresentation,paneActual);
-                    },5000);
+                    },static_cast<DWORD>(paneGeometryDeadline-paneGeometryNow));
                     const auto paneCheckName="search_pane_recreation_preserves_native_view_"+std::to_string(paneCommand);
                     check(paneCheckName.c_str(),paneReady&&
                         currentPidl_&&ILIsEqual(currentPidl_.get(),paneIdentity.get())&&searchScope_&&ILIsEqual(searchScope_.get(),paneScope.get())&&
                         activeQuery_==paneQuery&&searchBase_==paneBase&&searchFilters_==paneFilters&&searchRecursive_==paneRecursive&&
                         sameRules(searchScopeRules_)&&searchFileProperties_&&*searchFileProperties_==importedProperties&&
                         recentSearches_==paneRecent&&samePaneHistory(),hresultMessage(paneOperation)+L"; view="+hresultMessage(recreatedRead));
+                    const auto recreatedGeometry=sampleCurrentPaneGeometry(paneGeometryDeadline);
+                    const auto paneGeometryCheck="search_native_pane_recreation_preserves_full_footer_and_content_slot_"+std::to_string(paneCommand);
+                    check(paneGeometryCheck.c_str(),paneReady&&beforePaneGeometry.read==S_OK&&beforePaneGeometry.footerFull&&beforePaneGeometry.partition&&
+                        recreatedGeometry.read==S_OK&&recreatedGeometry.footerFull&&recreatedGeometry.partition&&
+                        EqualRect(&beforePaneGeometry.frameClient,&recreatedGeometry.frameClient)&&
+                        EqualRect(&beforePaneGeometry.footer,&recreatedGeometry.footer)&&currentPidl_&&ILIsEqual(currentPidl_.get(),paneIdentity.get())&&
+                        exactScopeMembership()&&samePaneHistory(),L"before="+paneGeometryFacts(beforePaneGeometry)+L"; after="+paneGeometryFacts(recreatedGeometry));
                     paneSetupReady=paneSetupReady&&paneReady;
                 }
                 // Restore only the preferences this fixture changed, through the

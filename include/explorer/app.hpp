@@ -185,6 +185,7 @@ public:
 private:
     static constexpr UINT PreviewResult = WM_APP + 7;
     static constexpr UINT PreviewChange = WM_APP + 8;
+    static constexpr UINT PreviewLayout = WM_APP + 9;
     HRESULT openLongSavedSearch(IShellItem* item, const std::wstring& typedAddress = {});
     ~ExplorerApp();
     HRESULT shutdownStatus_ = S_OK;
@@ -200,7 +201,13 @@ private:
         explicit PreviewCallScope(ExplorerApp& value) noexcept;
         ~PreviewCallScope();
     };
-    void layoutPreviewPane(RECT& browserBounds);
+    HRESULT layoutPreviewPane();
+    HRESULT resetPreviewLayout() noexcept;
+    HRESULT resetPreviewGrip() noexcept;
+    bool previewGripCurrent() const noexcept;
+    void queuePreviewLayout() noexcept;
+    static LRESULT CALLBACK previewLayoutProc(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
+    static LRESULT CALLBACK previewGripProc(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
     std::uint64_t invalidatePreview(PreviewEmptyReason reason = PreviewEmptyReason::None) noexcept;
     void updatePreviewTarget();
     HRESULT updatePreviewVisuals();
@@ -395,6 +402,9 @@ private:
     HWND breadcrumbs_ = nullptr, search_ = nullptr, addressActions_ = nullptr;
     HWND ribbonCollapse_=nullptr,ribbonCollapseTooltip_=nullptr;
     HWND previewPane_=nullptr,previewRender_=nullptr,previewText_=nullptr;
+    HWND previewGrip_=nullptr;
+    bool previewGripRetiring_=false;
+    HRESULT previewGripRetirementStatus_=S_OK;
     std::wstring previewSelectText_,previewUnavailableText_;
     std::unique_ptr<NativePreviewHost> previewHost_;
     struct PreviewTicket {
@@ -410,6 +420,19 @@ private:
     unsigned previewCallsActive_=0;
     int previewDragOffset_=0;
     RECT previewSplitter_{};
+    struct PreviewLayoutRecord {
+        ComPtr<IShellView> view;
+        HWND window=nullptr,parent=nullptr,frame=nullptr;
+        Pidl location;
+        unsigned navigation=0;
+        UINT dpi=0;
+        bool rtl=false,parentSlot=false,cropped=false,navigationPane=false,detailsPane=false;
+        RECT parentClient{},nativeInsets{},uncropped{},crop{};
+    } previewLayout_;
+    RECT previewContentBounds_{};
+    HRESULT previewLayoutStatus_=S_FALSE;
+    HRESULT previewLayoutCleanupStatus_=S_FALSE;
+    bool previewLayoutActive_=false,previewLayoutQueued_=false,previewLayoutAgain_=false;
     ULONG previewChangeCookie_=0;
     std::wstring ribbonCollapseTip_;
     std::map<UINT, std::wstring> navigationTooltipText_;

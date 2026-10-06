@@ -648,6 +648,8 @@ HRESULT ExplorerApp::createBrowser() {
     return S_OK;
 }
 void ExplorerApp::destroyBrowser() {
+    const auto detached=resetPreviewLayout();
+    if(FAILED(detached)){shutdownStatus_=detached;TerminateProcess(GetCurrentProcess(),8);std::_Exit(8);}
     invalidatePreview();
     cancelCommandStates();
     cancelFrequentPlaces();
@@ -1351,8 +1353,15 @@ void ExplorerApp::rebuildQuickAccess() {
 }
 void ExplorerApp::layout() {
     if(closing_)return;
+    if(previewGripRetiring_)return;
     if (!window_ || !nav_) return;
+    if(previewLayoutActive_) {previewLayoutAgain_=true;return;}
     PreviewCallScope lifetime(*this);
+    previewLayoutActive_=true;
+    struct LayoutEnd {
+        ExplorerApp& owner;
+        ~LayoutEnd(){owner.previewLayoutActive_=false;if(owner.previewLayoutAgain_){owner.previewLayoutAgain_=false;owner.queuePreviewLayout();}}
+    } layoutEnd{*this};
     RECT client{}; GetClientRect(window_, &client);
     const int width = client.right, height = client.bottom;
     const int y = static_cast<int>(ribbon_.height());
@@ -1368,8 +1377,10 @@ void ExplorerApp::layout() {
     MoveWindow(search_, navWidth + addressWidth + px(12), y + px(5), searchWidth, px(30), TRUE);
     if (browser_) {
         RECT viewRect{0, y + px(41), width, std::max(y + px(42), height)};
-        layoutPreviewPane(viewRect);
-        browser_->SetRect(nullptr, viewRect);
+        const auto nativeBrowser=browser_;
+        const auto laidOut=nativeBrowser->SetRect(nullptr, viewRect);
+        if(!closing_&&nativeBrowser.Get()==browser_.Get())
+            previewLayoutStatus_=laidOut==S_OK?layoutPreviewPane():laidOut;
     }
 }
 void ExplorerApp::updateNamespace() {
@@ -3428,7 +3439,7 @@ LRESULT ExplorerApp::onMessage(UINT message, WPARAM wparam, LPARAM lparam) {
         break;
     case WM_LBUTTONDOWN: {
         const POINT cursor{GET_X_LPARAM(lparam),GET_Y_LPARAM(lparam)};
-        if(preferences_.previewPane&&PtInRect(&previewSplitter_,cursor)) {
+        if(previewGripCurrent()&&PtInRect(&previewSplitter_,cursor)) {
             previewDragOffset_=previewSplitter_.right-cursor.x;
             previewResizing_=true;SetCapture(window_);return 0;
         }
@@ -3441,8 +3452,8 @@ LRESULT ExplorerApp::onMessage(UINT message, WPARAM wparam, LPARAM lparam) {
     }
     case WM_MOUSEMOVE:
         if(previewResizing_&&GetCapture()==window_) {
-            RECT bounds{};GetClientRect(window_,&bounds);
-            preferences_.previewWidth=std::clamp(MulDiv(bounds.right-GET_X_LPARAM(lparam)-previewDragOffset_,96,static_cast<int>(dpi_)),120,4096);
+            if(previewLayoutStatus_!=S_OK||!preferences_.previewPane) {previewResizing_=false;ReleaseCapture();return 0;}
+            preferences_.previewWidth=std::clamp(MulDiv(previewContentBounds_.right-GET_X_LPARAM(lparam)-previewDragOffset_,96,static_cast<int>(dpi_)),120,4096);
             layout();return 0;
         }
         if(searchResizing_&&GetCapture()==window_) {
@@ -3629,6 +3640,10 @@ LRESULT ExplorerApp::onMessage(UINT message, WPARAM wparam, LPARAM lparam) {
         return 0;
     case PreviewChange:
         previewChanged(wparam,lparam);return 0;
+    case PreviewLayout:
+        previewLayoutQueued_=false;
+        if(!closing_)layout();
+        return 0;
     case DeferredView:
         if (!closing_&&folderView_ && !navigating_) {
             DWORD flags{};
