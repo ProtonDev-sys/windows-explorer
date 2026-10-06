@@ -173,15 +173,17 @@ std::string read(const fs::path& path) {
     return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
 }
 
-bool pumpPrivateNamespaceUntil(const std::function<bool()>& complete,DWORD milliseconds) {
+bool pumpPrivateNamespaceUntil(const std::function<bool()>& complete,DWORD milliseconds,ULONGLONG absoluteDeadline=0) {
     struct Event {HANDLE value=CreateEventW(nullptr,TRUE,FALSE,nullptr);~Event(){if(value)CloseHandle(value);}}event;
     require(event.value!=nullptr,"Create owned namespace COM-dispatch event");
     const auto desktop=explorer::PrivateDesktop::current();
     require(desktop!=nullptr,"Native background fixture has no private desktop");
-    const auto deadline=GetTickCount64()+milliseconds;
+    const auto deadline=absoluteDeadline?(std::min)(GetTickCount64()+milliseconds,absoluteDeadline):GetTickCount64()+milliseconds;
     do {
+        if(absoluteDeadline&&GetTickCount64()>=deadline)return false;
         succeeded(desktop->verifyIsolation(),"Keep native background query on its private desktop");
-        if(complete())return true;
+        if(absoluteDeadline&&GetTickCount64()>=deadline)return false;
+        if(complete())return !absoluteDeadline||GetTickCount64()<deadline;
         MSG message{};unsigned dispatched=0;
         while(dispatched++<32&&PeekMessageW(&message,nullptr,0,0,PM_REMOVE)) {
             if(message.message==WM_QUIT){PostQuitMessage(static_cast<int>(message.wParam));return false;}
@@ -191,7 +193,7 @@ bool pumpPrivateNamespaceUntil(const std::function<bool()>& complete,DWORD milli
         const auto waited=CoWaitForMultipleHandles(COWAIT_DISPATCH_CALLS|COWAIT_DISPATCH_WINDOW_MESSAGES,5,1,&event.value,&index);
         if(waited!=RPC_S_CALLPENDING)succeeded(waited,"Dispatch native background provider's marshaled view calls");
     }while(GetTickCount64()<deadline);
-    return complete();
+    return !absoluteDeadline&&complete();
 }
 
 struct LookupEvidence {
@@ -531,6 +533,68 @@ struct NativeBackgroundView {
         }
         require(sourceCurrent(folderView.Get(),phase),"Native selection readbacks changed the original private folder/view");
         std::cout<<std::flush;
+    }
+    int ownedNativeIndex(PCIDLIST_ABSOLUTE target,ULONGLONG deadline,const char* phase) {
+        ComPtr<IFolderView2> folderView;succeeded(view.As(&folderView),"Retain original native indexed selection view");
+        const auto current=[&]{return GetTickCount64()<deadline&&sourceCurrent(folderView.Get())&&GetTickCount64()<deadline;};
+        require(current()&&target&&!expectedMembers.empty(),"Native indexed selection lost its exact owned source/deadline");
+        ComPtr<IShellFolder> desktopFolder;const auto desktopRead=SHGetDesktopFolder(&desktopFolder);
+        require(desktopRead==S_OK&&desktopFolder&&current(),"Retain native Desktop full PIDL authority for indexed selection");
+        auto targetMember=expectedMembers.end();
+        for(auto member=expectedMembers.begin();member!=expectedMembers.end();++member) {
+            require(current(),"Indexed target canonical lookup exceeded original deadline");
+            const auto canonical=desktopFolder->CompareIDs(SHCIDS_CANONICALONLY,target,member->pidl.get());
+            require(SUCCEEDED(canonical)&&current(),"Indexed target full canonical lookup failed or changed source");
+            if(canonical==S_OK&&static_cast<short>(HRESULT_CODE(canonical))==0) {
+                require(targetMember==expectedMembers.end(),"Indexed target matches multiple original canonical members");targetMember=member;
+            }
+        }
+        require(targetMember!=expectedMembers.end(),"Indexed selection target is not an original owned canonical member");
+        ComPtr<IShellFolder> nativeFolder;succeeded(folderView->GetFolder(IID_PPV_ARGS(&nativeFolder)),"Retain exact native indexed selection folder");
+        require(nativeFolder&&current(),"Indexed selection folder read changed the original source");
+        int count=-1;exactNativeCount(folderView.Get(),count,current);
+        std::vector<bool> matched(expectedMembers.size());int targetIndex=-1;
+        Pidl observedTarget;
+        for(int index=0;index<count;++index) {
+            require(current(),"Indexed native membership exceeded original selection deadline");
+            PITEMID_CHILD rawChild=nullptr;const auto childRead=folderView->Item(index,&rawChild);Pidl child(rawChild);
+            require(childRead==S_OK&&child&&current(),"Indexed native row child is absent or stale");
+            const auto found=std::find_if(expectedMembers.begin(),expectedMembers.end(),[&](const auto& member){return ILIsEqual(child.get(),ILFindLastID(member.pidl.get()));});
+            require(found!=expectedMembers.end(),"Indexed native row is not an original owned member");
+            const auto memberIndex=static_cast<size_t>(found-expectedMembers.begin());
+            require(!matched[memberIndex],"Indexed native membership contains a duplicate original member");
+            const auto canonical=nativeFolder->CompareIDs(SHCIDS_CANONICALONLY,child.get(),ILFindLastID(found->pidl.get()));
+            require(canonical==S_OK&&static_cast<short>(HRESULT_CODE(canonical))==0&&current(),"Indexed native child canonical identity differs");
+            ComPtr<IShellItem> row;const auto rowRead=folderView->GetItem(index,IID_PPV_ARGS(&row));
+            require(rowRead==S_OK&&row&&current(),"Indexed native item read is absent or stale");
+            PIDLIST_ABSOLUTE rawFull=nullptr;const auto fullRead=SHGetIDListFromObject(row.Get(),&rawFull);Pidl full(rawFull);
+            require(fullRead==S_OK&&full&&current(),"Indexed native full item identity read is absent or stale");
+            const auto fullCanonical=desktopFolder->CompareIDs(SHCIDS_CANONICALONLY,full.get(),found->pidl.get());
+            require(fullCanonical==S_OK&&static_cast<short>(HRESULT_CODE(fullCanonical))==0&&current(),"Indexed native full canonical identity differs");
+            PWSTR rawPath=nullptr;const auto pathRead=row->GetDisplayName(SIGDN_FILESYSPATH,&rawPath);
+            std::unique_ptr<wchar_t,decltype(&CoTaskMemFree)> path(rawPath,CoTaskMemFree);
+            require(pathRead==S_OK&&path&&current(),"Indexed native owned row path read is absent or stale");
+            const auto identity=readOwnedReportedPathIdentity(found->path,fs::path(path.get()),found->identity,current);
+            require(identity.accepted&&current(),"Indexed native row lost its immutable original file identity");
+            matched[memberIndex]=true;
+            if(found==targetMember){require(targetIndex==-1,"Indexed native target is not unique");targetIndex=index;observedTarget=std::move(child);}
+        }
+        require(targetIndex>=0&&std::all_of(matched.begin(),matched.end(),[](bool value){return value;}),"Indexed native selection lacks the complete original membership");
+        int finalCount=-1;exactNativeCount(folderView.Get(),finalCount,current);
+        require(finalCount==count,"Indexed native membership changed during exact target lookup");
+        PITEMID_CHILD rawAgain=nullptr;const auto againRead=folderView->Item(targetIndex,&rawAgain);Pidl again(rawAgain);
+        require(againRead==S_OK&&again&&current(),"Indexed native target read is absent or stale before selection");
+        const auto finalCanonical=nativeFolder->CompareIDs(SHCIDS_CANONICALONLY,again.get(),observedTarget.get());
+        require(finalCanonical==S_OK&&static_cast<short>(HRESULT_CODE(finalCanonical))==0&&current(),"Indexed native target moved before its single selection request");
+        std::cout<<"NativeBackground indexedTarget phase="<<phase<<" index="<<targetIndex<<" count="<<count
+            <<" canonicalHRESULT=0 ownedFullFileID=1 selectionRequests=0 deadlineReached=0\n"<<std::flush;
+        require(current(),"Indexed native target source/deadline expired after its diagnostic readback");
+        return targetIndex;
+    }
+    void exactNativeCount(IFolderView2* folderView,int& count,const std::function<bool()>& current) {
+        require(current(),"Indexed native count source is stale");
+        const auto status=folderView->ItemCount(SVGIO_ALLVIEW,&count);
+        require(status==S_OK&&count==static_cast<int>(expectedMembers.size())&&current(),"Indexed native view lacks complete owned membership");
     }
     void initialize(IShellItem* folder,std::vector<fs::path> ownedPaths={},IShellItem* target=nullptr) {
         const auto desktop=explorer::PrivateDesktop::current();
@@ -1239,14 +1303,19 @@ void nativeVideoCastParentState() {
     struct Pidl {PIDLIST_ABSOLUTE value=nullptr;~Pidl(){CoTaskMemFree(value);}}videoPidl;
     succeeded(SHGetIDListFromObject(video.Get(),&videoPidl.value),"Retain actual owned video identity for native selection");
     host.selectionDiagnostic("video-before-original-selection");
-    const auto selectStatus=host.view->SelectItem(ILFindLastID(videoPidl.value),SVSI_SELECT|SVSI_DESELECTOTHERS|SVSI_FOCUSED);
+    const auto selectionDeadline=GetTickCount64()+5000;
+    const auto nativeIndex=host.ownedNativeIndex(videoPidl.value,selectionDeadline,"video");
+    require(GetTickCount64()<selectionDeadline&&host.sourceCurrent(folderView.Get())&&GetTickCount64()<selectionDeadline,"Video indexed selection source/deadline expired before its single request");
+    const auto selectStatus=folderView->SelectItem(nativeIndex,SVSI_SELECT|SVSI_DESELECTOTHERS|SVSI_FOCUSED);
     std::cout<<"NativeBackground selection action=video HRESULT="<<static_cast<unsigned long>(selectStatus)<<" requests=1\n"<<std::flush;
     succeeded(selectStatus,"Select only owned video in actual native view");
     ComPtr<IShellItemArray> selected;
-    const bool selectionReady=pumpPrivateNamespaceUntil([&]{
+    const auto selectionWaitStart=GetTickCount64();
+    const bool selectionReady=selectionWaitStart<selectionDeadline&&pumpPrivateNamespaceUntil([&]{
+        if(GetTickCount64()>=selectionDeadline||!host.sourceCurrent(folderView.Get()))return false;
         selected.Reset();if(FAILED(folderView->GetSelection(FALSE,&selected))||!selected)return false;
-        DWORD count=0;return SUCCEEDED(selected->GetCount(&count))&&count==1;
-    },5000);
+        DWORD count=0;return SUCCEEDED(selected->GetCount(&count))&&count==1&&GetTickCount64()<selectionDeadline&&host.sourceCurrent(folderView.Get())&&GetTickCount64()<selectionDeadline;
+    },static_cast<DWORD>(selectionDeadline-selectionWaitStart),selectionDeadline);
     host.selectionDiagnostic("video-after-original-selection");
     require(selectionReady,"Actual native Cast video selection exceeded bounded wait");
     ComPtr<IShellItem> actual;succeeded(selected->GetItemAt(0,&actual),"Read exact original Cast selection member");
@@ -2331,11 +2400,15 @@ void asyncNativeKindAndOriginalView() {
     succeeded(SHGetIDListFromObject(text.Get(),&rawText),"Read exact owned nonmedia PIDL");Pidl textId(rawText);
     succeeded(SHGetIDListFromObject(folder.Get(),&rawFolder),"Retain exact native folder PIDL");Pidl folderId(rawFolder);
     host.selectionDiagnostic("music-before-original-selection");
-    const auto selectStatus=host.view->SelectItem(ILFindLastID(musicId.get()),SVSI_SELECT|SVSI_DESELECTOTHERS|SVSI_NOTAKEFOCUS);
+    const auto selectionDeadline=GetTickCount64()+2000;
+    const auto nativeIndex=host.ownedNativeIndex(musicId.get(),selectionDeadline,"music");
+    require(GetTickCount64()<selectionDeadline&&host.sourceCurrent(view.Get())&&GetTickCount64()<selectionDeadline,"Music indexed selection source/deadline expired before its single request");
+    const auto selectStatus=view->SelectItem(nativeIndex,SVSI_SELECT|SVSI_DESELECTOTHERS|SVSI_NOTAKEFOCUS);
     std::cout<<"NativeBackground selection action=music HRESULT="<<static_cast<unsigned long>(selectStatus)<<" requests=1\n"<<std::flush;
     succeeded(selectStatus,
               "Select exactly the owned native Music identity");
-    const bool selectionReady=pumpPrivateNamespaceUntil([&]{int count=-1;return view->ItemCount(SVGIO_SELECTION,&count)==S_OK&&count==1;},2000);
+    const auto selectionWaitStart=GetTickCount64();
+    const bool selectionReady=selectionWaitStart<selectionDeadline&&pumpPrivateNamespaceUntil([&]{int count=-1;return GetTickCount64()<selectionDeadline&&host.sourceCurrent(view.Get())&&view->ItemCount(SVGIO_SELECTION,&count)==S_OK&&count==1&&host.sourceCurrent(view.Get())&&GetTickCount64()<selectionDeadline;},static_cast<DWORD>(selectionDeadline-selectionWaitStart),selectionDeadline);
     host.selectionDiagnostic("music-after-original-selection");
     require(selectionReady,
             "Original native Music selection was not ready");

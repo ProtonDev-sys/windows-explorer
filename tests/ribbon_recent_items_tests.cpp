@@ -96,12 +96,13 @@ struct ActionResult {
     bool opened = false;
     unsigned presses = 0;
     bool finalPressed = false;
+    bool secondFinalPressed = false;
 };
 
 // Public accessibility acts only on our framework's own mock list. There is no
 // Shell identity, native command provider invocation, input injection, synthetic
 // mouse/key message, clipboard access, or global pin/history/settings mutation.
-ActionResult openAndPress(HDESK desktop, DWORD uiThread, bool initialPin, unsigned count) {
+ActionResult openAndPress(HDESK desktop, DWORD uiThread, bool initialPin, unsigned count, bool bothRows) {
     ActionResult result;
     try {
         Apartment apartment(desktop);
@@ -122,51 +123,55 @@ ActionResult openAndPress(HDESK desktop, DWORD uiThread, bool initialPin, unsign
         succeeded(invoke->Invoke(), "Open owned native File menu");
         result.opened = true;
 
-        auto row = findOwned(automation.Get(), uiThread, L"Owned Recent One");
-        const auto rowDeadline = GetTickCount64()+2000;
-        while(!row&&GetTickCount64()<rowDeadline) {
-            // Opening the menu returns before its asynchronous RecentItems
-            // source publishes accessible rows. Observe the exact owned row;
-            // do not invoke the menu or its default action a second time.
-            std::this_thread::sleep_for(std::chrono::milliseconds(20));
-            row = findOwned(automation.Get(),uiThread,L"Owned Recent One");
-        }
-        require(row != nullptr, "Owned native RecentItems row is missing");
-        ComPtr<IUIAutomationLegacyIAccessiblePattern> legacy;
-        succeeded(row->GetCurrentPatternAs(UIA_LegacyIAccessiblePatternId, IID_PPV_ARGS(&legacy)),
-                  "Read native RecentItems accessibility interface");
-        require(legacy != nullptr, "Owned RecentItems row has no native legacy interface");
-        ComPtr<IAccessible> accessible;
-        succeeded(legacy->GetIAccessible(&accessible), "Read native RecentItems MSAA object");
-        require(accessible != nullptr, "Owned native MSAA row is absent");
-        LONG children = 0;
-        succeeded(accessible->get_accChildCount(&children), "Read owned native pin child count");
-        require(children == 1, "Owned native pin structure differs");
-        Variant child, self, role;
-        child.value.vt = VT_I4;
-        child.value.lVal = 1;
-        self.value.vt = VT_I4;
-        self.value.lVal = CHILDID_SELF;
-        ComPtr<IDispatch> raw;
-        ComPtr<IAccessible> pin;
-        succeeded(accessible->get_accChild(child.value, &raw), "Read owned native pin child");
-        require(raw != nullptr, "Owned native pin child object is absent");
-        succeeded(raw.As(&pin), "Read owned native pin accessibility object");
-        succeeded(pin->get_accRole(self.value, &role.value), "Read owned native pin role");
-        require(role.value.vt == VT_I4 && role.value.lVal == ROLE_SYSTEM_PUSHBUTTON,
-                "Native recent-item pin is not its expected push button");
-        require(pressed(pin.Get()) == initialPin, "Native initial pin differs from supplied mock");
-        bool expected = initialPin;
-        for (unsigned index = 0; index < count; ++index) {
-            succeeded(pin->accDoDefaultAction(self.value), "Press owned native pin through public MSAA");
-            ++result.presses;
-            expected = !expected;
-            const auto end = GetTickCount64() + 3000;
-            while (pressed(pin.Get()) != expected && GetTickCount64() < end)
-                std::this_thread::sleep_for(std::chrono::milliseconds(5));
-            require(pressed(pin.Get()) == expected, "Native pin action did not change its actual pressed state");
-        }
-        result.finalPressed = pressed(pin.Get());
+        const auto pressRow=[&](std::wstring_view name) {
+            auto row = findOwned(automation.Get(), uiThread, name);
+            const auto rowDeadline = GetTickCount64()+2000;
+            while(!row&&GetTickCount64()<rowDeadline) {
+                // Opening the menu returns before its asynchronous RecentItems
+                // source publishes accessible rows. Observe the exact owned row;
+                // do not invoke the menu or its default action a second time.
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                row = findOwned(automation.Get(),uiThread,name);
+            }
+            require(row != nullptr, "Owned native RecentItems row is missing");
+            ComPtr<IUIAutomationLegacyIAccessiblePattern> legacy;
+            succeeded(row->GetCurrentPatternAs(UIA_LegacyIAccessiblePatternId, IID_PPV_ARGS(&legacy)),
+                      "Read native RecentItems accessibility interface");
+            require(legacy != nullptr, "Owned RecentItems row has no native legacy interface");
+            ComPtr<IAccessible> accessible;
+            succeeded(legacy->GetIAccessible(&accessible), "Read native RecentItems MSAA object");
+            require(accessible != nullptr, "Owned native MSAA row is absent");
+            LONG children = 0;
+            succeeded(accessible->get_accChildCount(&children), "Read owned native pin child count");
+            require(children == 1, "Owned native pin structure differs");
+            Variant child, self, role;
+            child.value.vt = VT_I4;
+            child.value.lVal = 1;
+            self.value.vt = VT_I4;
+            self.value.lVal = CHILDID_SELF;
+            ComPtr<IDispatch> raw;
+            ComPtr<IAccessible> pin;
+            succeeded(accessible->get_accChild(child.value, &raw), "Read owned native pin child");
+            require(raw != nullptr, "Owned native pin child object is absent");
+            succeeded(raw.As(&pin), "Read owned native pin accessibility object");
+            succeeded(pin->get_accRole(self.value, &role.value), "Read owned native pin role");
+            require(role.value.vt == VT_I4 && role.value.lVal == ROLE_SYSTEM_PUSHBUTTON,
+                    "Native recent-item pin is not its expected push button");
+            require(pressed(pin.Get()) == initialPin, "Native initial pin differs from supplied mock");
+            bool expected = initialPin;
+            for (unsigned index = 0; index < count; ++index) {
+                succeeded(pin->accDoDefaultAction(self.value), "Press owned native pin through public MSAA");
+                ++result.presses;
+                expected = !expected;
+                const auto end = GetTickCount64() + 3000;
+                while (pressed(pin.Get()) != expected && GetTickCount64() < end)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                require(pressed(pin.Get()) == expected, "Native pin action did not change its actual pressed state");
+            }
+            return pressed(pin.Get());
+        };
+        result.finalPressed=pressRow(L"Owned Recent One");
+        if(bothRows)result.secondFinalPressed=pressRow(L"Owned Recent Two");
         result.result = S_OK;
     } catch (const std::exception& error) {
         std::cerr << "Owned accessibility action failed: " << error.what() << '\n';
@@ -228,7 +233,7 @@ void runCase(explorer::PrivateDesktop& desktop, HINSTANCE instance, bool install
     ShowWindow(host.handle, SW_SHOWNOACTIVATE);
     UpdateWindow(host.handle);
     auto action = std::async(std::launch::async, openAndPress,
-                            GetThreadDesktop(uiThread), uiThread, initiallyPinned, presses);
+                            GetThreadDesktop(uiThread), uiThread, initiallyPinned, presses, false);
     pumpUntil(action);
     const auto native = action.get();
     succeeded(native.result, "Execute actual owned native pin action");
@@ -253,6 +258,63 @@ void runCase(explorer::PrivateDesktop& desktop, HINSTANCE instance, bool install
     std::cout << "PASS: " << description << " (" << (installed ? "installed" : "authored")
               << "; callbacks=" << model.callbacks << ")\n";
 }
+void runShutdownReentry(explorer::PrivateDesktop& desktop,HINSTANCE instance,bool installed,bool initializeEntry) {
+    const auto uiThread=GetCurrentThreadId();
+    std::array<bool,2> pins{false,false};
+    unsigned callbacks=0,unrelated=0,reads=0,reentered=0;
+    bool invalid=false;
+    Window host{CreateWindowExW(0,L"WindowsExplorerOwnedRecentItemsRegression",L"Owned shutdown RecentItems reentry",
+        WS_OVERLAPPEDWINDOW,0,0,900,600,nullptr,nullptr,instance,nullptr)};
+    require(host.handle!=nullptr,"Create owned private shutdown reentry host");
+    explorer::NativeRibbon ribbon;
+    const auto layout=installed?explorer::RibbonLayout::InstalledWindows10:explorer::RibbonLayout::Authored;
+    explorer::RibbonCallbacks handlers;
+    handlers.query=[](UINT){return explorer::RibbonCommandState{};};
+    handlers.execute=[&](UINT){++unrelated;return S_OK;};
+    handlers.executeItem=[&](UINT,UINT){++unrelated;return S_OK;};
+    handlers.items=[&](UINT command) {
+        if(command!=explorer::RibbonFrequentPlaces)return std::vector<explorer::RibbonItem>{};
+        ++reads;
+        return std::vector<explorer::RibbonItem>{{0,L"Owned Recent One",pins[0],{},L"Owned shutdown model"},
+                                               {1,L"Owned Recent Two",pins[1],{},L"Owned shutdown model"}};
+    };
+    handlers.pinItem=[&](UINT index,bool value) {
+        ++callbacks;
+        if(GetCurrentThreadId()!=uiThread||index!=0||!value||callbacks!=1){invalid=true;return E_INVALIDARG;}
+        pins[0]=value;++reentered;
+        if(initializeEntry) {
+            // A genuine initialize entry, deliberately rejected before COM,
+            // must still revoke the old Destroy callback's remaining writes.
+            explorer::RibbonCallbacks obsolete;
+            if(ribbon.initialize(nullptr,instance,std::move(obsolete),layout)!=E_INVALIDARG)invalid=true;
+        } else ribbon.reset(); // Real nested reset while the old Impl is retired.
+        return S_OK;
+    };
+    succeeded(ribbon.initialize(host.handle,instance,std::move(handlers),layout),"Initialize actual shutdown reentry Ribbon");
+    require(ribbon.layout()==layout,"Shutdown reentry Ribbon silently changed requested layout");
+    if(installed)require(ribbon.installedLayoutStatus()==S_OK,"Installed shutdown reentry Ribbon failed without fallback");
+    ShowWindow(host.handle,SW_SHOWNOACTIVATE);UpdateWindow(host.handle);
+    auto action=std::async(std::launch::async,openAndPress,GetThreadDesktop(uiThread),uiThread,false,1,true);
+    pumpUntil(action);const auto native=action.get();
+    succeeded(native.result,"Execute actual two-row owned native pin actions");
+    require(native.opened&&native.presses==2&&native.finalPressed&&native.secondFinalPressed,
+            "Actual native rows did not both change before shutdown");
+    require(reads>0&&callbacks==0&&!pins[0]&&!pins[1],"Native pin array arrived before the actual Destroy boundary");
+    // No manufactured Execute/value: Destroy delivers the framework's actual
+    // complete padded RecentItems array from those two real MSAA pin actions.
+    ribbon.reset();
+    require(!invalid&&unrelated==0&&callbacks==1&&reentered==1&&pins[0]&&!pins[1],
+            "Old Destroy callback continued after a newer reset/initialize entry");
+    require(!ribbon.valid(),"Shutdown reentry left a retired Ribbon published");
+    ribbon.reset();require(callbacks==1,"Completed retired transaction replayed on later reset");
+    bool isolated=false,visible=true;
+    succeeded(desktop.verifyIsolation(&isolated),"Private desktop unchanged after shutdown reentry");
+    succeeded(desktop.visibleWindowsOnInputDesktop(visible),"Read input visibility after shutdown reentry");
+    require(isolated&&!visible,"Shutdown reentry exposed input-desktop UI");
+    std::cout<<"PASS: actual native shutdown RecentItems "<<(initializeEntry?"initialize-entry":"nested-reset")
+        <<" revokes remaining original pins ("<<(installed?"installed":"authored")<<")\n";
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -275,8 +337,10 @@ int main(int argc, char** argv) {
         runCase(desktop, cls.hInstance, installed, false, 1, "native pin updates exactly its owned row");
         runCase(desktop, cls.hInstance, installed, true, 1, "native unpin preserves the other owned pin");
         runCase(desktop, cls.hInstance, installed, false, 2, "two native presses preserve original source state");
+        runShutdownReentry(desktop,cls.hInstance,installed,false);
+        runShutdownReentry(desktop,cls.hInstance,installed,true);
         require(UnregisterClassW(cls.lpszClassName, cls.hInstance) != FALSE, "Release owned regression class");
-        std::cout << "4/4 native RecentItems regression cases passed\n";
+        std::cout << "4/4 original native RecentItems cases and 2/2 actual shutdown reentry cases passed\n";
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';
         result = 1;

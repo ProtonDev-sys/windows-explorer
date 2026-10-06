@@ -6813,11 +6813,19 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report, bool library
                         if (splitterNoopRestored && splitterIntact(true)) { splitterApp->preferences_.previewPane = true; splitterApp->layout(); }
                         RECT originalRoot{};
                         if (splitterNoopRestored && GetWindowRect(splitterApp->window_, &originalRoot) && splitterGeometryIntact()) {
+                            const LONG resizeWidthDelta = -40, resizeHeightDelta = -20;
+                            const LONG originalRootWidth = originalRoot.right-originalRoot.left;
+                            const LONG originalRootHeight = originalRoot.bottom-originalRoot.top;
+                            const LONG requestedRootWidth = originalRootWidth+resizeWidthDelta;
+                            const LONG requestedRootHeight = originalRootHeight+resizeHeightDelta;
+                            // Keep the shrink above the production tracking minimum.
+                            const bool resizeFeasible = requestedRootWidth >= splitterApp->px(600) &&
+                                requestedRootHeight >= splitterApp->px(320);
                             SetLastError(ERROR_SUCCESS);
-                            const BOOL resized = SetWindowPos(splitterApp->window_, nullptr, 0, 0,
-                                originalRoot.right-originalRoot.left+40, originalRoot.bottom-originalRoot.top+20,
+                            const BOOL resized = resizeFeasible && SetWindowPos(splitterApp->window_, nullptr, 0, 0,
+                                requestedRootWidth, requestedRootHeight,
                                 SWP_NOMOVE|SWP_NOACTIVATE|SWP_NOZORDER|SWP_NOOWNERZORDER);
-                            const auto resizeRead = resized ? S_OK : paneGeometryError();
+                            const auto resizeRead = resizeFeasible ? (resized ? S_OK : paneGeometryError()) : E_ABORT;
                             RECT actualResizedRoot{};
                             HRESULT actualResizedRootRead = E_ABORT;
                             if (splitterCurrent()) {
@@ -6825,11 +6833,20 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report, bool library
                                 const auto actualRootRead = GetWindowRect(splitterApp->window_, &actualResizedRoot);
                                 actualResizedRootRead = actualRootRead ? S_OK : paneGeometryError();
                             }
-                            const auto larger = readNativePaneGeometry(splitterView.Get(), splitterApp->window_, splitterApp->previewPane_,
+                            const LONG actualRootWidth = actualResizedRoot.right-actualResizedRoot.left;
+                            const LONG actualRootHeight = actualResizedRoot.bottom-actualResizedRoot.top;
+                            const LONG actualRootWidthDelta = actualRootWidth-originalRootWidth;
+                            const LONG actualRootHeightDelta = actualRootHeight-originalRootHeight;
+                            const bool actualRootResizeMatches = actualResizedRootRead == S_OK &&
+                                actualRootWidth == requestedRootWidth && actualRootHeight == requestedRootHeight &&
+                                actualRootWidthDelta != 0 && actualRootHeightDelta != 0 &&
+                                actualRootWidthDelta == resizeWidthDelta && actualRootHeightDelta == resizeHeightDelta;
+                            const auto resizedGeometry = readNativePaneGeometry(splitterView.Get(), splitterApp->window_, splitterApp->previewPane_,
                                 splitterApp->previewSplitter_, true, splitterDeadline, splitterCurrent, splitterApp->previewGrip_);
-                            splitterResizePassed = resized && larger.read == S_OK && larger.footerFull && larger.partition &&
-                                sameFrameInsets(larger) && larger.frameClient.right-larger.frameClient.left ==
-                                splitterOriginalGeometry.frameClient.right-splitterOriginalGeometry.frameClient.left+40 && splitterIntact();
+                            splitterResizePassed = resizeFeasible && resized && actualRootResizeMatches &&
+                                resizedGeometry.read == S_OK && resizedGeometry.footerFull && resizedGeometry.partition &&
+                                sameFrameInsets(resizedGeometry) && resizedGeometry.frameClient.right-resizedGeometry.frameClient.left ==
+                                splitterOriginalGeometry.frameClient.right-splitterOriginalGeometry.frameClient.left+resizeWidthDelta && splitterIntact();
                             HRESULT rootRestoreRead = E_ABORT;
                             if (splitterCurrent()) {
                                 SetLastError(ERROR_SUCCESS);
@@ -6841,20 +6858,24 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report, bool library
                             splitterFinalGeometry = rootRestoreRead == S_OK && splitterGeometryIntact() && splitterIntact();
                             splitterGeometryTrace += L"; root resize/restore HRESULT=" + hresultMessage(resizeRead) + L"/" +
                                 hresultMessage(rootRestoreRead) + L"; requested resize width/height=" +
-                                std::to_wstring(originalRoot.right-originalRoot.left+40) + L"/" +
-                                std::to_wstring(originalRoot.bottom-originalRoot.top+20) +
+                                std::to_wstring(requestedRootWidth) + L"/" +
+                                std::to_wstring(requestedRootHeight) +
+                                L"; feasible resize/actual nonzero root size matches=" + std::to_wstring(resizeFeasible) + L"/" +
+                                std::to_wstring(actualRootResizeMatches) + L"; actual/requested root width/height deltas=" +
+                                std::to_wstring(actualRootWidthDelta) + L"/" + std::to_wstring(actualRootHeightDelta) + L"/" +
+                                std::to_wstring(resizeWidthDelta) + L"/" + std::to_wstring(resizeHeightDelta) +
                                 L"; actual resized root HRESULT/rectangle=" + hresultMessage(actualResizedRootRead) + L"/" +
                                 splitterRectangleFacts(actualResizedRoot) + L"; original root rectangle=" + splitterRectangleFacts(originalRoot) +
                                 L"; original/resized native frame insets=" +
                                 splitterRectangleFacts(splitterFrameInsets(splitterOriginalGeometry.rootClient, splitterOriginalGeometry.frameClient)) + L"/" +
-                                splitterRectangleFacts(splitterFrameInsets(larger.rootClient, larger.frameClient)) +
+                                splitterRectangleFacts(splitterFrameInsets(resizedGeometry.rootClient, resizedGeometry.frameClient)) +
                                 L"; resized frame actual/expected width=" +
-                                std::to_wstring(larger.frameClient.right-larger.frameClient.left) + L"/" +
-                                std::to_wstring(splitterOriginalGeometry.frameClient.right-splitterOriginalGeometry.frameClient.left+40) +
-                                L"; pure resized frame insets/width matches=" + std::to_wstring(sameFrameInsets(larger)) + L"/" +
-                                std::to_wstring(larger.frameClient.right-larger.frameClient.left ==
-                                    splitterOriginalGeometry.frameClient.right-splitterOriginalGeometry.frameClient.left+40) +
-                                L"; resized=" + paneGeometryFacts(larger);
+                                std::to_wstring(resizedGeometry.frameClient.right-resizedGeometry.frameClient.left) + L"/" +
+                                std::to_wstring(splitterOriginalGeometry.frameClient.right-splitterOriginalGeometry.frameClient.left+resizeWidthDelta) +
+                                L"; pure resized frame insets/width matches=" + std::to_wstring(sameFrameInsets(resizedGeometry)) + L"/" +
+                                std::to_wstring(resizedGeometry.frameClient.right-resizedGeometry.frameClient.left ==
+                                    splitterOriginalGeometry.frameClient.right-splitterOriginalGeometry.frameClient.left+resizeWidthDelta) +
+                                L"; resized=" + paneGeometryFacts(resizedGeometry);
                         }
                     }
                     splitterGeometryTrace += L"; exact accepted predicates geometry/drag/off/noop/resize/final=" +
@@ -7464,6 +7485,11 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report, bool library
                 check("live_search_cache_deduplicates_exact_native_identity_with_latest_metadata", latestMetadataRetained &&
                     searchLocations_.size() == 100 && navigationCount_ == cacheNavigationCount);
             }
+            const auto backExactBytes=[](PCIDLIST_ABSOLUTE left,PCIDLIST_ABSOLUTE right) {
+                if(!left||!right)return false;
+                const auto length=ILGetSize(left);
+                return length==ILGetSize(right)&&std::memcmp(left,right,length)==0;
+            };
             hr = mixedRefined && leftMixedSearch ? execute(Back) : E_UNEXPECTED;
             const bool mixedRestored = SUCCEEDED(hr) && pumpUntil(exactScopeMembership, 5000);
             check("saved_search_file_properties_refinement_leave_and_history",propertiesRefined&&propertiesCleared&&mixedRestored&&
@@ -7471,7 +7497,19 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report, bool library
                 L"Exact metadata retained on refinement, cleared on physical navigation and restored by Back");
             check("mixed_scope_history_restores_query_rules_and_membership", mixedRestored &&
                 sameRules(searchScopeRules_) && activeQuery_ == refinedMixedQuery &&
-                ILIsEqual(currentPidl_.get(), refinedMixedPidl.get()), scopeDetail(hr));
+                ILIsEqual(currentPidl_.get(), refinedMixedPidl.get()), scopeDetail(hr)+
+                    L"; navigating="+std::to_wstring(navigating_)+L"; search active/background="+
+                    std::to_wstring(searchActive_)+L"/"+std::to_wstring(searchBackground_)+
+                    L"; pending/history index="+std::to_wstring(pendingHistory_)+L"/"+std::to_wstring(historyIndex_)+
+                    L"; current/refined native identity="+std::to_wstring(currentPidl_&&refinedMixedPidl&&
+                        ILIsEqual(currentPidl_.get(),refinedMixedPidl.get()))+
+                    L"; retained exact factory/completed/history alias counts="+
+                    std::to_wstring(std::count_if(searchLocations_.begin(),searchLocations_.end(),[&](const SearchLocation& value){
+                        return backExactBytes(value.location.get(),currentPidl_.get());}))+L"/"+
+                    std::to_wstring(std::count_if(searchLocations_.begin(),searchLocations_.end(),[&](const SearchLocation& value){
+                        return backExactBytes(value.completedLocation.get(),currentPidl_.get());}))+L"/"+
+                    std::to_wstring(std::count_if(searchLocations_.begin(),searchLocations_.end(),[&](const SearchLocation& value){
+                        return backExactBytes(value.historyLocation.get(),currentPidl_.get());})));
             const bool contentRestored = mixedRestored && pumpUntil(nativeContent32, 2000);
             check("mixed_scope_content_view_survives_refinement_and_history", contentSelected && contentRefined && contentRestored &&
                 searchPresentation_ && searchPresentation_->mode == SearchViewMode::Content && searchPresentation_->iconSize == 32,
@@ -8599,7 +8637,9 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report, bool library
                 FOLDERVIEWMODE equivalentMode{};int equivalentSize=0;
                 const auto equivalentViewRead=folderView_->GetViewModeAndIconSize(&equivalentMode,&equivalentSize);
                 ComPtr<IShellItem> equivalentResults;
-                auto equivalentRead=createSearchFolderForScopeRules(equivalentQuery,equivalentRules,&equivalentResults);
+                auto equivalentRead=equivalentRules.empty()
+                    ?createSearchFolderForScopes(equivalentQuery,equivalentScopes.Get(),&equivalentResults,searchRecursive_)
+                    :createSearchFolderForScopeRules(equivalentQuery,equivalentRules,&equivalentResults);
                 PIDLIST_ABSOLUTE equivalentRaw=nullptr;
                 if(SUCCEEDED(equivalentRead))equivalentRead=SHGetIDListFromObject(equivalentResults.Get(),&equivalentRaw);
                 Pidl equivalentFactory(equivalentRaw);
@@ -9319,7 +9359,10 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report, bool library
                         L"; parentNavigation="+std::to_wstring(parentNavigations)+L"; parentPresentation="+hresultMessage(parentPresentationRead)+
                         L"; parentItems="+hresultMessage(parentMembershipRead)+L"/"+std::to_wstring(parentMembers)+L"; capture="+hresultMessage(captured)+
                         L"; consume="+hresultMessage(consumed)+L"; childPrepare="+hresultMessage(childPrepared)+L"; childCreate="+hresultMessage(childCreated)+
-                        L"; childReady="+std::to_wstring(childReady)+L"; childItems="+hresultMessage(childMembershipRead)+L"/"+std::to_wstring(childMembers));
+                        L"; childReady="+std::to_wstring(childReady)+L"; childItems="+hresultMessage(childMembershipRead)+L"/"+std::to_wstring(childMembers)+
+                        L"; exact metadata/scope/stableChild/presentation="+std::to_wstring(metadata)+L"/"+std::to_wstring(scopeMetadata)+L"/"+
+                        std::to_wstring(stableChild)+L"/"+std::to_wstring(transferred.presentation&&sameHandoffPresentation(actualPresentation,*transferred.presentation))+
+                        L"; actual/original explicit rule counts="+std::to_wstring(childRules.size())+L"/"+std::to_wstring(seed.rules.size()));
                     std::wstring dateDetail;
                     const bool nativeDate=childReady&&datePublication(*child,dateDetail);
                     check(explicitRules?"search_new_window_list_native_date_selected_item":"search_new_window_content_native_date_selected_item",nativeDate,dateDetail);

@@ -243,6 +243,7 @@ struct HiddenView {
         const auto originalView=view;
         const auto originalBrowser=browser;
         const auto folderView=diagnosticOriginalFolderView;
+        ComPtr<IShellFolder> desktopFolder,nativeFolder;
         const auto prefix=[&] {
             std::cout<<"NativeMenu boundary diagnosticOnly=1 stage="<<stage<<" operation="<<operation<<" edge="<<edge
                 <<" inputCount="<<expectedSelection<<" mixed="<<mixed<<" operationHRESULT="<<static_cast<ULONG>(operationRead);
@@ -267,6 +268,9 @@ struct HiddenView {
             PIDLIST_ABSOLUTE rawFolder=nullptr;
             const auto folderPidlRead=currentFolder?SHGetIDListFromObject(currentFolder.Get(),&rawFolder):E_NOINTERFACE;
             OwnedPidl folderPidl(rawFolder);
+            const auto folderDesktopRead=desktopFolder&&folderPidl?
+                desktopFolder->CompareIDs(SHCIDS_CANONICALONLY,folderPidl.get(),readinessFolderId.get()):E_PENDING;
+            const auto folderDesktopOrder=static_cast<short>(HRESULT_CODE(folderDesktopRead));
             HWND nativeWindow=nullptr;
             const auto windowRead=originalView->GetWindow(&nativeWindow);
             DWORD nativeProcess=0,ownerProcess=0;
@@ -283,7 +287,7 @@ struct HiddenView {
                 originalView.Get()==view.Get()&&originalBrowser.Get()==browser.Get()&&currentViewRead==S_OK&&
                 originalIdentityRead==S_OK&&currentIdentityRead==S_OK&&originalIdentity&&currentIdentity&&
                 originalIdentity.Get()==currentIdentity.Get()&&folderRead==S_OK&&compareRead==S_OK&&!order&&
-                folderPidlRead==S_OK&&folderPidl&&ILIsEqual(folderPidl.get(),readinessFolderId.get())&&
+                folderPidlRead==S_OK&&folderPidl&&(!desktopFolder||(folderDesktopRead==S_OK&&folderDesktopOrder==0))&&
                 windowRead==S_OK&&nativeWindow==diagnosticOriginalWindow&&IsWindow(nativeWindow)&&IsWindow(owner)&&
                 IsChild(owner,nativeWindow)&&nativeProcess==diagnosticCreatorProcess&&ownerProcess==diagnosticCreatorProcess&&
                 nativeThread==diagnosticCreatorThread&&ownerThread==diagnosticCreatorThread&&!IsWindowVisible(owner)&&
@@ -295,9 +299,10 @@ struct HiddenView {
                     <<" currentViewHRESULT/identityHRESULTs/same="<<static_cast<ULONG>(currentViewRead)<<"/"
                     <<static_cast<ULONG>(originalIdentityRead)<<","<<static_cast<ULONG>(currentIdentityRead)<<"/"
                     <<(originalIdentity&&currentIdentity&&originalIdentity.Get()==currentIdentity.Get())
-                    <<" folderHRESULT/compareHRESULT/order/PIDLHRESULT/exact="<<static_cast<ULONG>(folderRead)<<"/"
+                    <<" folderHRESULT/compareHRESULT/order/PIDLHRESULT/ILIsEqualReported="<<static_cast<ULONG>(folderRead)<<"/"
                     <<static_cast<ULONG>(compareRead)<<"/"<<order<<"/"<<static_cast<ULONG>(folderPidlRead)<<"/"
                     <<(folderPidl&&ILIsEqual(folderPidl.get(),readinessFolderId.get()))
+                    <<" folderDesktopCanonicalHRESULT/order="<<static_cast<ULONG>(folderDesktopRead)<<"/"<<folderDesktopOrder
                     <<" originalFolderPIDLBytes="<<ILGetSize(readinessFolderId.get())
                     <<" viewWindowHRESULT/HWND/PID/TID="<<static_cast<ULONG>(windowRead)<<"/"<<reinterpret_cast<ULONG_PTR>(nativeWindow)
                     <<"/"<<nativeProcess<<"/"<<nativeThread<<" originalHWND="<<reinterpret_cast<ULONG_PTR>(diagnosticOriginalWindow)
@@ -313,6 +318,12 @@ struct HiddenView {
         const auto folderViewRead=folderView?S_OK:E_NOINTERFACE;
         if(!folderView)fail("folder-view-unavailable");
         fence("begin",true);
+        fence("desktop-folder-before");const auto desktopFolderRead=SHGetDesktopFolder(&desktopFolder);fence("desktop-folder-after");
+        if(desktopFolderRead!=S_OK||!desktopFolder)fail("canonical-desktop-folder-unavailable");
+        fence("native-folder-before");const auto nativeFolderRead=folderView->GetFolder(IID_PPV_ARGS(&nativeFolder));fence("native-folder-after");
+        if(nativeFolderRead!=S_OK||!nativeFolder)fail("canonical-native-folder-unavailable");
+        prefix();std::cout<<" desktopFolderHRESULT/nativeFolderHRESULT="<<static_cast<ULONG>(desktopFolderRead)<<"/"
+            <<static_cast<ULONG>(nativeFolderRead)<<" CompareIDsFlags="<<SHCIDS_CANONICALONLY<<std::endl;
         DWORD flags=0;FOLDERVIEWMODE mode=FVM_AUTO;int iconSize=-1,all=-1,selected=-1;
         fence("flags-before");const auto flagsRead=folderView->GetCurrentFolderFlags(&flags);fence("flags-after");
         fence("mode-before");const auto modeRead=folderView->GetViewModeAndIconSize(&mode,&iconSize);fence("mode-after");
@@ -328,10 +339,15 @@ struct HiddenView {
             const auto arrayPidlRead=arrayItem?SHGetIDListFromObject(arrayItem.Get(),&rawItem):E_NOINTERFACE;
             OwnedPidl arrayPidl(rawItem);fence("array-pidl-after");
             const size_t expectedMember=mixed&&arrayRow==arrayCount-1?2:0;
-            const bool exact=arrayItemRead==S_OK&&arrayPidlRead==S_OK&&arrayPidl&&
-                ILIsEqual(arrayPidl.get(),readinessMembers[expectedMember].pidl.get());
+            fence("array-full-canonical-before");
+            const auto arrayCanonicalRead=arrayPidl?desktopFolder->CompareIDs(SHCIDS_CANONICALONLY,
+                arrayPidl.get(),readinessMembers[expectedMember].pidl.get()):E_NOINTERFACE;
+            const auto arrayCanonicalOrder=static_cast<short>(HRESULT_CODE(arrayCanonicalRead));fence("array-full-canonical-after");
+            const bool exact=arrayItemRead==S_OK&&arrayPidlRead==S_OK&&arrayPidl&&arrayCanonicalRead==S_OK&&arrayCanonicalOrder==0;
             prefix();std::cout<<" arrayRow="<<arrayRow<<" expectedOwnedMember="<<expectedMember
-                <<" itemHRESULT/PIDLHRESULT/exactFullPIDL="<<static_cast<ULONG>(arrayItemRead)<<"/"<<static_cast<ULONG>(arrayPidlRead)<<"/"<<exact<<std::endl;
+                <<" itemHRESULT/PIDLHRESULT/canonicalFullPIDLMatch="<<static_cast<ULONG>(arrayItemRead)<<"/"<<static_cast<ULONG>(arrayPidlRead)<<"/"<<exact
+                <<" arrayDesktopCanonicalHRESULT/order="<<static_cast<ULONG>(arrayCanonicalRead)<<"/"<<arrayCanonicalOrder
+                <<" arrayILIsEqualReported="<<(arrayPidl&&ILIsEqual(arrayPidl.get(),readinessMembers[expectedMember].pidl.get()))<<std::endl;
             arrayItem.Reset();fence("array-item-release-after");
             if(!exact)fail("original-full-selection-identity-changed");
         }
@@ -359,13 +375,19 @@ struct HiddenView {
         std::array<int,3> rows{-1,-1,-1};
         std::array<FILE_ID_INFO,3> nativeIds{};
         std::array<HRESULT,3> nativeReads{E_PENDING,E_PENDING,E_PENDING};
+        std::array<HRESULT,3> nativePathReads{E_PENDING,E_PENDING,E_PENDING};
+        std::array<bool,3> nativeIdAttempted{};
         // Never inspect an unowned row's display name or filesystem path. A
         // complete native count of three is required for bounded row matching.
         if(allRead==S_OK&&all==static_cast<int>(readinessMembers.size()))for(int rowIndex=0;rowIndex<all;++rowIndex) {
             fence("owned-child-before");PITEMID_CHILD rawChild=nullptr;
             const auto childRead=folderView->Item(rowIndex,&rawChild);OwnedPidl child(rawChild);fence("owned-child-after");
+            HRESULT childCanonicalRead=E_PENDING;short childCanonicalOrder=1;
             const auto member=child?std::find_if(readinessMembers.begin(),readinessMembers.end(),[&](const ReadyMember& value){
-                return ILIsEqual(child.get(),ILFindLastID(value.pidl.get()));}):readinessMembers.end();
+                fence("owned-child-canonical-before");
+                childCanonicalRead=nativeFolder->CompareIDs(SHCIDS_CANONICALONLY,child.get(),ILFindLastID(value.pidl.get()));
+                childCanonicalOrder=static_cast<short>(HRESULT_CODE(childCanonicalRead));fence("owned-child-canonical-after");
+                return childCanonicalRead==S_OK&&childCanonicalOrder==0;}):readinessMembers.end();
             if(childRead!=S_OK||member==readinessMembers.end()) {
                 prefix();std::cout<<" row="<<rowIndex<<" childHRESULT="<<static_cast<ULONG>(childRead)
                     <<" ownedChild=0 pathReadSkipped=1"<<std::endl;continue;
@@ -376,22 +398,57 @@ struct HiddenView {
             PIDLIST_ABSOLUTE rawRow=nullptr;
             const auto rowPidlRead=row?SHGetIDListFromObject(row.Get(),&rawRow):E_NOINTERFACE;
             OwnedPidl rowPidl(rawRow);fence("owned-full-pidl-after");
-            const bool exact=rowRead==S_OK&&rowPidlRead==S_OK&&rowPidl&&ILIsEqual(rowPidl.get(),member->pidl.get());
+            fence("owned-full-canonical-before");
+            const auto fullCanonicalRead=rowPidl?desktopFolder->CompareIDs(SHCIDS_CANONICALONLY,rowPidl.get(),member->pidl.get()):E_NOINTERFACE;
+            const auto fullCanonicalOrder=static_cast<short>(HRESULT_CODE(fullCanonicalRead));fence("owned-full-canonical-after");
+            const bool exact=rowRead==S_OK&&rowPidlRead==S_OK&&rowPidl&&childCanonicalRead==S_OK&&childCanonicalOrder==0&&
+                fullCanonicalRead==S_OK&&fullCanonicalOrder==0;
+            const auto observedBytes=rowPidl?ILGetSize(rowPidl.get()):0,expectedBytes=ILGetSize(member->pidl.get());
+            const bool byteEqual=rowPidl&&observedBytes==expectedBytes&&std::memcmp(rowPidl.get(),member->pidl.get(),expectedBytes)==0;
             prefix();std::cout<<" row="<<rowIndex<<" ownedMember="<<memberIndex<<" childHRESULT="<<static_cast<ULONG>(childRead)
-                <<" rowHRESULT/fullPIDLHRESULT/exactChildAndFullPIDL="<<static_cast<ULONG>(rowRead)<<"/"<<static_cast<ULONG>(rowPidlRead)
-                <<"/"<<exact<<" fullPIDLBytes="<<(rowPidl?ILGetSize(rowPidl.get()):0)<<std::endl;
+                <<" rowHRESULT/fullPIDLHRESULT/canonicalChildAndFullPIDLMatch="<<static_cast<ULONG>(rowRead)<<"/"<<static_cast<ULONG>(rowPidlRead)<<"/"<<exact
+                <<" nativeChildCanonicalHRESULT/order="<<static_cast<ULONG>(childCanonicalRead)<<"/"<<childCanonicalOrder
+                <<" desktopFullCanonicalHRESULT/order="<<static_cast<ULONG>(fullCanonicalRead)<<"/"<<fullCanonicalOrder
+                <<" childILIsEqualReported="<<ILIsEqual(child.get(),ILFindLastID(member->pidl.get()))
+                <<" fullILIsEqualReported="<<(rowPidl&&ILIsEqual(rowPidl.get(),member->pidl.get()))
+                <<" fullPIDLBytes/expectedBytes/rawByteEqual="<<observedBytes<<"/"<<expectedBytes<<"/"<<byteEqual<<std::endl;
             if(exact) {
+                // Original source FileID plus native-folder child CompareIDs,
+                // Desktop full CompareIDs and current private source authorize
+                // this exact owned row's reported path. Raw IL/byte results are
+                // diagnostic only; their conflicting runtime cause is unknown.
+                // A native alias can spell that same owned path differently.
+                FILE_ID_INFO sourceBeforePath{};
+                fence("owned-source-id-before-reported-path");
+                const auto sourceBeforePathRead=readReadyIdentity(member->path,sourceBeforePath);
+                fence("owned-source-id-after-reported-path-authorization");
+                const bool sourceBeforePathExact=sourceBeforePathRead==S_OK&&sameReadyIdentity(sourceBeforePath,member->identity);
+                prefix();std::cout<<" ownedMember="<<memberIndex<<" sourceBeforePathHRESULT/exactImmutableFileID="
+                    <<static_cast<ULONG>(sourceBeforePathRead)<<"/"<<sourceBeforePathExact
+                    <<" ownedAliasAuthorizedBeforePath="<<sourceBeforePathExact<<std::endl;
+                if(!sourceBeforePathExact)fail("original-owned-source-changed-before-reported-path");
                 fence("owned-path-before");PWSTR rawPath=nullptr;
                 const auto pathRead=row->GetDisplayName(SIGDN_FILESYSPATH,&rawPath);
+                nativePathReads[memberIndex]=pathRead;
                 std::unique_ptr<wchar_t,decltype(&CoTaskMemFree)> path(rawPath,CoTaskMemFree);fence("owned-path-after");
-                const bool pathOwned=pathRead==S_OK&&path&&*path&&
+                const bool pathPresent=path&&*path;
+                const bool lexicalPathMatch=pathRead==S_OK&&pathPresent&&
                     CompareStringOrdinal(path.get(),-1,member->path.c_str(),-1,TRUE)==CSTR_EQUAL;
                 prefix();std::cout<<" ownedMember="<<memberIndex<<" pathHRESULT="<<static_cast<ULONG>(pathRead)
-                    <<" exactOwnedPath="<<pathOwned<<" pathTextLogged=0"<<std::endl;
-                if(pathOwned) {
-                    fence("owned-native-id-before");nativeReads[memberIndex]=readReadyIdentity(fs::path(path.get()),nativeIds[memberIndex]);
+                    <<" reportedPathPresent="<<pathPresent<<" lexicalPathMatch="<<lexicalPathMatch<<" pathTextLogged=0"<<std::endl;
+                if(pathRead==S_OK&&pathPresent) {
+                    FILE_ID_INFO sourceBeforeNativeId{};
+                    fence("owned-source-id-before-native-path-open");
+                    const auto sourceBeforeNativeIdRead=readReadyIdentity(member->path,sourceBeforeNativeId);
+                    fence("owned-source-id-after-native-path-open-authorization");
+                    const bool sourceBeforeNativeIdExact=sourceBeforeNativeIdRead==S_OK&&sameReadyIdentity(sourceBeforeNativeId,member->identity);
+                    prefix();std::cout<<" ownedMember="<<memberIndex<<" sourceBeforeNativeIdHRESULT/exactImmutableFileID="
+                        <<static_cast<ULONG>(sourceBeforeNativeIdRead)<<"/"<<sourceBeforeNativeIdExact<<std::endl;
+                    if(!sourceBeforeNativeIdExact)fail("original-owned-source-changed-before-native-path-open");
+                    fence("owned-native-id-before");nativeIdAttempted[memberIndex]=true;
+                    nativeReads[memberIndex]=readReadyIdentity(fs::path(path.get()),nativeIds[memberIndex]);
                     fence("owned-native-id-after");
-                } else nativeReads[memberIndex]=pathRead==S_OK?E_ACCESSDENIED:pathRead;
+                }
                 if(rows[memberIndex]!=-1)fail("duplicate-owned-native-member");
                 rows[memberIndex]=rowIndex;
             }
@@ -412,9 +469,13 @@ struct HiddenView {
                 <<" sourceHRESULT/exactImmutableFileID="<<static_cast<ULONG>(sourceRead)<<"/"<<sourceExact
                 <<" expectedVolume/FileID="<<member.identity.VolumeSerialNumber<<"/"<<expectedId.data()
                 <<" sourceVolume/FileID="<<sourceId.VolumeSerialNumber<<"/"<<observedSourceId.data()
-                <<" nativeHRESULT/exactImmutableFileID="<<static_cast<ULONG>(nativeReads[memberIndex])<<"/"<<nativeExact
+                <<" nativePathHRESULT="<<static_cast<ULONG>(nativePathReads[memberIndex])
+                <<" nativeIdentityReadAttempted="<<nativeIdAttempted[memberIndex]
+                <<" nativeIdentityHRESULT/exactImmutableFileID="<<static_cast<ULONG>(nativeReads[memberIndex])<<"/"<<nativeExact
                 <<" nativeVolume/FileID="<<nativeIds[memberIndex].VolumeSerialNumber<<"/"<<nativeId.data()<<std::endl;
             if(!sourceExact)fail("original-owned-file-identity-changed");
+            if(nativeIdAttempted[memberIndex]&&nativeReads[memberIndex]==S_OK&&!nativeExact)
+                fail("owned-native-row-file-identity-changed");
         }
         int allAfter=-1,selectedAfter=-1;
         fence("all-count-final-before");const auto allAfterRead=folderView->ItemCount(SVGIO_ALLVIEW,&allAfter);fence("all-count-final-after");

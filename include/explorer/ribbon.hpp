@@ -4,8 +4,10 @@
 #include "explorer/ribbon_features.hpp"
 #include <windows.h>
 #include <uiribbon.h>
+#include <atomic>
 #include <filesystem>
 #include <functional>
+#include <cstdint>
 #include <memory>
 #include <span>
 #include <string>
@@ -14,6 +16,37 @@
 
 namespace explorer {
 struct NativePopupCapture;
+
+struct RibbonQuickAccessItem {
+    UINT command = 0; // Zero means the installed native ID is not mapped.
+    UINT nativeCommand = 0;
+    HRESULT commandRead = E_PENDING;
+};
+
+// Creator-STA snapshot of the actual framework collection. Its opaque state
+// retains every native row, including unmapped rows and their native metadata.
+// Destroy or replace it on the same STA, before resetting the Ribbon.
+class RibbonQuickAccessSnapshot {
+public:
+    RibbonQuickAccessSnapshot();
+    ~RibbonQuickAccessSnapshot();
+    RibbonQuickAccessSnapshot(RibbonQuickAccessSnapshot&&) noexcept;
+    RibbonQuickAccessSnapshot& operator=(RibbonQuickAccessSnapshot&&) noexcept;
+    std::span<const RibbonQuickAccessItem> items() const noexcept;
+    bool belowRibbon() const noexcept;
+private:
+    friend class NativeRibbon;
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+enum class RibbonQuickAccessEditKind { Add, Remove, Move };
+struct RibbonQuickAccessEdit {
+    RibbonQuickAccessEditKind kind;
+    UINT command = 0; // Add only.
+    UINT index = 0; // Remove or Move: actual snapshot row index.
+    UINT destination = 0; // Move: final row index.
+};
 enum class RibbonContext : UINT {
     None = 0, Picture = 1, Drive = 2, Compressed = 4, Search = 8,
     Library = 16, Recycle = 32, Application = 64, Music = 128, Video = 256, DiscImage = 512,
@@ -105,7 +138,15 @@ public:
     HRESULT quickAccessBelow(bool& value) const;
     HRESULT quickAccessCommands(std::vector<UINT>& commands) const;
     HRESULT setQuickAccessCommands(std::span<const UINT> commands);
+    HRESULT quickAccessSnapshot(RibbonQuickAccessSnapshot& output) const;
+    // Rejects a stale collection/dock/row binding. Untouched rows retain their
+    // exact native objects; no native labels, flags or row types are rebuilt.
+    // A failed Move insertion rolls back only an unchanged intermediate list.
+    HRESULT editQuickAccess(const RibbonQuickAccessSnapshot&, const RibbonQuickAccessEdit&);
     HRESULT saveSettings(const std::filesystem::path& path) const;
+    // Versioned application envelope retains ordered actual native IDs around
+    // opaque native settings. Legacy native streams still load, but contain no
+    // recoverable custom-order manifest. No native stream bytes are interpreted.
     HRESULT loadSettings(const std::filesystem::path& path);
     // Native image property is invalidation-only in IUIFramework. This returns
     // the same cached system-resource IUIImage used by UpdateProperty.
@@ -122,6 +163,10 @@ public:
     UINT nativeCommandId(UINT command) const noexcept;
 private:
     struct Impl;
-    std::unique_ptr<Impl> impl_;
+    std::shared_ptr<Impl> impl_;
+    std::uint64_t bindingGeneration_ = 0;
+    // Independent entry epoch survives NativeRibbon destruction in retired callbacks.
+    std::shared_ptr<std::atomic<std::uint64_t>> callbackEpoch_;
+    HRESULT setViewSetting(REFPROPERTYKEY key,const PROPVARIANT& value);
 };
 }

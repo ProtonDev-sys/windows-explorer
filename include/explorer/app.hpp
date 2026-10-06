@@ -13,6 +13,7 @@
 #include "explorer/search_history.hpp"
 #include "explorer/address_history.hpp"
 #include "explorer/search.hpp"
+#include "explorer/search_backing.hpp"
 #include "explorer/search_refinement.hpp"
 #include "explorer/search_window.hpp"
 #include "explorer/live_search.hpp"
@@ -283,6 +284,8 @@ private:
     void refreshSearchRefinements();
     void rememberSearchCacheHistory(PCIDLIST_ABSOLUTE location);
     HRESULT clearSearchHistory(const std::filesystem::path* ownedHeadlessPath = nullptr);
+    HRESULT buildSearchTarget(const std::wstring& query, const std::vector<SearchScopeRule>& rules, SearchFolderBuild* result);
+    HRESULT closeSearchBackings();
     HRESULT startSearch(const std::wstring& query, bool recursive,
                         std::optional<size_t> category = {}, const std::wstring& filter = L"",
                         const LiveSearchRequest* liveRequest = nullptr);
@@ -290,11 +293,30 @@ private:
     void cancelLiveSearch();
     void scheduleLiveSearch();
     HRESULT processLiveSearch();
+    friend struct SearchBackingNativeFixture;
+    // Native call-stack lifetime only; unlike the live-query dispatch scope,
+    // this does not suppress timer/Enter submission or reschedule a query.
+    struct SearchNativeCallScope {
+        ExplorerApp& owner;
+        bool previous;
+        explicit SearchNativeCallScope(ExplorerApp& value):owner(value),previous(value.searchNativeCallsActive_){owner.searchNativeCallsActive_=true;}
+        ~SearchNativeCallScope(){
+            owner.searchNativeCallsActive_=previous;
+            if(!previous&&!owner.liveSearchDispatchActive_&&owner.searchClosePending_&&owner.window_&&IsWindow(owner.window_))
+                PostMessageW(owner.window_,WM_CLOSE,0,0);
+        }
+    };
     struct LiveSearchDispatchScope {
         ExplorerApp& owner;
         bool previous;
         explicit LiveSearchDispatchScope(ExplorerApp& value):owner(value),previous(value.liveSearchDispatchActive_){owner.liveSearchDispatchActive_=true;}
-        ~LiveSearchDispatchScope(){owner.liveSearchDispatchActive_=previous;if(!previous)owner.scheduleLiveSearch();}
+        ~LiveSearchDispatchScope(){
+            owner.liveSearchDispatchActive_=previous;
+            if(!previous) {
+                if(!owner.searchNativeCallsActive_&&owner.searchClosePending_&&owner.window_&&IsWindow(owner.window_))PostMessageW(owner.window_,WM_CLOSE,0,0);
+                owner.scheduleLiveSearch();
+            }
+        }
     };
     bool completeLiveSearchNavigation(PCIDLIST_ABSOLUTE target, HRESULT result);
     void rememberQuery(const std::wstring& query);
@@ -531,6 +553,12 @@ private:
     unsigned breadcrumbGeneration_ = 0;
     POINT breadcrumbMenuPoint_{};
     std::vector<Pidl> history_;
+    // Declared before records: ordinary destruction releases records first.
+    // Explicit close also releases native aliases and proves worker drain.
+    std::unique_ptr<SearchBackingStore> searchBackings_;
+    bool searchClosePending_ = false;
+    bool searchBackingTeardownActive_ = false;
+    ULONGLONG searchTeardownDeadline_ = 0;
     struct SearchLocation {
         Pidl location; Pidl scope; std::wstring query; bool recursive;
         std::wstring base; std::array<std::wstring, 3> filters;
@@ -544,6 +572,7 @@ private:
         Pidl completedLocation;
         Pidl historyLocation;
         ComPtr<IShellItem> windowOrigin;
+        std::shared_ptr<const SearchBackingLease> backing;
     };
     std::vector<SearchLocation> searchLocations_;
     struct SearchPresentationLocation {
@@ -577,10 +606,13 @@ private:
     LiveSearchPolicy liveSearchPolicy_;
     bool suppressSearchChanges_ = false;
     bool liveSearchDispatchActive_ = false;
+    bool searchNativeCallsActive_ = false;
     unsigned long long searchInteractionRevision_ = 0;
     Pidl pendingDirectSearchTarget_;
     unsigned long long pendingDirectSearchRevision_ = 0;
     std::function<void()> headlessSearchFactoryReentryProbe_;
+    std::function<void()> headlessSearchReadbackReentryProbe_;
+    std::function<void()> headlessSearchRecreateReentryProbe_;
     std::function<void()> headlessLiveNavigationProbe_;
     std::function<HRESULT()> headlessLiveBrowseProbe_;
     Pidl liveSearchOrigin_;

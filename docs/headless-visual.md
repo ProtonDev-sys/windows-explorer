@@ -1,5 +1,22 @@
 # Native headless visual verification
 
+The latest complete installed-layout comparison is v108-r2 on October 6,
+2026, at `artifacts/visual/run-20261006-052127-3809128d3528448588964474186ea939`.
+All nineteen native captures pass at actual 96 DPI. Seven strict comparisons
+pass (Home, View, Picture, Search, Application, Music and Video), nine fail,
+and DiskImage, Library and Shortcut retain their documented source restrictions.
+All 24 pinned online references were verified; masks and thresholds were
+unchanged. Executable SHA-256 is
+`063f67b4da66f29540fbed8baa95a92527418fac0f1ed134df2292e1e6544afd`,
+reference manifest `a49f3266a436bd794daface43799ae99b351237497f3ee07ab173486cb92af73`,
+and comparator `51a9a5840ce7dc563f80527e1fd7a8571f2a18752911ed5e035dc49a1e20876b`.
+Video's strict pixel agreement is 0.980325 with edge F1 0.948908. This supersedes
+its earlier failing comparison without certifying another binary or hardware.
+Later functional/source changes have no new strict screenshot result. The
+installed-image audit shows the host replacement policy in source, but actual
+first native-current image availability and displaced artwork remain unknown
+until an owned native probe; it does not change these comparison counts.
+
 The current reference audit finds no embedded ICC profile in the pinned Tech
 JPEGs or PC Assist/Microsoft Press PNGs. Untagged web images use sRGB; inventing
 an AdobeRGB transform is unsupported. [W3C color contract](https://www.w3.org/TR/css-color-4/#untagged).
@@ -11,10 +28,23 @@ that state mismatch cannot prove a command-eligibility defect. The command band
 and dynamic count are already masked, so it does not explain the remaining
 strict chrome failure. Existing references, masks and thresholds remain intact.
 
-The v102-r7 layout experiment preserves the full-width native footer while
+The historical v102-r7 layout experiment preserves the full-width native footer while
 reapplying a public-view reservation after each native resize, for both LTR
-and RTL A/B/A views. This measured compatibility is not yet a production UI
-change or a strict screenshot pass. The production footer gap remains open.
+and RTL A/B/A views. At that checkpoint the measured compatibility was not yet
+a production UI change or a strict screenshot pass. The later v107 production App checks now
+pass the full-width native footer/content partition, actual grip input,
+both-source RTF rendering and source-B focus transitions in both layouts;
+see [verification](verification.md). Later v122 authored native checks pass
+strict LTR/RTL root shrink from 1200x800 to 1160x780, exact 1144-pixel shrunk
+frame, drag and teardown preservation, while that full App run fails its
+original Content handoff. The v124 run passes Content and strict footer checks
+in both layouts; each full General target still fails only direct-literal
+equivalence (two failures among six App/search targets). Its narrow v125
+comparison-fixture correction compiles and retains every original assertion.
+The later scoped General runs pass installed 303/303 in v125 and authored
+298/298 in v126. A v125 authored saved-search Back failure is retained; the
+v126 diagnostic pass does not resolve its cause or prove repeatability.
+These functional checks do not change the strict screenshot failures above.
 
 The v89 installed Compressed and Computer controls both pass native capture
 and fail the unchanged strict online-reference comparisons. Exact artifacts
@@ -27,7 +57,7 @@ Those results do not establish a disabled-group cause for caption colors.
 The unsupported diagnostic has been removed; no native state, color, reference
 mask or comparison threshold was changed.
 
-The latest v85 installed-layout eleven-scene control completed on October 6,
+The historical focused v85 installed-layout eleven-scene control completed on October 6,
 2026 in `artifacts/visual/run-20261005-235837-c386ebd8550e42049fe33fd10b6689ad`.
 Its immutable executable SHA-256 is
 `22ab1eaafc2c3120f43e1abe1353f597f99d873aa07c81b8b78a7ca361646a56`.
@@ -160,7 +190,7 @@ An open Date modified menu is a separate native owned HWND and is absent from th
 
 Live-search App checks drive only the owned search EDIT through real change notifications and timer dispatch. Late-created Unicode files are matched by native volume/File IDs. The checks cover automatic debounce without MRU writes, one search-history slot, explicit Enter completion, a newer edit during an older navigation, programmatic cancellation, clear/Escape origin restoration and saved-search scope restoration. A one-shot probe inside the actual accepted pending-navigation callback delivers the newer edit while the older request is genuinely pending. Monitoring starts immediately after that input is accepted; the old literal before input delivery is not classified as an overwrite. The accepted native history PIDL/index and cardinality must remain unchanged, and a later reset still fails. A controlled direct-factory callback edits away and back to the same text; its changed interaction generation must abort stale navigation and preserve the later real timer request. Enter and Escape independently test new intentions without text changes. Numeric progress identifies pending native navigation, result counts and the first unexpected edit category without logging query text. Each assertion requires its corresponding immutable App run; the separately verified scheduling module does not establish App integration by itself.
 
-The latest complete local run is v42, `artifacts/visual/run-20261005-153919-bb5eb675b4814b8d92a9455e4d486b6b`, on October 5, 2026 UTC. Its immutable executable SHA256 is `e5796664dcfdc48d4e2081f85d3093fefac2880e4993ecd508ebc9fc9bf2e07d`, reference protocol `be56ed7190d098f4dca449437110a6ef0a862e20a1b82dc795f0559a0fe49ac4` and comparer `51a9a5840ce7dc563f80527e1fd7a8571f2a18752911ed5e035dc49a1e20876b`. Windows 10 Home 22H2 build `19045.6466`, native binary versions, `en-GB`, requested Light theme and actual native 96DPI were recorded. All 19 scenes passed native rendering and private-desktop isolation. Six strict source comparisons passed and ten failed; three were restricted. DiskImage and Shortcut lack source scale/DPI evidence. The new built-in Documents Library fixture returned `E_INVALIDARG` before creating an App window. Its combined resolve field does not identify the failing subcall or prove that the profile lacks a Library; the source comparison remains unavailable and no custom-library substitute was compared. Subsequent source separates the known-folder, item, backing-path and parsing-name stages. The run returned failure and `wholeApplicationParityEstablished` remains false.
+The historical complete local v42 visual run is `artifacts/visual/run-20261005-153919-bb5eb675b4814b8d92a9455e4d486b6b`, on October 5, 2026 UTC. Its immutable executable SHA256 is `e5796664dcfdc48d4e2081f85d3093fefac2880e4993ecd508ebc9fc9bf2e07d`, reference protocol `be56ed7190d098f4dca449437110a6ef0a862e20a1b82dc795f0559a0fe49ac4` and comparer `51a9a5840ce7dc563f80527e1fd7a8571f2a18752911ed5e035dc49a1e20876b`. Windows 10 Home 22H2 build `19045.6466`, native binary versions, `en-GB`, requested Light theme and actual native 96DPI were recorded. All 19 scenes passed native rendering and private-desktop isolation. Six strict source comparisons passed and ten failed; three were restricted. DiskImage and Shortcut lack source scale/DPI evidence. The new built-in Documents Library fixture returned `E_INVALIDARG` before creating an App window. Its combined resolve field does not identify the failing subcall or prove that the profile lacks a Library; the source comparison remains unavailable and no custom-library substitute was compared. Subsequent source separates the known-folder, item, backing-path and parsing-name stages. The run returned failure and `wholeApplicationParityEstablished` remains false.
 
 The focused v43 correction resolved the native Library namespace and its independent backing path. The v44 diagnostic run, `artifacts/visual/run-20261005-155825-8e8301a28b584d16b3493b58139cbef8`, used executable `8a22a84c944534f155d72548777cb71d78d34580f70a3a766b3ffbda346aa28b`. Every resolution call succeeded. The App view, known-folder identity, backing path and checked native Library metadata remained stable, but the descriptor's actual file identity, bytes, write time and change time differed after browsing. The exact preservation guard returned `ERROR_RETRY`; it was not a successful capture and does not identify which process performed the replacement.
 
@@ -191,7 +221,7 @@ The fixture helper verified all seven genuine outputs. View read logical and act
 | ModernShare | Fail, full chrome | 95.58% | .897 |
 | ModernView | Fail, full chrome | 95.59% | .897 |
 
-All three modern address-dropdown and Refresh regions pass separately with 100% pixel agreement and edge F1 1.000. Their whole-frame failures retain the documented File-tab/frame palette and native Help-artwork differences. Drive uses the installed no-BitLocker template `0x707`; the source's Protect group is not edition-matched. Compressed independently reports 54 enabled native destinations with an image interface and enabled Extract all. Share's cached and fresh Email state agree (`S_OK`, hidden); Specific people and Stop sharing both return `E_NOTIMPL` for the original selected-item/site context. The custom owned Library has enabled Change icon and disabled Show in navigation pane/Restore defaults, unlike the source's built-in Documents library. Video retains unavailable association/device commands. Native state differences remain compared, without forced eligibility.
+All three modern address-dropdown and Refresh regions pass separately with 100% pixel agreement and edge F1 1.000. Their whole-frame failures retain the documented File-tab/frame palette and native Help-artwork differences. Drive uses the installed no-BitLocker template `0x707`; the source's Protect group is not edition-matched. Compressed independently reports 54 enabled native destinations with an image interface and enabled Extract all. Share's cached and fresh Email state agree (`S_OK`, hidden); Specific people and Stop sharing both return `E_NOTIMPL` for the original selected-item/site context. The custom owned Library has enabled Change icon and disabled Show in navigation pane/Restore defaults, unlike the source's built-in Documents library. That historical v23 Video capture retains unavailable association/device commands; the later current v108-r2 Video comparison passes. Native state differences remain compared, without forced eligibility.
 
 Search first passed in the focused run `artifacts/visual/run-20261005-120015-fd63ec2d3057441bae7f0d2d9d3ed927` and passed again in the complete v23 run above: pixel agreement 98.1119%, edge F1 .980327 and mean absolute error 1.108655. The actual physical-scope/Enter fixture proves one submission, one matching MRU entry with native Recent searches enabled, retained factories 0→1, one completed search navigation, committed history, preserved recursive scope and unchanged saved-input bytes/FileID. These source-state corrections use the normal production interaction and preserve native eligibility, masks, thresholds and artwork.
 
@@ -201,4 +231,4 @@ Historical baseline: the October 4 full run used executable `797d82951bdc90c6052
 
 The focused v71 run `artifacts/visual/run-20261005-212533-2658c30c40384e94baeb0403947010c4` captures Share and both Compressed contexts successfully; both strict comparisons fail. The Compressed comparison now selects the owned intact ZIP in its containing Downloads folder, matching the online source's disabled destination gallery and enabled Extract all. Its independent inside-ZIP member capture remains. Exact native address equality uses the existing owned directory's long path; the ZIP hash and selected count are checked. The updated reference manifest changes only this fixture description. Images, crops, masks, thresholds and comparer remain unchanged. The capture script's hash is now recorded separately.
 
-Share's actual action-owned menu returns `ERROR_NOT_SUPPORTED` for Specific people and Remove access, while the separate generic CommandStore lookup returns `ERROR_NOT_FOUND`. Neither is an enabled native menu result. Email's action plan instead uses the SendTo Mail Recipient route; its direct registered state remains distinct. Complete target, bytes, attributes, owner/group/DACL and settings preservation checks pass. Compressed agreement is 97.4024%, edge F1 .903344 and mean RGB error 1.236890; native group-caption and destination artwork differences remain measured. These focused results do not supersede the nineteen-scene v64 run or establish complete visual parity.
+Share's actual action-owned menu returns `ERROR_NOT_SUPPORTED` for Specific people and Remove access, while the separate generic CommandStore lookup returns `ERROR_NOT_FOUND`. Neither is an enabled native menu result. Email's action plan instead uses the SendTo Mail Recipient route; its direct registered state remains distinct. Complete target, bytes, attributes, owner/group/DACL and settings preservation checks pass. Compressed agreement is 97.4024%, edge F1 .903344 and mean RGB error 1.236890; native group-caption and destination artwork differences remain measured. At that checkpoint these focused results did not supersede the nineteen-scene v64 run. The current complete comparison is v108-r2 above; complete visual parity remains unproven.

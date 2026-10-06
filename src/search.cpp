@@ -873,12 +873,23 @@ HRESULT filePropertiesXml(const SearchFileProperties& properties, std::wstring& 
     xml += L"</properties>\r\n";
     return S_OK;
 }
-HRESULT writeNewFile(const std::filesystem::path& path, const std::string& bytes) {
+HRESULT writeNewFile(const std::filesystem::path& path, const std::string& bytes,
+                     SearchCreatedFileProof* createdFileProof = nullptr) {
     SaveFile file;
-    file.value = CreateFileW(path.c_str(), GENERIC_WRITE | DELETE, 0, nullptr, CREATE_NEW,
+    file.value = CreateFileW(path.c_str(), GENERIC_WRITE | DELETE | (createdFileProof ? FILE_READ_ATTRIBUTES : 0), 0, nullptr, CREATE_NEW,
                             FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file.value == INVALID_HANDLE_VALUE) return HRESULT_FROM_WIN32(GetLastError());
-    const auto hr = writeContents(file.value, bytes);
+    auto hr = writeContents(file.value, bytes);
+    if (SUCCEEDED(hr) && createdFileProof) {
+        FILE_ID_INFO identity{};
+        if (!GetFileInformationByHandleEx(file.value, FileIdInfo, &identity, sizeof(identity)))
+            hr = HRESULT_FROM_WIN32(GetLastError());
+        else {
+            createdFileProof->identity = identity;
+            createdFileProof->bytes = bytes;
+            createdFileProof->captured = true;
+        }
+    }
     file.retain = SUCCEEDED(hr);
     return hr;
 }
@@ -1195,6 +1206,33 @@ HRESULT createSearchFolderForScopes(const std::wstring& query, IShellItemArray* 
     } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
 }
 
+HRESULT validateSearchDescriptorQuery(const std::wstring& query) {
+    try {
+        std::wstring text;auto hr=queryText(query,text);if(FAILED(hr))return hr;
+        ComPtr<ICondition> condition;return parseQuery(text,false,&condition);
+    } catch(const std::bad_alloc&) {return E_OUTOFMEMORY;}
+}
+
+HRESULT searchScopeRulesRequireBacking(const std::vector<SearchScopeRule>& source, bool* required,
+                                      std::vector<SearchScopeRule>* descriptorRules) {
+    if (!required) return E_POINTER;
+    try {
+        std::vector<SearchScopeRule> physical;
+        const auto physicalStatus = normalizeRules(source, physical, ScopeDomainValidation::PhysicalLive);
+        if (physicalStatus == S_OK) { *required = false; return S_OK; }
+        if (physicalStatus != unsupported) return FAILED(physicalStatus)?physicalStatus:E_UNEXPECTED;
+        std::vector<SearchScopeRule> descriptor;
+        const auto descriptorStatus = normalizeRules(source, descriptor, ScopeDomainValidation::NativeDescriptor);
+        if (descriptorStatus != S_OK) return FAILED(descriptorStatus)?descriptorStatus:E_UNEXPECTED;
+        const bool shallowInclude = std::any_of(descriptor.begin(), descriptor.end(), [](const auto& rule) {
+            return !rule.excluded && !rule.recursive;
+        });
+        if (!shallowInclude) return physicalStatus;
+        if (descriptorRules) *descriptorRules = std::move(descriptor);
+        *required = true; return S_OK;
+    } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
+}
+
 HRESULT createSearchFolderForScopeRules(const std::wstring& query,
                                        const std::vector<SearchScopeRule>& scope, IShellItem** result) {
     if (!result) return E_POINTER;
@@ -1255,9 +1293,12 @@ HRESULT saveSearchForScopes(const std::wstring& query, IShellItemArray* scopes, 
 
 HRESULT saveSearchForScopeRules(const std::wstring& query, const std::vector<SearchScopeRule>& scopes,
                                const std::filesystem::path& path, SearchSaveMode mode,
-                               const SearchViewPresentation* presentation, const SearchFileProperties* fileProperties) {
+                               const SearchViewPresentation* presentation, const SearchFileProperties* fileProperties,
+                               SearchCreatedFileProof* createdFileProof) {
+    if (createdFileProof) *createdFileProof = {};
     try {
         if (mode != SearchSaveMode::CreateNew && mode != SearchSaveMode::UserConfirmed) return E_INVALIDARG;
+        if (createdFileProof && mode != SearchSaveMode::CreateNew) return E_INVALIDARG;
         if (path.empty() || path.native().find(L'\0') != std::wstring::npos) return E_INVALIDARG;
         auto extension = path.extension().native();
         std::transform(extension.begin(), extension.end(), extension.begin(), [](wchar_t c) {
@@ -1353,7 +1394,7 @@ HRESULT saveSearchForScopeRules(const std::wstring& query, const std::vector<Sea
         // semantic shapes still remain available through the native viewer.
         if (FAILED(hr = saved_search_internal::validateSerializedLimits(bytes))) return hr;
         bool replaced = false;
-        hr = mode == SearchSaveMode::CreateNew ? writeNewFile(path, bytes) : writeConfirmedFile(path, bytes, replaced);
+        hr = mode == SearchSaveMode::CreateNew ? writeNewFile(path, bytes, createdFileProof) : writeConfirmedFile(path, bytes, replaced);
         if (SUCCEEDED(hr)) {
             // A saved-search PIDL can cache its parsed query. Publish the
             // completed change after all file handles close, so a fresh native
