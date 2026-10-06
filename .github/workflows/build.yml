@@ -1,75 +1,16 @@
-name: Windows headless build and tests
+name: Isolated original native Copy/Paste control
 
 on:
   push:
-  pull_request:
+    branches:
+      - diagnostic/native-copy-paste-control-f322
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  build:
-    # Pin the image with VS2022 rather than inheriting future VS-only updates.
-    runs-on: windows-2022
-    # Covers the serialized native tests and pilot/final captures without
-    # extending any individual process's deadline.
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v7
-      - name: Build native C++ application
-        shell: pwsh
-        run: ./scripts/build.ps1 -Configuration Release
-      - name: Run headless core, Shell operation, and application checks
-        shell: pwsh
-        run: ./scripts/test.ps1 -Configuration Release -SkipBuild
-      - uses: actions/setup-python@v7
-        with:
-          python-version: '3.13'
-          cache: pip
-          cache-dependency-path: scripts/requirements-visual.txt
-      - name: Install pinned screenshot comparison dependencies
-        shell: pwsh
-        run: python -m pip install -r scripts/requirements-visual.txt
-      - name: Capture native UI on a private desktop
-        shell: pwsh
-        # Server 2022 supplies different Shell resources from the Windows 10
-        # screenshot baseline. Source comparisons run on the target Windows 10
-        # machine; this job proves native capture and desktop isolation.
-        run: ./scripts/visual-check.ps1 -Configuration Release -CaptureOnly
-      - name: Measure native folder navigation headlessly
-        shell: pwsh
-        run: ./scripts/benchmark.ps1 -Configuration Release
-      - name: Upload test reports
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: headless-test-reports
-          path: |
-            artifacts/core-tests.xml
-            artifacts/test-environment.json
-            artifacts/headless-tests.log
-            artifacts/headless-smoke*.json
-            artifacts/performance/**/native-navigation.json
-            artifacts/performance/**/environment.json
-            artifacts/performance/**/stdout.log
-            artifacts/performance/**/stderr.log
-            artifacts/visual/**/summary.json
-            artifacts/visual/**/reference-manifest.json
-            artifacts/visual/**/native.json
-            artifacts/visual/**/native.png
-            artifacts/visual/**/Native fixture report.json
-            !artifacts/visual/**/comparison/**
-            !artifacts/visual/**/private-source/**
-            !artifacts/**/binary/**
-          if-no-files-found: warn
-      - name: Stage native application for combined validation
-        uses: actions/upload-artifact@v7
-        with:
-          name: WindowsExplorer-x64-build
-          path: build/Release/WindowsExplorer.exe
-          if-no-files-found: error
-  native-transfer:
+  native-original-copy-paste-control:
     # Clipboard transfers create real Shell undo records. Keep this fixture
     # on a fresh disposable machine, separate from the native history suite.
     runs-on: windows-2022
@@ -80,78 +21,28 @@ jobs:
         id: transfer-build
         shell: pwsh
         run: ./scripts/build.ps1 -Configuration Release
-      - name: Exercise native clipboard and destination transfers headlessly
+      - name: Exercise original native Copy5 and the same normal Paste headlessly
         shell: pwsh
         env:
           WINDOWSEXPLORER_NATIVE_TRANSFER_TEST: '1'
         run: |
           New-Item -ItemType Directory -Path artifacts -Force | Out-Null
-          $reportPath = Join-Path $PWD 'artifacts/native-transfer.xml'
-          ctest --test-dir build -C Release -R '^native_shell_transfer$' --no-tests=error --output-on-failure --output-junit $reportPath 2>&1 | Tee-Object -FilePath artifacts/native-transfer.log
+          $reportPath = Join-Path $PWD 'artifacts/native-copy-paste-control.xml'
+          ctest --test-dir build -C Release -R '^native_original_copy_paste_control$' --no-tests=error --output-on-failure --output-junit $reportPath 2>&1 | Tee-Object -FilePath artifacts/native-copy-paste-control.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           [xml]$transferReport = Get-Content -LiteralPath $reportPath -Raw
           $transferCases = @($transferReport.testsuite.testcase)
-          if ($transferCases.Count -ne 1 -or $transferCases[0].name -ne 'native_shell_transfer' -or
+          if ($transferCases.Count -ne 1 -or $transferCases[0].name -ne 'native_original_copy_paste_control' -or
               $transferCases[0].status -ne 'run' -or $null -ne $transferCases[0].SelectSingleNode('skipped') -or
               $null -ne $transferCases[0].SelectSingleNode('failure')) {
             throw 'The dedicated native transfer job requires one actual passing test; a skip is not verification.'
           }
-      - name: Exercise native destination drops independently
-        # Preserve the clipboard gate's failure while still collecting drop
-        # evidence from a separate process after any successful build.
-        if: ${{ always() && steps.transfer-build.outcome == 'success' }}
-        shell: pwsh
-        env:
-          WINDOWSEXPLORER_NATIVE_TRANSFER_TEST: '1'
-        run: |
-          New-Item -ItemType Directory -Path artifacts -Force | Out-Null
-          $reportPath = Join-Path $PWD 'artifacts/native-drops.xml'
-          ctest --test-dir build -C Release -R '^native_shell_drops$' --no-tests=error --output-on-failure --output-junit $reportPath 2>&1 | Tee-Object -FilePath artifacts/native-drops.log
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          [xml]$dropReport = Get-Content -LiteralPath $reportPath -Raw
-          $dropCases = @($dropReport.testsuite.testcase)
-          if ($dropCases.Count -ne 1 -or $dropCases[0].name -ne 'native_shell_drops' -or
-              $dropCases[0].status -ne 'run' -or $null -ne $dropCases[0].SelectSingleNode('skipped') -or
-              $null -ne $dropCases[0].SelectSingleNode('failure')) {
-            throw 'The dedicated native drop job requires one actual passing test; a skip is not verification.'
-          }
-      - name: Upload native transfer evidence
+      - name: Upload original Copy/Paste control evidence
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: native-transfer-reports
+          name: native-copy-paste-control-reports
           path: |
-            artifacts/native-transfer.xml
-            artifacts/native-transfer.log
-            artifacts/native-drops.xml
-            artifacts/native-drops.log
+            artifacts/native-copy-paste-control.xml
+            artifacts/native-copy-paste-control.log
           if-no-files-found: warn
-  validated-application:
-    needs: [build, native-transfer]
-    runs-on: windows-2022
-    timeout-minutes: 5
-    steps:
-      - name: Retrieve the tested application
-        uses: actions/download-artifact@v8
-        with:
-          name: WindowsExplorer-x64-build
-          path: validated
-      - name: Record executable identity and completed gates
-        shell: pwsh
-        run: |
-          $application = Join-Path $PWD 'validated/WindowsExplorer.exe'
-          $applicationHash = (Get-FileHash -LiteralPath $application -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$applicationHash  WindowsExplorer.exe" | Set-Content -LiteralPath validated/SHA256SUMS.txt -Encoding ascii
-          @{
-            sourceCommit = $env:GITHUB_SHA
-            executableSha256 = $applicationHash
-            workflowRun = $env:GITHUB_RUN_ID
-            headlessBuildAndTests = 'passed'
-            nativeTransfer = 'passed'
-          } | ConvertTo-Json | Set-Content -LiteralPath validated/build-info.json -Encoding utf8
-      - name: Publish the application after both headless jobs pass
-        uses: actions/upload-artifact@v7
-        with:
-          name: WindowsExplorer-x64
-          path: validated/*
-          if-no-files-found: error

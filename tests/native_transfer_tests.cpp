@@ -1099,7 +1099,13 @@ bool ownedClipboardWindow(HWND window) {
 // clipboard sequence. It never treats OleGetClipboard's wrapper as a producer.
 class NativeCopyPublication final {
 public:
-    NativeCopyPublication(HWND frame, const Source& source) : frame_(frame), source_(source) {
+    NativeCopyPublication(HWND frame, const Source& source)
+        : NativeCopyPublication(frame, std::vector<const Source*>{&source}) {}
+    NativeCopyPublication(HWND frame, const std::vector<const Source*>& sources)
+        : frame_(frame), sources_(sources) {
+        require(!sources_.empty() && sources_.size() <= 8 &&
+            std::all_of(sources_.begin(), sources_.end(), [](const Source* source) { return source != nullptr; }),
+            "Native Copy control requires a complete bounded owned source selection");
         require(clipboardEmpty(frame_), "Native Copy control requires an empty clipboard");
         before_ = GetClipboardSequenceNumber();
         require(before_ != 0, "Read native Copy control clipboard sequence");
@@ -1117,12 +1123,18 @@ public:
             "Native Copy did not publish through the exact owned private STA");
         ComPtr<IDataObject> consumer;
         succeeded(nativeCall("OleGetClipboard", [&] { return OleGetClipboard(&consumer); }, "native-copy-consumer"), "Read original native Copy consumer");
-        const UINT clipboardCount = verifyCida(consumer.Get(), {&source_});
+        const UINT clipboardCount = verifyCida(consumer.Get(), sources_);
         const DWORD preferredEffect = effectData(consumer.Get(), CFSTR_PREFERREDDROPEFFECT);
-        const bool sourceExists = fs::exists(source_.path);
-        const bool sourceIdentityMatches = sourceExists && identity(source_.path) == source_.id;
-        const bool sourceContentMatches = sourceExists && readFile(source_.path) == source_.bytes;
-        const bool sourceModifiedMatches = sourceExists && modified(source_.path) == source_.modified;
+        bool sourceExists = true, sourceIdentityMatches = true, sourceContentMatches = true, sourceModifiedMatches = true;
+        size_t sourceBytes = 0;
+        for (const auto source : sources_) {
+            const bool exists = fs::exists(source->path);
+            sourceExists = sourceExists && exists;
+            sourceIdentityMatches = sourceIdentityMatches && exists && identity(source->path) == source->id;
+            sourceContentMatches = sourceContentMatches && exists && readFile(source->path) == source->bytes;
+            sourceModifiedMatches = sourceModifiedMatches && exists && modified(source->path) == source->modified;
+            sourceBytes += source->bytes.size();
+        }
         std::cout << "Native Copy capture cidaCount=" << clipboardCount << " exactCidaIdentityMatches=1 preferredEffect=" << preferredEffect
             << " exactCopyPreference=" << (preferredEffect == DROPEFFECT_COPY)
             << " copyBit=" << ((preferredEffect & DROPEFFECT_COPY) != 0)
@@ -1131,8 +1143,8 @@ public:
             << " scrollBit=" << ((preferredEffect & DROPEFFECT_SCROLL) != 0)
             << " sourceExists=" << sourceExists << " sourceIdentityMatches=" << sourceIdentityMatches
             << " sourceContentMatches=" << sourceContentMatches << " sourceModifiedMatches=" << sourceModifiedMatches
-            << " expectedSourceBytes=" << source_.bytes.size() << std::endl;
-        describeShortcutHdrop("native-copy-capture", "consumer", consumer.Get(), source_);
+            << " expectedSourceBytes=" << sourceBytes << " expectedSourceCount=" << sources_.size() << std::endl;
+        if (sources_.size() == 1) describeShortcutHdrop("native-copy-capture", "consumer", consumer.Get(), *sources_.front());
         // DROPEFFECT is a flag set: Microsoft requires masked comparisons.
         // https://learn.microsoft.com/en-us/windows/win32/com/dropeffect-constants
         require((preferredEffect & DROPEFFECT_COPY) != 0 && (preferredEffect & DROPEFFECT_MOVE) == 0 &&
@@ -1184,7 +1196,7 @@ private:
         return GetClipboardOwner() == owner_ && GetClipboardSequenceNumber() == sequence_ && ownedClipboardWindow(owner_);
     }
     HWND frame_ = nullptr, owner_ = nullptr;
-    const Source& source_;
+    const std::vector<const Source*> sources_;
     DWORD before_ = 0, sequence_ = 0, preferredEffect_ = MAXDWORD;
     bool captured_ = false, cleared_ = false;
     OperationLease operation_;
@@ -1295,6 +1307,228 @@ void verifyCopy(const Source& source, const fs::path& copied) {
     require(readFile(copied) == source.bytes && identity(copied) != source.id && preserved(source),
         "Native copy must preserve source and create one distinct correct file");
 }
+
+void describeCopyAsyncState(const char* label, IDataObject* object) {
+    ComPtr<IDataObjectAsyncCapability> asynchronous;
+    const HRESULT queried = nativeCall("IDataObject.QueryInterface.AsyncCapability", [&] {
+        return object->QueryInterface(IID_PPV_ARGS(&asynchronous));
+    }, label);
+    BOOL mode = FALSE, active = FALSE;
+    const HRESULT modeStatus = queried == S_OK && asynchronous ? nativeCall("IDataObjectAsyncCapability.GetAsyncMode", [&] {
+        return asynchronous->GetAsyncMode(&mode);
+    }, label) : E_NOINTERFACE;
+    const HRESULT activeStatus = queried == S_OK && asynchronous ? nativeCall("IDataObjectAsyncCapability.InOperation", [&] {
+        return asynchronous->InOperation(&active);
+    }, label) : E_NOINTERFACE;
+    std::cout << "Native Copy/Paste control async object=" << label << " queryHRESULT=" << static_cast<ULONG>(queried)
+        << " interface=" << (asynchronous != nullptr) << " modeHRESULT=" << static_cast<ULONG>(modeStatus)
+        << " mode=" << mode << " operationHRESULT=" << static_cast<ULONG>(activeStatus) << " active=" << active << std::endl;
+}
+
+void verifyCopyHdrop(IDataObject* object, const std::vector<const Source*>& sources) {
+    FORMATETC request{CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
+    Medium data;
+    succeeded(nativeCall("IDataObject.GetData.HDROP", [&] { return object->GetData(&request, &data.value); }, "native-copy-pair"),
+        "Read complete original native Copy HDROP");
+    require(data.value.tymed == TYMED_HGLOBAL && data.value.hGlobal && GlobalSize(data.value.hGlobal) >= sizeof(DROPFILES) &&
+        GlobalSize(data.value.hGlobal) <= 1024 * 1024, "Original native Copy HDROP global-data bound");
+    const auto drop = static_cast<HDROP>(data.value.hGlobal);
+    const UINT count = DragQueryFileW(drop, 0xffffffff, nullptr, 0);
+    require(count == sources.size(), "Original native Copy HDROP changed its complete source count");
+    std::set<Identity> actual, expected;
+    for (const auto source : sources) require(expected.insert(source->id).second, "Original native Copy source IDs must be unique");
+    for (UINT index = 0; index < count; ++index) {
+        const UINT length = DragQueryFileW(drop, index, nullptr, 0);
+        require(length && length <= 32767, "Original native Copy HDROP path bound");
+        std::wstring path(static_cast<size_t>(length) + 1, L'\0');
+        require(DragQueryFileW(drop, index, path.data(), static_cast<UINT>(path.size())) == length,
+            "Read complete original native Copy HDROP path");
+        path.resize(length);
+        require(actual.insert(identity(fs::path(path))).second, "Original native Copy HDROP contains duplicate IDs");
+    }
+    require(actual == expected, "Original native Copy HDROP changed its full source identities");
+    std::cout << "Native Copy/Paste control HDROP count=" << count << " exactFullSourceIdentities=1" << std::endl;
+}
+
+void originalViewCopyPasteControl(Browser& destination, Fixture& fixture) {
+    nativePhase("originalViewCopyPasteControl.begin");
+    const std::vector<const Source*> sources{&fixture.sources[0], &fixture.sources[1]};
+    const auto destinationView = destination.view;
+    const auto destinationFolder = destination.folder;
+    const auto destinationId = nativeCall("nativeCopyPair.destinationIdentity", [&] { return identity(itemPath(destinationFolder.Get())); });
+    Browser original;
+    nativeCall("nativeCopyPair.sourceBrowser.initialize", [&] {
+        original.initialize(fixture.root / L"Source", static_cast<int>(fixture.sources.size()), true);
+    });
+    const auto originalView = original.view;
+    const auto originalFolder = original.folder;
+    const auto sourceFolderId = nativeCall("nativeCopyPair.sourceFolderIdentity", [&] { return identity(itemPath(originalFolder.Get())); });
+    ComPtr<IUnknown> originalIdentity, destinationIdentity;
+    succeeded(nativeCall("view.QueryInterface.IUnknown", [&] { return originalView.As(&originalIdentity); }, "native-copy-pair-source"),
+        "Retain original native Copy view canonical identity");
+    succeeded(nativeCall("view.QueryInterface.IUnknown", [&] { return destinationView.As(&destinationIdentity); }, "native-copy-pair-destination"),
+        "Retain original native Paste view canonical identity");
+    require(originalIdentity && destinationIdentity, "Original native Copy/Paste canonical view identity is null");
+    std::set<Identity> expected, allSources;
+    for (const auto source : sources) expected.insert(source->id);
+    for (const auto& source : fixture.sources) allSources.insert(source.id);
+    require(expected.size() == 2 && allSources.size() == fixture.sources.size(), "Original native Copy fixture IDs must remain complete and unique");
+    for (size_t index = 0; index < sources.size(); ++index) {
+        const auto item = nativeCall("SHCreateItemFromParsingName", [&] { return shellItem(sources[index]->path); }, "native-copy-pair");
+        PIDLIST_ABSOLUTE raw = nullptr;
+        const auto read = nativeCall("SHGetIDListFromObject", [&] { return SHGetIDListFromObject(item.Get(), &raw); }, "native-copy-pair");
+        const Pidl sourceId(raw);
+        succeeded(read, "Read full original native Copy selected source PIDL");
+        require(sourceId != nullptr, "Original native Copy selected source PIDL is null");
+        const UINT flags = index ? SVSI_SELECT : SVSI_DESELECTOTHERS | SVSI_SELECT | SVSI_FOCUSED | SVSI_ENSUREVISIBLE;
+        succeeded(nativeCall("view.SelectItem", [&] { return original.view->SelectItem(ILFindLastID(sourceId.get()), flags); },
+            "native-copy-pair", static_cast<unsigned>(index)), "Select only the original native Copy pair");
+    }
+    waitFor([&] {
+        int count = -1;
+        return nativeCall("folderView.ItemCount.selection", [&] { return original.folderView->ItemCount(SVGIO_SELECTION, &count); },
+            "native-copy-pair") == S_OK && count == 2;
+    }, "Original native Copy pair selection did not settle");
+    const auto unchanged = [&] {
+        NativeCallScope sourceFence("nativeCopyPair.completeSourceFence", "retained-native-views", 0);
+        require(original.view.Get() == originalView.Get() && original.folder.Get() == originalFolder.Get() &&
+            destination.view.Get() == destinationView.Get() && destination.folder.Get() == destinationFolder.Get() &&
+            identity(itemPath(originalFolder.Get())) == sourceFolderId && identity(itemPath(destinationFolder.Get())) == destinationId,
+            "Original native Copy/Paste control changed its original folder/view/site");
+        ComPtr<IShellItemArray> selected;
+        succeeded(nativeCall("folderView.Items", [&] { return original.folderView->Items(SVGIO_SELECTION, IID_PPV_ARGS(&selected)); },
+            "native-copy-pair-fence"), "Read complete original native Copy pair selection");
+        require(selected != nullptr, "Original native Copy pair selection array is null");
+        DWORD count = 0;
+        succeeded(selected->GetCount(&count), "Read complete original native Copy pair count");
+        require(count == 2, "Original native Copy changed its two-item selection count");
+        std::set<Identity> actual;
+        for (DWORD index = 0; index < count; ++index) {
+            ComPtr<IShellItem> item;
+            succeeded(selected->GetItemAt(index, &item), "Read complete original native Copy selected item");
+            require(item && actual.insert(identity(itemPath(item.Get()))).second, "Original native Copy selection contains null/duplicate IDs");
+        }
+        require(actual == expected && original.members() == allSources, "Original native Copy changed complete source/view membership");
+        fixture.verifySources({});
+        const auto admitCurrentView = [&](Browser& host, IUnknown* expectedIdentity) {
+            ComPtr<IShellView> current;
+            succeeded(nativeCall("browser.GetCurrentView", [&] { return host.browser->GetCurrentView(IID_PPV_ARGS(&current)); },
+                "native-copy-pair-fence"), "Read current native Copy/Paste view before publication");
+            require(current != nullptr, "Current native Copy/Paste view is null");
+            ComPtr<IUnknown> currentIdentity;
+            succeeded(current.As(&currentIdentity), "Read current native Copy/Paste canonical view identity");
+            require(currentIdentity && currentIdentity.Get() == expectedIdentity, "Original native Copy/Paste browser replaced its current view");
+        };
+        admitCurrentView(original, originalIdentity.Get());
+        admitCurrentView(destination, destinationIdentity.Get());
+        require(original.view.Get() == originalView.Get() && original.folder.Get() == originalFolder.Get() &&
+            destination.view.Get() == destinationView.Get() && destination.folder.Get() == destinationFolder.Get(),
+            "Original native Copy/Paste changed retained fields during final native source reads");
+    };
+    unchanged();
+    ComPtr<IDataObject> viewData;
+    succeeded(nativeCall("view.GetItemObject.IDataObject", [&] { return originalView->GetItemObject(SVGIO_SELECTION, IID_PPV_ARGS(&viewData)); },
+        "native-copy-pair"), "Read original native Copy full view selection data");
+    require(viewData != nullptr, "Original native Copy view selection data is null");
+    nativeCall("nativeCopyPair.verifyViewCida", [&] { verifyCida(viewData.Get(), sources); });
+    describeCopyAsyncState("original-view-selection", viewData.Get());
+    const auto helperArray = nativeCall("nativeCopyPair.sourceArray", [&] { return sourceArray(sources); });
+    ComPtr<IDataObject> helperData;
+    succeeded(nativeCall("IShellItemArray.BindToHandler.BHID_DataObject", [&] {
+        return helperArray->BindToHandler(nullptr, BHID_DataObject, IID_PPV_ARGS(&helperData));
+    }, "unpublished-helper-pair"), "Read native array-bound pair data without publishing or changing its formats");
+    require(helperData != nullptr, "Unpublished array-bound pair data is null");
+    nativeCall("nativeCopyPair.verifyUnpublishedCida", [&] { verifyCida(helperData.Get(), sources); });
+    describeCopyAsyncState("unpublished-helper-pair", helperData.Get());
+    ComPtr<IContextMenu> context;
+    succeeded(nativeCall("view.GetItemObject.IContextMenu", [&] { return originalView->GetItemObject(SVGIO_SELECTION, IID_PPV_ARGS(&context)); },
+        "native-copy-pair"), "Read already-sited original native Copy selection menu");
+    require(context != nullptr, "Original native Copy selection menu is null");
+    explorer::NativeContextMenu menu;
+    succeeded(nativeCall("NativeContextMenu.create", [&] {
+        return menu.create(original.owner, context.Get(), nullptr, CMF_EXTENDEDVERBS | CMF_ITEMMENU);
+    }, "native-copy-pair"), "Create original native Copy selection menu without changing its site");
+    std::vector<explorer::ContextMenuEntry> entries;
+    succeeded(nativeCall("NativeContextMenu.enumerate", [&] { return menu.enumerate(entries, false); }, "native-copy-pair"),
+        "Enumerate original native Copy canonical leaf");
+    UINT command = 0;
+    unsigned matches = 0;
+    bool enabled = false;
+    const auto find = [&](const auto& self, const std::vector<explorer::ContextMenuEntry>& rows) -> void {
+        for (const auto& row : rows) {
+            if (!row.submenu && !row.separator() && _wcsicmp(row.canonicalVerb.c_str(), L"copy") == 0) {
+                ++matches; command = row.id; enabled = row.enabled();
+            }
+            self(self, row.children);
+        }
+    };
+    find(find, entries);
+    require(matches == 1 && command && enabled, "Original native Copy requires its unique actual enabled canonical leaf");
+    unchanged();
+    {
+        NativeCopyPublication publication(original.owner, sources);
+        succeeded(nativeCall("NativeContextMenu.invoke.copy", [&] { return menu.invoke(command); }, "native-copy-pair", command),
+            "Invoke the original native view canonical Copy exactly once");
+        nativeCall("NativeCopyPublication.capturePair", [&] { publication.capture(); });
+        require(publication.preferredEffect() == static_cast<DWORD>(DROPEFFECT_COPY | DROPEFFECT_LINK),
+            "Original native Copy did not naturally publish effect5; this control cannot compare the observed helper5 hang");
+        ComPtr<IDataObject> consumer;
+        succeeded(nativeCall("OleGetClipboard", [&] { return OleGetClipboard(&consumer); }, "native-copy-pair-consumer"),
+            "Read original native Copy clipboard consumer");
+        require(consumer != nullptr, "Original native Copy consumer is null");
+        nativeCall("nativeCopyPair.verifyConsumerCida", [&] { verifyCida(consumer.Get(), sources); });
+        nativeCall("nativeCopyPair.verifyConsumerHdrop", [&] { verifyCopyHdrop(consumer.Get(), sources); });
+        describeCopyAsyncState("native-copy-pair-consumer", consumer.Get());
+        unchanged(); publication.verify();
+        SetActiveWindow(destination.owner);
+        require(GetActiveWindow() == destination.owner, "Activate the exact original private Paste destination frame");
+        succeeded(nativeCall("view.UIActivate", [&] { return destinationView->UIActivate(SVUIA_ACTIVATE_NOFOCUS); }, "native-copy-pair-destination"),
+            "Activate the original native Paste destination view");
+        nativeCall("nativeCopyPair.emptyDestination", [&] {
+            require(children(fixture.root / L"Copy").empty() && destination.members().empty(),
+                "Original native Copy/Paste control requires its exact empty destination");
+        });
+        unchanged(); publication.verify();
+        destination.invoke(L"Windows.paste");
+        ComPtr<IDataObjectAsyncCapability> asynchronous;
+        const auto queried = nativeCall("IDataObject.QueryInterface.AsyncCapability", [&] {
+            return consumer->QueryInterface(IID_PPV_ARGS(&asynchronous));
+        }, "native-copy-pair-completion");
+        require(queried == S_OK || queried == E_NOINTERFACE,
+            "Original native Copy/Paste async completion support returned an unknown failure");
+        if (queried == S_OK) {
+            require(asynchronous != nullptr, "Original native Copy async success returned a null interface");
+            waitFor([&] {
+                BOOL active = TRUE;
+                return nativeCall("IDataObjectAsyncCapability.InOperation", [&] { return asynchronous->InOperation(&active); },
+                    "native-copy-pair-completion") == S_OK && !active;
+            }, "Original native Copy/Paste operation did not finish");
+        }
+        nativeCall("nativeCopyPair.waitMembership", [&] { waitMembership(destination, fixture.root / L"Copy", 2); });
+        std::set<Identity> outputs;
+        for (const auto source : sources) {
+            const auto copied = fixture.root / L"Copy" / source->path.filename();
+            verifyCopy(*source, copied);
+            require(outputs.insert(identity(copied)).second, "Original native Copy/Paste outputs contain duplicate IDs");
+        }
+        nativeCall("nativeCopyPair.completeOutputMembership", [&] {
+            require(destination.members() == outputs && outputs.size() == 2,
+                "Original native Copy/Paste did not produce the exact two real native destination IDs");
+        });
+        unchanged(); publication.verify();
+        nativeCall("nativeCopyPair.consumer.release", [&] { asynchronous.Reset(); consumer.Reset(); });
+        publication.clear();
+    }
+    unchanged();
+    require(!destination.plan(L"Windows.paste").enabled, "Original native Copy/Paste remained enabled after exact owned cleanup");
+    nativeCall("nativeCopyPair.resources.release", [&] { menu.reset(); context.Reset(); helperData.Reset(); viewData.Reset(); });
+    original.close();
+    require(destination.view.Get() == destinationView.Get() && destination.folder.Get() == destinationFolder.Get() &&
+        identity(itemPath(destinationFolder.Get())) == destinationId, "Original native Copy/Paste changed its retained destination view/site");
+    fixture.verifySources({});
+    std::cout << "PASS control original-view Copy5/normal Windows.paste: full two-item CIDA/HDROP, new native IDs/content, unchanged sources and exact owned cleanup\n";
+}
+
 void verifyMove(const Source& source, const fs::path& moved) {
     require(!fs::exists(source.path) && readFile(moved) == source.bytes && identity(moved) == source.id,
         "Native same-volume move must preserve exact file identity/content");
@@ -1478,6 +1712,36 @@ void run(bool dropsOnly) {
     // Native owned undo records remain confined to this disposable VM. No
     // undocumented global undo reset or foreign clipboard restoration occurs.
 }
+
+void runOriginalCopyPasteControl() {
+    nativePhase("run.original-copy-paste-control");
+    VisibilityObserver observer; nativeCall("observer.start", [&] { observer.start(); }); observation = &observer;
+    struct ObservationScope { ~ObservationScope() { observation = nullptr; } } scoped;
+    nativePhase("owned-fixture.create");
+    Fixture fixture; Browser browser; browser.initialize(fixture.root / L"Copy");
+    require(clipboardEmpty(browser.owner), "Fresh disposable transfer VM clipboard must initially be empty");
+    require(!browser.plan(L"Windows.undo").enabled && !browser.plan(L"Windows.redo").enabled,
+        "Fresh disposable transfer VM must have no pre-existing native history");
+    require(!browser.plan(L"Windows.paste").enabled && !browser.plan(L"Windows.pastelink").enabled,
+        "Native paste commands must be disabled with empty clipboard");
+    // Match the three publication/checked-clear predecessors of f322's first
+    // helper Copy5/Paste. This independent process never replaces or skips the
+    // original full fixture; its actual native Copy is the sole changed source.
+    controlledClipboardCapabilities(browser, fixture);
+    originalViewCopyPasteControl(browser, fixture);
+    pump(); require(!observer.unexpected(), "Original Copy/Paste control displayed unexpected visible UI");
+    succeeded(nativeCall("drainStaWorkers", [] { return explorer::drainStaWorkers(5000); }, "control-final-teardown"),
+        "Drain original Copy/Paste control workers before view teardown");
+    require(clipboardEmpty(browser.owner), "Original Copy/Paste control did not retain exact owned empty cleanup");
+    fixture.verifySources({});
+    browser.close(); nativeCall("owned-fixture.cleanup", [&] { fixture.cleanup(); });
+    pump(); nativeCall("observer.stop", [&] { observer.stop(); }); observer.reportEnumeration();
+    require(observer.inputObservations() > 0 && observer.privateObservations() > 0,
+        "Original Copy/Paste control must independently observe both desktops");
+    require(!observer.unexpected(), "Original Copy/Paste control teardown displayed unexpected visible UI");
+    succeeded(explorer::PrivateDesktop::current()->verifyIsolation(), "Original Copy/Paste control teardown changed desktop isolation");
+    std::cout << "PASS diagnostic control complete; original full transfer target remains independent and unchanged\n";
+}
 } // namespace
 
 int main(int argc, char** argv) {
@@ -1489,7 +1753,8 @@ int main(int argc, char** argv) {
         return 77;
     }
     const bool dropsOnly = argc == 2 && std::strcmp(argv[1], "--drops-only") == 0;
-    if (argc != 1 && !dropsOnly) { std::cerr << "FAIL: unknown native transfer mode\n"; return 1; }
+    const bool originalCopyPasteControl = argc == 2 && std::strcmp(argv[1], "--native-copy-paste-control") == 0;
+    if (argc != 1 && !dropsOnly && !originalCopyPasteControl) { std::cerr << "FAIL: unknown native transfer mode\n"; return 1; }
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX);
     explorer::PrivateDesktop desktop;
     nativePhase("PrivateDesktop.initialize");
@@ -1502,7 +1767,10 @@ int main(int argc, char** argv) {
     const auto initialized = nativeCall("OleInitialize", [] { return OleInitialize(nullptr); });
     if (FAILED(initialized)) { std::cerr << "FAIL: initialize isolated transfer STA\n"; return 1; }
     int result = 0;
-    try { run(dropsOnly); }
+    try {
+        if (originalCopyPasteControl) runOriginalCopyPasteControl();
+        else run(dropsOnly);
+    }
     catch (const std::exception& error) { std::cerr << "FAIL: native transfer: " << error.what() << '\n'; result = 1; }
     catch (...) { std::cerr << "FAIL: native transfer: unknown exception\n"; result = 1; }
     if (FAILED(nativeCall("drainStaWorkers", [] { return explorer::drainStaWorkers(5000); }, "main-shutdown"))) {
