@@ -49,7 +49,7 @@ struct NativePaneGeometry {
     HRESULT finalBoundsRead = E_PENDING, directionRead = E_PENDING, finalFooterRead = E_PENDING;
     HRESULT paneHitRead = E_PENDING, gripHitRead = E_PENDING;
     HRESULT rootStyleRead = E_PENDING, paneStyleRead = E_PENDING, gripStyleRead = E_PENDING;
-    HWND view = nullptr, parent = nullptr, frame = nullptr, footerWindow = nullptr;
+    HWND view = nullptr, parent = nullptr, frame = nullptr, footerWindow = nullptr, statusWindow = nullptr;
     HWND expectedGrip = nullptr, paneHit = nullptr, gripHit = nullptr;
     DWORD paneHitError = ERROR_SUCCESS, gripHitError = ERROR_SUCCESS;
     DWORD rootStyleError = ERROR_SUCCESS, paneStyleError = ERROR_SUCCESS, gripStyleError = ERROR_SUCCESS;
@@ -121,6 +121,7 @@ NativePaneGeometry readNativePaneGeometry(IShellView* retainedView, HWND root, H
     if (!live()) { result.read = E_ABORT; return result; }
     if (result.serviceRead == S_OK && browser) {
         HWND status = nullptr; result.statusRead = browser->GetControlWindow(FCW_STATUS, &status);
+        result.statusWindow = status; // Preserve the raw optional control output independently of the MSAA footer.
         if (!live()) { result.read = E_ABORT; return result; }
         if (result.statusRead == S_OK && paneGeometryOwned(status, root) &&
             (status == result.frame || IsChild(result.frame, status))) {
@@ -334,12 +335,13 @@ std::wstring paneGeometryFacts(const NativePaneGeometry& value) {
         L"; effective root/pane/grip visible="+std::to_wstring(value.rootVisible)+L"/"+std::to_wstring(value.paneVisible)+L"/"+std::to_wstring(value.gripVisible)+
         L"; pane/grip owned/visibilityConsistent="+std::to_wstring(value.paneOwned)+L"/"+std::to_wstring(value.gripOwned)+L"/"+
         std::to_wstring(value.visibilityConsistent)+L"; actual grip HWND rectangle="+rect(value.gripWindow)+
+        L"; raw optional FCW_STATUS HWND="+std::to_wstring(reinterpret_cast<UINT_PTR>(value.statusWindow))+
         L"; exact public HWND view/parent/frame/footer="+std::to_wstring(reinterpret_cast<UINT_PTR>(value.view))+L"/"+
         std::to_wstring(reinterpret_cast<UINT_PTR>(value.parent))+L"/"+std::to_wstring(reinterpret_cast<UINT_PTR>(value.frame))+L"/"+
         std::to_wstring(reinterpret_cast<UINT_PTR>(value.footerWindow))+L"; nodes/candidates/complete/fullFooter/partition="+
         std::to_wstring(value.nodes)+L"/"+std::to_wstring(value.candidates)+L"/"+std::to_wstring(value.complete)+L"/"+
-        std::to_wstring(value.footerFull)+L"/"+std::to_wstring(value.partition)+L"; physical parent/frame/content/pane/grip/footer="+
-        rect(value.parentClient)+L"/"+rect(value.frameClient)+L"/"+rect(value.content)+L"/"+rect(value.pane)+L"/"+rect(value.grip)+L"/"+rect(value.footer);
+        std::to_wstring(value.footerFull)+L"/"+std::to_wstring(value.partition)+L"; physical rootClient/parent/frame/content/pane/grip/footer="+
+        rect(value.rootClient)+L"/"+rect(value.parentClient)+L"/"+rect(value.frameClient)+L"/"+rect(value.content)+L"/"+rect(value.pane)+L"/"+rect(value.grip)+L"/"+rect(value.footer);
 }
 constexpr std::array<const wchar_t*, 8> ViewNames{
     L"Extra large icons", L"Large icons", L"Medium icons", L"Small icons",
@@ -6781,13 +6783,17 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report, bool library
                     check(splitterRtl ? "native_preview_splitter_rtl_exact_grab_bounds_and_source_preservation" :
                         "native_preview_splitter_ltr_exact_grab_bounds_and_source_preservation",
                         splitterRestored && splitterBoundsPassed && splitterCompletedGrips == 2, splitterFacts);
+                    const auto splitterFrameInsets = [](const RECT& root, const RECT& frame) {
+                        return RECT{frame.left-root.left, frame.top-root.top, root.right-frame.right, root.bottom-frame.bottom};
+                    };
                     const auto sameFrameInsets = [&](const NativePaneGeometry& geometry) {
-                        const auto insets = [](const RECT& root, const RECT& frame) {
-                            return RECT{frame.left-root.left, frame.top-root.top, root.right-frame.right, root.bottom-frame.bottom};
-                        };
-                        const auto original = insets(splitterOriginalGeometry.rootClient, splitterOriginalGeometry.frameClient);
-                        const auto actual = insets(geometry.rootClient, geometry.frameClient);
+                        const auto original = splitterFrameInsets(splitterOriginalGeometry.rootClient, splitterOriginalGeometry.frameClient);
+                        const auto actual = splitterFrameInsets(geometry.rootClient, geometry.frameClient);
                         return EqualRect(&original, &actual);
+                    };
+                    const auto splitterRectangleFacts = [](const RECT& value) {
+                        return std::to_wstring(value.left)+L","+std::to_wstring(value.top)+L","+
+                            std::to_wstring(value.right)+L","+std::to_wstring(value.bottom);
                     };
                     bool splitterOffRestored = false, splitterNoopRestored = false, splitterResizePassed = false, splitterFinalGeometry = false;
                     if (splitterRestored && splitterGeometryPassed && splitterIntact()) {
@@ -6812,6 +6818,13 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report, bool library
                                 originalRoot.right-originalRoot.left+40, originalRoot.bottom-originalRoot.top+20,
                                 SWP_NOMOVE|SWP_NOACTIVATE|SWP_NOZORDER|SWP_NOOWNERZORDER);
                             const auto resizeRead = resized ? S_OK : paneGeometryError();
+                            RECT actualResizedRoot{};
+                            HRESULT actualResizedRootRead = E_ABORT;
+                            if (splitterCurrent()) {
+                                SetLastError(ERROR_SUCCESS);
+                                const auto actualRootRead = GetWindowRect(splitterApp->window_, &actualResizedRoot);
+                                actualResizedRootRead = actualRootRead ? S_OK : paneGeometryError();
+                            }
                             const auto larger = readNativePaneGeometry(splitterView.Get(), splitterApp->window_, splitterApp->previewPane_,
                                 splitterApp->previewSplitter_, true, splitterDeadline, splitterCurrent, splitterApp->previewGrip_);
                             splitterResizePassed = resized && larger.read == S_OK && larger.footerFull && larger.partition &&
@@ -6827,9 +6840,28 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report, bool library
                             }
                             splitterFinalGeometry = rootRestoreRead == S_OK && splitterGeometryIntact() && splitterIntact();
                             splitterGeometryTrace += L"; root resize/restore HRESULT=" + hresultMessage(resizeRead) + L"/" +
-                                hresultMessage(rootRestoreRead) + L"; resized=" + paneGeometryFacts(larger);
+                                hresultMessage(rootRestoreRead) + L"; requested resize width/height=" +
+                                std::to_wstring(originalRoot.right-originalRoot.left+40) + L"/" +
+                                std::to_wstring(originalRoot.bottom-originalRoot.top+20) +
+                                L"; actual resized root HRESULT/rectangle=" + hresultMessage(actualResizedRootRead) + L"/" +
+                                splitterRectangleFacts(actualResizedRoot) + L"; original root rectangle=" + splitterRectangleFacts(originalRoot) +
+                                L"; original/resized native frame insets=" +
+                                splitterRectangleFacts(splitterFrameInsets(splitterOriginalGeometry.rootClient, splitterOriginalGeometry.frameClient)) + L"/" +
+                                splitterRectangleFacts(splitterFrameInsets(larger.rootClient, larger.frameClient)) +
+                                L"; resized frame actual/expected width=" +
+                                std::to_wstring(larger.frameClient.right-larger.frameClient.left) + L"/" +
+                                std::to_wstring(splitterOriginalGeometry.frameClient.right-splitterOriginalGeometry.frameClient.left+40) +
+                                L"; pure resized frame insets/width matches=" + std::to_wstring(sameFrameInsets(larger)) + L"/" +
+                                std::to_wstring(larger.frameClient.right-larger.frameClient.left ==
+                                    splitterOriginalGeometry.frameClient.right-splitterOriginalGeometry.frameClient.left+40) +
+                                L"; resized=" + paneGeometryFacts(larger);
                         }
                     }
+                    splitterGeometryTrace += L"; exact accepted predicates geometry/drag/off/noop/resize/final=" +
+                        std::to_wstring(splitterGeometryPassed) + L"/" + std::to_wstring(splitterRestored) + L"/" +
+                        std::to_wstring(splitterOffRestored) + L"/" +
+                        std::to_wstring(splitterNoopRestored) + L"/" + std::to_wstring(splitterResizePassed) + L"/" +
+                        std::to_wstring(splitterFinalGeometry);
                     check(splitterRtl ? "native_preview_rtl_full_footer_partition_off_noop_and_resize" :
                         "native_preview_ltr_full_footer_partition_off_noop_and_resize",
                         splitterGeometryPassed && splitterOffRestored && splitterNoopRestored && splitterResizePassed && splitterFinalGeometry,
