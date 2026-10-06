@@ -1,3 +1,4 @@
+#include "explorer/native_apartment.hpp"
 #include "explorer/ribbon.hpp"
 #include "explorer/commands.hpp"
 #include "explorer/namespace_actions.hpp"
@@ -13,6 +14,9 @@
 #include <wrl/client.h>
 #include <wincodec.h>
 #include <commctrl.h>
+#include <bcrypt.h>
+#include <cstring>
+#include <cstdlib>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -21,6 +25,8 @@
 #include <new>
 #include <set>
 #include <thread>
+#include <tuple>
+#include <iterator>
 #include <utility>
 
 namespace explorer {
@@ -29,6 +35,14 @@ namespace {
 struct Variant {
     PROPVARIANT value{};
     ~Variant() { PropVariantClear(&value); }
+};
+// Shared lifetime makes the exit bump safe even if a callback resets the host.
+// Every host QAT/state writer and genuine Execute enters and exits a scope.
+struct RibbonRevision { std::uint64_t value=0; bool windowDestroyed=false,retired=false; };
+struct RibbonMutation {
+    std::shared_ptr<RibbonRevision> revision;
+    explicit RibbonMutation(std::shared_ptr<RibbonRevision> value):revision(std::move(value)){++revision->value;}
+    ~RibbonMutation(){++revision->value;}
 };
 
 struct TabSelection {
@@ -241,6 +255,7 @@ HRESULT selectNativeTab(IUIAutomation* automation, const TabSelection& request) 
     if(request.cancelled)return E_ABORT;
     ComPtr<IUIAutomationSelectionItemPattern> selection;
     hr=element->GetCurrentPatternAs(UIA_SelectionItemPatternId,IID_PPV_ARGS(&selection));if(FAILED(hr))return hr;
+    if(!selection)return E_NOINTERFACE;
     BOOL selected=FALSE;hr=selection->get_CurrentIsSelected(&selected);
     if(FAILED(hr)||selected)return hr;
     if(request.cancelled)return E_ABORT;
@@ -478,7 +493,8 @@ struct StockTranslation {
 };
 class StockFramework final : public IUIFramework, public IPropertyStore {
 public:
-    StockFramework(IUIFramework* native,std::shared_ptr<StockTranslation> translation):native_(native),translation_(std::move(translation)) {
+    StockFramework(IUIFramework* native,std::shared_ptr<StockTranslation> translation,std::shared_ptr<RibbonRevision> revision):
+        native_(native),translation_(std::move(translation)),revision_(std::move(revision)) {
         native_->QueryInterface(IID_PPV_ARGS(&properties_));
     }
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid,void** output) override {
@@ -499,6 +515,8 @@ public:
         return native?native_->GetUICommandProperty(native,key,value):HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
     }
     HRESULT STDMETHODCALLTYPE SetUICommandProperty(UINT32 id,REFPROPERTYKEY key,REFPROPVARIANT value) override {
+        if(revision_->retired)return HRESULT_FROM_WIN32(ERROR_RETRY);
+        RibbonMutation mutation(revision_);
         const auto native=translation_->nativeId(id);
         return native?native_->SetUICommandProperty(native,key,value):HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
     }
@@ -521,6 +539,7 @@ private:
     ComPtr<IUIFramework> native_;
     ComPtr<IPropertyStore> properties_;
     std::shared_ptr<StockTranslation> translation_;
+    std::shared_ptr<RibbonRevision> revision_;
 };
 class Item final : public IUISimplePropertySet {
 public:
@@ -552,13 +571,97 @@ private:
     ComPtr<IUIImage> image_;
 };
 constexpr DWORD maximumSettingsBytes = 64 * 1024;
+constexpr std::array<BYTE,8> settingsMagic{'W','E','Q','A','T','\r','\n',0x1a};
+constexpr std::size_t settingsHeaderBytes=56;
+constexpr std::size_t maximumSettingsFileBytes=maximumSettingsBytes+settingsHeaderBytes+20*4;
+constexpr HRESULT changedBinding=HRESULT_FROM_WIN32(ERROR_RETRY);
+constexpr HRESULT invalidSettings=HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+UINT settingsUInt(std::span<const BYTE> bytes,std::size_t offset) noexcept {
+    return static_cast<UINT>(bytes[offset])|(static_cast<UINT>(bytes[offset+1])<<8)|
+        (static_cast<UINT>(bytes[offset+2])<<16)|(static_cast<UINT>(bytes[offset+3])<<24);
+}
+void putSettingsUInt(std::span<BYTE> bytes,std::size_t offset,UINT value) noexcept {
+    for(unsigned part=0;part<4;++part)bytes[offset+part]=static_cast<BYTE>(value>>(part*8));
+}
+HRESULT settingsDigest(std::span<const BYTE> bytes,std::array<BYTE,32>& digest) {
+    struct Algorithm {BCRYPT_ALG_HANDLE value=nullptr;~Algorithm(){if(value)BCryptCloseAlgorithmProvider(value,0);}} algorithm;
+    auto status=BCryptOpenAlgorithmProvider(&algorithm.value,BCRYPT_SHA256_ALGORITHM,nullptr,0);
+    if(status<0)return HRESULT_FROM_NT(status);
+    DWORD length=0,written=0;
+    status=BCryptGetProperty(algorithm.value,BCRYPT_OBJECT_LENGTH,reinterpret_cast<PUCHAR>(&length),sizeof(length),&written,0);
+    if(status<0)return HRESULT_FROM_NT(status);
+    if(written!=sizeof(length)||!length)return E_UNEXPECTED;
+    std::vector<BYTE> object(length);
+    struct Hash {BCRYPT_HASH_HANDLE value=nullptr;~Hash(){if(value)BCryptDestroyHash(value);}} hash;
+    status=BCryptCreateHash(algorithm.value,&hash.value,object.data(),length,nullptr,0,0);
+    if(status<0)return HRESULT_FROM_NT(status);
+    // The digest field is logically zero. Cover header, IDs and opaque payload.
+    std::array<BYTE,32> zero{};
+    for(const auto part:{bytes.first(24),std::span<const BYTE>(zero),bytes.subspan(settingsHeaderBytes)}) {
+        status=BCryptHashData(hash.value,const_cast<PUCHAR>(part.data()),static_cast<ULONG>(part.size()),0);
+        if(status<0)return HRESULT_FROM_NT(status);
+    }
+    status=BCryptFinishHash(hash.value,digest.data(),static_cast<ULONG>(digest.size()),0);
+    return status<0?HRESULT_FROM_NT(status):S_OK;
+}
+struct SettingsFile {
+    std::span<const BYTE> native;
+    std::vector<UINT> order;
+    bool envelope=false;
+};
+HRESULT decodeSettings(std::span<const BYTE> bytes,RibbonLayout layout,SettingsFile& output) {
+    if(bytes.empty()||bytes.size()>maximumSettingsFileBytes)return invalidSettings;
+    const bool marked=bytes.size()>=5&&std::equal(settingsMagic.begin(),settingsMagic.begin()+5,bytes.begin());
+    if(!marked) {
+        if(bytes.size()>maximumSettingsBytes)return invalidSettings;
+        output.native=bytes;return S_OK; // Native itself validates legacy opaque bytes.
+    }
+    if(bytes.size()<settingsHeaderBytes||!std::equal(settingsMagic.begin(),settingsMagic.end(),bytes.begin()))return invalidSettings;
+    const auto version=settingsUInt(bytes,8),savedLayout=settingsUInt(bytes,12),count=settingsUInt(bytes,16),length=settingsUInt(bytes,20);
+    if(version!=1||savedLayout>1||savedLayout!=static_cast<UINT>(layout)||count>20||!length||length>maximumSettingsBytes)
+        return invalidSettings;
+    const std::size_t payload=settingsHeaderBytes+static_cast<std::size_t>(count)*4;
+    if(bytes.size()!=payload+length)return invalidSettings; // Exact size rejects overflow, truncation and trailing bytes.
+    std::vector<UINT> order;order.reserve(count);
+    for(UINT index=0;index<count;++index) {
+        const auto id=settingsUInt(bytes,settingsHeaderBytes+index*4);
+        if(!id||std::find(order.begin(),order.end(),id)!=order.end())return invalidSettings;
+        order.push_back(id);
+    }
+    std::array<BYTE,32> digest{};const auto hr=settingsDigest(bytes,digest);if(hr!=S_OK)return hr;
+    if(!std::equal(digest.begin(),digest.end(),bytes.begin()+24))return invalidSettings;
+    output.native=bytes.subspan(payload,length);output.order=std::move(order);output.envelope=true;return S_OK;
+}
+HRESULT encodeSettings(RibbonLayout layout,std::span<const UINT> order,std::span<const BYTE> native,std::vector<BYTE>& output) {
+    if(order.size()>20||native.empty()||native.size()>maximumSettingsBytes)return invalidSettings;
+    std::vector<BYTE> bytes(settingsHeaderBytes+order.size()*4+native.size());
+    std::copy(settingsMagic.begin(),settingsMagic.end(),bytes.begin());
+    putSettingsUInt(bytes,8,1);putSettingsUInt(bytes,12,static_cast<UINT>(layout));
+    putSettingsUInt(bytes,16,static_cast<UINT>(order.size()));putSettingsUInt(bytes,20,static_cast<UINT>(native.size()));
+    for(std::size_t index=0;index<order.size();++index) {
+        if(!order[index]||std::find(order.begin(),order.begin()+static_cast<std::ptrdiff_t>(index),order[index])!=order.begin()+static_cast<std::ptrdiff_t>(index))return invalidSettings;
+        putSettingsUInt(bytes,settingsHeaderBytes+index*4,order[index]);
+    }
+    std::copy(native.begin(),native.end(),bytes.begin()+static_cast<std::ptrdiff_t>(settingsHeaderBytes+order.size()*4));
+    std::array<BYTE,32> digest{};const auto hr=settingsDigest(bytes,digest);if(hr!=S_OK)return hr;
+    std::copy(digest.begin(),digest.end(),bytes.begin()+24);output=std::move(bytes);return S_OK;
+}
+HRESULT settingsStreamBytes(IStream* stream,std::vector<BYTE>& output) {
+    STATSTG stat{};auto hr=stream->Stat(&stat,STATFLAG_NONAME);if(hr!=S_OK)return FAILED(hr)?hr:E_UNEXPECTED;
+    if(!stat.cbSize.QuadPart||stat.cbSize.QuadPart>maximumSettingsBytes)return HRESULT_FROM_WIN32(ERROR_FILE_TOO_LARGE);
+    HGLOBAL memory=nullptr;hr=GetHGlobalFromStream(stream,&memory);if(hr!=S_OK)return FAILED(hr)?hr:E_UNEXPECTED;
+    struct Lock {HGLOBAL memory;const BYTE* bytes;~Lock(){if(bytes)GlobalUnlock(memory);}} lock{memory,static_cast<const BYTE*>(GlobalLock(memory))};
+    if(!lock.bytes)return E_OUTOFMEMORY;
+    output.assign(lock.bytes,lock.bytes+static_cast<std::size_t>(stat.cbSize.QuadPart));return S_OK;
+}
 HRESULT readFile(const std::filesystem::path& path, std::vector<BYTE>& output) {
     const HANDLE file = CreateFileW(path.c_str(),GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);
     if (file == INVALID_HANDLE_VALUE) return HRESULT_FROM_WIN32(GetLastError());
+    struct CloseFile {HANDLE value;~CloseFile(){CloseHandle(value);}} close{file};
     LARGE_INTEGER size{};
     HRESULT result = S_OK;
     if (!GetFileSizeEx(file,&size)) result = HRESULT_FROM_WIN32(GetLastError());
-    else if (!size.QuadPart || size.QuadPart > maximumSettingsBytes) result = HRESULT_FROM_WIN32(ERROR_FILE_TOO_LARGE);
+    else if (size.QuadPart <= 0 || size.QuadPart > static_cast<LONGLONG>(maximumSettingsFileBytes)) result = HRESULT_FROM_WIN32(ERROR_FILE_TOO_LARGE);
     else {
         std::vector<BYTE> bytes(static_cast<std::size_t>(size.QuadPart));
         DWORD read = 0;
@@ -566,18 +669,236 @@ HRESULT readFile(const std::filesystem::path& path, std::vector<BYTE>& output) {
         else if (read != bytes.size()) result = HRESULT_FROM_WIN32(ERROR_HANDLE_EOF);
         else output = std::move(bytes);
     }
-    CloseHandle(file); return result;
+    return result;
 }
 }
 
-struct NativeRibbon::Impl {
+struct RibbonQuickAccessSnapshot::Impl {
+    const NativeRibbon* owner=nullptr;
+    const void* ribbonState=nullptr;
+    DWORD thread=0;
+    HWND window=nullptr;
+    std::uint64_t generation=0,revision=0;
+    ComPtr<IUIFramework> framework;
+    UINT nativeQuickAccess=0;
+    ComPtr<IUnknown> viewIdentity;
+    ComPtr<IUICollection> collection;
+    ComPtr<IUnknown> collectionIdentity;
+    ComPtr<IPropertyStore> viewProperties;
+    std::vector<ComPtr<IUnknown>> rows,identities;
+    std::vector<RibbonQuickAccessItem> items;
+    ULONG dock=UI_CONTROLDOCK_TOP;
+    bool minimized=false;
+    struct Property {
+        PROPVARIANT value{};
+        HRESULT result=E_PENDING;
+        ComPtr<IUnknown> identity;
+        Property()=default;
+        Property(const Property&)=delete;
+        Property& operator=(const Property&)=delete;
+        Property(Property&& other)noexcept:value(other.value),result(other.result),identity(std::move(other.identity)){PropVariantInit(&other.value);}
+        Property& operator=(Property&& other)noexcept {
+            if(this!=&other){PropVariantClear(&value);value=other.value;PropVariantInit(&other.value);result=other.result;identity=std::move(other.identity);}return *this;
+        }
+        ~Property(){PropVariantClear(&value);}
+    };
+    // Preserve and fence the documented row metadata, including failure/VT
+    // provenance and canonical object-valued properties. Rows remain opaque.
+    static constexpr std::size_t propertyCount=12;
+    static inline const std::array<const PROPERTYKEY*,propertyCount> propertyKeys{&UI_PKEY_CommandId,&UI_PKEY_CommandType,&UI_PKEY_Label,
+        &UI_PKEY_LabelDescription,&UI_PKEY_Enabled,&UI_PKEY_Pinned,&UI_PKEY_CategoryId,&UI_PKEY_Keytip,
+        &UI_PKEY_TooltipTitle,&UI_PKEY_TooltipDescription,&UI_PKEY_SmallImage,&UI_PKEY_LargeImage};
+    using Properties=std::array<Property,propertyCount>;
+    std::vector<Properties> properties;
+    template<class Current>
+    static HRESULT readProperties(IUnknown* row,Properties& output,Current&& current) {
+        ComPtr<IUISimplePropertySet> set;const auto query=row->QueryInterface(IID_PPV_ARGS(&set));
+        if(!current())return changedBinding;
+        for(std::size_t index=0;index<propertyKeys.size();++index) {
+            auto& property=output[index];property.result=query==S_OK&&set?set->GetValue(*propertyKeys[index],&property.value):query;
+            if(!current())return changedBinding;
+            if(property.result==S_OK&&property.value.vt==VT_UNKNOWN&&property.value.punkVal) {
+                const auto hr=property.value.punkVal->QueryInterface(IID_PPV_ARGS(&property.identity));
+                if(!current())return changedBinding;
+                if(hr!=S_OK)return FAILED(hr)?hr:E_UNEXPECTED;
+            }
+        }
+        return S_OK;
+    }
+    static bool sameProperty(const Property& left,const Property& right) noexcept {
+        if(left.result!=right.result||left.value.vt!=right.value.vt)return false;
+        if(left.value.vt==VT_UNKNOWN)return left.identity.Get()==right.identity.Get()&&
+            (left.identity?true:left.value.punkVal==right.value.punkVal)&&
+            (left.value.punkVal==nullptr)==(right.value.punkVal==nullptr);
+        if(left.value.vt==VT_BOOL)return left.value.boolVal==right.value.boolVal;
+        if(left.value.vt==VT_LPWSTR)return (left.value.pwszVal==nullptr)==(right.value.pwszVal==nullptr)&&
+            (!left.value.pwszVal||std::wcscmp(left.value.pwszVal,right.value.pwszVal)==0);
+        if(left.value.vt==VT_BSTR)return (left.value.bstrVal==nullptr)==(right.value.bstrVal==nullptr)&&
+            SysStringLen(left.value.bstrVal)==SysStringLen(right.value.bstrVal)&&
+            (!left.value.bstrVal||std::memcmp(left.value.bstrVal,right.value.bstrVal,SysStringLen(left.value.bstrVal)*sizeof(wchar_t))==0);
+        return PropVariantCompareEx(left.value,right.value,PVCU_DEFAULT,PVCF_USESTRCMPC)==0;
+    }
+
+    static HRESULT readCommand(IUnknown* row,UINT& nativeCommand) {
+        ComPtr<IUISimplePropertySet> properties;
+        auto hr=row->QueryInterface(IID_PPV_ARGS(&properties));
+        if(hr!=S_OK)return hr;
+        if(!properties)return E_UNEXPECTED;
+        Variant value;hr=properties->GetValue(UI_PKEY_CommandId,&value.value);
+        if(hr!=S_OK)return hr;
+        ULONG command=0;hr=PropVariantToUInt32(value.value,&command);
+        if(hr==S_OK)nativeCommand=command;
+        return hr;
+    }
+    template<class Current>
+    HRESULT matches(const std::vector<ComPtr<IUnknown>>& expected,Current&& current,UINT addedCommand=0,const Impl* extra=nullptr) const {
+        if(!current())return HRESULT_FROM_WIN32(ERROR_RETRY);
+        Variant source;auto hr=framework->GetUICommandProperty(nativeQuickAccess,UI_PKEY_ItemsSource,&source.value);
+        if(!current())return changedBinding;
+        if(hr!=S_OK||source.value.vt!=VT_UNKNOWN||!source.value.punkVal)return FAILED(hr)?hr:changedBinding;
+        ComPtr<IUnknown> actualCollection;hr=source.value.punkVal->QueryInterface(IID_PPV_ARGS(&actualCollection));
+        if(!current())return changedBinding;
+        if(hr!=S_OK||actualCollection.Get()!=collectionIdentity.Get())return changedBinding;
+        ComPtr<IUIRibbon> actualRibbon;hr=framework->GetView(0,IID_PPV_ARGS(&actualRibbon));
+        if(!current())return changedBinding;
+        if(hr!=S_OK||!actualRibbon)return changedBinding;
+        ComPtr<IUnknown> actualView;hr=actualRibbon.As(&actualView);
+        if(!current())return changedBinding;
+        if(hr!=S_OK||actualView.Get()!=viewIdentity.Get())return changedBinding;
+        UINT count=0;hr=collection->GetCount(&count);
+        if(!current())return HRESULT_FROM_WIN32(ERROR_RETRY);
+        if(hr!=S_OK)return FAILED(hr)?hr:E_UNEXPECTED;
+        if(count!=expected.size())return HRESULT_FROM_WIN32(ERROR_RETRY);
+        for(UINT index=0;index<count;++index) {
+            if(!current())return HRESULT_FROM_WIN32(ERROR_RETRY);
+            ComPtr<IUnknown> row,identity;
+            hr=collection->GetItem(index,&row);
+            if(!current())return HRESULT_FROM_WIN32(ERROR_RETRY);
+            if(hr!=S_OK||!row)return FAILED(hr)?hr:E_UNEXPECTED;
+            hr=row.As(&identity);
+            if(!current())return HRESULT_FROM_WIN32(ERROR_RETRY);
+            if(hr!=S_OK||!identity)return FAILED(hr)?hr:E_UNEXPECTED;
+            if(identity.Get()!=expected[index].Get())return HRESULT_FROM_WIN32(ERROR_RETRY);
+            // Reordering changes collection indices, never the binding of a
+            // retained original object. Match its original snapshot identity.
+            const auto original=std::find_if(identities.begin(),identities.end(),[&](const auto& retained){
+                return retained.Get()==identity.Get();});
+            UINT command=0;const auto read=readCommand(row.Get(),command);
+            if(!current())return HRESULT_FROM_WIN32(ERROR_RETRY);
+            const auto extraOriginal=extra?std::find_if(extra->identities.begin(),extra->identities.end(),[&](const auto& retained){
+                return retained.Get()==identity.Get();}):identities.end();
+            const Impl* binding=nullptr;std::size_t originalIndex=0;
+            if(extra&&extraOriginal!=extra->identities.end()){binding=extra;originalIndex=static_cast<std::size_t>(extraOriginal-extra->identities.begin());}
+            else if(original!=identities.end()){binding=this;originalIndex=static_cast<std::size_t>(original-identities.begin());}
+            if(binding) {
+                if(read!=binding->items[originalIndex].commandRead||
+                   (read==S_OK&&command!=binding->items[originalIndex].nativeCommand))return HRESULT_FROM_WIN32(ERROR_RETRY);
+                Properties observed;hr=readProperties(row.Get(),observed,current);if(hr!=S_OK)return hr;
+                for(std::size_t property=0;property<propertyKeys.size();++property)
+                    if(!sameProperty(binding->properties[originalIndex][property],observed[property]))return changedBinding;
+            } else if(!addedCommand||read!=S_OK||command!=addedCommand) {
+                return HRESULT_FROM_WIN32(ERROR_RETRY);
+            }
+        }
+        if(!current())return HRESULT_FROM_WIN32(ERROR_RETRY);
+        UINT finalCount=0;hr=collection->GetCount(&finalCount);
+        if(!current())return HRESULT_FROM_WIN32(ERROR_RETRY);
+        if(hr!=S_OK)return FAILED(hr)?hr:E_UNEXPECTED;
+        if(finalCount!=count)return HRESULT_FROM_WIN32(ERROR_RETRY);
+        Variant value;hr=viewProperties->GetValue(UI_PKEY_QuickAccessToolbarDock,&value.value);
+        if(!current())return HRESULT_FROM_WIN32(ERROR_RETRY);
+        if(hr!=S_OK)return FAILED(hr)?hr:E_UNEXPECTED;
+        ULONG actualDock=0;hr=PropVariantToUInt32(value.value,&actualDock);
+        if(!current())return HRESULT_FROM_WIN32(ERROR_RETRY);
+        if(hr!=S_OK)return FAILED(hr)?hr:E_UNEXPECTED;
+        if(actualDock!=dock)return changedBinding;
+        Variant minimizedValue;hr=viewProperties->GetValue(UI_PKEY_Minimized,&minimizedValue.value);
+        if(!current())return changedBinding;
+        if(hr!=S_OK)return FAILED(hr)?hr:E_UNEXPECTED;
+        BOOL actualMinimized=FALSE;hr=PropVariantToBoolean(minimizedValue.value,&actualMinimized);
+        if(!current())return changedBinding;
+        if(hr!=S_OK)return FAILED(hr)?hr:E_UNEXPECTED;
+        return (actualMinimized!=FALSE)==minimized?S_OK:changedBinding;
+    }
+};
+RibbonQuickAccessSnapshot::RibbonQuickAccessSnapshot()=default;
+RibbonQuickAccessSnapshot::~RibbonQuickAccessSnapshot()=default;
+RibbonQuickAccessSnapshot::RibbonQuickAccessSnapshot(RibbonQuickAccessSnapshot&&) noexcept=default;
+RibbonQuickAccessSnapshot& RibbonQuickAccessSnapshot::operator=(RibbonQuickAccessSnapshot&&) noexcept=default;
+std::span<const RibbonQuickAccessItem> RibbonQuickAccessSnapshot::items() const noexcept {
+    return impl_?std::span<const RibbonQuickAccessItem>(impl_->items):std::span<const RibbonQuickAccessItem>{};
+}
+bool RibbonQuickAccessSnapshot::belowRibbon() const noexcept {return impl_&&impl_->dock==UI_CONTROLDOCK_BOTTOM;}
+
+struct NativeRibbon::Impl : std::enable_shared_from_this<NativeRibbon::Impl> {
+    struct StockModule {
+        HMODULE owned=nullptr;
+        StockModule()=default;
+        StockModule(const StockModule&)=delete;
+        StockModule& operator=(const StockModule&)=delete;
+        ~StockModule(){reset();}
+        HMODULE get() const noexcept {return owned;}
+        void reset(HMODULE replacement=nullptr) noexcept {
+            const auto previous=owned;owned=replacement;
+            if(previous)FreeLibrary(previous);
+        }
+    };
+    // Declared first so the one owned LoadLibraryEx reference is released last,
+    // after every native image/cache/framework/handler/callback member below.
+    // LoadUI borrows get(); this owner also covers partial initialization.
+    StockModule stockModule;
     enum class LabelSource { NativeProvider, AuthoredFallback, EnglishPresentation };
     struct Metadata {
         std::wstring label,description,icon;
         LabelSource labelSource=LabelSource::AuthoredFallback;
     };
+    NativeApartmentClient apartmentClient; // Retires after the native COM/cache fields.
     HWND window=nullptr;
     DWORD thread=0;
+    std::shared_ptr<RibbonRevision> revision=std::make_shared<RibbonRevision>();
+    std::shared_ptr<std::atomic<std::uint64_t>> callbackEpoch;
+    std::shared_ptr<RibbonRecentItemsDiagnostics> recentItemsDiagnostics;
+    struct RecentItemsReceiptScope {
+        RibbonRecentItemsReceipt* receipt=nullptr;
+        std::shared_ptr<RibbonRevision> revision;
+        std::shared_ptr<std::atomic<std::uint64_t>> epoch;
+        // Keep only the fixed receipt storage and non-provider epoch/revision.
+        // The final readback happens after local COM releases, even on return.
+        std::shared_ptr<RibbonRecentItemsDiagnostics> storage;
+        RecentItemsReceiptScope(Impl& owner,RibbonRecentItemsReceiptKind kind,
+            const PROPVARIANT* value=nullptr):storage(owner.recentItemsDiagnostics) {
+            if(!storage)return;
+            revision=owner.revision;epoch=owner.callbackEpoch;
+            if(storage->count>=storage->receipts.size()){storage->overflow=true;return;}
+            receipt=&storage->receipts[storage->count++];
+            receipt->kind=kind;receipt->entryTick=GetTickCount64();receipt->entryEpoch=epoch?epoch->load():0;
+            receipt->entryRevision=revision->value;receipt->retired=revision->retired;
+            receipt->windowDestroyed=revision->windowDestroyed;
+            receipt->shutdownActive=owner.shutdownRecentItems;receipt->shutdownStarted=owner.shutdownRecentItemsStarted;
+            receipt->variantType=value?value->vt:VT_EMPTY;
+        }
+        ~RecentItemsReceiptScope(){if(receipt){receipt->exitTick=GetTickCount64();receipt->exitEpoch=epoch?epoch->load():0;
+            receipt->exitRevision=revision->value;receipt->exitRetired=revision->retired;
+            receipt->exitWindowDestroyed=revision->windowDestroyed;}}
+        void initial(const std::vector<bool>& pins) noexcept {if(!receipt)return;
+            receipt->initialCount=static_cast<UINT>(pins.size());
+            for(size_t index=0;index<std::min(pins.size(),receipt->initialPins.size());++index)receipt->initialPins[index]=pins[index];}
+        void bounds(LONG first,LONG last) noexcept {if(receipt){receipt->first=first;receipt->last=last;}}
+        void decoded(UINT index,bool pinned) noexcept {if(receipt&&index<receipt->decoded.size()){
+            receipt->decoded[index]=true;receipt->decodedPins[index]=pinned;++receipt->decodedCount;}}
+        void dispatched(UINT index,HRESULT result) noexcept {if(receipt&&index<receipt->dispatched.size()){
+            receipt->dispatched[index]=true;receipt->callbackResults[index]=result;
+            receipt->callbackReturnTicks[index]=GetTickCount64();++receipt->callbackCount;}}
+        HRESULT finish(HRESULT result) noexcept {if(receipt)receipt->result=result;return result;}
+    };
+    std::uint64_t shutdownRecentItemsEpoch=0;
+    IUIFramework* shutdownRecentItemsFramework=nullptr; // Borrowed inside the original retained close/reset stack.
+    bool shutdownRecentItems=false,shutdownRecentItemsStarted=false;
+    bool shutdownMessageActive=false,shutdownRecentItemsDispatching=false;
+    bool nativeDestroyStarted=false,nativeDestroyCompleted=false,nativeDestroyFailed=false,nativeRetirementDeferred=false;
+    std::function<bool()> ownerWindowRetirementHook;
+    std::vector<bool> shutdownRecentPins;
+    std::function<HRESULT(UINT,bool)> shutdownPinItem;
     UINT height=0;
     bool computerMode=false;
     bool networkMode=false;
@@ -588,7 +909,6 @@ struct NativeRibbon::Impl {
     bool englishPresentation=true;
     RibbonLayout layout=RibbonLayout::Authored;
     HRESULT stockStatus=E_NOTIMPL;
-    HMODULE stockModule=nullptr;
     RibbonCallbacks callbacks;
     ComPtr<IUIFramework> framework;
     ComPtr<IUIFramework> publicFramework;
@@ -616,14 +936,99 @@ struct NativeRibbon::Impl {
     std::vector<bool> recentPins;
     std::set<UINT> requestedCollections;
     std::map<UINT,RibbonCollectionReadback> collectionReads;
+    // A physical command/size gets one provenance opportunity per Impl. The
+    // separate seen set also prevents recapture after a DPI change: a later
+    // current may be a host fallback, even if its DPI-specific cache is empty.
+    using NativeImageKey=std::tuple<UINT,bool,UINT>; // physical ID, LargeImage, actual HWND DPI
+    std::set<std::pair<UINT,bool>> observedNativeImages;
+    std::map<NativeImageKey,ComPtr<IUIImage>> nativeImages;
+    bool nativeImageCapturePoisoned=false;
+    std::set<UINT> explicitImageSpecifications;
+    std::uint64_t imageSpecificationRevision=0;
+    struct NativeImageRequest {
+        bool eligible=false,first=false;
+        NativeImageKey key{};
+        HWND capturedWindow=nullptr;
+        DWORD creator=0;
+        IUIFramework* capturedFramework=nullptr;
+        std::shared_ptr<RibbonRevision> capturedRevision;
+        std::shared_ptr<std::atomic<std::uint64_t>> epochState;
+        std::uint64_t windowGeneration=0,epoch=0,revisionValue=0,specificationRevision=0;
+        bool current(const Impl& owner)const noexcept {
+            if(!eligible)return true;
+            DWORD process=0;
+            return GetCurrentThreadId()==creator&&owner.thread==creator&&owner.window==capturedWindow&&
+                owner.framework.Get()==capturedFramework&&owner.layout==RibbonLayout::InstalledWindows10&&
+                owner.revision.get()==capturedRevision.get()&&!capturedRevision->retired&&!capturedRevision->windowDestroyed&&
+                capturedRevision->value==revisionValue&&owner.imageSpecificationRevision==specificationRevision&&
+                owner.imageDiagnosticWindowGeneration==windowGeneration&&epochState&&owner.callbackEpoch.get()==epochState.get()&&
+                epochState->load(std::memory_order_acquire)==epoch&&
+                GetWindowThreadProcessId(capturedWindow,&process)==creator&&process==GetCurrentProcessId()&&
+                GetDpiForWindow(capturedWindow)==std::get<2>(key);
+        }
+    };
+    HRESULT beginNativeImageRequest(UINT command,bool large,NativeImageRequest& request) {
+        // No QI/AddRef/property query precedes reservation of the actual first
+        // callback, including when the opt-in observer retains currentValue.
+        if(layout!=RibbonLayout::InstalledWindows10||dynamicCommands.contains(command)||
+           !nativeCommandTypes.contains(command)||!applicationId(command))return S_OK;
+        request.eligible=true;request.capturedWindow=window;request.creator=thread;
+        request.capturedFramework=framework.Get();request.capturedRevision=revision;request.epochState=callbackEpoch;
+        request.windowGeneration=imageDiagnosticWindowGeneration;
+        request.epoch=callbackEpoch?callbackEpoch->load(std::memory_order_acquire):std::uint64_t{0};
+        request.revisionValue=revision->value;request.specificationRevision=imageSpecificationRevision;
+        const UINT dpi=GetDpiForWindow(window);request.key=std::make_tuple(command,large,dpi);
+        if(!dpi||!request.current(*this))return changedBinding;
+        if(nativeImageCapturePoisoned)return S_OK; // Existing authentic cache entries remain usable.
+        try {request.first=observedNativeImages.emplace(command,large).second;}
+        catch(const std::bad_alloc&){
+            // We cannot record which physical first opportunity was lost.
+            // Disable further captures on this Impl, never recapture a later
+            // fallback as native. The next binding starts with fresh storage.
+            nativeImageCapturePoisoned=true;return E_OUTOFMEMORY;
+        }
+        return S_OK;
+    }
+    HRESULT nativeImageProperty(const NativeImageRequest& request,UINT command,
+                                const PROPVARIANT* current,PROPVARIANT* output,RibbonObservedImagePath* path) {
+        if(!request.eligible)return S_FALSE;
+        if(!request.current(*this))return changedBinding;
+        if(request.first&&current&&current->vt==VT_UNKNOWN&&current->punkVal) {
+            ComPtr<IUIImage> image;
+            const auto retained=current->punkVal->QueryInterface(IID_PPV_ARGS(&image));
+            if(!request.current(*this)){image.Reset();return changedBinding;}
+            if(SUCCEEDED(retained)&&image) {
+                // Move, not copy: no external AddRef runs while a cache node is
+                // being inserted. The old Impl remains retained by the handler.
+                try {nativeImages.emplace(request.key,std::move(image));}
+                catch(const std::bad_alloc&){image.Reset();return request.current(*this)?E_OUTOFMEMORY:changedBinding;}
+            }
+            image.Reset(); // Failed QI outputs are released before the fence.
+            if(!request.current(*this))return changedBinding;
+        }
+        // Empty first current or failed first IUIImage QI is permanently seen.
+        // Later actual native callbacks can never promote a host-created image.
+        if(explicitImageSpecifications.contains(command))return S_FALSE;
+        const auto cached=nativeImages.find(request.key);
+        if(cached==nativeImages.end())return S_FALSE;
+        PROPVARIANT borrowed{};borrowed.vt=VT_UNKNOWN;borrowed.punkVal=cached->second.Get();
+        const auto result=PropVariantCopy(output,&borrowed);
+        if(!request.current(*this)){PropVariantClear(output);PropVariantInit(output);return changedBinding;}
+        if(SUCCEEDED(result)&&path)*path=request.first?RibbonObservedImagePath::InstalledNativeFirstCurrent:
+            RibbonObservedImagePath::InstalledNativeCached;
+        return result;
+    }
     struct Invalidation {UINT command;UI_INVALIDATIONS flags;PROPERTYKEY key{};bool hasKey=false;};
     std::vector<Invalidation> deferredInvalidations;
     UINT propertyDepth=0;
+    UINT imageDiagnosticDepth=0,imageObserverDeliveryDepth=0;
+    std::uint64_t imageDiagnosticWindowGeneration=0,imageDiagnosticOrdinal=0;
+    RibbonImageObservationStats imageDiagnosticStats;
     UINT invalidationMessage=0;
     bool invalidationPosted=false,subclassAttached=false;
     std::shared_ptr<StockTranslation> translation=std::make_shared<StockTranslation>();
     UINT nextDynamicCommand=0x9000;
-    ~Impl(){detachSubclass();if(stockModule)FreeLibrary(stockModule);}
+    ~Impl(){apartmentClient.beforeNativeRelease();detachSubclass();}
     void detachSubclass() noexcept {
         if(subclassAttached&&IsWindow(window))RemoveWindowSubclass(window,subclassProcedure,reinterpret_cast<UINT_PTR>(this));
         subclassAttached=false;invalidationPosted=false;
@@ -633,8 +1038,9 @@ struct NativeRibbon::Impl {
             invalidationPosted=PostMessageW(window,invalidationMessage,reinterpret_cast<WPARAM>(this),0)!=FALSE;
     }
     HRESULT requestInvalidation(UINT command,UI_INVALIDATIONS flags,const PROPERTYKEY* key=nullptr) {
+        const auto lifetime=shared_from_this();if(revision->retired)return changedBinding;
         if(!framework)return E_UNEXPECTED;
-        if(!propertyDepth)return framework->InvalidateUICommand(command,flags,key);
+        if(!propertyDepth){const auto retained=framework;const auto result=retained->InvalidateUICommand(command,flags,key);return revision->retired?changedBinding:result;}
         // UpdateProperty must return before calling the Ribbon framework again.
         // The queue owns property keys; no borrowed callback pointer survives.
         const auto found=std::find_if(deferredInvalidations.begin(),deferredInvalidations.end(),[&](const auto& entry) {
@@ -645,18 +1051,21 @@ struct NativeRibbon::Impl {
         return S_OK;
     }
     HRESULT drainInvalidations() {
+        const auto lifetime=shared_from_this();if(revision->retired)return changedBinding;
         if(propertyDepth)return E_PENDING;
         invalidationPosted=false;
         auto pending=std::move(deferredInvalidations);deferredInvalidations.clear();
         HRESULT result=S_OK;
         for(const auto& entry:pending) {
             const auto hr=requestInvalidation(entry.command,entry.flags,entry.hasKey?&entry.key:nullptr);
+            if(revision->retired)return changedBinding;
             if(FAILED(hr)&&SUCCEEDED(result))result=hr;
         }
         postInvalidations();return result;
     }
     static LRESULT CALLBACK subclassProcedure(HWND window,UINT message,WPARAM wParam,LPARAM lParam,UINT_PTR,DWORD_PTR data) {
         auto& owner=*reinterpret_cast<Impl*>(data);
+        const auto lifetime=owner.shared_from_this();
         if(message==owner.invalidationMessage&&wParam==reinterpret_cast<WPARAM>(&owner)) {
             // Nested message pumps inside a provider cannot bypass the return
             // boundary. The outer property callback posts again on its exit.
@@ -664,13 +1073,13 @@ struct NativeRibbon::Impl {
             if(!owner.propertyDepth)try{owner.drainInvalidations();}catch(...){}
             return 0;
         }
-        if(message==WM_NCDESTROY)owner.detachSubclass();
+        if(message==WM_NCDESTROY){owner.revision->windowDestroyed=true;++owner.revision->value;owner.detachSubclass();}
         return DefSubclassProc(window,message,wParam,lParam);
     }
     struct PropertyCallback {
         Impl& owner;
         explicit PropertyCallback(Impl& value):owner(value){++owner.propertyDepth;}
-        ~PropertyCallback(){--owner.propertyDepth;owner.postInvalidations();}
+        ~PropertyCallback(){--owner.propertyDepth;if(!owner.revision->retired)owner.postInvalidations();}
     };
     std::vector<RibbonItem> collectionItems(UINT command) {
         std::vector<RibbonItem> items;
@@ -703,6 +1112,70 @@ struct NativeRibbon::Impl {
     UINT homeModes() const noexcept {return 0xa1|(features.discBurning?0x20000:0x40000);}
     UINT computerModes() const noexcept {return 4|(features.mediaFoundation?0x2000:0x4000);}
 
+    bool shutdownRecentItemsCurrent() const noexcept {
+        if(GetCurrentThreadId()!=thread)return false;
+        DWORD process=0;
+        return (revision->retired||shutdownMessageActive)&&shutdownRecentItems&&callbackEpoch&&callbackEpoch->load()==shutdownRecentItemsEpoch&&
+            framework.Get()==shutdownRecentItemsFramework&&shutdownRecentItemsFramework&&
+            !revision->windowDestroyed&&IsWindow(window)&&GetWindowThreadProcessId(window,&process)==thread&&
+            process==GetCurrentProcessId();
+    }
+    HRESULT executeShutdownRecentItems(const PROPVARIANT* value) {
+        RecentItemsReceiptScope diagnostic(*this,revision->retired?RibbonRecentItemsReceiptKind::RetiredCommit:RibbonRecentItemsReceiptKind::NormalCommit,value);
+        diagnostic.initial(shutdownRecentPins);
+        // One complete genuine native RecentItems commit from the captured
+        // original framework, on its creator, during close or final retirement.
+        if(!shutdownRecentItemsCurrent()||shutdownRecentItemsStarted)return diagnostic.finish(changedBinding);
+        shutdownRecentItemsStarted=true; // One original batch across message and Destroy.
+        struct Dispatch {Impl& owner;explicit Dispatch(Impl& value):owner(value){owner.shutdownRecentItemsDispatching=true;}
+            ~Dispatch(){owner.shutdownRecentItemsDispatching=false;}} dispatch{*this};
+        const auto initialPins=shutdownRecentPins;const auto pinItem=shutdownPinItem;
+        if(!shutdownRecentItemsCurrent())return diagnostic.finish(changedBinding);
+        if(!value||value->vt!=(VT_ARRAY|VT_UNKNOWN)||!value->parray||SafeArrayGetDim(value->parray)!=1)return diagnostic.finish(E_INVALIDARG);
+        LONG first=0,last=-1;
+        if(!shutdownRecentItemsCurrent())return diagnostic.finish(changedBinding);
+        auto hr=SafeArrayGetLBound(value->parray,1,&first);
+        if(!shutdownRecentItemsCurrent())return diagnostic.finish(changedBinding);
+        if(FAILED(hr))return diagnostic.finish(hr);
+        hr=SafeArrayGetUBound(value->parray,1,&last);
+        if(!shutdownRecentItemsCurrent())return diagnostic.finish(changedBinding);
+        if(FAILED(hr))return diagnostic.finish(hr);
+        diagnostic.bounds(first,last);
+        const auto count=static_cast<std::int64_t>(last)-static_cast<std::int64_t>(first)+1;
+        if(count<0||count>64||static_cast<std::uint64_t>(count)<initialPins.size())return diagnostic.finish(E_INVALIDARG);
+        // Decode every originally owned row before invoking any host code.
+        // Remaining native padding is intentionally not a host model row.
+        std::vector<bool> decoded(initialPins.size());
+        for(size_t index=0;index<initialPins.size();++index) {
+            if(!shutdownRecentItemsCurrent())return diagnostic.finish(changedBinding);
+            LONG nativeIndex=first+static_cast<LONG>(index);
+            ComPtr<IUnknown> raw;ComPtr<IUISimplePropertySet> item;Variant pin;
+            hr=SafeArrayGetElement(value->parray,&nativeIndex,raw.GetAddressOf());
+            if(!shutdownRecentItemsCurrent())return diagnostic.finish(changedBinding);
+            if(FAILED(hr))return diagnostic.finish(hr);
+            if(!raw)return diagnostic.finish(E_INVALIDARG);
+            hr=raw.As(&item);
+            if(!shutdownRecentItemsCurrent())return diagnostic.finish(changedBinding);
+            if(FAILED(hr))return diagnostic.finish(hr);
+            hr=item->GetValue(UI_PKEY_Pinned,&pin.value);
+            if(!shutdownRecentItemsCurrent())return diagnostic.finish(changedBinding);
+            if(FAILED(hr))return diagnostic.finish(hr);
+            BOOL pinned=FALSE;hr=PropVariantToBoolean(pin.value,&pinned);
+            if(!shutdownRecentItemsCurrent())return diagnostic.finish(changedBinding);
+            if(FAILED(hr))return diagnostic.finish(hr);
+            decoded[index]=pinned!=FALSE;diagnostic.decoded(static_cast<UINT>(index),decoded[index]);
+        }
+        HRESULT result=S_OK;
+        for(size_t index=0;index<initialPins.size();++index) {
+            if(!shutdownRecentItemsCurrent())return diagnostic.finish(changedBinding);
+            if(initialPins[index]==decoded[index]||!pinItem)continue;
+            hr=pinItem(static_cast<UINT>(index),decoded[index]);diagnostic.dispatched(static_cast<UINT>(index),hr);
+            if(!shutdownRecentItemsCurrent())return diagnostic.finish(changedBinding);
+            if(FAILED(hr)&&SUCCEEDED(result))result=hr;
+        }
+        return diagnostic.finish(result);
+    }
+
     struct Handler final : IUIApplication,IUICommandHandler {
         explicit Handler(Impl& owner): owner_(owner) {}
         HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid,void** output) override {
@@ -716,16 +1189,20 @@ struct NativeRibbon::Impl {
         ULONG STDMETHODCALLTYPE Release() override {const auto count=--references_;if(!count)delete this;return count;}
         HRESULT STDMETHODCALLTYPE OnViewChanged(UINT32,UI_VIEWTYPE type,IUnknown* view,UI_VIEWVERB verb,INT32 reason) override {
             if(type!=UI_VIEWTYPE_RIBBON)return E_NOTIMPL;
+            const auto lifetime=owner_.shared_from_this();
             try {
                 if(verb==UI_VIEWVERB_ERROR)return reason;
                 if(verb==UI_VIEWVERB_CREATE||verb==UI_VIEWVERB_SIZE){
                     ComPtr<IUIRibbon> nativeView;
                     const auto hr=view?view->QueryInterface(IID_PPV_ARGS(&nativeView)):E_POINTER;
+                    if(owner_.revision->retired)return changedBinding;
                     if(FAILED(hr))return hr;
                     UINT nativeHeight=0;const auto result=nativeView->GetHeight(&nativeHeight);
+                    if(owner_.revision->retired)return changedBinding;
                     if(FAILED(result))return result;
                     owner_.ribbon=nativeView;owner_.height=nativeHeight;
                     if(owner_.callbacks.heightChanged)owner_.callbacks.heightChanged(nativeHeight);
+                    if(owner_.revision->retired)return changedBinding;
                 }else if(verb==UI_VIEWVERB_DESTROY){owner_.height=0;owner_.ribbon.Reset();}
                 return S_OK;
             } catch(...) {return E_FAIL;}
@@ -743,7 +1220,21 @@ struct NativeRibbon::Impl {
         }
         HRESULT STDMETHODCALLTYPE Execute(UINT32 id,UI_EXECUTIONVERB verb,const PROPERTYKEY* key,const PROPVARIANT* value,IUISimplePropertySet* properties) override {
             if(verb!=UI_EXECUTIONVERB_EXECUTE)return S_OK;
+            if(GetCurrentThreadId()!=owner_.thread)return RPC_E_WRONG_THREAD;
+            const auto lifetime=owner_.shared_from_this();
+            if(!owner_.revision->retired&&owner_.shutdownMessageActive&&
+               id==owner_.nativeId(RibbonFrequentPlaces)&&owner_.applicationId(id)==RibbonFrequentPlaces&&
+               key&&IsEqualPropertyKey(*key,UI_PKEY_RecentItems)) {
+                if(owner_.readOnlyMenuExpansion)return E_ACCESSDENIED;
+                try{return owner_.executeShutdownRecentItems(value);}catch(...){return E_FAIL;}
+            }
+            if(owner_.revision->retired) {
+                if(owner_.readOnlyMenuExpansion||id!=owner_.nativeId(RibbonFrequentPlaces)||owner_.applicationId(id)!=RibbonFrequentPlaces||
+                   !key||!IsEqualPropertyKey(*key,UI_PKEY_RecentItems))return changedBinding;
+                try{return owner_.executeShutdownRecentItems(value);}catch(...){return E_FAIL;}
+            }
             if(owner_.readOnlyMenuExpansion){++owner_.menuExpansionExecutionAttempts;return E_ACCESSDENIED;}
+            RibbonMutation mutation(owner_.revision);
             try {
                 const auto originalId=id;
                 if(const auto dynamic=owner_.dynamicCommands.find(id);dynamic!=owner_.dynamicCommands.end())
@@ -751,12 +1242,15 @@ struct NativeRibbon::Impl {
                         owner_.callbacks.executeItem(dynamic->second.parent,dynamic->second.index):E_ACCESSDENIED;
                 id=owner_.applicationId(id);if(!id)return E_NOTIMPL;
                 if(id==RibbonFrequentPlaces&&key&&IsEqualPropertyKey(*key,UI_PKEY_RecentItems)) {
-                    if(!value||value->vt!=(VT_ARRAY|VT_UNKNOWN)||!value->parray)return E_INVALIDARG;
+                    RecentItemsReceiptScope diagnostic(owner_,RibbonRecentItemsReceiptKind::NormalCommit,value);
+                    diagnostic.initial(owner_.recentPins);
+                    if(!value||value->vt!=(VT_ARRAY|VT_UNKNOWN)||!value->parray)return diagnostic.finish(E_INVALIDARG);
                     LONG first=0,last=-1;auto hr=SafeArrayGetLBound(value->parray,1,&first);
                     if(SUCCEEDED(hr))hr=SafeArrayGetUBound(value->parray,1,&last);
-                    if(FAILED(hr)||last-first>=64)return E_INVALIDARG;
+                    if(FAILED(hr)||last-first>=64)return diagnostic.finish(E_INVALIDARG);
+                    diagnostic.bounds(first,last);
                     const auto initialPins=owner_.recentPins;
-                    if(static_cast<size_t>(last-first+1)<initialPins.size())return E_INVALIDARG;
+                    if(static_cast<size_t>(last-first+1)<initialPins.size())return diagnostic.finish(E_INVALIDARG);
                     HRESULT result=S_OK;
                     for(LONG index=first;index<first+static_cast<LONG>(initialPins.size());++index) {
                         ComPtr<IUnknown> raw;ComPtr<IUISimplePropertySet> item;Variant pin;
@@ -764,18 +1258,30 @@ struct NativeRibbon::Impl {
                         if(SUCCEEDED(hr))hr=raw.As(&item);
                         if(SUCCEEDED(hr))hr=item->GetValue(UI_PKEY_Pinned,&pin.value);
                         BOOL pinned=FALSE;if(SUCCEEDED(hr))hr=PropVariantToBoolean(pin.value,&pinned);
+                        if(SUCCEEDED(hr))diagnostic.decoded(static_cast<UINT>(index-first),pinned!=FALSE);
                         if(SUCCEEDED(hr)&&initialPins[static_cast<size_t>(index-first)]!=(pinned!=FALSE)&&owner_.callbacks.pinItem)
-                            hr=owner_.callbacks.pinItem(static_cast<UINT>(index-first),pinned!=FALSE);
+                        {hr=owner_.callbacks.pinItem(static_cast<UINT>(index-first),pinned!=FALSE);
+                         diagnostic.dispatched(static_cast<UINT>(index-first),hr);}
+                        if(owner_.revision->retired)return diagnostic.finish(changedBinding);
                         if(FAILED(hr)&&SUCCEEDED(result))result=hr;
                     }
-                    return result;
+                    return diagnostic.finish(result);
                 }
                 if(id==RibbonFrequentPlaces&&key&&IsEqualPropertyKey(*key,UI_PKEY_Pinned)) {
+                    RecentItemsReceiptScope diagnostic(owner_,RibbonRecentItemsReceiptKind::NormalPinned,value);
+                    diagnostic.initial(owner_.recentPins);
                     BOOL pinned=FALSE;ULONG index=0;Variant selected;
                     auto hr=value?PropVariantToBoolean(*value,&pinned):E_POINTER;
                     if(SUCCEEDED(hr))hr=properties?properties->GetValue(UI_PKEY_SelectedItem,&selected.value):E_POINTER;
                     if(SUCCEEDED(hr))hr=PropVariantToUInt32(selected.value,&index);
-                    return SUCCEEDED(hr)&&owner_.callbacks.pinItem?owner_.callbacks.pinItem(index,pinned!=FALSE):FAILED(hr)?hr:E_NOTIMPL;
+                    if(SUCCEEDED(hr)) {
+                        if(diagnostic.receipt){diagnostic.receipt->requestedIndex=index;diagnostic.receipt->requestedPin=pinned!=FALSE;}
+                        diagnostic.decoded(index,pinned!=FALSE);
+                    }
+                    if(SUCCEEDED(hr)&&owner_.callbacks.pinItem){hr=owner_.callbacks.pinItem(index,pinned!=FALSE);
+                        diagnostic.dispatched(index,hr);}
+                    else if(SUCCEEDED(hr))hr=E_NOTIMPL;
+                    return diagnostic.finish(hr);
                 }
                 if(id==RibbonLayoutGallery&&key&&IsEqualPropertyKey(*key,UI_PKEY_SelectedItem)){
                     ULONG selected=0;const auto hr=value?PropVariantToUInt32(*value,&selected):E_POINTER;
@@ -789,6 +1295,11 @@ struct NativeRibbon::Impl {
                 if((id==RibbonNewMenu||id==RibbonExtractToGallery||id==RibbonFrequentPlaces||id==RecentSearches||id==SearchDateMenu||id==SearchKindMenu||id==SearchSizeMenu||id==RibbonSearchOtherProperties)&&key&&IsEqualPropertyKey(*key,UI_PKEY_SelectedItem)){
                     ULONG selected=0;const auto hr=value?PropVariantToUInt32(*value,&selected):E_POINTER;
                     if(FAILED(hr)||selected>=4096)return E_INVALIDARG;
+                    if(id==RibbonExtractToGallery) {
+                        const auto indices=owner_.collectionInvocationIndices.find(originalId);
+                        if(indices==owner_.collectionInvocationIndices.end()||selected>=indices->second.size())return E_INVALIDARG;
+                        selected=indices->second[selected];
+                    }
                     return owner_.callbacks.executeItem?owner_.callbacks.executeItem(id,selected):E_NOTIMPL;
                 }
                 if(id==RibbonHelpButton)id=RibbonHelp;
@@ -805,9 +1316,154 @@ struct NativeRibbon::Impl {
                 return E_NOTIMPL;
             }catch(...){return E_FAIL;}
         }
+        static void copyTextReceipt(RibbonTextValueReceipt& receipt,const PROPVARIANT* value) noexcept {
+            receipt.present=value!=nullptr;receipt.type=value?value->vt:static_cast<VARTYPE>(VT_EMPTY);
+            if(!value||value->vt!=VT_LPWSTR||!value->pwszVal)return;
+            receipt.stringPresent=true;
+            const auto length=wcsnlen_s(value->pwszVal,receipt.text.size());
+            receipt.truncated=length==receipt.text.size();
+            const auto copied=std::min(length,receipt.text.size()-1);
+            if(copied)std::memcpy(receipt.text.data(),value->pwszVal,copied*sizeof(wchar_t));
+            receipt.text[copied]=L'\0';
+        }
+        HRESULT updateTextDiagnostic(UINT32 id,REFPROPERTYKEY key,const PROPVARIANT* current,PROPVARIANT* value) {
+            const auto lifetime=owner_.shared_from_this();
+            const auto storage=owner_.callbacks.textDiagnostics;
+            // No opt-in/native field read precedes creator admission. The
+            // ordinary function still owns all original result/guard behavior.
+            if(GetCurrentThreadId()!=owner_.thread||!storage)
+                return updateProperty(id,key,current,value,NativeImageRequest{});
+            if(storage->filterCount>storage->nativeCommands.size()) {
+                storage->overflow=true;return updateProperty(id,key,current,value,NativeImageRequest{});
+            }
+            bool filtered=false;for(UINT i=0;i<storage->filterCount;++i)if(storage->nativeCommands[i]==id)filtered=true;
+            if(!filtered)return updateProperty(id,key,current,value,NativeImageRequest{});
+            ++storage->requests;
+            const bool label=IsEqualPropertyKey(key,UI_PKEY_Label);
+            for(UINT i=0;i<storage->count;++i)if(storage->receipts[i].nativeCommand==id&&storage->receipts[i].label==label)
+                return updateProperty(id,key,current,value,NativeImageRequest{});
+            if(storage->count>=storage->receipts.size()) {
+                storage->overflow=true;return updateProperty(id,key,current,value,NativeImageRequest{});
+            }
+            // Fixed first-entry reservation precedes normal provider callbacks.
+            // Nested completion cannot redefine a first physical current.
+            auto& row=storage->receipts[storage->count++];
+            const auto capturedRevision=owner_.revision;const auto epoch=owner_.callbackEpoch;
+            const auto capturedFramework=owner_.framework.Get();const auto capturedWindow=owner_.window;
+            const auto generation=owner_.imageDiagnosticWindowGeneration;
+            row.nativeCommand=id;row.applicationCommand=owner_.applicationId(id);row.label=label;
+            row.creatorThread=owner_.thread;row.window=capturedWindow;row.windowGeneration=generation;
+            row.ordinal=storage->requests;row.entryRevision=capturedRevision->value;row.entryEpoch=epoch?epoch->load(std::memory_order_acquire):0;
+            if(const auto type=owner_.nativeCommandTypes.find(id);type!=owner_.nativeCommandTypes.end())row.nativeType=type->second;
+            copyTextReceipt(row.current,current);
+            const auto result=updateProperty(id,key,current,value,NativeImageRequest{});
+            row.normalResult=result;copyTextReceipt(row.returned,value);
+            row.exitRevision=capturedRevision->value;row.exitEpoch=epoch?epoch->load(std::memory_order_acquire):0;
+            row.bindingStable=GetCurrentThreadId()==row.creatorThread&&owner_.thread==row.creatorThread&&owner_.window==capturedWindow&&
+                owner_.framework.Get()==capturedFramework&&owner_.imageDiagnosticWindowGeneration==generation&&
+                owner_.revision.get()==capturedRevision.get()&&!capturedRevision->retired&&!capturedRevision->windowDestroyed&&
+                row.entryRevision==row.exitRevision&&epoch&&owner_.callbackEpoch.get()==epoch.get()&&row.entryEpoch==row.exitEpoch;
+            // Receipts never replace the actual native result or returned value.
+            return result;
+        }
         HRESULT STDMETHODCALLTYPE UpdateProperty(UINT32 id,REFPROPERTYKEY key,const PROPVARIANT* current,PROPVARIANT* value) override {
+            if(value&&owner_.callbacks.textDiagnostics&&
+               (IsEqualPropertyKey(key,UI_PKEY_Label)||IsEqualPropertyKey(key,UI_PKEY_TooltipTitle)))
+                return updateTextDiagnostic(id,key,current,value);
+            const bool large=IsEqualPropertyKey(key,UI_PKEY_LargeImage);
+            const bool imageProperty=large||IsEqualPropertyKey(key,UI_PKEY_SmallImage);
+            NativeImageRequest nativeRequest;
+            if(value&&imageProperty) {
+                if(GetCurrentThreadId()!=owner_.thread){PropVariantInit(value);return RPC_E_WRONG_THREAD;}
+                if(owner_.callbacks.observeImageRequest)++owner_.imageDiagnosticStats.requests;
+                if(owner_.callbacks.observeImageRequest&&owner_.imageObserverDeliveryDepth) {
+                    ++owner_.imageDiagnosticStats.reentrant;++owner_.imageDiagnosticStats.dropped;
+                    PropVariantInit(value);return E_PENDING;
+                }
+                try {const auto admitted=owner_.beginNativeImageRequest(id,large,nativeRequest);
+                    if(FAILED(admitted)){if(owner_.callbacks.observeImageRequest)++owner_.imageDiagnosticStats.dropped;PropVariantInit(value);return admitted;}}
+                catch(const std::bad_alloc&){if(owner_.callbacks.observeImageRequest)++owner_.imageDiagnosticStats.dropped;PropVariantInit(value);return E_OUTOFMEMORY;}
+            }
+            if(!value||!imageProperty||!owner_.callbacks.observeImageRequest)
+                return updateProperty(id,key,current,value,nativeRequest);
+            // First physical-current reservation above makes no external
+            // calls. Creator admission still precedes diagnostic counter/depth access.
+            if(GetCurrentThreadId()!=owner_.thread){PropVariantInit(value);return RPC_E_WRONG_THREAD;}
+            // Provider-internal nested callbacks retain the original behavior;
+            // they do not recursively enter the opt-in external observer.
+            if(owner_.imageDiagnosticDepth){++owner_.imageDiagnosticStats.dropped;return updateProperty(id,key,current,value,nativeRequest);}
+            const auto lifetime=owner_.shared_from_this();
+            if(owner_.revision->retired){++owner_.imageDiagnosticStats.dropped;PropVariantInit(value);return changedBinding;}
+            PropertyCallback boundary(owner_);
+            struct DiagnosticDepth {Impl& owner;explicit DiagnosticDepth(Impl& value):owner(value){++owner.imageDiagnosticDepth;}
+                ~DiagnosticDepth(){--owner.imageDiagnosticDepth;}} depth(owner_);
+            const auto capturedWindow=owner_.window;const auto creator=owner_.thread;
+            const auto generation=owner_.imageDiagnosticWindowGeneration;
+            const auto epochState=owner_.callbackEpoch;
+            const std::uint64_t epoch=epochState?epochState->load(std::memory_order_acquire):std::uint64_t{0};
+            const auto currentBinding=[&] {
+                DWORD process=0;
+                return nativeRequest.current(owner_)&&!owner_.revision->retired&&!owner_.revision->windowDestroyed&&owner_.window==capturedWindow&&
+                    owner_.thread==creator&&owner_.imageDiagnosticWindowGeneration==generation&&epochState&&
+                    owner_.callbackEpoch.get()==epochState.get()&&epochState->load(std::memory_order_acquire)==epoch&&
+                    GetWindowThreadProcessId(capturedWindow,&process)==creator&&process==GetCurrentProcessId();
+            };
+            if(!currentBinding()){++owner_.imageDiagnosticStats.dropped;PropVariantInit(value);return changedBinding;}
+            std::shared_ptr<RibbonImageObservationCompletion> completion;
+            try {completion=std::make_shared<RibbonImageObservationCompletion>();}
+            catch(...) {++owner_.imageDiagnosticStats.dropped;return updateProperty(id,key,current,value,nativeRequest);}
+            RibbonImageObservation observed;
+            observed.nativeCommand=id;observed.applicationCommand=owner_.applicationId(id);observed.large=large;
+            observed.currentPresent=current!=nullptr;observed.currentType=current?current->vt:VT_EMPTY;
+            observed.creatorThread=creator;observed.window=capturedWindow;observed.hwndDpi=GetDpiForWindow(capturedWindow);
+            observed.windowGeneration=generation;observed.callbackEpoch=epoch;observed.ordinal=++owner_.imageDiagnosticOrdinal;
+            observed.installedLayout=owner_.layout==RibbonLayout::InstalledWindows10;observed.completion=completion;
+            if(const auto type=owner_.nativeCommandTypes.find(id);type!=owner_.nativeCommandTypes.end())observed.nativeType=type->second;
+            observed.path=owner_.dynamicCommands.contains(id)?RibbonObservedImagePath::DynamicItemMetadata:
+                observed.applicationCommand?RibbonObservedImagePath::CommandMetadata:RibbonObservedImagePath::Unmapped;
+            ComPtr<IUIImage> currentImage,returnedImage;
+            const auto beforeRetain=owner_.revision->value;
+            observed.currentImageQuery=current&&current->vt==VT_UNKNOWN&&current->punkVal?
+                current->punkVal->QueryInterface(IID_PPV_ARGS(&currentImage)):E_NOINTERFACE;
+            // QI/AddRef and observer code are external calls. The original Impl
+            // is retained, and its binding is fenced on each side of retention.
+            if(!currentBinding()||owner_.revision->value!=beforeRetain) {
+                ++owner_.imageDiagnosticStats.dropped;PropVariantInit(value);completion->result=changedBinding;return changedBinding;
+            }
+            const auto result=updateProperty(id,key,current,value,nativeRequest,&observed.path);
+            observed.nativeFirstObservation=nativeRequest.eligible&&nativeRequest.first;
+            observed.nativeImageCached=nativeRequest.eligible&&owner_.nativeImages.contains(nativeRequest.key);
+            observed.nativeFirstAdmissionFailed=owner_.nativeImageCapturePoisoned;
+            observed.normalUpdateResult=result;observed.returnedType=value->vt;
+            if(!currentBinding()) {++owner_.imageDiagnosticStats.dropped;PropVariantClear(value);PropVariantInit(value);completion->result=changedBinding;return changedBinding;}
+            const auto beforeOutputRetain=owner_.revision->value;
+            observed.returnedImageQuery=value->vt==VT_UNKNOWN&&value->punkVal?
+                value->punkVal->QueryInterface(IID_PPV_ARGS(&returnedImage)):E_NOINTERFACE;
+            if(!currentBinding()||owner_.revision->value!=beforeOutputRetain) {
+                ++owner_.imageDiagnosticStats.dropped;PropVariantClear(value);PropVariantInit(value);completion->result=changedBinding;return changedBinding;
+            }
+            observed.currentImage=currentImage.Get();observed.returnedImage=returnedImage.Get();
+            const auto beforeObserver=owner_.revision->value;
+            {
+                struct DeliveryDepth {Impl& owner;explicit DeliveryDepth(Impl& value):owner(value){++owner.imageObserverDeliveryDepth;}
+                    ~DeliveryDepth(){--owner.imageObserverDeliveryDepth;}} delivery(owner_);
+                ++owner_.imageDiagnosticStats.delivered;
+                try {owner_.callbacks.observeImageRequest(observed);}catch(...){completion->observerThrew=true;}
+            }
+            // Release diagnostic-owned temporaries before the final fence.
+            // The fixture has retained any interfaces it needs for after-return
+            // reads; output ownership is still in the real PROPVARIANT.
+            currentImage.Reset();returnedImage.Reset();
+            if(!currentBinding()||owner_.revision->value!=beforeObserver||GetDpiForWindow(capturedWindow)!=observed.hwndDpi) {
+                PropVariantClear(value);PropVariantInit(value);completion->result=changedBinding;return changedBinding;
+            }
+            completion->bindingStable=true;completion->result=result;
+            return result;
+        }
+        HRESULT updateProperty(UINT32 id,REFPROPERTYKEY key,const PROPVARIANT* current,PROPVARIANT* value,const NativeImageRequest& nativeRequest,RibbonObservedImagePath* imagePath=nullptr) {
             if(!value)return E_POINTER;
             PropVariantInit(value);
+            const auto lifetime=owner_.shared_from_this();if(owner_.revision->retired)return changedBinding;
             PropertyCallback callback(owner_);
             try {
                 const auto originalId=id;
@@ -816,6 +1472,7 @@ struct NativeRibbon::Impl {
                     const auto& item=dynamic->second.item;
                     if(IsEqualPropertyKey(key,UI_PKEY_Enabled)) {
                         const auto parent=owner_.callbacks.query?owner_.callbacks.query(dynamic->second.parent):RibbonCommandState{};
+                        if(owner_.revision->retired)return changedBinding;
                         return InitPropVariantFromBoolean(parent.enabled&&item.enabled,value);
                     }
                     if(IsEqualPropertyKey(key,UI_PKEY_BooleanValue))return InitPropVariantFromBoolean(item.checked,value);
@@ -825,12 +1482,6 @@ struct NativeRibbon::Impl {
                         ComPtr<IUIImage> image;const auto hr=owner_.imageSpec(item.image,IsEqualPropertyKey(key,UI_PKEY_LargeImage),image);
                         return SUCCEEDED(hr)?UIInitPropertyFromImage(key,image.Get(),value):hr;
                     }
-                    if(IsEqualPropertyKey(key,UI_PKEY_ItemsSource)&&!item.children.empty()) {
-                        if(!current||current->vt!=VT_UNKNOWN||!current->punkVal)return E_INVALIDARG;
-                        ComPtr<IUICollection> collection;const auto hr=current->punkVal->QueryInterface(IID_PPV_ARGS(&collection));
-                        return SUCCEEDED(hr)?owner_.replaceCollection(dynamic->second.parent,originalId,UI_COMMANDTYPE_COMMANDCOLLECTION,item.children,collection.Get()):hr;
-                    }
-                    if(IsEqualPropertyKey(key,UI_PKEY_Categories))return owner_.replaceCategories(item.children,current);
                     return E_NOTIMPL;
                 }
                 id=owner_.applicationId(id);
@@ -846,6 +1497,7 @@ struct NativeRibbon::Impl {
                 const auto type=owner_.commandTypes.find(id);
                 const bool action=type!=owner_.commandTypes.end() && type->second!=UI_COMMANDTYPE_GROUP && type->second!=UI_COMMANDTYPE_CONTEXT;
                 const auto state=action&&owner_.callbacks.query?owner_.callbacks.query(id):RibbonCommandState{};
+                if(owner_.revision->retired)return changedBinding;
                 if(IsEqualPropertyKey(key,UI_PKEY_Enabled))return InitPropVariantFromBoolean(state.enabled,value);
                 if(IsEqualPropertyKey(key,UI_PKEY_BooleanValue))return InitPropVariantFromBoolean(state.checked,value);
                 if(IsEqualPropertyKey(key,UI_PKEY_SelectedItem)) {
@@ -895,33 +1547,44 @@ struct NativeRibbon::Impl {
                     return found!=owner_.metadata.end()&&!found->second.description.empty()?InitPropVariantFromString(found->second.description.c_str(),value):E_NOTIMPL;
                 }
                 if(IsEqualPropertyKey(key,UI_PKEY_SmallImage)||IsEqualPropertyKey(key,UI_PKEY_LargeImage)){
+                    const auto native=owner_.nativeImageProperty(nativeRequest,id,current,value,imagePath);
+                    if(native!=S_FALSE)return native;
                     ComPtr<IUIImage> image;
                     const auto hr=owner_.image(id,IsEqualPropertyKey(key,UI_PKEY_LargeImage),image);
-                    return SUCCEEDED(hr)?UIInitPropertyFromImage(key,image.Get(),value):hr;
+                    const auto result=SUCCEEDED(hr)?UIInitPropertyFromImage(key,image.Get(),value):hr;
+                    image.Reset();
+                    if(!nativeRequest.current(owner_)){PropVariantClear(value);PropVariantInit(value);return changedBinding;}
+                    return result;
                 }
                 if(IsEqualPropertyKey(key,UI_PKEY_Categories)&&owner_.layout==RibbonLayout::InstalledWindows10) {
                     const auto items=owner_.callbacks.items?owner_.callbacks.items(id):std::vector<RibbonItem>{};
+                    if(owner_.revision->retired)return changedBinding;
                     return owner_.replaceCategories(items,current);
                 }
                 if(IsEqualPropertyKey(key,UI_PKEY_ItemsSource)||IsEqualPropertyKey(key,UI_PKEY_RecentItems)){
                     if(id==RibbonQuickAccess)return S_FALSE;
                     if(id==RibbonFrequentPlaces){
                         const auto items=owner_.callbacks.items?owner_.callbacks.items(id):std::vector<RibbonItem>{};
+                        if(owner_.revision->retired)return changedBinding;
                         if(items.size()>64)return E_INVALIDARG;
                         owner_.recentPins.clear();for(const auto& item:items)owner_.recentPins.push_back(item.pinned);
+                        RecentItemsReceiptScope diagnostic(owner_,RibbonRecentItemsReceiptKind::Source,current);
+                        diagnostic.initial(owner_.recentPins);
+                        if(diagnostic.receipt)diagnostic.receipt->recentItemsKey=IsEqualPropertyKey(key,UI_PKEY_RecentItems);
                         std::vector<ComPtr<IUnknown>> values;
                         for(const auto& item:items){ComPtr<IUISimplePropertySet> properties;properties.Attach(new Item(item,true));ComPtr<IUnknown> unknown;properties.As(&unknown);values.push_back(std::move(unknown));}
                         const auto array=SafeArrayCreateVector(VT_UNKNOWN,0,static_cast<ULONG>(values.size()));
-                        if(!array)return E_OUTOFMEMORY;
-                        for(LONG i=0;i<static_cast<LONG>(values.size());++i){const auto hr=SafeArrayPutElement(array,&i,values[static_cast<std::size_t>(i)].Get());if(FAILED(hr)){SafeArrayDestroy(array);return hr;}}
+                        if(!array)return diagnostic.finish(E_OUTOFMEMORY);
+                        for(LONG i=0;i<static_cast<LONG>(values.size());++i){const auto hr=SafeArrayPutElement(array,&i,values[static_cast<std::size_t>(i)].Get());if(FAILED(hr)){SafeArrayDestroy(array);return diagnostic.finish(hr);}}
                         value->vt=VT_ARRAY|VT_UNKNOWN;value->parray=array;
                         if(IsEqualPropertyKey(key,UI_PKEY_ItemsSource))owner_.requestedCollections.insert(id);
-                        return S_OK;
+                        return diagnostic.finish(S_OK);
                     }
                     if(owner_.layout!=RibbonLayout::InstalledWindows10&&id!=RibbonNewMenu&&id!=RibbonExtractToGallery&&id!=RibbonLayoutGallery && id!=RibbonShareGallery&&id!=RecentSearches&&id!=SearchDateMenu&&id!=SearchKindMenu&&id!=SearchSizeMenu&&id!=RibbonSearchOtherProperties)return E_NOTIMPL;
                     if(!current||current->vt!=VT_UNKNOWN||!current->punkVal)return E_INVALIDARG;
                     ComPtr<IUICollection> collection;auto hr=current->punkVal->QueryInterface(IID_PPV_ARGS(&collection));if(FAILED(hr))return hr;
                     auto items=owner_.collectionItems(id);
+                    if(owner_.revision->retired)return changedBinding;
                     if(items.size()>4096)return E_INVALIDARG;
                     hr=owner_.replaceCollection(id,originalId,type!=owner_.commandTypes.end()?type->second:UI_COMMANDTYPE_COLLECTION,items,collection.Get());
                     // The first provider callback already supplies the current
@@ -932,7 +1595,10 @@ struct NativeRibbon::Impl {
                     return hr;
                 }
                 return E_NOTIMPL;
-            }catch(...){return E_FAIL;}
+            }catch(...){
+                if(!nativeRequest.current(owner_)){PropVariantClear(value);PropVariantInit(value);return changedBinding;}
+                return E_FAIL;
+            }
         }
     private:
         std::atomic<ULONG> references_{1};Impl& owner_;
@@ -951,17 +1617,16 @@ struct NativeRibbon::Impl {
     }
     HRESULT replaceCollection(UINT parent,UINT nativeParent,UI_COMMANDTYPE type,const std::vector<RibbonItem>& items,IUICollection* collection) {
         if(!collection)return E_POINTER;if(items.size()>4096)return E_INVALIDARG;
+        const bool dynamicCollection=type==UI_COMMANDTYPE_COMMANDCOLLECTION&&
+            (layout==RibbonLayout::InstalledWindows10||parent==RibbonExtractToGallery);
         // Clear/Add can notify native listeners. Keep selection and invocation
         // indexes unavailable until the complete replacement has succeeded.
         collectionInvocationIndices[nativeParent].clear();
         auto hr=collection->Clear();if(FAILED(hr))return hr;
         std::vector<UINT> indices;indices.reserve(items.size());
-        if(layout==RibbonLayout::InstalledWindows10) {
-            std::vector<UINT> oldParents{nativeParent};
+        if(dynamicCollection) {
             for(auto entry=dynamicCommands.begin();entry!=dynamicCommands.end();) {
-                // A nested collection owns its descendants by the native parent ID.
-                if(std::find(oldParents.begin(),oldParents.end(),entry->second.nativeParent)==oldParents.end()) {++entry;continue;}
-                oldParents.push_back(entry->first);
+                if(entry->second.nativeParent!=nativeParent) {++entry;continue;}
                 const auto& item=entry->second.item;
                 availableDynamicCommands[item.checkable?UI_COMMANDTYPE_BOOLEAN:UI_COMMANDTYPE_ACTION].push_back(entry->first);
                 entry=dynamicCommands.erase(entry);
@@ -973,24 +1638,22 @@ struct NativeRibbon::Impl {
             ComPtr<IUIImage> picture;
             if(!item.image.empty())imageSpec(item.image,false,picture);
             else if(parent==RibbonLayoutGallery||parent==RibbonShareGallery)image(item.command,false,picture);
-            if(layout==RibbonLayout::InstalledWindows10) {
-                if(type==UI_COMMANDTYPE_COMMANDCOLLECTION) {
-                    // The installed native command galleries use 16-bit IDs.
-                    // Recycle only the same immutable command type after its
-                    // previous collection has been cleared, then invalidate
-                    // every cached property before exposing the replacement.
-                    const auto itemType=item.checkable?UI_COMMANDTYPE_BOOLEAN:UI_COMMANDTYPE_ACTION;
-                    auto& available=availableDynamicCommands[itemType];
-                    UINT id=0;
-                    if(!available.empty()) {id=available.back();available.pop_back();}
-                    else {if(nextDynamicCommand>0xfffe)return HRESULT_FROM_WIN32(ERROR_NO_SYSTEM_RESOURCES);id=nextDynamicCommand++;}
-                    dynamicCommands.insert_or_assign(id,DynamicCommand{parent,item.invocationIndex==UI_COLLECTION_INVALIDINDEX?index:item.invocationIndex,nativeParent,item});
-                    item.command=id;
-                } else {const auto translated=nativeId(item.command);if(translated)item.command=translated;}
-            }
+            if(dynamicCollection) {
+                // Native command galleries use 16-bit IDs in either layout.
+                // Recycle only the same immutable command type after its
+                // previous collection has been cleared, then invalidate
+                // every cached property before exposing the replacement.
+                const auto itemType=item.checkable?UI_COMMANDTYPE_BOOLEAN:UI_COMMANDTYPE_ACTION;
+                auto& available=availableDynamicCommands[itemType];
+                UINT id=0;
+                if(!available.empty()) {id=available.back();available.pop_back();}
+                else {if(nextDynamicCommand>0xfffe)return HRESULT_FROM_WIN32(ERROR_NO_SYSTEM_RESOURCES);id=nextDynamicCommand++;}
+                dynamicCommands.insert_or_assign(id,DynamicCommand{parent,item.invocationIndex==UI_COLLECTION_INVALIDINDEX?index:item.invocationIndex,nativeParent,item});
+                item.command=id;
+            } else if(layout==RibbonLayout::InstalledWindows10) {const auto translated=nativeId(item.command);if(translated)item.command=translated;}
             ComPtr<IUISimplePropertySet> properties;properties.Attach(new Item(std::move(item),false,picture.Get()));
             hr=collection->Add(properties.Get());if(FAILED(hr))return hr;
-            if(layout==RibbonLayout::InstalledWindows10&&type==UI_COMMANDTYPE_COMMANDCOLLECTION) {
+            if(dynamicCollection) {
                 Variant command;ULONG id=0;
                 if(SUCCEEDED(properties->GetValue(UI_PKEY_CommandId,&command.value))&&SUCCEEDED(PropVariantToUInt32(command.value,&id)))
                     requestInvalidation(id,UI_INVALIDATIONS_ALLPROPERTIES,nullptr);
@@ -1008,7 +1671,10 @@ struct NativeRibbon::Impl {
             return requestInvalidation(nativeParent,UI_INVALIDATIONS_VALUE,nullptr);
         return S_OK;
     }
-    HRESULT sameThread()const noexcept {return thread==GetCurrentThreadId()?S_OK:RPC_E_WRONG_THREAD;}
+    HRESULT sameThread()const noexcept {
+        if(thread!=GetCurrentThreadId())return RPC_E_WRONG_THREAD;
+        return imageObserverDeliveryDepth?E_PENDING:S_OK;
+    }
     HRESULT viewStore(ComPtr<IPropertyStore>& store)const {return ribbon?ribbon.As(&store):E_UNEXPECTED;}
     HRESULT setViewValue(REFPROPERTYKEY key,const PROPVARIANT& value){ComPtr<IPropertyStore>store;auto hr=viewStore(store);if(SUCCEEDED(hr))hr=store->SetValue(key,value);if(SUCCEEDED(hr))hr=store->Commit();return hr;}
     HRESULT image(UINT command,bool large,ComPtr<IUIImage>& output){
@@ -1128,15 +1794,24 @@ std::wstring_view ribbonCommandStoreName(UINT command) noexcept {
     return {};
 }
 
-NativeRibbon::NativeRibbon()=default;
-NativeRibbon::~NativeRibbon(){reset();}
+NativeRibbon::NativeRibbon():callbackEpoch_(std::make_shared<std::atomic<std::uint64_t>>(0)){}
+NativeRibbon::~NativeRibbon(){
+    reset();finishOwnerWindowRetirement();
+    // A live deferred raw/native chain cannot outlive its owner storage.
+    // The caller must destroy that original owned HWND on its creator first.
+    if(delayedWindowImpl_){TerminateProcess(GetCurrentProcess(),8);std::_Exit(8);}
+}
 HRESULT NativeRibbon::initialize(HWND window,HINSTANCE instance,RibbonCallbacks callbacks,RibbonLayout layout){
+    ++*callbackEpoch_; // Even a failed/new initialization entry revokes an old shutdown commit.
     if(!IsWindow(window)||!instance)return E_INVALIDARG;
     if(impl_)return HRESULT_FROM_WIN32(ERROR_ALREADY_INITIALIZED);
     APTTYPE apartment{};APTTYPEQUALIFIER qualifier{};auto hr=CoGetApartmentType(&apartment,&qualifier);
     if(FAILED(hr))return hr;if(apartment!=APTTYPE_STA&&apartment!=APTTYPE_MAINSTA)return RPC_E_WRONG_THREAD;
     try {
-        auto impl=std::make_unique<Impl>();impl->window=window;impl->thread=GetCurrentThreadId();impl->callbacks=std::move(callbacks);
+        auto impl=std::make_shared<Impl>();impl->window=window;impl->thread=GetCurrentThreadId();impl->callbacks=std::move(callbacks);
+        hr=impl->apartmentClient.acquire();if(FAILED(hr))return hr;
+        impl->imageDiagnosticWindowGeneration=bindingGeneration_+1;
+        impl->callbackEpoch=callbackEpoch_;impl->recentItemsDiagnostics=recentItemsDiagnostics_;
         impl->englishPresentation=englishPresentationLanguage();
         impl->invalidationMessage=RegisterWindowMessageW(L"WindowsExplorer.NativeRibbon.DeferredInvalidations.v1");
         if(!impl->invalidationMessage)return HRESULT_FROM_WIN32(GetLastError());
@@ -1144,9 +1819,9 @@ HRESULT NativeRibbon::initialize(HWND window,HINSTANCE instance,RibbonCallbacks 
             return HRESULT_FROM_WIN32(GetLastError()?GetLastError():ERROR_NOT_ENOUGH_MEMORY);
         impl->subclassAttached=true;
         if(layout==RibbonLayout::InstalledWindows10) {
-            impl->stockModule=compatibleStockRibbon();
-            impl->stockStatus=impl->stockModule?S_OK:HRESULT_FROM_WIN32(ERROR_REVISION_MISMATCH);
-            if(impl->stockModule)impl->layout=RibbonLayout::InstalledWindows10;
+            impl->stockModule.reset(compatibleStockRibbon());
+            impl->stockStatus=impl->stockModule.get()?S_OK:HRESULT_FROM_WIN32(ERROR_REVISION_MISMATCH);
+            if(impl->stockModule.get())impl->layout=RibbonLayout::InstalledWindows10;
         }
         installedRibbonFeatures(&impl->features);
         if(impl->layout==RibbonLayout::InstalledWindows10)impl->updateTemplateAliases();
@@ -1202,28 +1877,205 @@ HRESULT NativeRibbon::initialize(HWND window,HINSTANCE instance,RibbonCallbacks 
         hr=CoCreateInstance(CLSID_UIRibbonFramework,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&impl->framework));if(FAILED(hr))return hr;
         hr=CoCreateInstance(CLSID_UIRibbonImageFromBitmapFactory,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&impl->images));if(FAILED(hr))return hr;
         hr=impl->framework->Initialize(window,impl->handler.Get());if(FAILED(hr))return hr;
-        hr=impl->framework->LoadUI(impl->stockModule?impl->stockModule:instance,impl->stockModule?L"EXPLORER_RIBBON":L"APPLICATION_RIBBON");
-        if(impl->stockModule)impl->stockStatus=hr;
-        if(FAILED(hr)&&impl->stockModule) {
-            impl->framework->Destroy();impl->framework.Reset();impl->ribbon.Reset();
+        hr=impl->framework->LoadUI(impl->stockModule.get()?impl->stockModule.get():instance,impl->stockModule.get()?L"EXPLORER_RIBBON":L"APPLICATION_RIBBON");
+        if(impl->stockModule.get())impl->stockStatus=hr;
+        const auto codeStatus=impl->apartmentClient.observeLoadedCode();
+        if(FAILED(codeStatus)) {
+            impl->revision->retired=true;
+            const auto disposed=impl->framework->Destroy();
+            if(FAILED(disposed)){TerminateProcess(GetCurrentProcess(),8);std::_Exit(8);}
+            return codeStatus;
+        }
+        if(FAILED(hr)&&impl->stockModule.get()) {
+            // This failed native binding has never been published as impl_.
+            // Block provider/property reentry while external releases dispose
+            // it; do not reuse any partial installed artwork in authored UI.
+            impl->revision->retired=true;
+            const HRESULT disposed=impl->framework->Destroy();
+            if(FAILED(disposed)) {
+                // A failed native Destroy cannot establish callback/resource
+                // retirement. Keep every old owner and the retired guard;
+                // use the same cleanup-failure exit policy as retireImpl.
+                TerminateProcess(GetCurrentProcess(),8);std::_Exit(8);
+            }
+            impl->publicFramework.Reset();impl->ribbon.Reset();impl->framework.Reset();
+            impl->nativeImages.clear();impl->imageCache.clear();impl->itemImageCache.clear();
+            impl->images.Reset();impl->imaging.Reset();
+            impl->observedNativeImages.clear();impl->nativeImageCapturePoisoned=false;
+            impl->observedNativeLabels.clear();impl->observedNativeTooltips.clear();
+            impl->nativeLabels.clear();impl->nativeTooltips.clear();
             impl->deferredInvalidations.clear();impl->requestedCollections.clear();impl->dynamicCommands.clear();
             impl->collectionReads.clear();impl->collectionInvocationIndices.clear();impl->recentPins.clear();
             impl->availableDynamicCommands.clear();impl->nextDynamicCommand=0x9000;
-            FreeLibrary(impl->stockModule);impl->stockModule=nullptr;impl->layout=RibbonLayout::Authored;
+            impl->stockModule.reset();impl->layout=RibbonLayout::Authored;
             impl->commandTypes.clear();impl->nativeCommandTypes.clear();
             hr=CoCreateInstance(CLSID_UIRibbonFramework,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&impl->framework));
-            if(SUCCEEDED(hr))hr=impl->framework->Initialize(window,impl->handler.Get());
+            if(SUCCEEDED(hr))hr=CoCreateInstance(CLSID_UIRibbonImageFromBitmapFactory,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&impl->images));
+            if(SUCCEEDED(hr)){impl->revision->retired=false;hr=impl->framework->Initialize(window,impl->handler.Get());}
             if(SUCCEEDED(hr))hr=impl->framework->LoadUI(instance,L"APPLICATION_RIBBON");
         }
-        if(FAILED(hr)){impl->framework->Destroy();return hr;}
-        if(impl->layout==RibbonLayout::InstalledWindows10)impl->publicFramework.Attach(new StockFramework(impl->framework.Get(),impl->translation));
-        impl_=std::move(impl);
+        if(FAILED(hr)){if(impl->framework)impl->framework->Destroy();return hr;}
+        if(impl->layout==RibbonLayout::InstalledWindows10)impl->publicFramework.Attach(new StockFramework(impl->framework.Get(),impl->translation,impl->revision));
+        impl_=std::move(impl);++bindingGeneration_;
         hr=setComputerMode(false);if(FAILED(hr)){reset();return hr;}
         hr=setContexts(RibbonContext::None);if(FAILED(hr)){reset();return hr;}
         return S_OK;
     }catch(...){return E_OUTOFMEMORY;}
 }
-void NativeRibbon::reset()noexcept{if(!impl_)return;impl_->detachSubclass();impl_->deferredInvalidations.clear();if(impl_->framework)impl_->framework->Destroy();impl_->ribbon.Reset();impl_->framework.Reset();impl_->handler.Reset();impl_.reset();}
+void NativeRibbon::reset()noexcept{resetImpl(nullptr);}
+LRESULT NativeRibbon::dispatchCloseWithFinalPinCallback(const std::function<HRESULT(UINT,bool)>& callback,
+    const std::function<LRESULT()>& continuation) {
+    if(!continuation)return 0;
+    const auto lifetime=impl_;
+    if(!lifetime||GetCurrentThreadId()!=lifetime->thread||lifetime->revision->retired||lifetime->shutdownMessageActive)
+        return continuation();
+    struct Scope {
+        NativeRibbon& ribbon;Impl& owner;
+        ~Scope(){owner.shutdownMessageActive=false;owner.shutdownRecentItems=false;
+            owner.shutdownRecentItemsFramework=nullptr;owner.shutdownPinItem={};owner.shutdownRecentPins.clear();
+            if(ribbon.closingImpl_.get()==&owner)ribbon.closingImpl_.reset();}
+    } scope{*this,*lifetime};
+    closingImpl_=lifetime;
+    lifetime->shutdownRecentItemsEpoch=callbackEpoch_->load();
+    lifetime->shutdownRecentItemsFramework=lifetime->framework.Get();
+    lifetime->shutdownRecentItemsStarted=false;lifetime->shutdownMessageActive=true;lifetime->shutdownRecentItems=true;
+    lifetime->shutdownRecentPins=lifetime->recentPins;lifetime->shutdownPinItem=callback;
+    if(!lifetime->shutdownRecentItemsCurrent())lifetime->shutdownRecentItems=false;
+    return continuation();
+}
+HRESULT NativeRibbon::setOwnerWindowRetirementHook(HWND window,const std::function<bool()>& callback) {
+    if(!impl_||impl_->revision->retired||impl_->window!=window||!callback)return E_INVALIDARG;
+    if(GetCurrentThreadId()!=impl_->thread)return RPC_E_WRONG_THREAD;
+    if(ownerHookRegistered_)return HRESULT_FROM_WIN32(ERROR_ALREADY_INITIALIZED);
+    try{impl_->ownerWindowRetirementHook=callback;ownerHookRegistered_=true;return S_OK;}catch(...){return E_OUTOFMEMORY;}
+}
+void NativeRibbon::finishOwnerWindowRetirement() noexcept {
+    if(deferredRetirementDrainActive_)return;
+    struct Drain {bool& active;explicit Drain(bool& value):active(value){active=true;}~Drain(){active=false;}} drain{deferredRetirementDrainActive_};
+    const auto original=delayedWindowImpl_;
+    if(!original||GetCurrentThreadId()!=original->thread||original->shutdownMessageActive||
+       (!original->revision->windowDestroyed&&IsWindow(original->window)))return;
+    // Admit the actual original's death irreversibly before any provider call.
+    // Destroy/AddRef can pump reuse of this numeric HWND; generic teardown's
+    // temporary pin fields must never restore that dead window's authority.
+    original->revision->windowDestroyed=true;
+    // There is one registered original App binding. Its strong local escrow
+    // spans all provider calls; there is no mutable list/cursor across pumps.
+    // This runs after the complete original window/close continuation returns.
+    // Never query, reset or overwrite a newer published native framework.
+    delayedWindowImpl_.reset();original->nativeRetirementDeferred=false;original->ownerWindowRetirementHook={};
+    retireImpl(original,nullptr,callbackEpoch_->load(),false);
+}
+bool NativeRibbon::closeDispatchActive()const noexcept{return closingImpl_&&closingImpl_->shutdownMessageActive;}
+std::uint64_t NativeRibbon::callbackEntryEpoch()const noexcept{return callbackEpoch_->load();}
+HRESULT NativeRibbon::enableRecentItemsDiagnostics(){
+    if(!impl_)return E_UNEXPECTED;if(GetCurrentThreadId()!=impl_->thread)return RPC_E_WRONG_THREAD;
+    try{recentItemsDiagnostics_=std::make_shared<RibbonRecentItemsDiagnostics>();
+        impl_->recentItemsDiagnostics=recentItemsDiagnostics_;return S_OK;}catch(...){return E_OUTOFMEMORY;}
+}
+void NativeRibbon::recentItemsDiagnostics(RibbonRecentItemsDiagnostics& output)const noexcept{
+    output=recentItemsDiagnostics_?*recentItemsDiagnostics_:RibbonRecentItemsDiagnostics{};
+}
+void NativeRibbon::resetImpl(const std::function<HRESULT(UINT,bool)>* finalPinCallback)noexcept{
+    // Only an explicitly supplied original final callback, outside a batch,
+    // can carry the same message capture through its one expected retirement.
+    const bool continueMessage=impl_&&finalPinCallback&&impl_->shutdownMessageActive&&
+        !impl_->shutdownRecentItemsDispatching&&!impl_->revision->retired&&impl_->shutdownRecentItemsCurrent();
+    const auto epoch=++*callbackEpoch_; // Nested reset without an Impl still revokes the old transaction.
+    if(!impl_)return;
+    auto retired=std::move(impl_);++bindingGeneration_;
+    retireImpl(std::move(retired),finalPinCallback,epoch,continueMessage);
+}
+void NativeRibbon::resetClosingFramework()noexcept{resetClosingImpl(nullptr);}
+void NativeRibbon::resetClosingFrameworkWithFinalPinCallback(const std::function<HRESULT(UINT,bool)>& callback)noexcept{resetClosingImpl(&callback);}
+void NativeRibbon::resetClosingImpl(const std::function<HRESULT(UINT,bool)>* finalPinCallback)noexcept{
+    const auto original=closingImpl_;
+    if(!original){resetImpl(finalPinCallback);return;}
+    const bool continueMessage=finalPinCallback&&original->shutdownMessageActive&&
+        !original->shutdownRecentItemsDispatching&&!original->revision->retired&&original->shutdownRecentItemsCurrent();
+    const auto epoch=++*callbackEpoch_;
+    if(impl_.get()==original.get()){impl_.reset();++bindingGeneration_;}
+    // In particular, never move/reset a newer different published Impl here.
+    retireImpl(original,finalPinCallback,epoch,continueMessage);
+}
+void NativeRibbon::retireImpl(std::shared_ptr<Impl> retired,const std::function<HRESULT(UINT,bool)>* finalPinCallback,
+    std::uint64_t epoch,bool continueMessage)noexcept{
+    if(!retired||!retired->framework||retired->nativeDestroyStarted||retired->nativeRetirementDeferred)return;
+    Impl::RecentItemsReceiptScope diagnostic(*retired,RibbonRecentItemsReceiptKind::Reset);
+    diagnostic.initial(retired->recentPins);
+    if(diagnostic.receipt)diagnostic.receipt->finalOverride=finalPinCallback!=nullptr;
+    // Retire before any native callback: old QAT/state/commands stay blocked.
+    // Retain only a stack-scoped exception for the original RecentItems commit.
+    ++retired->revision->value;retired->revision->retired=true;
+    retired->deferredInvalidations.clear();
+    // A real original RecentItems callback can reset while its saved native
+    // WM_CLOSE procedure is still on the stack. Retire pin/command authority
+    // now, but keep that original framework's physical UI and interfaces until
+    // the complete owned close returns. COM retention alone cannot preserve
+    // UI resources that IUIFramework::Destroy would synchronously dismantle.
+    if(retired->ownerWindowRetirementHook&&closingImpl_.get()==retired.get()&&
+       retired->shutdownMessageActive&&retired->shutdownRecentItemsDispatching) {
+        if(GetCurrentThreadId()!=retired->thread||
+           (delayedWindowImpl_&&delayedWindowImpl_.get()!=retired.get())) {
+            // One original binding owns the allocation-free escrow. Never
+            // overwrite/release a different still-retained native-chain owner.
+            TerminateProcess(GetCurrentProcess(),8);std::_Exit(8);
+        }
+        retired->shutdownRecentItems=false;retired->nativeRetirementDeferred=true;
+        delayedWindowImpl_=retired;return;
+    }
+    // Ordinary old commands are already retired. Remove the App raw wrapper
+    // before any AddRef/Destroy on its captured lower native chain, including
+    // nested reset/initialize entries that revoked the original pin authority.
+    if(retired->ownerWindowRetirementHook&&!retired->revision->windowDestroyed&&IsWindow(retired->window)) {
+        bool admitted=false;try{admitted=retired->ownerWindowRetirementHook();}catch(...){}
+        if(!admitted) {
+            // Registration admits only one original owned App binding. This
+            // shared_ptr retention allocates nothing and outlives the moved
+            // publication/close stack. Preserve its real lower chain intact.
+            retired->shutdownRecentItems=false;retired->nativeRetirementDeferred=true;
+            delayedWindowImpl_=retired;return;
+        }
+    }
+    retired->ownerWindowRetirementHook={};
+    // Reserve the single Destroy before any external framework AddRef/call.
+    // A nested original-close reset can still revoke epoch, never destroy twice.
+    retired->nativeDestroyStarted=true;
+    const auto framework=retired->framework;
+    {
+        struct ShutdownCommit {
+            Impl& owner;bool preserve;
+            ~ShutdownCommit(){
+                if(preserve)return;
+                owner.shutdownRecentItems=false;owner.shutdownRecentItemsFramework=nullptr;
+                owner.shutdownPinItem={};owner.shutdownRecentPins.clear();
+            }
+        } commit{*retired,continueMessage};
+        if(continueMessage)retired->shutdownRecentItemsEpoch=epoch;
+        else if(retired->shutdownMessageActive)retired->shutdownRecentItems=false;
+        else retired->shutdownRecentItemsEpoch=epoch;
+        retired->shutdownRecentItemsFramework=framework.Get();
+        try {
+            if(!retired->shutdownMessageActive) {
+            retired->shutdownRecentPins=retired->recentPins;retired->shutdownPinItem=finalPinCallback?*finalPinCallback:retired->callbacks.pinItem;
+            retired->shutdownRecentItemsStarted=false;
+            retired->shutdownRecentItems=retired->callbackEpoch&&retired->callbackEpoch->load()==epoch;
+            }
+        }catch(...) {retired->shutdownRecentItems=false;}
+        if(framework){const auto hr=framework->Destroy();diagnostic.finish(hr);
+            retired->nativeDestroyFailed=FAILED(hr);
+            // A failed Destroy leaves actual retained COM handler/hook lifetime
+            // unproven even after HWND destruction. Do not retry or release an
+            // owner that can still be called through that native interface.
+            if(FAILED(hr)){TerminateProcess(GetCurrentProcess(),8);std::_Exit(8);}
+            retired->nativeDestroyCompleted=true;}
+    }
+    // Keep the old unique subclass until Destroy returns so WM_NCDESTROY can
+    // invalidate the original window even when a callback reuses its HWND.
+    // Retirement blocks its invalidations; this ID never detaches a new Impl.
+    retired->detachSubclass();
+    retired->ribbon.Reset();retired->framework.Reset();retired->handler.Reset();
+}
 bool NativeRibbon::valid()const noexcept{return impl_&&impl_->framework&&impl_->ribbon;}
 UINT NativeRibbon::height()const noexcept{return impl_?impl_->height:0;}
 IUIFramework* NativeRibbon::framework()const noexcept{return impl_?(impl_->publicFramework?impl_->publicFramework.Get():impl_->framework.Get()):nullptr;}
@@ -1235,14 +2087,18 @@ HRESULT NativeRibbon::invalidate(UINT command){if(!valid())return E_UNEXPECTED;a
 HRESULT NativeRibbon::invalidateState(UINT command){if(!valid())return E_UNEXPECTED;auto hr=impl_->sameThread();if(FAILED(hr))return hr;const auto id=impl_->nativeId(command);return command&&!id?HRESULT_FROM_WIN32(ERROR_NOT_FOUND):impl_->requestInvalidation(id,UI_INVALIDATIONS_STATE|UI_INVALIDATIONS_VALUE,nullptr);}
 HRESULT NativeRibbon::invalidateItems(UINT command) {
     if(!valid())return E_UNEXPECTED;const auto thread=impl_->sameThread();if(FAILED(thread))return thread;
-    const auto requested=impl_->requestedCollections;
+    const auto lifetime=impl_;const auto framework=lifetime->framework;const auto generation=bindingGeneration_;
+    const auto current=[&]{return impl_.get()==lifetime.get()&&bindingGeneration_==generation&&impl_->framework.Get()==framework.Get();};
+    const auto requested=lifetime->requestedCollections;
     HRESULT result=S_OK;
     for(const auto id:requested)if(!command||command==id) {
-        const auto hr=impl_->requestInvalidation(impl_->nativeId(id),UI_INVALIDATIONS_PROPERTY,&UI_PKEY_ItemsSource);
-        impl_->collectionReads[id].lastInvalidation=hr;
+        const auto hr=lifetime->requestInvalidation(lifetime->nativeId(id),UI_INVALIDATIONS_PROPERTY,&UI_PKEY_ItemsSource);
+        if(!current())return changedBinding;
+        lifetime->collectionReads[id].lastInvalidation=hr;
         if(FAILED(hr)&&SUCCEEDED(result))result=hr;
-        if(impl_->layout==RibbonLayout::InstalledWindows10) {
-            const auto categories=impl_->requestInvalidation(impl_->nativeId(id),UI_INVALIDATIONS_PROPERTY,&UI_PKEY_Categories);
+        if(lifetime->layout==RibbonLayout::InstalledWindows10) {
+            const auto categories=lifetime->requestInvalidation(lifetime->nativeId(id),UI_INVALIDATIONS_PROPERTY,&UI_PKEY_Categories);
+            if(!current())return changedBinding;
             if(FAILED(categories)&&SUCCEEDED(result))result=categories;
         }
     }
@@ -1259,7 +2115,13 @@ HRESULT NativeRibbon::collectionReadback(UINT command,RibbonCollectionReadback& 
         [native](const auto& entry){return entry.command==native;}));
     return S_OK;
 }
-HRESULT NativeRibbon::flush(){if(!valid())return E_UNEXPECTED;auto hr=impl_->sameThread();if(FAILED(hr))return hr;if(impl_->propertyDepth)return E_PENDING;hr=impl_->drainInvalidations();return FAILED(hr)?hr:impl_->framework->FlushPendingInvalidations();}
+HRESULT NativeRibbon::flush(){
+    if(!valid())return E_UNEXPECTED;const auto lifetime=impl_;auto hr=lifetime->sameThread();if(FAILED(hr))return hr;
+    if(lifetime->propertyDepth)return E_PENDING;const auto framework=lifetime->framework;const auto generation=bindingGeneration_;
+    const auto current=[&]{return impl_.get()==lifetime.get()&&bindingGeneration_==generation&&impl_->framework.Get()==framework.Get();};
+    hr=lifetime->drainInvalidations();if(!current())return changedBinding;if(FAILED(hr))return hr;
+    hr=framework->FlushPendingInvalidations();return current()?hr:changedBinding;
+}
 HRESULT NativeRibbon::setContexts(RibbonContext contexts,bool activate){
     if(!valid())return E_UNEXPECTED;auto hr=impl_->sameThread();if(FAILED(hr))return hr;
     const auto flags=static_cast<UINT>(contexts);if(flags&~2047u)return E_INVALIDARG;
@@ -1316,7 +2178,20 @@ HRESULT NativeRibbon::selectTab(UINT tab){
     },reinterpret_cast<LPARAM>(&bar));
     try {return selectTabOnMta(bar?bar:impl_->window,name.c_str());}catch(...){return E_OUTOFMEMORY;}
 }
-HRESULT NativeRibbon::setMinimized(bool minimized){if(!valid())return E_UNEXPECTED;auto hr=impl_->sameThread();if(FAILED(hr))return hr;Variant value;InitPropVariantFromBoolean(minimized,&value.value);return impl_->setViewValue(UI_PKEY_Minimized,value.value);}
+HRESULT NativeRibbon::setViewSetting(REFPROPERTYKEY key,const PROPVARIANT& value) {
+    if(!valid())return E_UNEXPECTED;auto hr=impl_->sameThread();if(hr!=S_OK)return hr;
+    const auto lifetime=impl_;auto* const original=lifetime.get();const auto framework=original->framework;const auto ribbon=original->ribbon;
+    const auto generation=bindingGeneration_;const auto window=original->window;const auto thread=original->thread;
+    RibbonMutation mutation(original->revision);const auto revision=mutation.revision->value;
+    const auto current=[&]{DWORD process=0;return impl_.get()==original&&bindingGeneration_==generation&&
+        impl_->framework.Get()==framework.Get()&&mutation.revision->value==revision&&!mutation.revision->windowDestroyed&&
+        IsWindow(window)&&GetWindowThreadProcessId(window,&process)==thread&&process==GetCurrentProcessId();};
+    ComPtr<IPropertyStore> store;hr=ribbon.As(&store);if(!current())return changedBinding;
+    if(hr!=S_OK||!store)return FAILED(hr)?hr:E_UNEXPECTED;
+    hr=store->SetValue(key,value);if(!current())return changedBinding;if(hr!=S_OK)return FAILED(hr)?hr:E_UNEXPECTED;
+    hr=store->Commit();if(!current())return changedBinding;return hr;
+}
+HRESULT NativeRibbon::setMinimized(bool minimized){Variant value;InitPropVariantFromBoolean(minimized,&value.value);return setViewSetting(UI_PKEY_Minimized,value.value);}
 HRESULT NativeRibbon::expandSearchDateMenu(std::span<const std::wstring> expectedRows,UINT& matchedRows,
                                          NativePopupCapture* popup) {
     matchedRows=0;if(!valid())return E_UNEXPECTED;
@@ -1356,8 +2231,170 @@ HRESULT NativeRibbon::expandSearchDateMenu(std::span<const std::wstring> expecte
     }catch(...){if(popup)popup->executionAttempts=impl_->menuExpansionExecutionAttempts;return E_OUTOFMEMORY;}
 }
 HRESULT NativeRibbon::minimized(bool& output)const{if(!valid())return E_UNEXPECTED;auto hr=impl_->sameThread();if(FAILED(hr))return hr;ComPtr<IPropertyStore>store;hr=impl_->viewStore(store);if(FAILED(hr))return hr;Variant value;hr=store->GetValue(UI_PKEY_Minimized,&value.value);if(FAILED(hr))return hr;BOOL flag=FALSE;hr=PropVariantToBoolean(value.value,&flag);if(SUCCEEDED(hr))output=flag!=FALSE;return hr;}
-HRESULT NativeRibbon::setQuickAccessBelow(bool below){if(!valid())return E_UNEXPECTED;auto hr=impl_->sameThread();if(FAILED(hr))return hr;Variant value;InitPropVariantFromUInt32(below?UI_CONTROLDOCK_BOTTOM:UI_CONTROLDOCK_TOP,&value.value);return impl_->setViewValue(UI_PKEY_QuickAccessToolbarDock,value.value);}
+HRESULT NativeRibbon::setQuickAccessBelow(bool below){Variant value;InitPropVariantFromUInt32(below?UI_CONTROLDOCK_BOTTOM:UI_CONTROLDOCK_TOP,&value.value);return setViewSetting(UI_PKEY_QuickAccessToolbarDock,value.value);}
 HRESULT NativeRibbon::quickAccessBelow(bool& output)const{if(!valid())return E_UNEXPECTED;auto hr=impl_->sameThread();if(FAILED(hr))return hr;ComPtr<IPropertyStore>store;hr=impl_->viewStore(store);if(FAILED(hr))return hr;Variant value;hr=store->GetValue(UI_PKEY_QuickAccessToolbarDock,&value.value);ULONG dock=0;if(SUCCEEDED(hr))hr=PropVariantToUInt32(value.value,&dock);if(SUCCEEDED(hr))output=dock==UI_CONTROLDOCK_BOTTOM;return hr;}
+HRESULT NativeRibbon::quickAccessSnapshot(RibbonQuickAccessSnapshot& output) const {
+    if(!valid())return E_UNEXPECTED;
+    auto hr=impl_->sameThread();if(FAILED(hr))return hr;
+    try {
+        const auto lifetime=impl_;auto* const original=lifetime.get();const auto framework=original->framework;const auto ribbon=original->ribbon;
+        const auto generation=bindingGeneration_,revision=original->revision->value;
+        const auto revisionState=original->revision;const auto window=original->window;const auto thread=original->thread;
+        const auto nativeQuickAccess=original->nativeId(RibbonQuickAccess);
+        const auto current=[&]{DWORD process=0;return impl_.get()==original&&bindingGeneration_==generation&&
+            impl_->framework.Get()==framework.Get()&&revisionState->value==revision&&!revisionState->windowDestroyed&&
+            IsWindow(window)&&GetWindowThreadProcessId(window,&process)==thread&&process==GetCurrentProcessId();};
+        RibbonQuickAccessSnapshot captured;captured.impl_=std::make_unique<RibbonQuickAccessSnapshot::Impl>();
+        auto& snapshot=*captured.impl_;
+        snapshot.owner=this;snapshot.ribbonState=original;snapshot.thread=thread;snapshot.window=window;
+        snapshot.generation=generation;snapshot.revision=revision;snapshot.framework=framework;snapshot.nativeQuickAccess=nativeQuickAccess;
+        if(!current())return HRESULT_FROM_WIN32(ERROR_RETRY);
+        Variant source;hr=framework->GetUICommandProperty(nativeQuickAccess,UI_PKEY_ItemsSource,&source.value);
+        if(!current())return changedBinding;
+        if(hr!=S_OK||source.value.vt!=VT_UNKNOWN||!source.value.punkVal)return FAILED(hr)?hr:E_UNEXPECTED;
+        hr=source.value.punkVal->QueryInterface(IID_PPV_ARGS(&snapshot.collection));
+        if(!current())return HRESULT_FROM_WIN32(ERROR_RETRY);
+        if(hr!=S_OK||!snapshot.collection)return FAILED(hr)?hr:E_UNEXPECTED;
+        hr=snapshot.collection.As(&snapshot.collectionIdentity);
+        if(!current())return HRESULT_FROM_WIN32(ERROR_RETRY);
+        if(hr!=S_OK||!snapshot.collectionIdentity)return FAILED(hr)?hr:E_UNEXPECTED;
+        hr=ribbon.As(&snapshot.viewProperties);
+        if(!current())return HRESULT_FROM_WIN32(ERROR_RETRY);
+        if(hr!=S_OK||!snapshot.viewProperties)return FAILED(hr)?hr:E_UNEXPECTED;
+        hr=ribbon.As(&snapshot.viewIdentity);if(!current())return changedBinding;
+        if(hr!=S_OK||!snapshot.viewIdentity)return FAILED(hr)?hr:E_UNEXPECTED;
+        Variant dock;hr=snapshot.viewProperties->GetValue(UI_PKEY_QuickAccessToolbarDock,&dock.value);
+        if(!current())return HRESULT_FROM_WIN32(ERROR_RETRY);
+        if(hr!=S_OK)return FAILED(hr)?hr:E_UNEXPECTED;
+        hr=PropVariantToUInt32(dock.value,&snapshot.dock);
+        if(hr!=S_OK)return FAILED(hr)?hr:E_UNEXPECTED;
+        if(snapshot.dock!=UI_CONTROLDOCK_TOP&&snapshot.dock!=UI_CONTROLDOCK_BOTTOM)return E_UNEXPECTED;
+        Variant minimizedValue;hr=snapshot.viewProperties->GetValue(UI_PKEY_Minimized,&minimizedValue.value);
+        if(!current())return changedBinding;
+        if(hr!=S_OK)return FAILED(hr)?hr:E_UNEXPECTED;
+        BOOL minimized=FALSE;hr=PropVariantToBoolean(minimizedValue.value,&minimized);
+        if(hr!=S_OK)return FAILED(hr)?hr:E_UNEXPECTED;snapshot.minimized=minimized!=FALSE;
+        UINT count=0;hr=snapshot.collection->GetCount(&count);
+        if(!current())return HRESULT_FROM_WIN32(ERROR_RETRY);
+        if(hr!=S_OK)return FAILED(hr)?hr:E_UNEXPECTED;
+        // The public native QAT supports at most20 commands. Do not truncate.
+        // https://learn.microsoft.com/windows/win32/windowsribbon/windowsribbon-controls-quickaccesstoolbar
+        if(count>20)return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+        snapshot.rows.reserve(count);snapshot.identities.reserve(count);snapshot.items.reserve(count);snapshot.properties.reserve(count);
+        for(UINT index=0;index<count;++index) {
+            if(!current())return HRESULT_FROM_WIN32(ERROR_RETRY);
+            ComPtr<IUnknown> row,identity;hr=snapshot.collection->GetItem(index,&row);
+            if(!current())return HRESULT_FROM_WIN32(ERROR_RETRY);
+            if(hr!=S_OK||!row)return FAILED(hr)?hr:E_UNEXPECTED;
+            hr=row.As(&identity);
+            if(!current())return HRESULT_FROM_WIN32(ERROR_RETRY);
+            if(hr!=S_OK||!identity)return FAILED(hr)?hr:E_UNEXPECTED;
+            RibbonQuickAccessItem item;item.commandRead=RibbonQuickAccessSnapshot::Impl::readCommand(row.Get(),item.nativeCommand);
+            if(!current())return HRESULT_FROM_WIN32(ERROR_RETRY);
+            if(item.commandRead==S_OK)item.command=original->applicationId(item.nativeCommand);
+            RibbonQuickAccessSnapshot::Impl::Properties properties;
+            hr=RibbonQuickAccessSnapshot::Impl::readProperties(row.Get(),properties,current);if(hr!=S_OK)return hr;
+            snapshot.properties.push_back(std::move(properties));
+            snapshot.rows.push_back(std::move(row));snapshot.identities.push_back(std::move(identity));snapshot.items.push_back(item);
+        }
+        hr=snapshot.matches(snapshot.identities,current);if(hr!=S_OK)return hr;
+        output=std::move(captured);return S_OK;
+    } catch(const std::bad_alloc&) {return E_OUTOFMEMORY;}
+}
+
+HRESULT NativeRibbon::editQuickAccess(const RibbonQuickAccessSnapshot& captured,const RibbonQuickAccessEdit& edit) {
+    if(!valid()||!captured.impl_)return E_UNEXPECTED;
+    const auto& snapshot=*captured.impl_;
+    if(snapshot.thread!=GetCurrentThreadId())return RPC_E_WRONG_THREAD;
+    if(snapshot.owner!=this)return E_INVALIDARG;
+    auto hr=impl_->sameThread();if(FAILED(hr))return hr;
+    const auto lifetime=impl_;auto* const original=lifetime.get();
+    auto revision=original->revision->value;const auto revisionState=original->revision;
+    const auto current=[&]{return impl_.get()==original&&snapshot.ribbonState==original&&
+        bindingGeneration_==snapshot.generation&&impl_->framework.Get()==snapshot.framework.Get()&&
+        revisionState->value==revision&&!revisionState->windowDestroyed&&IsWindow(snapshot.window)&&
+        GetWindowThreadProcessId(snapshot.window,nullptr)==snapshot.thread;};
+    if(!current()||revision!=snapshot.revision)return HRESULT_FROM_WIN32(ERROR_RETRY);
+    try {
+        ComPtr<IUICollection> collection;ComPtr<IUnknown> identity;
+        hr=original->quickCollection(collection);
+        if(!current())return HRESULT_FROM_WIN32(ERROR_RETRY);
+        if(hr!=S_OK||!collection)return FAILED(hr)?hr:E_UNEXPECTED;
+        hr=collection.As(&identity);
+        if(!current())return HRESULT_FROM_WIN32(ERROR_RETRY);
+        if(hr!=S_OK||!identity)return FAILED(hr)?hr:E_UNEXPECTED;
+        if(identity.Get()!=snapshot.collectionIdentity.Get())return HRESULT_FROM_WIN32(ERROR_RETRY);
+        hr=snapshot.matches(snapshot.identities,current);if(hr!=S_OK)return hr;
+        const auto count=static_cast<UINT>(snapshot.rows.size());
+        auto expected=snapshot.identities;
+        if(!current())return HRESULT_FROM_WIN32(ERROR_RETRY);
+        if(edit.kind==RibbonQuickAccessEditKind::Add) {
+            if(!edit.command||edit.index||edit.destination)return E_INVALIDARG;
+            // An unavailable binding cannot prove that the desired command
+            // is absent. Preserve opaque rows; do not manufacture a duplicate.
+            if(std::any_of(snapshot.items.begin(),snapshot.items.end(),[](const auto& item){
+                return item.commandRead!=S_OK;}))return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+            const auto command=original->nativeId(edit.command);
+            if(!command)return E_INVALIDARG;
+            const auto declared=std::find_if(std::begin(compiledLabels),std::end(compiledLabels),
+                [&](const auto& label){return label.command==edit.command;});
+            const auto type=original->commandTypes.find(edit.command);
+            if(declared==std::end(compiledLabels)||edit.command==FileMenu||edit.command==RibbonQuickAccess||
+               edit.command==RibbonFrequentPlaces||(edit.command>=1500&&edit.command<2000)||
+               (edit.command>=RibbonHomeTab&&edit.command<=RibbonShortcutTab)||
+               (edit.command>=RibbonPictureContext&&edit.command<=RibbonShortcutContext)||
+               (type!=original->commandTypes.end()&&(type->second==UI_COMMANDTYPE_GROUP||type->second==UI_COMMANDTYPE_CONTEXT)))return E_INVALIDARG;
+            if(std::any_of(snapshot.items.begin(),snapshot.items.end(),[&](const auto& item){
+                return item.commandRead==S_OK&&item.nativeCommand==command;}))return S_FALSE;
+            if(count>=20)return HRESULT_FROM_WIN32(ERROR_TOO_MANY_CMDS);
+            ComPtr<IUISimplePropertySet> properties;properties.Attach(new Item({command,{},false}));
+            ComPtr<IUnknown> row;hr=properties.As(&row);if(hr!=S_OK)return FAILED(hr)?hr:E_UNEXPECTED;
+            expected.push_back(row);
+            hr=snapshot.matches(snapshot.identities,current);if(hr!=S_OK)return hr;
+            RibbonMutation mutation(revisionState);revision=revisionState->value;
+            hr=collection->Add(row.Get());
+            if(!current())return HRESULT_FROM_WIN32(ERROR_RETRY);
+            if(hr!=S_OK)return FAILED(hr)?hr:E_UNEXPECTED;
+            return snapshot.matches(expected,current,command);
+        }
+        if(edit.command||edit.index>=count||snapshot.items[edit.index].commandRead!=S_OK||
+           !snapshot.items[edit.index].command)return E_INVALIDARG;
+        if(edit.kind==RibbonQuickAccessEditKind::Remove) {
+            if(edit.destination)return E_INVALIDARG;
+            expected.erase(expected.begin()+edit.index);
+            hr=snapshot.matches(snapshot.identities,current);if(hr!=S_OK)return hr;
+            RibbonMutation mutation(revisionState);revision=revisionState->value;
+            hr=collection->RemoveAt(edit.index);
+            if(!current())return HRESULT_FROM_WIN32(ERROR_RETRY);
+            if(hr!=S_OK)return FAILED(hr)?hr:E_UNEXPECTED;
+            return snapshot.matches(expected,current);
+        }
+        if(edit.kind!=RibbonQuickAccessEditKind::Move||edit.destination>=count)return E_INVALIDARG;
+        if(edit.index==edit.destination)return S_FALSE;
+        const auto moved=snapshot.rows[edit.index];const auto movedIdentity=expected[edit.index];
+        expected.erase(expected.begin()+edit.index);
+        // Allocate both expected lists before any mutation. A local allocation
+        // failure must leave the complete original native collection intact.
+        auto reordered=expected;reordered.insert(reordered.begin()+edit.destination,movedIdentity);
+        hr=snapshot.matches(snapshot.identities,current);if(hr!=S_OK)return hr;
+        RibbonMutation mutation(revisionState);revision=revisionState->value;
+        hr=collection->RemoveAt(edit.index);
+        if(!current())return HRESULT_FROM_WIN32(ERROR_RETRY);
+        if(hr!=S_OK)return FAILED(hr)?hr:E_UNEXPECTED;
+        hr=snapshot.matches(expected,current);if(hr!=S_OK)return hr;
+        hr=collection->Insert(edit.destination,moved.Get());
+        if(!current())return HRESULT_FROM_WIN32(ERROR_RETRY);
+        if(hr==S_OK)return snapshot.matches(reordered,current);
+        const auto operation=FAILED(hr)?hr:E_UNEXPECTED;
+        const auto rollbackReady=snapshot.matches(expected,current);
+        if(rollbackReady!=S_OK)return rollbackReady;
+        const auto rollback=collection->Insert(edit.index,moved.Get());
+        if(!current())return HRESULT_FROM_WIN32(ERROR_RETRY);
+        if(rollback!=S_OK)return FAILED(rollback)?rollback:E_UNEXPECTED;
+        const auto restored=snapshot.matches(snapshot.identities,current);
+        return restored==S_OK?operation:restored;
+    } catch(const std::bad_alloc&) {return E_OUTOFMEMORY;}
+}
 HRESULT NativeRibbon::quickAccessCommands(std::vector<UINT>& output)const{
     if(!valid())return E_UNEXPECTED;auto hr=impl_->sameThread();if(FAILED(hr))return hr;ComPtr<IUICollection>collection;hr=impl_->quickCollection(collection);if(FAILED(hr))return hr;
     UINT count=0;hr=collection->GetCount(&count);if(FAILED(hr))return hr;if(count>20)return E_UNEXPECTED;
@@ -1369,6 +2406,12 @@ HRESULT NativeRibbon::quickAccessCommands(std::vector<UINT>& output)const{
 }
 HRESULT NativeRibbon::setQuickAccessCommands(std::span<const UINT> commands){
     if(!valid())return E_UNEXPECTED;auto hr=impl_->sameThread();if(FAILED(hr))return hr;if(commands.size()>20)return E_INVALIDARG;
+    const auto lifetime=impl_;auto* const original=lifetime.get();const auto framework=original->framework;const auto revisionState=original->revision;
+    const auto generation=bindingGeneration_;auto revision=revisionState->value;
+    const auto current=[&]{return impl_.get()==original&&bindingGeneration_==generation&&impl_->framework.Get()==framework.Get()&&
+        revisionState->value==revision&&!revisionState->windowDestroyed&&IsWindow(impl_->window)&&
+        GetWindowThreadProcessId(impl_->window,nullptr)==impl_->thread;};
+    try {
     std::vector<ComPtr<IUnknown>>replacement;
     for(std::size_t i=0;i<commands.size();++i){if(std::find(commands.begin(),commands.begin()+static_cast<std::ptrdiff_t>(i),commands[i])!=commands.begin()+static_cast<std::ptrdiff_t>(i))return E_INVALIDARG;
         if((commands[i]>=RibbonHomeTab&&commands[i]<=RibbonShortcutTab)||commands[i]==FileMenu||commands[i]==RibbonQuickAccess||commands[i]==RibbonFrequentPlaces)return E_INVALIDARG;
@@ -1377,25 +2420,188 @@ HRESULT NativeRibbon::setQuickAccessCommands(std::span<const UINT> commands){
         if(declared==std::end(compiledLabels)||(commands[i]>=1500&&commands[i]<2000)||(commands[i]>=RibbonPictureContext&&commands[i]<=RibbonShortcutContext)||(found!=impl_->commandTypes.end()&&(found->second==UI_COMMANDTYPE_GROUP||found->second==UI_COMMANDTYPE_CONTEXT)))return E_INVALIDARG;
         const auto id=impl_->nativeId(commands[i]);if(!id)return E_INVALIDARG;
         ComPtr<IUISimplePropertySet>properties;properties.Attach(new Item({id,{},false}));ComPtr<IUnknown>unknown;properties.As(&unknown);replacement.push_back(std::move(unknown));}
-    ComPtr<IUICollection>collection;hr=impl_->quickCollection(collection);if(FAILED(hr))return hr;UINT count=0;hr=collection->GetCount(&count);if(FAILED(hr))return hr;
-    std::vector<ComPtr<IUnknown>>previous;for(UINT i=0;i<count;++i){ComPtr<IUnknown>item;hr=collection->GetItem(i,&item);if(FAILED(hr))return hr;previous.push_back(std::move(item));}
-    hr=collection->Clear();if(FAILED(hr))return hr;for(const auto& item:replacement){hr=collection->Add(item.Get());if(FAILED(hr))break;}
-    if(FAILED(hr)){collection->Clear();for(const auto& item:previous)collection->Add(item.Get());}
-    return hr;
+    RibbonQuickAccessSnapshot previous;hr=quickAccessSnapshot(previous);if(!current()||hr!=S_OK)return changedBinding;
+    const auto& before=*previous.impl_;RibbonQuickAccessSnapshot::Impl replacements;
+    replacements.rows=replacement;replacements.identities.reserve(replacement.size());replacements.items.reserve(replacement.size());
+    replacements.properties.reserve(replacement.size());
+    for(const auto& row:replacement) {
+        ComPtr<IUnknown> identity;hr=row.As(&identity);if(!current())return changedBinding;if(hr!=S_OK)return FAILED(hr)?hr:E_UNEXPECTED;
+        RibbonQuickAccessItem item;item.commandRead=RibbonQuickAccessSnapshot::Impl::readCommand(row.Get(),item.nativeCommand);
+        if(!current())return changedBinding;if(item.commandRead!=S_OK)return FAILED(item.commandRead)?item.commandRead:E_UNEXPECTED;
+        RibbonQuickAccessSnapshot::Impl::Properties properties;hr=RibbonQuickAccessSnapshot::Impl::readProperties(row.Get(),properties,current);
+        if(hr!=S_OK)return hr;replacements.identities.push_back(std::move(identity));replacements.items.push_back(item);replacements.properties.push_back(std::move(properties));
+    }
+    auto expected=before.identities;expected.reserve(20);
+    hr=before.matches(expected,current);if(hr!=S_OK)return hr;
+    RibbonMutation mutation(revisionState);revision=revisionState->value;
+    const auto apply=[&](auto&& operation,std::vector<ComPtr<IUnknown>> next)->HRESULT {
+        if(before.matches(expected,current,0,&replacements)!=S_OK)return changedBinding;
+        const auto result=operation();if(!current())return changedBinding;
+        if(before.matches(next,current,0,&replacements)==S_OK){expected=std::move(next);return result==S_OK?S_OK:FAILED(result)?result:E_UNEXPECTED;}
+        if(before.matches(expected,current,0,&replacements)!=S_OK)return changedBinding;
+        return result==S_OK?E_UNEXPECTED:FAILED(result)?result:E_UNEXPECTED;
+    };
+    const auto replace=[&](const std::vector<ComPtr<IUnknown>>& rows,const std::vector<ComPtr<IUnknown>>& identities)->HRESULT {
+        while(!expected.empty()) {
+            const auto index=static_cast<UINT>(expected.size()-1);auto next=expected;next.pop_back();
+            const auto result=apply([&]{return before.collection->RemoveAt(index);},std::move(next));if(result!=S_OK)return result;
+        }
+        for(std::size_t index=0;index<rows.size();++index) {
+            auto next=expected;next.push_back(identities[index]);
+            const auto result=apply([&]{return before.collection->Insert(static_cast<UINT>(index),rows[index].Get());},std::move(next));if(result!=S_OK)return result;
+        }
+        return S_OK;
+    };
+    try {
+        hr=replace(replacement,replacements.identities);if(hr==S_OK)return S_OK;
+        if(!current()||before.matches(expected,current,0,&replacements)!=S_OK)return changedBinding;
+        const auto restored=replace(before.rows,before.identities);return restored==S_OK?hr:changedBinding;
+    }catch(const std::bad_alloc&) {
+        if(!current()||before.matches(expected,current,0,&replacements)!=S_OK)return changedBinding;
+        try{return replace(before.rows,before.identities)==S_OK?E_OUTOFMEMORY:changedBinding;}catch(...){return changedBinding;}
+    }
+    }catch(const std::bad_alloc&){return E_OUTOFMEMORY;}
 }
 HRESULT NativeRibbon::saveSettings(const std::filesystem::path& path)const{
-    if(!valid())return E_UNEXPECTED;auto hr=impl_->sameThread();if(FAILED(hr))return hr;if(path.empty()||!path.is_absolute())return E_INVALIDARG;
-    ComPtr<IStream>stream;hr=CreateStreamOnHGlobal(nullptr,TRUE,&stream);if(FAILED(hr))return hr;
-    hr=impl_->ribbon->SaveSettingsToStream(stream.Get());if(FAILED(hr))return hr;STATSTG stat{};hr=stream->Stat(&stat,STATFLAG_NONAME);if(FAILED(hr))return hr;if(!stat.cbSize.QuadPart||stat.cbSize.QuadPart>maximumSettingsBytes)return HRESULT_FROM_WIN32(ERROR_FILE_TOO_LARGE);
-    HGLOBAL memory=nullptr;hr=GetHGlobalFromStream(stream.Get(),&memory);if(FAILED(hr))return hr;const auto bytes=static_cast<const BYTE*>(GlobalLock(memory));if(!bytes)return E_OUTOFMEMORY;
-    hr=writeStateFileAtomic(path,{bytes,static_cast<std::size_t>(stat.cbSize.QuadPart)});GlobalUnlock(memory);return hr;
+    if(!valid())return E_UNEXPECTED;auto hr=impl_->sameThread();if(hr!=S_OK)return hr;
+    if(path.empty()||!path.is_absolute()||path.native().find(L'\0')!=std::wstring::npos)return E_INVALIDARG;
+    try {
+        RibbonQuickAccessSnapshot saved;hr=quickAccessSnapshot(saved);if(hr!=S_OK)return hr;
+        const auto& before=*saved.impl_;const auto lifetime=impl_;auto* const original=lifetime.get();
+        const auto nativeView=original->ribbon;const auto framework=original->framework;const auto revision=original->revision;
+        const auto layout=original->layout;
+        const auto current=[&]{DWORD process=0;return impl_.get()==original&&bindingGeneration_==before.generation&&
+            impl_->framework.Get()==framework.Get()&&impl_->ribbon.Get()==nativeView.Get()&&revision->value==before.revision&&
+            !revision->windowDestroyed&&IsWindow(before.window)&&GetWindowThreadProcessId(before.window,&process)==before.thread&&
+            process==GetCurrentProcessId();};
+        std::vector<UINT> order;order.reserve(before.items.size());
+        for(const auto& item:before.items) {
+            if(item.commandRead!=S_OK||!item.nativeCommand||std::find(order.begin(),order.end(),item.nativeCommand)!=order.end())
+                return invalidSettings;
+            order.push_back(item.nativeCommand); // Actual IDs include valid unmapped native commands.
+        }
+        hr=before.matches(before.identities,current);if(hr!=S_OK)return hr;
+        ComPtr<IStream> stream;hr=CreateStreamOnHGlobal(nullptr,TRUE,&stream);if(!current())return changedBinding;
+        if(hr!=S_OK)return FAILED(hr)?hr:E_UNEXPECTED;
+        hr=nativeView->SaveSettingsToStream(stream.Get());if(!current())return changedBinding;
+        if(hr!=S_OK)return FAILED(hr)?hr:E_UNEXPECTED;
+        hr=before.matches(before.identities,current);if(hr!=S_OK)return hr;
+        std::vector<BYTE> native,envelope;hr=settingsStreamBytes(stream.Get(),native);if(hr!=S_OK)return hr;
+        hr=encodeSettings(layout,order,native,envelope);if(hr!=S_OK)return hr;
+        hr=before.matches(before.identities,current);if(hr!=S_OK)return hr;
+        const auto committed=writeStateFileAtomic(path,envelope);
+        if(!current())return changedBinding;
+        hr=before.matches(before.identities,current);return hr==S_OK?committed:hr;
+    }catch(const std::bad_alloc&){return E_OUTOFMEMORY;}
 }
 HRESULT NativeRibbon::loadSettings(const std::filesystem::path& path){
-    if(!valid())return E_UNEXPECTED;auto hr=impl_->sameThread();if(FAILED(hr))return hr;if(path.empty()||!path.is_absolute())return E_INVALIDARG;
-    std::vector<BYTE>bytes;hr=readFile(path,bytes);if(FAILED(hr))return hr;ComPtr<IStream>input;input.Attach(SHCreateMemStream(bytes.data(),static_cast<UINT>(bytes.size())));if(!input)return E_OUTOFMEMORY;
-    ComPtr<IStream>previous;hr=CreateStreamOnHGlobal(nullptr,TRUE,&previous);if(FAILED(hr))return hr;hr=impl_->ribbon->SaveSettingsToStream(previous.Get());if(FAILED(hr))return hr;
-    hr=impl_->ribbon->LoadSettingsFromStream(input.Get());if(FAILED(hr)){LARGE_INTEGER zero{};previous->Seek(zero,STREAM_SEEK_SET,nullptr);impl_->ribbon->LoadSettingsFromStream(previous.Get());}
-    return hr;
+    if(!valid())return E_UNEXPECTED;auto hr=impl_->sameThread();if(hr!=S_OK)return hr;
+    if(path.empty()||!path.is_absolute()||path.native().find(L'\0')!=std::wstring::npos)return E_INVALIDARG;
+    bool nativeMutated=false;
+    try {
+        // Validate the complete owned wrapper before making any native Load.
+        std::vector<BYTE> bytes;hr=readFile(path,bytes);if(hr!=S_OK)return hr;
+        SettingsFile settings;hr=decodeSettings(bytes,impl_->layout,settings);if(hr!=S_OK)return hr;
+        RibbonQuickAccessSnapshot saved;hr=quickAccessSnapshot(saved);if(hr!=S_OK)return hr;
+        const auto& before=*saved.impl_;const auto lifetime=impl_;auto* const original=lifetime.get();
+        const auto nativeView=original->ribbon;const auto framework=original->framework;const auto revisionState=original->revision;
+        auto revision=revisionState->value;
+        const auto current=[&]{DWORD process=0;return impl_.get()==original&&bindingGeneration_==before.generation&&
+            impl_->framework.Get()==framework.Get()&&impl_->ribbon.Get()==nativeView.Get()&&revisionState->value==revision&&
+            !revisionState->windowDestroyed&&IsWindow(before.window)&&GetWindowThreadProcessId(before.window,&process)==before.thread&&
+            process==GetCurrentProcessId();};
+        hr=before.matches(before.identities,current);if(hr!=S_OK)return hr;
+        ComPtr<IStream> input;input.Attach(SHCreateMemStream(settings.native.data(),static_cast<UINT>(settings.native.size())));
+        if(!input)return E_OUTOFMEMORY;
+        ComPtr<IStream> previous;hr=CreateStreamOnHGlobal(nullptr,TRUE,&previous);if(!current())return changedBinding;
+        if(hr!=S_OK)return FAILED(hr)?hr:E_UNEXPECTED;
+        hr=nativeView->SaveSettingsToStream(previous.Get());if(!current())return changedBinding;
+        if(hr!=S_OK)return FAILED(hr)?hr:E_UNEXPECTED;
+        hr=before.matches(before.identities,current);if(hr!=S_OK)return hr;
+        // Reserve the bounded identity manifest before native mutation.
+        std::vector<ComPtr<IUnknown>> expected;expected.reserve(20);
+        RibbonMutation mutation(revisionState);revision=revisionState->value;
+        nativeMutated=true;const auto nativeLoad=nativeView->LoadSettingsFromStream(input.Get());
+        if(!current())return changedBinding; // Preserve a newer host/UI edit or retired binding.
+        RibbonQuickAccessSnapshot loaded;hr=quickAccessSnapshot(loaded);if(!current()||hr!=S_OK)return changedBinding;
+        auto* owned=loaded.impl_.get();expected.assign(owned->identities.begin(),owned->identities.end());
+        const RibbonQuickAccessSnapshot::Impl* extraBindings=nullptr;
+        // The observed post-native state is the last state attributable to our
+        // native call when the binding and scoped revision still agree. Raw
+        // borrowed COM edits inside native Load cannot universally be attributed.
+        const auto apply=[&](auto&& operation,std::vector<ComPtr<IUnknown>> next)->HRESULT {
+            auto ready=owned->matches(expected,current,0,extraBindings);if(ready!=S_OK)return changedBinding;
+            const auto result=operation();if(!current())return changedBinding;
+            const auto advanced=owned->matches(next,current,0,extraBindings);
+            if(advanced==S_OK){expected=std::move(next);return result==S_OK?S_OK:FAILED(result)?result:E_UNEXPECTED;}
+            // A failing COM operation may leave either its exact old state or
+            // its exact requested state. Anything else has no rollback owner.
+            if(owned->matches(expected,current,0,extraBindings)!=S_OK)return changedBinding;
+            return result==S_OK?E_UNEXPECTED:FAILED(result)?result:E_UNEXPECTED;
+        };
+        const auto rollback=[&](HRESULT operation)->HRESULT {
+            try {
+            if(!current()||owned->matches(expected,current,0,extraBindings)!=S_OK)return changedBinding;
+            LARGE_INTEGER zero{};auto restored=previous->Seek(zero,STREAM_SEEK_SET,nullptr);
+            if(!current()||restored!=S_OK)return changedBinding;
+            restored=nativeView->LoadSettingsFromStream(previous.Get());
+            if(!current()||restored!=S_OK)return changedBinding;
+            RibbonQuickAccessSnapshot nativeRestored;restored=quickAccessSnapshot(nativeRestored);
+            if(!current()||restored!=S_OK)return changedBinding;
+            // Native restores state and dock. We restore exact retained rows
+            // because another native roundtrip also discards custom order.
+            if(nativeRestored.impl_->dock!=before.dock||nativeRestored.impl_->minimized!=before.minimized)return changedBinding;
+            loaded=std::move(nativeRestored);owned=loaded.impl_.get();expected=owned->identities;
+            extraBindings=&before;
+            while(!expected.empty()) {
+                auto next=expected;next.pop_back();const auto index=static_cast<UINT>(expected.size()-1);
+                restored=apply([&]{return owned->collection->RemoveAt(index);},std::move(next));
+                if(restored!=S_OK)return changedBinding;
+            }
+            for(std::size_t index=0;index<before.rows.size();++index) {
+                auto next=expected;next.push_back(before.identities[index]);
+                restored=apply([&]{return owned->collection->Insert(static_cast<UINT>(index),before.rows[index].Get());},std::move(next));
+                if(restored!=S_OK)return changedBinding;
+            }
+            return owned->matches(before.identities,current,0,&before)==S_OK?operation:changedBinding;
+            }catch(...){return changedBinding;}
+        };
+        try {
+        if(nativeLoad!=S_OK)return rollback(FAILED(nativeLoad)?nativeLoad:E_UNEXPECTED);
+        if(!settings.envelope)return S_OK; // Legacy native order is not recoverable from opaque bytes.
+        if(owned->items.size()!=settings.order.size())return rollback(invalidSettings);
+        std::vector<UINT> actual;actual.reserve(owned->items.size());
+        for(const auto& item:owned->items) {
+            if(item.commandRead!=S_OK||!item.nativeCommand||std::find(actual.begin(),actual.end(),item.nativeCommand)!=actual.end())return rollback(invalidSettings);
+            actual.push_back(item.nativeCommand);
+        }
+        auto actualSet=actual,desiredSet=settings.order;
+        std::sort(actualSet.begin(),actualSet.end());std::sort(desiredSet.begin(),desiredSet.end());
+        if(actualSet!=desiredSet)return rollback(invalidSettings);
+        hr=owned->matches(expected,current);if(hr!=S_OK)return changedBinding;
+        // Move only loaded whole IUnknown rows, including valid unmapped IDs.
+        // No native payload parsing, synthetic replacement rows, or state edits.
+        for(std::size_t destination=0;destination<settings.order.size();++destination) {
+            const auto found=std::find(actual.begin()+static_cast<std::ptrdiff_t>(destination),actual.end(),settings.order[destination]);
+            if(found==actual.end())return rollback(invalidSettings);
+            const auto index=static_cast<std::size_t>(found-actual.begin());if(index==destination)continue;
+            const auto moved=expected[index];
+            const auto row=std::find_if(owned->identities.begin(),owned->identities.end(),[&](const auto& identity){return identity.Get()==moved.Get();});
+            if(row==owned->identities.end())return rollback(invalidSettings);
+            const auto object=owned->rows[static_cast<std::size_t>(row-owned->identities.begin())];
+            auto removed=expected;removed.erase(removed.begin()+static_cast<std::ptrdiff_t>(index));
+            auto reordered=removed;reordered.insert(reordered.begin()+static_cast<std::ptrdiff_t>(destination),moved);
+            hr=apply([&]{return owned->collection->RemoveAt(static_cast<UINT>(index));},std::move(removed));if(hr!=S_OK)return rollback(hr);
+            hr=apply([&]{return owned->collection->Insert(static_cast<UINT>(destination),object.Get());},std::move(reordered));if(hr!=S_OK)return rollback(hr);
+            const auto id=actual[index];actual.erase(actual.begin()+static_cast<std::ptrdiff_t>(index));actual.insert(actual.begin()+static_cast<std::ptrdiff_t>(destination),id);
+        }
+        hr=owned->matches(expected,current);return hr==S_OK?S_OK:changedBinding;
+        }catch(const std::bad_alloc&){return rollback(E_OUTOFMEMORY);}
+    }catch(const std::bad_alloc&){return nativeMutated?changedBinding:E_OUTOFMEMORY;}
+}
+HRESULT NativeRibbon::imageObservationStats(RibbonImageObservationStats& output)const{
+    if(!valid())return E_UNEXPECTED;const auto hr=impl_->sameThread();if(FAILED(hr))return hr;
+    output=impl_->imageDiagnosticStats;return S_OK;
 }
 HRESULT NativeRibbon::commandImage(UINT command,bool large,IUIImage** output){
     if(!output)return E_POINTER;*output=nullptr;if(!valid())return E_UNEXPECTED;
@@ -1423,20 +2629,43 @@ HRESULT NativeRibbon::itemImage(const std::wstring& specification,bool large,IUI
 }
 HRESULT NativeRibbon::setCommandImageSpec(UINT command,const std::wstring& specification) {
     if(!valid())return E_UNEXPECTED;
-    const auto hr=impl_->sameThread();if(FAILED(hr))return hr;
-    const auto found=impl_->metadata.find(command);
-    if(found==impl_->metadata.end()||specification.size()>32768||specification.find(L'\0')!=std::wstring::npos)return E_INVALIDARG;
-    const auto& icon=specification.empty()?impl_->defaultIcons.at(command):specification;
-    if(found->second.icon==icon)return S_FALSE;
-    found->second.icon=icon;
-    for(auto item=impl_->imageCache.begin();item!=impl_->imageCache.end();) {
-        if(item->first.first==command)item=impl_->imageCache.erase(item);else ++item;
-    }
-    if(impl_->commandTypes.contains(command)) {
-        auto result=impl_->requestInvalidation(impl_->nativeId(command),UI_INVALIDATIONS_PROPERTY,&UI_PKEY_SmallImage);
-        if(SUCCEEDED(result))result=impl_->requestInvalidation(impl_->nativeId(command),UI_INVALIDATIONS_PROPERTY,&UI_PKEY_LargeImage);
-        return result;
-    }
-    return S_OK;
+    const auto owner=impl_;const auto generation=bindingGeneration_;
+    const auto thread=owner->sameThread();if(FAILED(thread))return thread;
+    const auto found=owner->metadata.find(command);
+    if(found==owner->metadata.end()||specification.size()>32768||specification.find(L'\0')!=std::wstring::npos)return E_INVALIDARG;
+    const bool explicitSpecification=!specification.empty();
+    const auto& icon=explicitSpecification?specification:owner->defaultIcons.at(command);
+    if(found->second.icon==icon&&owner->explicitImageSpecifications.contains(command)==explicitSpecification)return S_FALSE;
+    try {
+        // Stage every allocation before changing the visible source. A real
+        // nonempty setter is an override even when equal to default metadata.
+        std::wstring replacement=icon;
+        if(explicitSpecification)owner->explicitImageSpecifications.insert(command);
+        else owner->explicitImageSpecifications.erase(command);
+        found->second.icon.swap(replacement);++owner->imageSpecificationRevision;
+        const auto specificationRevision=owner->imageSpecificationRevision;
+        const auto revisionValue=owner->revision->value;
+        const auto epoch=owner->callbackEpoch->load(std::memory_order_acquire);
+        const auto current=[&]{return impl_.get()==owner.get()&&bindingGeneration_==generation&&
+            !owner->revision->retired&&!owner->revision->windowDestroyed&&owner->revision->value==revisionValue&&
+            owner->imageSpecificationRevision==specificationRevision&&owner->callbackEpoch->load(std::memory_order_acquire)==epoch;};
+        // Extract nodes without releasing COM objects during iteration. Release
+        // only the detached map, so a pumped setter/reset cannot invalidate an
+        // iterator into the live fallback cache. The native cache is untouched.
+        decltype(owner->imageCache) removed;
+        for(auto item=owner->imageCache.begin();item!=owner->imageCache.end();) {
+            if(item->first.first==command){auto next=std::next(item);removed.insert(owner->imageCache.extract(item));item=next;}
+            else ++item;
+        }
+        removed.clear();
+        if(!current())return changedBinding;
+        if(owner->commandTypes.contains(command)) {
+            auto result=owner->requestInvalidation(owner->nativeId(command),UI_INVALIDATIONS_PROPERTY,&UI_PKEY_SmallImage);
+            if(!current())return changedBinding;
+            if(SUCCEEDED(result))result=owner->requestInvalidation(owner->nativeId(command),UI_INVALIDATIONS_PROPERTY,&UI_PKEY_LargeImage);
+            return current()?result:changedBinding;
+        }
+        return S_OK;
+    }catch(const std::bad_alloc&){return E_OUTOFMEMORY;}
 }
 }

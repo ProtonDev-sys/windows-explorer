@@ -16,6 +16,8 @@ struct IShellItem;
 
 namespace explorer {
 
+class StartupDesktopChild;
+
 // Attach the calling thread before OleInitialize, registering window classes,
 // or creating any HWND. The desktop is never made an input desktop. Destroy all
 // windows and uninitialize COM before destroying this guard.
@@ -26,29 +28,32 @@ public:
     PrivateDesktop(const PrivateDesktop&) = delete;
     PrivateDesktop& operator=(const PrivateDesktop&) = delete;
     HRESULT initialize();
+    // Diagnostic B arm only: adopt the exact Windows-assigned initial desktop
+    // validated by the retained startup handshake, before COM/HWND creation.
+    // The caller keeps context alive through finish after native/OLE teardown.
+    // No desktop is created, switched, restored or closed by this borrowed mode.
+    HRESULT adoptInitialForDiagnostic(const StartupDesktopChild& context);
+    HRESULT finishInitialForDiagnostic();
     HRESULT verifyIsolation(bool* inputDesktopUnchanged = nullptr) const;
     HRESULT visibleWindowsOnInputDesktop(bool& visible) const;
-    struct DiagnosticMessageReadback {
-        HRESULT status = E_PENDING;
-        DWORD visited = 0, owned = 0, differentDesktop = 0, unknownDesktop = 0, completedPasses = 0;
-    };
-    HRESULT verifyEmptyForDiagnostic(DWORD& windows, bool& enumReturned, DWORD& enumError,
-        DiagnosticMessageReadback* messages = nullptr) const;
-    struct DiagnosticLabelReadback {
-        HRESULT guard = E_PENDING, before = E_PENDING, applied = E_PENDING, after = E_PENDING;
+    struct DiagnosticAtomicLabelReadback {
+        HRESULT guard = E_PENDING, defaultCreated = E_PENDING, lowCreated = E_PENDING;
+        HRESULT defaultSecurity = E_PENDING, lowSecurity = E_PENDING, equivalentSecurity = E_PENDING;
         HRESULT apartmentRead = E_PENDING;
         int apartmentType = -1, apartmentQualifier = -1;
-        DWORD windows = 0, beforeLabels = 0, beforeRid = 0, beforeMask = 0;
-        DWORD afterLabels = 0, afterRid = 0, afterMask = 0, afterFlags = 0;
-        bool enumReturned = false;
-        DWORD enumError = 0;
-        bool exactOwnedCurrent = false, daclUnchanged = false, ownerUnchanged = false, groupUnchanged = false;
-        DiagnosticMessageReadback messageWindows;
+        DWORD defaultLabels = 0, defaultRid = 0, defaultMask = 0, defaultFlags = 0, defaultControl = 0;
+        DWORD lowLabels = 0, lowRid = 0, lowMask = 0, lowFlags = 0, lowControl = 0;
+        bool exactOwnedCurrent = false, noninheritable = false;
+        bool daclEqual = false, ownerEqual = false, groupEqual = false, nonlabelControlEqual = false;
     };
-    // Only an empty, exact current owned desktop, before explicit COM/HWND creation.
-    // This is a diagnostic comparison; initialize() retains its default SD.
-    // Changes LABEL only, reads it back, and never permits desktop switching.
-    HRESULT setLowIntegrityLabelForDiagnostic(DiagnosticLabelReadback& readback);
+    // Two new GUID siblings, created before caller COM/HWND initialization.
+    // NULL-SD and SACL-only LOW creation must have identical native owner,
+    // group and DACL readbacks. Neither existing desktop is relabeled.
+    HRESULT initializeAtomicLowForDiagnostic(DiagnosticAtomicLabelReadback& readback, ULONGLONG deadline);
+    const std::wstring& diagnosticDefaultName() const noexcept { return diagnosticDefaultName_; }
+    // Retain both siblings through admission controls, then restore the exact
+    // borrowed creator desktop and observe both native CloseDesktop results.
+    HRESULT finishAtomicLowForDiagnostic();
     // The initialized guard on this UI thread, for bounded native rendering
     // phases in otherwise hidden tests. Null on unguarded/other threads.
     static const PrivateDesktop* current() noexcept;
@@ -61,6 +66,9 @@ private:
     DWORD thread_ = 0;
     std::wstring name_;
     std::wstring inputName_;
+    HDESK diagnosticDefault_ = nullptr;
+    std::wstring diagnosticDefaultName_;
+    const StartupDesktopChild* borrowedInitialContext_ = nullptr;
 };
 
 // Verifies one complete unresolved native DateModified Today leaf. Equivalent
@@ -269,6 +277,39 @@ struct VisualCaptureOptions {
         bool slowStateCompleted = false;
         HRESULT nativeRead = E_NOTIMPL;
         UINT nativeState = 0;
+        // Read-only comparison with the exact registered menu over the App's
+        // retained full selection/site. This never changes cached eligibility.
+        bool registeredAttempted = false;
+        HRESULT registeredRead = E_NOTIMPL;
+        HRESULT registeredGenericRead = E_NOTIMPL;
+        HRESULT registeredPlanStatus = E_NOTIMPL;
+        int registeredRoute = -1;
+        HRESULT registeredRawStateRead = E_NOTIMPL;
+        UINT registeredState = 0; // actual MFS_* only when raw read succeeds
+        UINT registeredCommandId = 0;
+        bool registeredSubmenu = false;
+        bool registeredEnabled = false;
+        ULONGLONG registeredReadMs = 0;
+        bool registeredSynchronous = false;
+        HRESULT registeredPreservationRead = E_NOTIMPL;
+        bool registeredTargetPreserved = false;
+        bool registeredSourcesPreserved = false;
+        bool registeredSettingsPreserved = false;
+        // Independent retained selection-menu read, including when the
+        // provider or invocation planner cannot describe the sharing action.
+        bool selectionMenuAttempted = false;
+        HRESULT selectionMenuRead = E_NOTIMPL;
+        HRESULT selectionMenuPlanRead = E_NOTIMPL;
+        HRESULT selectionMenuPlanStatus = E_NOTIMPL;
+        int selectionMenuPlanRoute = -1;
+        bool selectionMenuPlanEnabled = false;
+        HRESULT selectionMenuRawRead = E_NOTIMPL;
+        UINT selectionMenuMatches = 0;
+        UINT selectionMenuState = 0;
+        UINT selectionMenuCommandId = 0;
+        bool selectionMenuSubmenu = false;
+        bool selectionMenuAncestorDisabled = false;
+        ULONGLONG selectionMenuReadMs = 0;
     };
     IUIFramework* ribbonFramework = nullptr; // borrowed; optional native state evidence
     IUIFramework* nativeRibbonFramework = nullptr; // borrowed underlying owner-STA framework

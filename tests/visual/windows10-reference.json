@@ -127,7 +127,7 @@
         565
       ],
       "publisher": "Tech Pilipinas",
-      "edition": "2024 stock Windows 10 Ribbon screenshot with red article annotations; source OS DPI unrecorded, app frame [30,26,886,539]."
+      "edition": "2024 stock Windows 10 Ribbon screenshot with red article annotations; source OS DPI unrecorded, visible app frame [30,26,886,538] (exclusive bottom); source row 538 is desktop wallpaper below the white frame."
     },
     {
       "id": "tech2024-share",
@@ -141,7 +141,7 @@
         565
       ],
       "publisher": "Tech Pilipinas",
-      "edition": "2024 stock Windows 10 Ribbon screenshot with red article annotations; source OS DPI unrecorded, app frame [30,26,886,539]."
+      "edition": "2024 stock Windows 10 Ribbon screenshot with red article annotations; source OS DPI unrecorded, visible app frame [30,26,886,538] (exclusive bottom); source row 538 is desktop wallpaper below the white frame."
     },
     {
       "id": "tech2024-view",
@@ -155,7 +155,7 @@
         565
       ],
       "publisher": "Tech Pilipinas",
-      "edition": "2024 stock Windows 10 Ribbon screenshot with red article annotations; source OS DPI unrecorded, app frame [30,26,886,539]."
+      "edition": "2024 stock Windows 10 Ribbon screenshot with red article annotations; source OS DPI unrecorded, visible app frame [30,26,886,538] (exclusive bottom); source row 538 is desktop wallpaper below the white frame."
     },
     {
       "id": "techradar-dark",
@@ -892,7 +892,7 @@
       "name": "ModernHome",
       "reference": "tech2024-home",
       "width": 856,
-      "height": 513,
+      "height": 512,
       "layoutDpi": 96,
       "dpiEvidence": "Publisher unrecorded OS DPI/build; image window crop has native-like pixel geometry and captures are checked at actual96DPI. Measurements apply to these explicit crops only.",
       "state": "Modern2024 Windows10 Quick access; expanded Home; dynamic route data and separately measured command band are excluded from full-window chrome region.",
@@ -904,13 +904,13 @@
             30,
             26,
             886,
-            539
+            538
           ],
           "actual": [
             0,
             0,
             856,
-            513
+            512
           ],
           "actualOrigin": "window",
           "masks": [
@@ -987,7 +987,7 @@
             "Publisher selected-tab red left annotation only.",
             "Publisher selected-tab red right annotation only."
           ],
-          "reason": "Complete visible frame at identical dimensions with explicit route-dependent masks. Retains caption/QAT, static navigation/address/search glyphs and borders, status shortcuts, outer frame and row geometry. This scope does not prove the masked command band or folder body."
+          "reason": "Complete visible source frame [30,26,886,538] at identical 856x512 native capture dimensions with the existing explicit route-dependent masks. Decoded source row 537 is the final white frame row; row 538 is desktop wallpaper outside Explorer and is excluded by the corrected exclusive frame bound. Retains caption/QAT, static navigation/address/search glyphs and borders, status shortcuts, outer frame and row geometry. Fresh native captures must use this visible geometry; prior 856x513 results remain prior failures. This scope does not prove the masked command band or folder body."
         },
         {
           "name": "modern-address-dropdown",
@@ -1038,7 +1038,7 @@
       "name": "ModernShare",
       "reference": "tech2024-share",
       "width": 856,
-      "height": 513,
+      "height": 512,
       "layoutDpi": 96,
       "dpiEvidence": "Publisher unrecorded OS DPI/build; image window crop has native-like pixel geometry and captures are checked at actual96DPI. Measurements apply to these explicit crops only.",
       "state": "Modern2024 Windows10 Quick access; expanded Share; dynamic route data and separately measured command band are excluded from full-window chrome region.",
@@ -1050,13 +1050,13 @@
             30,
             26,
             886,
-            539
+            538
           ],
           "actual": [
             0,
             0,
             856,
-            513
+            512
           ],
           "actualOrigin": "window",
           "masks": [
@@ -1133,7 +1133,7 @@
             "Publisher selected-tab red left annotation only.",
             "Publisher selected-tab red right annotation only."
           ],
-          "reason": "Complete visible frame at identical dimensions with explicit route-dependent masks. Retains caption/QAT, static navigation/address/search glyphs and borders, status shortcuts, outer frame and row geometry. This scope does not prove the masked command band or folder body."
+          "reason": "Complete visible source frame [30,26,886,538] at identical 856x512 native capture dimensions with the existing explicit route-dependent masks. Decoded source row 537 is the final white frame row; row 538 is desktop wallpaper outside Explorer and is excluded by the corrected exclusive frame bound. Retains caption/QAT, static navigation/address/search glyphs and borders, status shortcuts, outer frame and row geometry. Fresh native captures must use this visible geometry; prior 856x513 results remain prior failures. This scope does not prove the masked command band or folder body."
         },
         {
           "name": "modern-address-dropdown",
@@ -1184,7 +1184,7 @@
       "name": "ModernView",
       "reference": "tech2024-view",
       "width": 856,
-      "height": 513,
+      "height": 512,
       "layoutDpi": 96,
       "dpiEvidence": "Publisher unrecorded OS DPI/build; image window crop has native-like pixel geometry and captures are checked at actual96DPI. Measurements apply to these explicit crops only.",
       "state": "Modern2024 Windows10 Quick access; expanded View; dynamic route data and separately measured command band are excluded from full-window chrome region.",
@@ -1196,13 +1196,13 @@
             30,
             26,
             886,
-            539
+            538
           ],
           "actual": [
             0,
             0,
             856,
-            513
+            512
           ],
           "actualOrigin": "window",
           "masks": [
@@ -1279,7 +1279,7 @@
             "Publisher selected-tab red left annotation only.",
             "Publisher selected-tab red right annotation only."
           ],
-          "reason": "Complete visible frame at identical dimensions with explicit route-dependent masks. Retains caption/QAT, static navigation/address/search glyphs and borders, status shortcuts, outer frame and row geometry. This scope does not prove the masked command band or folder body."
+          "reason": "Complete visible source frame [30,26,886,538] at identical 856x512 native capture dimensions with the existing explicit route-dependent masks. Decoded source row 537 is the final white frame row; row 538 is desktop wallpaper outside Explorer and is excluded by the corrected exclusive frame bound. Retains caption/QAT, static navigation/address/search glyphs and borders, status shortcuts, outer frame and row geometry. Fresh native captures must use this visible geometry; prior 856x513 results remain prior failures. This scope does not prove the masked command band or folder body."
         },
         {
           "name": "modern-address-dropdown",
@@ -1423,7 +1423,7 @@
       "height": 503,
       "layoutDpi": 96,
       "dpiEvidence": "Publisher cropped the real Windows10 band, did not record build/DPI. Captures use actual96DPI and identical crop pixels; drop shadow excluded, source caption/body not inferred.",
-      "state": "Expanded Compressed native band in an owned ZIP namespace with its actual text member selected. Native MRU destinations differ from the publisher's profile; unrecorded enabled-state differences remain compared.",
+      "state": "Comparison: expanded Compressed native band in an owned Downloads containing folder with Archive.zip selected, matching the source's Downloads caption, disabled Extract-to destination gallery and enabled Extract all. Independent primary capture remains inside the owned ZIP with its actual text member selected. Native MRU destination artwork can differ from the publisher's profile; all icon/state pixels, crops, masks and thresholds remain compared unchanged.",
       "regions": [
         {
           "name": "compressed-ribbon",

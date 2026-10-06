@@ -25,7 +25,7 @@ const QuickAccessCommand* quickAccessCommand(Command command) noexcept;
 
 class QuickAccessToolbar {
 public:
-    static constexpr std::size_t MaximumCommands = 16;
+    static constexpr std::size_t MaximumCommands = 20;
     static constexpr std::size_t Append = std::numeric_limits<std::size_t>::max();
 
     QuickAccessToolbar();

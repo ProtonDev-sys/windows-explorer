@@ -31,12 +31,14 @@ struct Preferences {
     int searchWidth = 146;
     bool useWindowsStartup = true;
     std::wstring startupLocation = L"shell:::{679f85cb-0220-4080-b29b-5540cc05aab6}";
+    int previewWidth = 300; // App-owned logical pixels; persisted range 120..4096.
 };
 
 std::filesystem::path preferencesPath();
 // Read-only Windows 10 Folder Options "Open File Explorer to" preference.
 std::wstring windowsDefaultStartupLocation();
 Preferences loadPreferences(const std::filesystem::path& path);
+HRESULT savePreferencesStatus(const std::filesystem::path& path, const Preferences& preferences) noexcept;
 bool savePreferences(const std::filesystem::path& path, const Preferences& preferences);
 std::wstring trim(const std::wstring& text);
 std::wstring expandEnvironment(const std::wstring& text);

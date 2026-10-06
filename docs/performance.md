@@ -9,6 +9,47 @@ every navigation and selection change. The current implementation reads native
 command state once per change and constructs full provider menus when requested.
 Native Ribbon property callbacks use cached results.
 
+## Latest continuation snapshot
+
+The serialized v87 installed-layout benchmark at 2026-10-06 00:19 UTC passes
+native counts, current Kind status, command readiness and desktop isolation.
+Select all over 10,000 items has an immediate count at 491.288 ms, creator queue
+drained at 923.109 ms, and all native command states ready at 8,267.143 ms.
+Creator host work is 285.803 ms: Kind scheduling is 193.751 ms, publication is
+0.016 ms, and current Kind readiness delay is 371.429 ms. The Kind worker reads
+the original aggregate in 164.512 ms; the menu worker's QueryContextMenu takes
+7,209.857 ms. These separate completion times verify independent publication.
+Navigation medians for 10/1,000/10,000 items are 169.071/319.465/118.696 ms;
+startup native-view readiness is 512.483 ms and private bytes are 52,809,728.
+This single run establishes neither an A/B speedup nor absence of a navigation
+regression. The report is
+`artifacts/performance/run-20261006-001911-3e1542e3c1374b4ba189fd32b3b0509e/native-navigation.json`,
+using executable SHA-256
+`9ae5e968242e43a10066413d2dcef9cb97e87890279d7c9e9fac437d27f531e9`.
+The PowerShell wrapper returned 1 because it incorrectly converted a null
+LASTEXITCODE to failure; benchmark.ps1 itself completed normally after validating
+the native process and passing report. That distinction is retained in
+`artifacts/continuation-benchmark-v87-receipt.json`.
+
+The serialized v84 installed-layout run at 2026-10-05 23:13 UTC passes native
+selection, readiness and private-desktop checks. Its immutable executable is
+`deadeae5cda15e692325fdbf6a046d8f3d2657db2325312dc1d544488054495e`.
+Five navigation samples per folder give median/p95 times of 109.269/113.525 ms
+for 10 files, 115.946/130.104 ms for 1,000 and 183.130/235.509 ms for 10,000.
+The first native view is ready at 467.400 ms; private bytes are 56,094,720.
+This single process is a current observation, not a controlled improvement claim.
+
+Selecting all 10,000 items reports the immediate exact count at 1,119.934 ms,
+drains creator work at 1,926.085 ms and completes all command states at
+8,016.028 ms. Invert-none-to-all takes 688.245/1,932.769/7,078.764 ms for the
+same boundaries. Native kind classification costs 367.357/548.257 ms on the
+creator STA, and worker scheduling costs 240.800/430.117 ms. Namespace
+preparation is 26.421/78.070 ms. The background selection-menu query accounts
+for 5,645.293/4,958.995 ms; its duration is not UI-thread blocking time.
+These costs remain optimization work, with full-array/provider correctness
+required. The raw report is
+`artifacts/performance/run-20261005-231349-451f0880956e4207a26e2450821ecaa7/native-navigation.json`.
+
 ## Interleaved optimization candidate
 
 On 2026-10-05, twelve alternating-order baseline/candidate rounds ran serially

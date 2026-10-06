@@ -3,7 +3,8 @@ param(
     [ValidateSet('Debug', 'Release', 'RelWithDebInfo', 'MinSizeRel')]
     [string]$Configuration = 'Release',
     [string]$BuildDirectory = '',
-    [int]$Parallel = [Environment]::ProcessorCount
+    [int]$Parallel = [Environment]::ProcessorCount,
+    [switch]$AppSearchResidentStress
 )
 
 $ErrorActionPreference = 'Stop'
@@ -26,7 +27,11 @@ else {
     if (-not (Test-Path -LiteralPath $cmakePath)) { throw 'Install the CMake component in Visual Studio 2022.' }
 }
 
-& $cmakePath -S $projectRoot -B $BuildDirectory -G 'Visual Studio 17 2022' -A x64 -DBUILD_TESTING=ON 2>&1 | Tee-Object -FilePath $buildLog -Append
+$additionalConfigureOptions = @()
+if ($AppSearchResidentStress) {
+    $additionalConfigureOptions += '-DEXPLORER_ENABLE_SEARCH_BACKING_RESIDENT_STRESS_TESTS=ON'
+}
+& $cmakePath -S $projectRoot -B $BuildDirectory -G 'Visual Studio 17 2022' -A x64 -DBUILD_TESTING=ON @additionalConfigureOptions 2>&1 | Tee-Object -FilePath $buildLog -Append
 if ($LASTEXITCODE -ne 0) { throw "CMake configuration failed (exit $LASTEXITCODE). See $buildLog" }
 & $cmakePath --build $BuildDirectory --config $Configuration --parallel ([Math]::Max(1, $Parallel)) 2>&1 | Tee-Object -FilePath $buildLog -Append
 if ($LASTEXITCODE -ne 0) { throw "C++ build failed (exit $LASTEXITCODE). See $buildLog" }

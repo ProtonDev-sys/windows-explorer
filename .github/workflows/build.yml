@@ -4,23 +4,40 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+    inputs:
+      owned_profile_mutation:
+        description: Permit one owned GUID pin roundtrip in a fresh disposable Hosted profile
+        type: boolean
+        required: true
+        default: false
+      case_mode:
+        description: Select one separate fresh-VM pin persistence case
+        type: choice
+        required: true
+        default: normal-flow
+        options: [normal-flow, final-destroy-only]
 
 permissions:
   contents: read
 
 jobs:
   build:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.owned_profile_mutation == true) }}
     # Pin the image with VS2022 rather than inheriting future VS-only updates.
     runs-on: windows-2022
-    timeout-minutes: 20
+    # Covers the serialized native tests and pilot/final captures without
+    # extending any individual process's deadline.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
       - name: Build native C++ application
         shell: pwsh
-        run: ./scripts/build.ps1 -Configuration Release
+        run: ./scripts/build.ps1 -Configuration Release -AppSearchResidentStress
       - name: Run headless core, Shell operation, and application checks
         shell: pwsh
-        run: ./scripts/test.ps1 -Configuration Release -SkipBuild
+        env:
+          EXPLORER_NATIVE_KIND_BOUNDARY_DIAGNOSTICS: '1'
+        run: ./scripts/test.ps1 -Configuration Release -SkipBuild -RequireAppSearchResidentStress
       - uses: actions/setup-python@v7
         with:
           python-version: '3.13'
@@ -68,6 +85,7 @@ jobs:
           path: build/Release/WindowsExplorer.exe
           if-no-files-found: error
   native-transfer:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.owned_profile_mutation == true) }}
     # Clipboard transfers create real Shell undo records. Keep this fixture
     # on a fresh disposable machine, separate from the native history suite.
     runs-on: windows-2022
@@ -125,6 +143,7 @@ jobs:
             artifacts/native-drops.log
           if-no-files-found: warn
   validated-application:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.owned_profile_mutation == true) }}
     needs: [build, native-transfer]
     runs-on: windows-2022
     timeout-minutes: 5
@@ -153,3 +172,152 @@ jobs:
           name: WindowsExplorer-x64
           path: validated/*
           if-no-files-found: error
+  app_pin_persistence_owned:
+    # A separate fresh VM and actual job identity; never an ordinary/local test.
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.owned_profile_mutation == true }}
+    runs-on: windows-2022
+    timeout-minutes: 20
+    env:
+      EXPLORER_HOSTED_PIN_MUTATION: owned-guid-only
+      EXPLORER_HOSTED_PIN_CASE: ${{ inputs.case_mode }}
+      EXPLORER_NATIVE_KIND_BOUNDARY_DIAGNOSTICS: '1'
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build and run one explicit owned pin case with source identity receipts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:RUNNER_ENVIRONMENT -ne 'github-hosted' -or $env:GITHUB_JOB -ne 'app_pin_persistence_owned' -or
+              $env:GITHUB_ACTIONS -ne 'true' -or $env:CI -ne 'true' -or
+              $env:EXPLORER_HOSTED_PIN_CASE -notin @('normal-flow', 'final-destroy-only')) {
+            throw 'Only the explicitly selected fresh Hosted job may issue authority'
+          }
+          $projectRoot = $PWD.Path
+          $reportDirectory = Join-Path $projectRoot 'artifacts/hosted-pin-public'
+          if (Test-Path -LiteralPath $reportDirectory) { throw 'Public receipts must start in a fresh directory' }
+          New-Item -ItemType Directory -Path $reportDirectory -Force | Out-Null
+          $buildDirectory = Join-Path $projectRoot 'build/hosted-pins'
+          $exe = Join-Path $buildDirectory 'Release/app_pin_persistence_hosted_tests.exe'
+          $receipt = [ordered]@{
+            sourceGitSha = $env:GITHUB_SHA; workflowRun = $env:GITHUB_RUN_ID; runAttempt = $env:GITHUB_RUN_ATTEMPT
+            actualJob = $env:GITHUB_JOB; caseMode = $env:EXPLORER_HOSTED_PIN_CASE; runnerEnvironment = $env:RUNNER_ENVIRONMENT
+            sourceBeforeSha256 = $null; sourceAfterBuildSha256 = $null; sourceAfterRunSha256 = $null
+            executableSha256 = $null; executableAfterRunSha256 = $null
+            configureExit = $null; buildExit = $null; ctestExit = $null; status = 'not-completed'; failure = $null
+          }
+          function Assert-Checkout {
+            $head = (& git rev-parse HEAD).Trim()
+            if ($LASTEXITCODE -ne 0 -or $head -cne $env:GITHUB_SHA) { throw 'Actual checkout does not match GITHUB_SHA' }
+            $dirty = @(& git status --porcelain=v1 --untracked-files=all)
+            if ($LASTEXITCODE -ne 0 -or $dirty.Count -ne 0) { throw 'Actual checkout source is not clean' }
+          }
+          function Read-SourceCensus([string]$name) {
+            Assert-Checkout
+            $files = @(foreach ($directory in @('include', 'src', 'tests', 'resources')) {
+              Get-ChildItem -LiteralPath (Join-Path $projectRoot $directory) -File -Recurse -Force
+            })
+            $files += @(foreach ($file in @('CMakeLists.txt', '.github/workflows/build.yml', 'docs/hosted-pin-persistence.md')) {
+              Get-Item -LiteralPath (Join-Path $projectRoot $file) -Force
+            })
+            $rows = @($files | ForEach-Object {
+              [ordered]@{ path = [IO.Path]::GetRelativePath($projectRoot, $_.FullName).Replace('\', '/'); bytes = $_.Length
+                sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant() }
+            } | Sort-Object { $_.path })
+            if ($rows.Count -eq 0 -or @($rows.path | Select-Object -Unique).Count -ne $rows.Count) { throw 'Invalid source census' }
+            $json = ConvertTo-Json -InputObject $rows -Depth 4 -Compress
+            $path = Join-Path $reportDirectory "source-$name.json"
+            [IO.File]::WriteAllText($path, $json, [Text.UTF8Encoding]::new($false))
+            return [pscustomobject]@{ Json = $json; Sha256 = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() }
+          }
+          $before = $null
+          try {
+            $before = Read-SourceCensus 'before'
+            $receipt.sourceBeforeSha256 = $before.Sha256
+            if (Test-Path -LiteralPath $buildDirectory) { throw 'Hosted build must start in a fresh directory' }
+            $nonce = [guid]::NewGuid().ToString('D')
+            $marker = Join-Path $env:RUNNER_TEMP "ExplorerHostedPinsAdmission-$nonce.txt"
+            if (Test-Path -LiteralPath $marker) { throw 'Fresh admission name already exists' }
+            # CMake records this exact marker path in the opt-in CTest arguments.
+            # This allocates a name; the actual marker is issued only after build.
+            $env:EXPLORER_HOSTED_PIN_NONCE = $nonce
+            $env:EXPLORER_HOSTED_PIN_ADMISSION = $marker
+            cmake -S . -B $buildDirectory -G 'Visual Studio 17 2022' -A x64 -DBUILD_TESTING=ON -DEXPLORER_ENABLE_HOSTED_APP_PIN_PERSISTENCE_TESTS=ON 2>&1 |
+              Tee-Object -FilePath (Join-Path $reportDirectory 'configure.log')
+            $receipt.configureExit = $LASTEXITCODE
+            if ($receipt.configureExit -ne 0) { throw 'Hosted target configuration failed' }
+            cmake --build $buildDirectory --config Release --target app_pin_persistence_hosted_tests --parallel 1 2>&1 |
+              Tee-Object -FilePath (Join-Path $reportDirectory 'build.log')
+            $receipt.buildExit = $LASTEXITCODE
+            if ($receipt.buildExit -ne 0) { throw 'Hosted target build failed' }
+            if (Select-String -LiteralPath (Join-Path $reportDirectory 'build.log') -Pattern '\bwarning\s+(?:C\d{4}|LNK\d{4})\b' -Quiet) {
+              throw 'MSVC warning-free build gate failed'
+            }
+            if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw 'Fresh Hosted executable is missing' }
+            $afterBuild = Read-SourceCensus 'after-build'
+            $receipt.sourceAfterBuildSha256 = $afterBuild.Sha256
+            if ($before.Json -cne $afterBuild.Json) { throw 'Actual source changed during build' }
+            $receipt.executableSha256 = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+            Add-Type -TypeDefinition 'using System.Runtime.InteropServices; public static class HostedPinClock { [DllImport("kernel32.dll")] public static extern ulong GetTickCount64(); }'
+            $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+            $lines = @(
+              'version=1', 'authorization=owned-quick-access-pin-roundtrip', 'disposable=fresh-vm-single-job',
+              "case=$env:EXPLORER_HOSTED_PIN_CASE", "runner_environment=$env:RUNNER_ENVIRONMENT", "job=$env:GITHUB_JOB",
+              "run_id=$env:GITHUB_RUN_ID", "run_attempt=$env:GITHUB_RUN_ATTEMPT", "runner_name=$env:RUNNER_NAME",
+              "computer=$env:COMPUTERNAME", "sid=$($identity.User.Value)", "profile=$env:USERPROFILE", "nonce=$nonce",
+              "source_sha=$env:GITHUB_SHA", "marker_tick=$([HostedPinClock]::GetTickCount64())"
+            )
+            $bytes = [Text.UTF8Encoding]::new($false).GetBytes(($lines -join "`n") + "`n")
+            $stream = [IO.FileStream]::new($marker, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+            try { $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
+            $acl = [Security.AccessControl.FileSecurity]::new()
+            $acl.SetOwner($identity.User)
+            $acl.SetAccessRuleProtection($true, $false)
+            $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($identity.User, 'FullControl', 'Allow'))
+            Set-Acl -LiteralPath $marker -AclObject $acl
+            $caseName = if ($env:EXPLORER_HOSTED_PIN_CASE -eq 'normal-flow') { 'hosted_app_pin_persistence_owned' } else { 'hosted_app_final_pin_persistence_owned' }
+            $xmlPath = Join-Path $reportDirectory 'native.xml'
+            ctest --test-dir $buildDirectory -C Release --verbose --parallel 1 -R "^$caseName`$" --no-tests=error --output-junit $xmlPath 2>&1 |
+              Tee-Object -FilePath (Join-Path $reportDirectory 'native.log')
+            $receipt.ctestExit = $LASTEXITCODE
+            if ($receipt.ctestExit -ne 0) { throw 'Actual Hosted pin persistence or profile restoration failed' }
+            [xml]$nativeReport = Get-Content -LiteralPath $xmlPath -Raw
+            $cases = @($nativeReport.testsuite.testcase)
+            if ($cases.Count -ne 1 -or $cases[0].name -cne $caseName -or $cases[0].status -ne 'run' -or
+                $null -ne $cases[0].SelectSingleNode('failure') -or $null -ne $cases[0].SelectSingleNode('skipped')) {
+              throw 'One actual passing selected native test is required; skip is not verification'
+            }
+            $receipt.status = 'native-case-passed'
+          } catch {
+            $receipt.status = 'failed'
+            $receipt.failure = $_.Exception.Message
+            throw
+          } finally {
+            try {
+              $afterRun = Read-SourceCensus 'after-run'
+              $receipt.sourceAfterRunSha256 = $afterRun.Sha256
+              if ($null -ne $before -and $before.Json -cne $afterRun.Json) { throw 'Actual source changed before final receipt' }
+              if (Test-Path -LiteralPath $exe -PathType Leaf) {
+                $receipt.executableAfterRunSha256 = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+                if ($null -ne $receipt.executableSha256 -and $receipt.executableSha256 -cne $receipt.executableAfterRunSha256) {
+                  throw 'Actual executable changed during native run'
+                }
+              }
+            } catch {
+              $receipt.status = 'failed'
+              $receipt.failure = $_.Exception.Message
+              throw
+            } finally {
+              $receipt | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $reportDirectory 'identity.json') -Encoding utf8
+            }
+          }
+      - name: Upload actual checkout and native receipts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: owned-app-pin-${{ inputs.case_mode }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            artifacts/hosted-pin-public/**
+            build/hosted-pins/Testing/Temporary/LastTest.log
+            build/hosted-pins/Testing/Temporary/LastTestsFailed.log
+            docs/hosted-pin-persistence.md
+          if-no-files-found: warn

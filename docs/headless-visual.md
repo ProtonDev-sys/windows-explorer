@@ -1,5 +1,113 @@
 # Native headless visual verification
 
+The latest complete installed-layout run is v134 on October 6, 2026, at
+`artifacts/visual/run-20261006-091029-e05919ac9d8a4d03bc6de9668456ddb8`.
+Eighteen native captures pass at actual 96 DPI. Six strict comparisons pass
+(Home, View, Picture, Application, Music and Video), nine fail, and DiskImage,
+Library and Shortcut retain their documented source restrictions. Search
+capture fails its preserved-scope fixture predicate. All 24 pinned online
+references were verified; masks and thresholds were unchanged. Executable
+SHA-256 is
+`3449cdb6cd1d615d36980827ce24c95a929b3a6489ea0dcea8609cfdebf62843`,
+reference manifest `a49f3266a436bd794daface43799ae99b351237497f3ee07ab173486cb92af73`,
+and comparator `51a9a5840ce7dc563f80527e1fd7a8571f2a18752911ed5e035dc49a1e20876b`.
+The focused Search run at
+`artifacts/visual/run-20261006-093237-19bc1b9b29174981bf45d8d5769d9fa6`
+passes native capture and the unchanged strict comparison: RGB error 0.987026,
+pixel agreement 0.982421 and edge F1 0.988886. Its executable is
+`eb1e09a1e10f718bb5a30f6967aa8e16c271724de1b61620f37885c529773eac`.
+The fixture now derives the physical query's implicit rule from its actual
+retained scope before comparing it with explicit imported saved-search rules;
+the production metadata and all source/identity predicates are unchanged.
+
+The v140 native image probe records 184 exact comparable first-current images
+and zero differences. Its added association/restoration scenario fails and
+then crashes during COM teardown. Four visibly mismatching commands have
+genuine null first images and use fallback resources, so those differences are
+outside the 184-image result. Whole-application visual parity remains unproved.
+
+The current reference audit finds no embedded ICC profile in the pinned Tech
+JPEGs or PC Assist/Microsoft Press PNGs. Untagged web images use sRGB; inventing
+an AdobeRGB transform is unsupported. [W3C color contract](https://www.w3.org/TR/css-color-4/#untagged).
+Computer and Compressed references have the same blue File interior as the
+native framework. Tech's teal File interior has unrecorded build/accent
+provenance. The current full-frame crop includes one row of desktop wallpaper
+below the visible frame: all 856 pixels differ. The source-only v134 audit
+records the exact boundary and remaining color/status residuals. That is a
+comparison-protocol defect requiring a reviewed bounds correction; the current
+results remain failures. Its Share screenshot has one selected
+item/62 bytes, whereas the existing Quick Access control has no selection;
+that state mismatch cannot prove a command-eligibility defect. The command band
+and dynamic count are already masked, so it does not explain the remaining
+strict chrome failure. Existing references, masks and thresholds remain intact.
+
+The historical v102-r7 layout experiment preserves the full-width native footer while
+reapplying a public-view reservation after each native resize, for both LTR
+and RTL A/B/A views. At that checkpoint the measured compatibility was not yet
+a production UI change or a strict screenshot pass. The later v107 production App checks now
+pass the full-width native footer/content partition, actual grip input,
+both-source RTF rendering and source-B focus transitions in both layouts;
+see [verification](verification.md). Later v122 authored native checks pass
+strict LTR/RTL root shrink from 1200x800 to 1160x780, exact 1144-pixel shrunk
+frame, drag and teardown preservation, while that full App run fails its
+original Content handoff. The v124 run passes Content and strict footer checks
+in both layouts; each full General target still fails only direct-literal
+equivalence (two failures among six App/search targets). Its narrow v125
+comparison-fixture correction compiles and retains every original assertion.
+The later scoped General runs pass installed 303/303 in v125 and authored
+298/298 in v126. A v125 authored saved-search Back failure is retained; the
+v126 diagnostic pass does not resolve its cause or prove repeatability.
+These functional checks do not change the strict screenshot failures above.
+
+The v89 installed Compressed and Computer controls both pass native capture
+and fail the unchanged strict online-reference comparisons. Exact artifacts
+are `artifacts/visual/run-20261006-004300-cc82668109d5486096addb84286e478c`,
+executable SHA-256
+`96827501dbe8780055ccca5cdbbdfc504ebf6c0dfff32fe159fd607648652f23`.
+Failure-only group-property readbacks return `ERROR_NOT_SUPPORTED`, empty
+variants and no Boolean values for all three requested group identifiers.
+Those results do not establish a disabled-group cause for caption colors.
+The unsupported diagnostic has been removed; no native state, color, reference
+mask or comparison threshold was changed.
+
+The historical focused v85 installed-layout eleven-scene control completed on October 6,
+2026 in `artifacts/visual/run-20261005-235837-c386ebd8550e42049fe33fd10b6689ad`.
+Its immutable executable SHA-256 is
+`22ab1eaafc2c3120f43e1abe1353f597f99d873aa07c81b8b78a7ca361646a56`.
+All eleven native captures pass; strict online-reference comparisons pass Home
+and View and fail the remaining nine scenes. This subset does not replace the
+nineteen-scene coverage below. The preceding full v85 attempt timed out while
+the native fixture builder was creating its inputs, before any scene capture;
+that incomplete run supplies no screenshot evidence. New process receipts
+retain actual child PID, timeout and exit status, and phase diagnostics will
+localize the fixture failure in the next compiled run. Comparison thresholds,
+source masks and native availability remain unchanged.
+
+The integrated v64 installed-layout run on October 5, 2026 is
+`artifacts/visual/run-20261005-195124-4045f61663d24dda83be3f01a05df76a`,
+executable SHA256 `8cc5d768b67be4337a219b9364d76adff6e67984c6f47c0ffe41ea52f41f68e9`.
+All nineteen native captures passed; strict comparisons passed for Home, View,
+Picture, Search, Application and Music, failed for ten scenes, and were
+restricted for DiskImage, Shortcut and Library. The unchanged protocol/comparer
+hashes are `be56ed7190d098f4dca449437110a6ef0a862e20a1b82dc795f0559a0fe49ac4`
+and `51a9a5840ce7dc563f80527e1fd7a8571f2a18752911ed5e035dc49a1e20876b`.
+The earlier v64 authored run used a different Ribbon implementation and failed
+the Search popup plus fourteen comparisons. A current installed five-scene
+control passed Home, View, Music, Application and Search; it does not erase the
+authored failures. Use `-InstalledRibbon` to check the normal Windows 10 layout.
+
+Drive's missing Protect group follows the measured Home-edition feature state
+and installed no-BitLocker template `0x707`; the publisher's edition is unknown.
+Video's native playlist command returns `ERROR_NO_ASSOCIATION` for the actual
+valid owned AVI. The later owned v68 Cast controls independently read the real
+audio and video registered menus: both use the same native CLSID and return one
+disabled parent, zero children and zero enabled leaves. Production agrees, and
+source, FileID, CIDA, settings and input-desktop preservation pass. This supports
+the observed disabled state without establishing its device-related cause.
+The v64 inventory does not include Cast/playlist image HRESULTs, so absent
+artwork cannot yet be attributed to image extraction. These differences remain
+in strict pixel comparisons, and whole-application parity remains false.
+
 New report environments retain the full Windows build/update revision and both fixed numeric and textual resource versions of the native Explorer binaries. This identifies cumulative-update differences that the earlier `19045.0` environment field omitted. Historical source images still require their own build, theme, scale and command-state evidence; recording the target revision does not supply missing publisher provenance.
 
 The application has a dedicated `--headless-visual` mode. Before COM or any window is created, `PrivateDesktop` creates a uniquely named Windows desktop and attaches the UI thread. It deliberately requests no desktop-switch access and never activates that desktop. Visible native controls on that private desktop can paint normally while the user's input desktop remains unchanged. The application verifies isolation before displaying or capturing any window and checks that none of its process windows is visible on the input desktop. [Microsoft: SetThreadDesktop](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setthreaddesktop), [desktop access rights](https://learn.microsoft.com/en-us/windows/win32/winstation/desktop-security-and-access-rights)
@@ -13,7 +121,7 @@ python -m pip install -r scripts/requirements-visual.txt
 ./scripts/visual-check.ps1
 ```
 
-The script creates an owned, deterministic filesystem fixture and captures sixteen Home, Share, View and contextual command pages, including Network, Shortcut and Disk Image Tools, in separate private-desktop processes. It also captures `ModernHome`, `ModernShare` and `ModernView` at the newer reference's complete 856-by-513 visible frame. Their chrome comparisons preserve the QAT, caption buttons, static navigation/address/search glyphs and borders, status shortcuts and outer frame; the manifest documents each mask for dynamic route data, separately measured command bands and article annotations. Home also has a read-only source-state fixture in the native Desktop namespace, selecting the actual UsersFilesFolder item so Windows supplies its command eligibility. Computer compares the actual native Computer namespace; Drive selects the real volume containing the owned fixture there. Network browses the actual native Network namespace, whose device names remain private. These fixtures' full screenshots and inventory can contain personal Desktop item names and drive labels: they stay in `artifacts/visual/<run>/private-source`, must be excluded from publication, and are marked nonpublishable in the summary. A pilot capture measures the actual visible frame; the final capture changes the HWND dimensions to match the reference dimensions. PNGs are never resized to manufacture a match. `-Scenes Home,View` restricts the run to those pages when called directly from PowerShell. `-CaptureOnly` verifies native rendering and desktop isolation without claiming a comparison to online screenshots. The executable is copied once into the run directory and hashed so every scene uses the same immutable build.
+The script creates an owned, deterministic filesystem fixture and captures sixteen Home, Share, View and contextual command pages, including Network, Shortcut and Disk Image Tools, in separate private-desktop processes. It also captures `ModernHome`, `ModernShare` and `ModernView` at the newer reference's complete 856-by-512 visible frame. The original 513-row crop included one desktop-wallpaper row below the window; only that source/capture boundary was corrected, without changing masks or comparison thresholds. Their chrome comparisons preserve the QAT, caption buttons, static navigation/address/search glyphs and borders, status shortcuts and outer frame; the manifest documents each mask for dynamic route data, separately measured command bands and article annotations. Home also has a read-only source-state fixture in the native Desktop namespace, selecting the actual UsersFilesFolder item so Windows supplies its command eligibility. Computer compares the actual native Computer namespace; Drive selects the real volume containing the owned fixture there. Network browses the actual native Network namespace, whose device names remain private. These fixtures' full screenshots and inventory can contain personal Desktop item names and drive labels: they stay in `artifacts/visual/<run>/private-source`, must be excluded from publication, and are marked nonpublishable in the summary. A pilot capture measures the actual visible frame; the final capture changes the HWND dimensions to match the reference dimensions. PNGs are never resized to manufacture a match. `-Scenes Home,View` restricts the run to those pages when called directly from PowerShell. `-CaptureOnly` verifies native rendering and desktop isolation without claiming a comparison to online screenshots. The executable is copied once into the run directory and hashed so every scene uses the same immutable build.
 
 The reference manifest is [windows10-reference.json](../tests/visual/windows10-reference.json). It pins source URLs, source file hashes, PDF page/image identifiers, screenshot hashes, crops, masks and thresholds. References include original Microsoft Press screenshots, Microsoft Support's Windows 10 images, and stock Windows 10 Ribbon screenshots published in 2024. The modern Share band crop excludes the article's red annotation border using explicit coordinates. Downloaded source PDFs, screenshots, comparisons and differences stay under ignored `artifacts`; they are research intermediates and are not distributed in the repository or release. [Microsoft Press PDF](https://download.microsoft.com/download/7/3/8/7381E0E8-CE72-4366-9849-13B2BAFBBA3C/Microsoft_Press_ebook_Windows_10_Tools_8.5x11.pdf), [Microsoft Support, Windows 10 section](https://support.microsoft.com/en-gb/windows/experience/fileexplorer/file-explorer-in-windows?nochrome=true), [2024 stock Ribbon screenshots](https://techpilipinas.com/get-help-file-explorer-windows/)
 
@@ -95,7 +203,7 @@ An open Date modified menu is a separate native owned HWND and is absent from th
 
 Live-search App checks drive only the owned search EDIT through real change notifications and timer dispatch. Late-created Unicode files are matched by native volume/File IDs. The checks cover automatic debounce without MRU writes, one search-history slot, explicit Enter completion, a newer edit during an older navigation, programmatic cancellation, clear/Escape origin restoration and saved-search scope restoration. A one-shot probe inside the actual accepted pending-navigation callback delivers the newer edit while the older request is genuinely pending. Monitoring starts immediately after that input is accepted; the old literal before input delivery is not classified as an overwrite. The accepted native history PIDL/index and cardinality must remain unchanged, and a later reset still fails. A controlled direct-factory callback edits away and back to the same text; its changed interaction generation must abort stale navigation and preserve the later real timer request. Enter and Escape independently test new intentions without text changes. Numeric progress identifies pending native navigation, result counts and the first unexpected edit category without logging query text. Each assertion requires its corresponding immutable App run; the separately verified scheduling module does not establish App integration by itself.
 
-The latest complete local run is v42, `artifacts/visual/run-20261005-153919-bb5eb675b4814b8d92a9455e4d486b6b`, on October 5, 2026 UTC. Its immutable executable SHA256 is `e5796664dcfdc48d4e2081f85d3093fefac2880e4993ecd508ebc9fc9bf2e07d`, reference protocol `be56ed7190d098f4dca449437110a6ef0a862e20a1b82dc795f0559a0fe49ac4` and comparer `51a9a5840ce7dc563f80527e1fd7a8571f2a18752911ed5e035dc49a1e20876b`. Windows 10 Home 22H2 build `19045.6466`, native binary versions, `en-GB`, requested Light theme and actual native 96DPI were recorded. All 19 scenes passed native rendering and private-desktop isolation. Six strict source comparisons passed and ten failed; three were restricted. DiskImage and Shortcut lack source scale/DPI evidence. The new built-in Documents Library fixture returned `E_INVALIDARG` before creating an App window. Its combined resolve field does not identify the failing subcall or prove that the profile lacks a Library; the source comparison remains unavailable and no custom-library substitute was compared. Subsequent source separates the known-folder, item, backing-path and parsing-name stages. The run returned failure and `wholeApplicationParityEstablished` remains false.
+The historical complete local v42 visual run is `artifacts/visual/run-20261005-153919-bb5eb675b4814b8d92a9455e4d486b6b`, on October 5, 2026 UTC. Its immutable executable SHA256 is `e5796664dcfdc48d4e2081f85d3093fefac2880e4993ecd508ebc9fc9bf2e07d`, reference protocol `be56ed7190d098f4dca449437110a6ef0a862e20a1b82dc795f0559a0fe49ac4` and comparer `51a9a5840ce7dc563f80527e1fd7a8571f2a18752911ed5e035dc49a1e20876b`. Windows 10 Home 22H2 build `19045.6466`, native binary versions, `en-GB`, requested Light theme and actual native 96DPI were recorded. All 19 scenes passed native rendering and private-desktop isolation. Six strict source comparisons passed and ten failed; three were restricted. DiskImage and Shortcut lack source scale/DPI evidence. The new built-in Documents Library fixture returned `E_INVALIDARG` before creating an App window. Its combined resolve field does not identify the failing subcall or prove that the profile lacks a Library; the source comparison remains unavailable and no custom-library substitute was compared. Subsequent source separates the known-folder, item, backing-path and parsing-name stages. The run returned failure and `wholeApplicationParityEstablished` remains false.
 
 The focused v43 correction resolved the native Library namespace and its independent backing path. The v44 diagnostic run, `artifacts/visual/run-20261005-155825-8e8301a28b584d16b3493b58139cbef8`, used executable `8a22a84c944534f155d72548777cb71d78d34580f70a3a766b3ffbda346aa28b`. Every resolution call succeeded. The App view, known-folder identity, backing path and checked native Library metadata remained stable, but the descriptor's actual file identity, bytes, write time and change time differed after browsing. The exact preservation guard returned `ERROR_RETRY`; it was not a successful capture and does not identify which process performed the replacement.
 
@@ -126,10 +234,14 @@ The fixture helper verified all seven genuine outputs. View read logical and act
 | ModernShare | Fail, full chrome | 95.58% | .897 |
 | ModernView | Fail, full chrome | 95.59% | .897 |
 
-All three modern address-dropdown and Refresh regions pass separately with 100% pixel agreement and edge F1 1.000. Their whole-frame failures retain the documented File-tab/frame palette and native Help-artwork differences. Drive uses the installed no-BitLocker template `0x707`; the source's Protect group is not edition-matched. Compressed independently reports 54 enabled native destinations with an image interface and enabled Extract all. Share's cached and fresh Email state agree (`S_OK`, hidden); Specific people and Stop sharing both return `E_NOTIMPL` for the original selected-item/site context. The custom owned Library has enabled Change icon and disabled Show in navigation pane/Restore defaults, unlike the source's built-in Documents library. Video retains unavailable association/device commands. Native state differences remain compared, without forced eligibility.
+All three modern address-dropdown and Refresh regions pass separately with 100% pixel agreement and edge F1 1.000. Their whole-frame failures retain the documented File-tab/frame palette and native Help-artwork differences. Drive uses the installed no-BitLocker template `0x707`; the source's Protect group is not edition-matched. Compressed independently reports 54 enabled native destinations with an image interface and enabled Extract all. Share's cached and fresh Email state agree (`S_OK`, hidden); Specific people and Stop sharing both return `E_NOTIMPL` for the original selected-item/site context. The custom owned Library has enabled Change icon and disabled Show in navigation pane/Restore defaults, unlike the source's built-in Documents library. That historical v23 Video capture retains unavailable association/device commands; the later current v108-r2 Video comparison passes. Native state differences remain compared, without forced eligibility.
 
 Search first passed in the focused run `artifacts/visual/run-20261005-120015-fd63ec2d3057441bae7f0d2d9d3ed927` and passed again in the complete v23 run above: pixel agreement 98.1119%, edge F1 .980327 and mean absolute error 1.108655. The actual physical-scope/Enter fixture proves one submission, one matching MRU entry with native Recent searches enabled, retained factories 0→1, one completed search navigation, committed history, preserved recursive scope and unchanged saved-input bytes/FileID. These source-state corrections use the normal production interaction and preserve native eligibility, masks, thresholds and artwork.
 
 Independent installed-BML realization proves all four actual Search group captions, including an empty fourth group, and no Kind parent caption (`VT_EMPTY`). The Close-group-only correction and independent four-group comparison passed the installed native Ribbon gate; the separate Close-search leaf remains titled. Kind matches its independently read native provider title without claiming BML caption parity. The earlier v15 Search capture opened the saved view without a committed MRU; the corrected typed-query state now uses the source's genuine Enter interaction. Its native eligibility, masks, thresholds and artwork remain unchanged.
 
 Historical baseline: the October 4 full run used executable `797d82951bdc90c6052ba73391ad1f873df4f09eace5ca17aa64bf6c19dbc2b9` with the same protocol and comparer. All 19 native captures passed, while four strict scenes passed and 13 failed. The obsolete duplicate Share-with group caption was subsequently removed and verified in native rendered pixels. Historical artifacts remain under ignored `artifacts/visual/run-20261004-225731-519261879c784dafa83f65143784e924`; they do not replace the latest complete report. References, private-source images and PDBs are not publication artifacts.
+
+The focused v71 run `artifacts/visual/run-20261005-212533-2658c30c40384e94baeb0403947010c4` captures Share and both Compressed contexts successfully; both strict comparisons fail. The Compressed comparison now selects the owned intact ZIP in its containing Downloads folder, matching the online source's disabled destination gallery and enabled Extract all. Its independent inside-ZIP member capture remains. Exact native address equality uses the existing owned directory's long path; the ZIP hash and selected count are checked. The updated reference manifest changes only this fixture description. Images, crops, masks, thresholds and comparer remain unchanged. The capture script's hash is now recorded separately.
+
+Share's actual action-owned menu returns `ERROR_NOT_SUPPORTED` for Specific people and Remove access, while the separate generic CommandStore lookup returns `ERROR_NOT_FOUND`. Neither is an enabled native menu result. Email's action plan instead uses the SendTo Mail Recipient route; its direct registered state remains distinct. Complete target, bytes, attributes, owner/group/DACL and settings preservation checks pass. Compressed agreement is 97.4024%, edge F1 .903344 and mean RGB error 1.236890; native group-caption and destination artwork differences remain measured. At that checkpoint these focused results did not supersede the nineteen-scene v64 run. The current complete comparison is v108-r2 above; complete visual parity remains unproven.

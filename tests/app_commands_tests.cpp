@@ -1,3 +1,4 @@
+#include "explorer/native_apartment.hpp"
 #include "explorer/app_commands.hpp"
 #include "explorer/search.hpp"
 #include "explorer/library.hpp"
@@ -10,6 +11,7 @@
 #include <propvarutil.h>
 #include <wrl/implements.h>
 #include <array>
+#include <algorithm>
 #include <atomic>
 #include <cwctype>
 #include <chrono>
@@ -20,6 +22,7 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <memory>
 #include <set>
 #include <span>
 #include <stdexcept>
@@ -91,12 +94,424 @@ public:
     HRESULT STDMETHODCALLTYPE OnNavigationFailed(PCIDLIST_ABSOLUTE) override { finished = true; status = E_FAIL; return S_OK; }
 };
 struct HiddenView {
+    struct PidlDelete {
+        using pointer=LPITEMIDLIST;
+        void operator()(pointer value)const noexcept {CoTaskMemFree(value);}
+    };
+    using OwnedPidl=std::unique_ptr<ITEMIDLIST,PidlDelete>;
+    struct ReadyMember {fs::path path;OwnedPidl pidl;FILE_ID_INFO identity{};};
     HWND owner = nullptr;
     ComPtr<IExplorerBrowser> browser;
     ComPtr<IShellView> view;
     ComPtr<NavigationEvents> events;
     DWORD cookie = 0;
-    explicit HiddenView(IShellItem* folder) {
+    ULONGLONG initializationDeadline=0;
+    ComPtr<IShellItem> readinessFolder;
+    OwnedPidl readinessFolderId;
+    std::vector<ReadyMember> readinessMembers;
+    DWORD diagnosticCreatorProcess=GetCurrentProcessId(),diagnosticCreatorThread=GetCurrentThreadId();
+    HWND diagnosticOriginalWindow=nullptr;
+    ComPtr<IFolderView2> diagnosticOriginalFolderView;
+    bool diagnosticBoundaryEnabled=false;
+    static HRESULT readReadyIdentity(const fs::path& path,FILE_ID_INFO& identity) {
+        struct File {HANDLE value=INVALID_HANDLE_VALUE;~File(){if(value!=INVALID_HANDLE_VALUE)CloseHandle(value);}}file;
+        file.value=CreateFileW(path.c_str(),FILE_READ_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
+            nullptr,OPEN_EXISTING,FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT,nullptr);
+        if(file.value==INVALID_HANDLE_VALUE)return HRESULT_FROM_WIN32(GetLastError());
+        return GetFileInformationByHandleEx(file.value,FileIdInfo,&identity,sizeof(identity))?S_OK:HRESULT_FROM_WIN32(GetLastError());
+    }
+    static bool sameReadyIdentity(const FILE_ID_INFO& first,const FILE_ID_INFO& second) {
+        return first.VolumeSerialNumber==second.VolumeSerialNumber&&
+            std::memcmp(first.FileId.Identifier,second.FileId.Identifier,sizeof(first.FileId.Identifier))==0;
+    }
+    void waitForOwnedMembers(IShellItem* originalFolder,PCIDLIST_ABSOLUTE originalFolderId,const std::vector<ReadyMember>& expected) {
+        require(originalFolder&&originalFolderId&&expected.size()==3&&browser&&view&&initializationDeadline,
+            "Equivalence readiness requires exactly three original sources and its actual initialized view");
+        ComPtr<IFolderView2> folderView;succeeded(view.As(&folderView),"Read original equivalence readiness folder view");
+        const auto current=[&](const char* phase=nullptr) {
+            const auto desktop=PrivateDesktop::current();
+            const auto privateRead=desktop?desktop->verifyIsolation():E_ACCESSDENIED;
+            ComPtr<IShellItem> actualFolder;const auto folderRead=folderView->GetFolder(IID_PPV_ARGS(&actualFolder));
+            int order=1;const auto compare=folderRead==S_OK&&actualFolder?actualFolder->Compare(originalFolder,SICHINT_CANONICAL,&order):E_NOINTERFACE;
+            PIDLIST_ABSOLUTE rawFolder=nullptr;
+            const auto folderPidlRead=folderRead==S_OK&&actualFolder?SHGetIDListFromObject(actualFolder.Get(),&rawFolder):E_NOINTERFACE;
+            OwnedPidl folderPidl(rawFolder);
+            HWND nativeWindow=nullptr;const auto windowRead=view->GetWindow(&nativeWindow);
+            DWORD nativeProcess=0,ownerProcess=0;
+            const auto nativeThread=nativeWindow?GetWindowThreadProcessId(nativeWindow,&nativeProcess):0;
+            const auto ownerThread=owner?GetWindowThreadProcessId(owner,&ownerProcess):0;
+            ComPtr<IShellView> actualView;const auto viewRead=browser->GetCurrentView(IID_PPV_ARGS(&actualView));
+            const auto privateAfter=desktop?desktop->verifyIsolation():E_ACCESSDENIED;
+            const bool exact=privateRead==S_OK&&privateAfter==S_OK&&viewRead==S_OK&&actualView.Get()==view.Get()&&folderRead==S_OK&&
+                compare==S_OK&&order==0&&folderPidlRead==S_OK&&folderPidl&&ILIsEqual(folderPidl.get(),originalFolderId)&&
+                windowRead==S_OK&&nativeWindow&&IsChild(owner,nativeWindow)&&nativeThread==GetCurrentThreadId()&&
+                ownerThread==GetCurrentThreadId()&&nativeProcess==GetCurrentProcessId()&&ownerProcess==GetCurrentProcessId()&&!IsWindowVisible(owner);
+            if(phase)std::cout<<"NativeMenu readiness source phase="<<phase<<" privateHRESULT="<<static_cast<unsigned long>(privateRead)
+                <<" privateAfterHRESULT="<<static_cast<unsigned long>(privateAfter)
+                <<" viewHRESULT="<<static_cast<unsigned long>(viewRead)<<" sameView="<<(actualView.Get()==view.Get())
+                <<" folderHRESULT="<<static_cast<unsigned long>(folderRead)<<" folderCompareHRESULT="<<static_cast<unsigned long>(compare)
+                <<" folderOrder="<<order<<" folderPIDLHRESULT="<<static_cast<unsigned long>(folderPidlRead)
+                <<" exactFolderPIDL="<<(folderPidl&&ILIsEqual(folderPidl.get(),originalFolderId))
+                <<" windowHRESULT="<<static_cast<unsigned long>(windowRead)<<" viewHWND="<<reinterpret_cast<ULONG_PTR>(nativeWindow)
+                <<" viewPID="<<nativeProcess<<" viewTID="<<nativeThread<<" ownerHWND="<<reinterpret_cast<ULONG_PTR>(owner)
+                <<" ownerPID="<<ownerProcess<<" ownerTID="<<ownerThread<<" sourceCurrent="<<exact<<'\n'<<std::flush;
+            return exact;
+        };
+        const auto counts=[&](const char* phase) {
+            int all=-1,selected=-1;
+            const auto allRead=folderView->ItemCount(SVGIO_ALLVIEW,&all);
+            const auto selectedRead=folderView->ItemCount(SVGIO_SELECTION,&selected);
+            const bool sourceCurrent=current(phase);
+            std::cout<<"NativeMenu readiness counts phase="<<phase<<" allHRESULT="<<static_cast<unsigned long>(allRead)
+                <<" all="<<all<<" selectionHRESULT="<<static_cast<unsigned long>(selectedRead)<<" selected="<<selected
+                <<" sourceCurrent="<<sourceCurrent<<" elapsedMs="<<(GetTickCount64()-(initializationDeadline-5000))<<'\n'<<std::flush;
+        };
+        counts("before-first-provider");
+        unsigned observations=0;int previousCount=-2;HRESULT previousRead=E_PENDING;
+        std::array<bool,3> identityLogged{};
+        const auto ready=[&] {
+            if(GetTickCount64()>=initializationDeadline)return false;
+            require(current(),"Equivalence readiness lost the original private folder/view");
+            int count=-1;const auto countRead=folderView->ItemCount(SVGIO_ALLVIEW,&count);++observations;
+            if(countRead!=previousRead||count!=previousCount) {
+                std::cout<<"NativeMenu readiness observed allHRESULT="<<static_cast<unsigned long>(countRead)<<" all="<<count
+                    <<" expected="<<expected.size()<<" observations="<<observations
+                    <<" elapsedMs="<<(GetTickCount64()-(initializationDeadline-5000))<<'\n'<<std::flush;
+                previousCount=count;previousRead=countRead;
+            }
+            if(countRead!=S_OK||count!=static_cast<int>(expected.size()))return false;
+            std::array<bool,3> matched{};
+            for(int index=0;index<count;++index) {
+                if(GetTickCount64()>=initializationDeadline||!current())return false;
+                PITEMID_CHILD rawChild=nullptr;const auto childRead=folderView->Item(index,&rawChild);OwnedPidl child(rawChild);
+                if(childRead!=S_OK||!child)return false;
+                const auto found=std::find_if(expected.begin(),expected.end(),[&](const ReadyMember& member){
+                    return ILIsEqual(child.get(),ILFindLastID(member.pidl.get()));});
+                if(found==expected.end())return false;
+                const auto memberIndex=static_cast<size_t>(found-expected.begin());
+                if(matched[memberIndex])return false;
+                ComPtr<IShellItem> row;const auto rowRead=folderView->GetItem(index,IID_PPV_ARGS(&row));
+                if(rowRead!=S_OK||!row||!current())return false;
+                PIDLIST_ABSOLUTE rawRow=nullptr;const auto rowPidlRead=SHGetIDListFromObject(row.Get(),&rawRow);OwnedPidl rowPidl(rawRow);
+                if(rowPidlRead!=S_OK||!rowPidl||!ILIsEqual(rowPidl.get(),found->pidl.get())||!current())return false;
+                PWSTR rawPath=nullptr;const auto pathRead=row->GetDisplayName(SIGDN_FILESYSPATH,&rawPath);
+                std::unique_ptr<wchar_t,decltype(&CoTaskMemFree)> path(rawPath,CoTaskMemFree);
+                if(pathRead!=S_OK||!path||!*path||!current()||GetTickCount64()>=initializationDeadline)return false;
+                FILE_ID_INFO originalIdentity{},nativeIdentity{};
+                const auto originalRead=readReadyIdentity(found->path,originalIdentity);
+                if(originalRead!=S_OK||!sameReadyIdentity(originalIdentity,found->identity)||!current())return false;
+                // Only exact owned child/full PIDLs and the unchanged source
+                // authorize this actual row's reported filesystem path.
+                const auto nativeRead=readReadyIdentity(fs::path(path.get()),nativeIdentity);
+                if(nativeRead!=S_OK||!sameReadyIdentity(nativeIdentity,found->identity)||!current())return false;
+                if(!identityLogged[memberIndex]) {
+                    identityLogged[memberIndex]=true;
+                    std::array<char,33> encoded{};constexpr char hex[]="0123456789abcdef";
+                    for(size_t byte=0;byte<16;++byte){encoded[2*byte]=hex[nativeIdentity.FileId.Identifier[byte]>>4];encoded[2*byte+1]=hex[nativeIdentity.FileId.Identifier[byte]&15];}
+                    std::cout<<"NativeMenu readiness member="<<memberIndex<<" row="<<index<<" exactChildAndFullPIDL=1"
+                        <<" originalIdentityHRESULT="<<static_cast<unsigned long>(originalRead)<<" nativeIdentityHRESULT="<<static_cast<unsigned long>(nativeRead)
+                        <<" exactImmutableFileID=1 volume="<<nativeIdentity.VolumeSerialNumber<<" FileID="<<encoded.data()<<'\n'<<std::flush;
+                }
+                matched[memberIndex]=true;
+            }
+            return std::all_of(matched.begin(),matched.end(),[](bool value){return value;})&&current()&&GetTickCount64()<initializationDeadline;
+        };
+        bool completed=ready();
+        while(!completed&&GetTickCount64()<initializationDeadline) {
+            MSG message{};
+            while(GetTickCount64()<initializationDeadline&&PeekMessageW(&message,nullptr,0,0,PM_REMOVE)){TranslateMessage(&message);DispatchMessageW(&message);}
+            completed=ready();
+            if(!completed&&GetTickCount64()<initializationDeadline)Sleep(1);
+        }
+        counts(completed?"ready-before-first-provider":"failed-before-first-provider");
+        require(completed&&current()&&GetTickCount64()<initializationDeadline,
+            "Original complete owned menu view membership did not become ready within initialization budget");
+        std::cout<<"NativeMenu readiness completeOwnedFileIDs=3 beforeFirstProvider=1 observations="<<observations<<'\n'<<std::flush;
+        if(diagnosticBoundaryEnabled)diagnosticOriginalFolderView=folderView;
+    }
+    void waitForOwnedMembers() {
+        require(readinessFolder&&readinessFolderId&&readinessMembers.size()==3,
+            "Opt-in equivalence readiness has no complete original source snapshot");
+        waitForOwnedMembers(readinessFolder.Get(),readinessFolderId.get(),readinessMembers);
+    }
+    void recordRegisteredMenuBoundary(const char* stage,const char* operation,const char* edge,
+        IShellItemArray* originalSelection,DWORD expectedSelection,bool mixed,HRESULT operationRead=E_PENDING) {
+        // Diagnostic-only single pass: these reads can themselves enter/pump
+        // native COM. Fence every read against the original source and a new
+        // 1000-ms diagnostic budget; do not retry, refresh or extend any test
+        // deadline. A changed source must fail, never replace strict leaf truth.
+        const auto started=GetTickCount64(),deadline=started+1000;
+        const auto originalView=view;
+        const auto originalBrowser=browser;
+        const auto folderView=diagnosticOriginalFolderView;
+        ComPtr<IShellFolder> desktopFolder,nativeFolder;
+        const auto prefix=[&] {
+            std::cout<<"NativeMenu boundary diagnosticOnly=1 stage="<<stage<<" operation="<<operation<<" edge="<<edge
+                <<" inputCount="<<expectedSelection<<" mixed="<<mixed<<" operationHRESULT="<<static_cast<ULONG>(operationRead);
+        };
+        const auto fail=[&](const char* reason) {
+            prefix();std::cout<<" rejected="<<reason<<" elapsedMs="<<(GetTickCount64()-started)
+                <<" originalStrictFailurePreserved=1"<<std::endl;
+            throw std::runtime_error("Registered menu boundary diagnostic lost original source or diagnostic budget; strict comparison cannot continue");
+        };
+        if(!originalView||!originalBrowser||!readinessFolder||!readinessFolderId||readinessMembers.size()!=3||
+            !originalSelection||!diagnosticOriginalWindow||!owner||GetCurrentProcessId()!=diagnosticCreatorProcess||
+            GetCurrentThreadId()!=diagnosticCreatorThread)fail("original-source-unavailable");
+        const auto fence=[&](const char* point,bool emit=false) {
+            if(GetTickCount64()>=deadline)fail("diagnostic-deadline");
+            const auto desktop=PrivateDesktop::current();
+            bool inputUnchanged=false;
+            const auto privateRead=desktop?desktop->verifyIsolation(&inputUnchanged):E_ACCESSDENIED;
+            ComPtr<IShellItem> currentFolder;
+            const auto folderRead=folderView?folderView->GetFolder(IID_PPV_ARGS(&currentFolder)):E_NOINTERFACE;
+            int order=1;
+            const auto compareRead=currentFolder?currentFolder->Compare(readinessFolder.Get(),SICHINT_CANONICAL,&order):E_NOINTERFACE;
+            PIDLIST_ABSOLUTE rawFolder=nullptr;
+            const auto folderPidlRead=currentFolder?SHGetIDListFromObject(currentFolder.Get(),&rawFolder):E_NOINTERFACE;
+            OwnedPidl folderPidl(rawFolder);
+            const auto folderDesktopRead=desktopFolder&&folderPidl?
+                desktopFolder->CompareIDs(SHCIDS_CANONICALONLY,folderPidl.get(),readinessFolderId.get()):E_PENDING;
+            const auto folderDesktopOrder=static_cast<short>(HRESULT_CODE(folderDesktopRead));
+            HWND nativeWindow=nullptr;
+            const auto windowRead=originalView->GetWindow(&nativeWindow);
+            DWORD nativeProcess=0,ownerProcess=0;
+            const auto nativeThread=nativeWindow?GetWindowThreadProcessId(nativeWindow,&nativeProcess):0;
+            const auto ownerThread=GetWindowThreadProcessId(owner,&ownerProcess);
+            ComPtr<IShellView> currentView;
+            const auto currentViewRead=originalBrowser->GetCurrentView(IID_PPV_ARGS(&currentView));
+            ComPtr<IUnknown> originalIdentity,currentIdentity;
+            const auto originalIdentityRead=originalView.As(&originalIdentity);
+            const auto currentIdentityRead=currentView?currentView.As(&currentIdentity):E_NOINTERFACE;
+            bool inputAfter=false;
+            const auto privateAfter=desktop?desktop->verifyIsolation(&inputAfter):E_ACCESSDENIED;
+            const bool same=privateRead==S_OK&&privateAfter==S_OK&&inputUnchanged&&inputAfter&&
+                originalView.Get()==view.Get()&&originalBrowser.Get()==browser.Get()&&currentViewRead==S_OK&&
+                originalIdentityRead==S_OK&&currentIdentityRead==S_OK&&originalIdentity&&currentIdentity&&
+                originalIdentity.Get()==currentIdentity.Get()&&folderRead==S_OK&&compareRead==S_OK&&!order&&
+                folderPidlRead==S_OK&&folderPidl&&(!desktopFolder||(folderDesktopRead==S_OK&&folderDesktopOrder==0))&&
+                windowRead==S_OK&&nativeWindow==diagnosticOriginalWindow&&IsWindow(nativeWindow)&&IsWindow(owner)&&
+                IsChild(owner,nativeWindow)&&nativeProcess==diagnosticCreatorProcess&&ownerProcess==diagnosticCreatorProcess&&
+                nativeThread==diagnosticCreatorThread&&ownerThread==diagnosticCreatorThread&&!IsWindowVisible(owner)&&
+                GetCurrentProcessId()==diagnosticCreatorProcess&&GetCurrentThreadId()==diagnosticCreatorThread;
+            if(emit||!same) {
+                prefix();std::cout<<" probe="<<point<<" sourceCurrent="<<same
+                    <<" creatorPID/TID="<<diagnosticCreatorProcess<<"/"<<diagnosticCreatorThread
+                    <<" browser/view="<<reinterpret_cast<ULONG_PTR>(originalBrowser.Get())<<"/"<<reinterpret_cast<ULONG_PTR>(originalView.Get())
+                    <<" currentViewHRESULT/identityHRESULTs/same="<<static_cast<ULONG>(currentViewRead)<<"/"
+                    <<static_cast<ULONG>(originalIdentityRead)<<","<<static_cast<ULONG>(currentIdentityRead)<<"/"
+                    <<(originalIdentity&&currentIdentity&&originalIdentity.Get()==currentIdentity.Get())
+                    <<" folderHRESULT/compareHRESULT/order/PIDLHRESULT/ILIsEqualReported="<<static_cast<ULONG>(folderRead)<<"/"
+                    <<static_cast<ULONG>(compareRead)<<"/"<<order<<"/"<<static_cast<ULONG>(folderPidlRead)<<"/"
+                    <<(folderPidl&&ILIsEqual(folderPidl.get(),readinessFolderId.get()))
+                    <<" folderDesktopCanonicalHRESULT/order="<<static_cast<ULONG>(folderDesktopRead)<<"/"<<folderDesktopOrder
+                    <<" originalFolderPIDLBytes="<<ILGetSize(readinessFolderId.get())
+                    <<" viewWindowHRESULT/HWND/PID/TID="<<static_cast<ULONG>(windowRead)<<"/"<<reinterpret_cast<ULONG_PTR>(nativeWindow)
+                    <<"/"<<nativeProcess<<"/"<<nativeThread<<" originalHWND="<<reinterpret_cast<ULONG_PTR>(diagnosticOriginalWindow)
+                    <<" ownerHWND/PID/TID/visible="<<reinterpret_cast<ULONG_PTR>(owner)<<"/"<<ownerProcess<<"/"<<ownerThread<<"/"<<IsWindowVisible(owner)
+                    <<" privateHRESULT/afterHRESULT/inputUnchanged="<<static_cast<ULONG>(privateRead)<<"/"<<static_cast<ULONG>(privateAfter)
+                    <<"/"<<(inputUnchanged&&inputAfter)<<" elapsedMs="<<(GetTickCount64()-started)<<std::endl;
+            }
+            if(!same)fail("original-source-changed");
+            if(GetTickCount64()>=deadline)fail("diagnostic-deadline");
+        };
+        // Retain the interface obtained by the original readiness QI. Do not
+        // add a new un-fenced native interface query before source validation.
+        const auto folderViewRead=folderView?S_OK:E_NOINTERFACE;
+        if(!folderView)fail("folder-view-unavailable");
+        fence("begin",true);
+        fence("desktop-folder-before");const auto desktopFolderRead=SHGetDesktopFolder(&desktopFolder);fence("desktop-folder-after");
+        if(desktopFolderRead!=S_OK||!desktopFolder)fail("canonical-desktop-folder-unavailable");
+        fence("native-folder-before");const auto nativeFolderRead=folderView->GetFolder(IID_PPV_ARGS(&nativeFolder));fence("native-folder-after");
+        if(nativeFolderRead!=S_OK||!nativeFolder)fail("canonical-native-folder-unavailable");
+        prefix();std::cout<<" desktopFolderHRESULT/nativeFolderHRESULT="<<static_cast<ULONG>(desktopFolderRead)<<"/"
+            <<static_cast<ULONG>(nativeFolderRead)<<" CompareIDsFlags="<<SHCIDS_CANONICALONLY<<std::endl;
+        DWORD flags=0;FOLDERVIEWMODE mode=FVM_AUTO;int iconSize=-1,all=-1,selected=-1;
+        fence("flags-before");const auto flagsRead=folderView->GetCurrentFolderFlags(&flags);fence("flags-after");
+        fence("mode-before");const auto modeRead=folderView->GetViewModeAndIconSize(&mode,&iconSize);fence("mode-after");
+        fence("all-count-before");const auto allRead=folderView->ItemCount(SVGIO_ALLVIEW,&all);fence("all-count-after");
+        fence("selected-count-before");const auto selectedRead=folderView->ItemCount(SVGIO_SELECTION,&selected);fence("selected-count-after");
+        DWORD arrayCount=0;
+        fence("array-count-before");const auto arrayCountRead=originalSelection->GetCount(&arrayCount);fence("array-count-after");
+        if(arrayCountRead!=S_OK||arrayCount!=expectedSelection||!arrayCount)fail("original-full-selection-changed");
+        for(const auto arrayRow:std::array<DWORD,2>{0,arrayCount-1}) {
+            fence("array-item-before");ComPtr<IShellItem> arrayItem;
+            const auto arrayItemRead=originalSelection->GetItemAt(arrayRow,&arrayItem);fence("array-item-after");
+            PIDLIST_ABSOLUTE rawItem=nullptr;
+            const auto arrayPidlRead=arrayItem?SHGetIDListFromObject(arrayItem.Get(),&rawItem):E_NOINTERFACE;
+            OwnedPidl arrayPidl(rawItem);fence("array-pidl-after");
+            const size_t expectedMember=mixed&&arrayRow==arrayCount-1?2:0;
+            fence("array-full-canonical-before");
+            const auto arrayCanonicalRead=arrayPidl?desktopFolder->CompareIDs(SHCIDS_CANONICALONLY,
+                arrayPidl.get(),readinessMembers[expectedMember].pidl.get()):E_NOINTERFACE;
+            const auto arrayCanonicalOrder=static_cast<short>(HRESULT_CODE(arrayCanonicalRead));fence("array-full-canonical-after");
+            const bool exact=arrayItemRead==S_OK&&arrayPidlRead==S_OK&&arrayPidl&&arrayCanonicalRead==S_OK&&arrayCanonicalOrder==0;
+            prefix();std::cout<<" arrayRow="<<arrayRow<<" expectedOwnedMember="<<expectedMember
+                <<" itemHRESULT/PIDLHRESULT/canonicalFullPIDLMatch="<<static_cast<ULONG>(arrayItemRead)<<"/"<<static_cast<ULONG>(arrayPidlRead)<<"/"<<exact
+                <<" arrayDesktopCanonicalHRESULT/order="<<static_cast<ULONG>(arrayCanonicalRead)<<"/"<<arrayCanonicalOrder
+                <<" arrayILIsEqualReported="<<(arrayPidl&&ILIsEqual(arrayPidl.get(),readinessMembers[expectedMember].pidl.get()))<<std::endl;
+            arrayItem.Reset();fence("array-item-release-after");
+            if(!exact)fail("original-full-selection-identity-changed");
+        }
+        std::array<BYTE,256> keyboard{};
+        fence("keyboard-before");const auto keyboardRead=GetKeyboardState(keyboard.data());const auto keyboardError=keyboardRead?ERROR_SUCCESS:GetLastError();
+        const auto active=GetActiveWindow(),focus=GetFocus(),foreground=GetForegroundWindow();
+        const auto layout=GetKeyboardLayout(0);fence("keyboard-after");
+        bool visibleInput=false;
+        fence("private-visible-before");const auto desktop=PrivateDesktop::current();
+        const auto visibleRead=desktop?desktop->visibleWindowsOnInputDesktop(visibleInput):E_ACCESSDENIED;fence("private-visible-after");
+        prefix();std::cout<<" folderViewHRESULT="<<static_cast<ULONG>(folderViewRead)
+            <<" flagsHRESULT/value="<<static_cast<ULONG>(flagsRead)<<"/"<<flags
+            <<" modeHRESULT/value/iconSize="<<static_cast<ULONG>(modeRead)<<"/"<<static_cast<int>(mode)<<"/"<<iconSize
+            <<" allHRESULT/count="<<static_cast<ULONG>(allRead)<<"/"<<all
+            <<" selectedHRESULT/count="<<static_cast<ULONG>(selectedRead)<<"/"<<selected
+            <<" arrayHRESULT/count="<<static_cast<ULONG>(arrayCountRead)<<"/"<<arrayCount
+            <<" active/focus/foreground/HKL="<<reinterpret_cast<ULONG_PTR>(active)<<"/"<<reinterpret_cast<ULONG_PTR>(focus)<<"/"
+            <<reinterpret_cast<ULONG_PTR>(foreground)<<"/"<<reinterpret_cast<ULONG_PTR>(layout)
+            <<" keyboardRead/error="<<keyboardRead<<"/"<<keyboardError
+            <<" shift/ctrl/alt/caps/num/scroll="<<static_cast<unsigned>(keyboard[VK_SHIFT])<<"/"<<static_cast<unsigned>(keyboard[VK_CONTROL])<<"/"
+            <<static_cast<unsigned>(keyboard[VK_MENU])<<"/"<<static_cast<unsigned>(keyboard[VK_CAPITAL])<<"/"
+            <<static_cast<unsigned>(keyboard[VK_NUMLOCK])<<"/"<<static_cast<unsigned>(keyboard[VK_SCROLL])
+            <<" inputVisibilityHRESULT/visible="<<static_cast<ULONG>(visibleRead)<<"/"<<visibleInput<<std::endl;
+        if(visibleRead!=S_OK||visibleInput)fail("private-input-isolation-changed");
+        std::array<int,3> rows{-1,-1,-1};
+        std::array<FILE_ID_INFO,3> nativeIds{};
+        std::array<HRESULT,3> nativeReads{E_PENDING,E_PENDING,E_PENDING};
+        std::array<HRESULT,3> nativePathReads{E_PENDING,E_PENDING,E_PENDING};
+        std::array<bool,3> nativeIdAttempted{};
+        // Never inspect an unowned row's display name or filesystem path. A
+        // complete native count of three is required for bounded row matching.
+        if(allRead==S_OK&&all==static_cast<int>(readinessMembers.size()))for(int rowIndex=0;rowIndex<all;++rowIndex) {
+            fence("owned-child-before");PITEMID_CHILD rawChild=nullptr;
+            const auto childRead=folderView->Item(rowIndex,&rawChild);OwnedPidl child(rawChild);fence("owned-child-after");
+            HRESULT childCanonicalRead=E_PENDING;short childCanonicalOrder=1;
+            const auto member=child?std::find_if(readinessMembers.begin(),readinessMembers.end(),[&](const ReadyMember& value){
+                fence("owned-child-canonical-before");
+                childCanonicalRead=nativeFolder->CompareIDs(SHCIDS_CANONICALONLY,child.get(),ILFindLastID(value.pidl.get()));
+                childCanonicalOrder=static_cast<short>(HRESULT_CODE(childCanonicalRead));fence("owned-child-canonical-after");
+                return childCanonicalRead==S_OK&&childCanonicalOrder==0;}):readinessMembers.end();
+            if(childRead!=S_OK||member==readinessMembers.end()) {
+                prefix();std::cout<<" row="<<rowIndex<<" childHRESULT="<<static_cast<ULONG>(childRead)
+                    <<" ownedChild=0 pathReadSkipped=1"<<std::endl;continue;
+            }
+            const auto memberIndex=static_cast<size_t>(member-readinessMembers.begin());
+            fence("owned-row-before");ComPtr<IShellItem> row;
+            const auto rowRead=folderView->GetItem(rowIndex,IID_PPV_ARGS(&row));fence("owned-row-after");
+            PIDLIST_ABSOLUTE rawRow=nullptr;
+            const auto rowPidlRead=row?SHGetIDListFromObject(row.Get(),&rawRow):E_NOINTERFACE;
+            OwnedPidl rowPidl(rawRow);fence("owned-full-pidl-after");
+            fence("owned-full-canonical-before");
+            const auto fullCanonicalRead=rowPidl?desktopFolder->CompareIDs(SHCIDS_CANONICALONLY,rowPidl.get(),member->pidl.get()):E_NOINTERFACE;
+            const auto fullCanonicalOrder=static_cast<short>(HRESULT_CODE(fullCanonicalRead));fence("owned-full-canonical-after");
+            const bool exact=rowRead==S_OK&&rowPidlRead==S_OK&&rowPidl&&childCanonicalRead==S_OK&&childCanonicalOrder==0&&
+                fullCanonicalRead==S_OK&&fullCanonicalOrder==0;
+            const auto observedBytes=rowPidl?ILGetSize(rowPidl.get()):0,expectedBytes=ILGetSize(member->pidl.get());
+            const bool byteEqual=rowPidl&&observedBytes==expectedBytes&&std::memcmp(rowPidl.get(),member->pidl.get(),expectedBytes)==0;
+            prefix();std::cout<<" row="<<rowIndex<<" ownedMember="<<memberIndex<<" childHRESULT="<<static_cast<ULONG>(childRead)
+                <<" rowHRESULT/fullPIDLHRESULT/canonicalChildAndFullPIDLMatch="<<static_cast<ULONG>(rowRead)<<"/"<<static_cast<ULONG>(rowPidlRead)<<"/"<<exact
+                <<" nativeChildCanonicalHRESULT/order="<<static_cast<ULONG>(childCanonicalRead)<<"/"<<childCanonicalOrder
+                <<" desktopFullCanonicalHRESULT/order="<<static_cast<ULONG>(fullCanonicalRead)<<"/"<<fullCanonicalOrder
+                <<" childILIsEqualReported="<<ILIsEqual(child.get(),ILFindLastID(member->pidl.get()))
+                <<" fullILIsEqualReported="<<(rowPidl&&ILIsEqual(rowPidl.get(),member->pidl.get()))
+                <<" fullPIDLBytes/expectedBytes/rawByteEqual="<<observedBytes<<"/"<<expectedBytes<<"/"<<byteEqual<<std::endl;
+            if(exact) {
+                // Original source FileID plus native-folder child CompareIDs,
+                // Desktop full CompareIDs and current private source authorize
+                // this exact owned row's reported path. Raw IL/byte results are
+                // diagnostic only; their conflicting runtime cause is unknown.
+                // A native alias can spell that same owned path differently.
+                FILE_ID_INFO sourceBeforePath{};
+                fence("owned-source-id-before-reported-path");
+                const auto sourceBeforePathRead=readReadyIdentity(member->path,sourceBeforePath);
+                fence("owned-source-id-after-reported-path-authorization");
+                const bool sourceBeforePathExact=sourceBeforePathRead==S_OK&&sameReadyIdentity(sourceBeforePath,member->identity);
+                prefix();std::cout<<" ownedMember="<<memberIndex<<" sourceBeforePathHRESULT/exactImmutableFileID="
+                    <<static_cast<ULONG>(sourceBeforePathRead)<<"/"<<sourceBeforePathExact
+                    <<" ownedAliasAuthorizedBeforePath="<<sourceBeforePathExact<<std::endl;
+                if(!sourceBeforePathExact)fail("original-owned-source-changed-before-reported-path");
+                fence("owned-path-before");PWSTR rawPath=nullptr;
+                const auto pathRead=row->GetDisplayName(SIGDN_FILESYSPATH,&rawPath);
+                nativePathReads[memberIndex]=pathRead;
+                std::unique_ptr<wchar_t,decltype(&CoTaskMemFree)> path(rawPath,CoTaskMemFree);fence("owned-path-after");
+                const bool pathPresent=path&&*path;
+                const bool lexicalPathMatch=pathRead==S_OK&&pathPresent&&
+                    CompareStringOrdinal(path.get(),-1,member->path.c_str(),-1,TRUE)==CSTR_EQUAL;
+                prefix();std::cout<<" ownedMember="<<memberIndex<<" pathHRESULT="<<static_cast<ULONG>(pathRead)
+                    <<" reportedPathPresent="<<pathPresent<<" lexicalPathMatch="<<lexicalPathMatch<<" pathTextLogged=0"<<std::endl;
+                if(pathRead==S_OK&&pathPresent) {
+                    FILE_ID_INFO sourceBeforeNativeId{};
+                    fence("owned-source-id-before-native-path-open");
+                    const auto sourceBeforeNativeIdRead=readReadyIdentity(member->path,sourceBeforeNativeId);
+                    fence("owned-source-id-after-native-path-open-authorization");
+                    const bool sourceBeforeNativeIdExact=sourceBeforeNativeIdRead==S_OK&&sameReadyIdentity(sourceBeforeNativeId,member->identity);
+                    prefix();std::cout<<" ownedMember="<<memberIndex<<" sourceBeforeNativeIdHRESULT/exactImmutableFileID="
+                        <<static_cast<ULONG>(sourceBeforeNativeIdRead)<<"/"<<sourceBeforeNativeIdExact<<std::endl;
+                    if(!sourceBeforeNativeIdExact)fail("original-owned-source-changed-before-native-path-open");
+                    fence("owned-native-id-before");nativeIdAttempted[memberIndex]=true;
+                    nativeReads[memberIndex]=readReadyIdentity(fs::path(path.get()),nativeIds[memberIndex]);
+                    fence("owned-native-id-after");
+                }
+                if(rows[memberIndex]!=-1)fail("duplicate-owned-native-member");
+                rows[memberIndex]=rowIndex;
+            }
+            row.Reset();fence("owned-row-release-after");
+        }
+        for(size_t memberIndex=0;memberIndex<readinessMembers.size();++memberIndex) {
+            const auto& member=readinessMembers[memberIndex];FILE_ID_INFO sourceId{};
+            fence("owned-source-id-before");const auto sourceRead=readReadyIdentity(member.path,sourceId);fence("owned-source-id-after");
+            const bool sourceExact=sourceRead==S_OK&&sameReadyIdentity(sourceId,member.identity);
+            const bool nativeExact=nativeReads[memberIndex]==S_OK&&sameReadyIdentity(nativeIds[memberIndex],member.identity);
+            const auto encode=[](const FILE_ID_INFO& identity) {
+                std::array<char,33> encoded{};constexpr char hex[]="0123456789abcdef";
+                for(size_t byte=0;byte<16;++byte){encoded[2*byte]=hex[identity.FileId.Identifier[byte]>>4];encoded[2*byte+1]=hex[identity.FileId.Identifier[byte]&15];}
+                return encoded;
+            };
+            const auto expectedId=encode(member.identity),observedSourceId=encode(sourceId),nativeId=encode(nativeIds[memberIndex]);
+            prefix();std::cout<<" ownedMember="<<memberIndex<<" nativeRow="<<rows[memberIndex]<<" expectedFullPIDLBytes="<<ILGetSize(member.pidl.get())
+                <<" sourceHRESULT/exactImmutableFileID="<<static_cast<ULONG>(sourceRead)<<"/"<<sourceExact
+                <<" expectedVolume/FileID="<<member.identity.VolumeSerialNumber<<"/"<<expectedId.data()
+                <<" sourceVolume/FileID="<<sourceId.VolumeSerialNumber<<"/"<<observedSourceId.data()
+                <<" nativePathHRESULT="<<static_cast<ULONG>(nativePathReads[memberIndex])
+                <<" nativeIdentityReadAttempted="<<nativeIdAttempted[memberIndex]
+                <<" nativeIdentityHRESULT/exactImmutableFileID="<<static_cast<ULONG>(nativeReads[memberIndex])<<"/"<<nativeExact
+                <<" nativeVolume/FileID="<<nativeIds[memberIndex].VolumeSerialNumber<<"/"<<nativeId.data()<<std::endl;
+            if(!sourceExact)fail("original-owned-file-identity-changed");
+            if(nativeIdAttempted[memberIndex]&&nativeReads[memberIndex]==S_OK&&!nativeExact)
+                fail("owned-native-row-file-identity-changed");
+        }
+        int allAfter=-1,selectedAfter=-1;
+        fence("all-count-final-before");const auto allAfterRead=folderView->ItemCount(SVGIO_ALLVIEW,&allAfter);fence("all-count-final-after");
+        fence("selected-count-final-before");const auto selectedAfterRead=folderView->ItemCount(SVGIO_SELECTION,&selectedAfter);fence("selected-count-final-after");
+        prefix();std::cout<<" allAfterHRESULT/count="<<static_cast<ULONG>(allAfterRead)<<"/"<<allAfter
+            <<" selectedAfterHRESULT/count="<<static_cast<ULONG>(selectedAfterRead)<<"/"<<selectedAfter
+            <<" countChangedDuringDiagnostic="<<(allRead!=allAfterRead||all!=allAfter||selectedRead!=selectedAfterRead||selected!=selectedAfter)<<std::endl;
+        fence("end",true);
+        prefix();std::cout<<" complete=1 nativeMembershipComplete="<<(allRead==S_OK&&all==3&&allAfterRead==S_OK&&allAfter==all&&
+            selectedRead==selectedAfterRead&&selected==selectedAfter&&
+            std::all_of(rows.begin(),rows.end(),[](int row){return row>=0;})&&
+            std::all_of(nativeReads.begin(),nativeReads.end(),[](HRESULT hr){return hr==S_OK;})&&
+            sameReadyIdentity(nativeIds[0],readinessMembers[0].identity)&&sameReadyIdentity(nativeIds[1],readinessMembers[1].identity)&&
+            sameReadyIdentity(nativeIds[2],readinessMembers[2].identity))<<" elapsedMs="<<(GetTickCount64()-started)<<std::endl;
+    }
+    explicit HiddenView(IShellItem* folder,std::span<const fs::path> ownedPaths={},bool registeredBoundaryDiagnostics=false) {
+        diagnosticBoundaryEnabled=registeredBoundaryDiagnostics;
+        auto& expected=readinessMembers;
+        auto& originalFolderId=readinessFolderId;
+        if(!ownedPaths.empty()) {
+            require(ownedPaths.size()==3,"Equivalence readiness must retain all three owned source members");
+            readinessFolder=folder;
+            PIDLIST_ABSOLUTE raw=nullptr;const auto folderRead=SHGetIDListFromObject(folder,&raw);originalFolderId.reset(raw);
+            succeeded(folderRead,"Retain exact original equivalence readiness folder PIDL");require(originalFolderId!=nullptr,"Original readiness folder has no PIDL");
+            for(const auto& path:ownedPaths) {
+                ReadyMember member;member.path=path;
+                const auto native=item(path);
+                raw=nullptr;const auto itemRead=SHGetIDListFromObject(native.Get(),&raw);member.pidl.reset(raw);
+                succeeded(itemRead,"Retain exact original equivalence readiness member PIDL");require(member.pidl!=nullptr,"Original readiness member has no PIDL");
+                succeeded(readReadyIdentity(path,member.identity),"Retain full original owned readiness FileID");
+                require(std::none_of(expected.begin(),expected.end(),[&](const ReadyMember& prior){return sameReadyIdentity(prior.identity,member.identity);}),
+                    "Original readiness members have duplicate native FileIDs");
+                expected.push_back(std::move(member));
+            }
+        }
         owner = CreateWindowExW(0,L"STATIC",L"headless native command fixture",WS_POPUP,
             0,0,800,600,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
         require(owner && !IsWindowVisible(owner),"Create exclusively hidden owned provider host");
@@ -109,8 +524,8 @@ struct HiddenView {
         require(events != nullptr,"Create native navigation observer");
         succeeded(browser->Advise(events.Get(),&cookie),"Observe hidden native view navigation");
         succeeded(browser->BrowseToObject(folder,SBSP_ABSOLUTE),"Browse owned fixture without displaying a window");
-        const auto deadline = GetTickCount64()+5000;
-        while (!events->finished && GetTickCount64()<deadline) {
+        initializationDeadline=GetTickCount64()+5000;
+        while (!events->finished && GetTickCount64()<initializationDeadline) {
             MSG message{};
             while (PeekMessageW(&message,nullptr,0,0,PM_REMOVE)) { TranslateMessage(&message); DispatchMessageW(&message); }
             Sleep(1);
@@ -119,8 +534,13 @@ struct HiddenView {
         succeeded(events->status,"Native hidden provider completed navigation");
         succeeded(browser->GetCurrentView(IID_PPV_ARGS(&view)),"Read actual native IShellView site");
         require(!IsWindowVisible(owner),"Native view initialization displayed its owner");
+        if(diagnosticBoundaryEnabled) {
+            const auto windowRead=view->GetWindow(&diagnosticOriginalWindow);
+            if(windowRead!=S_OK||!diagnosticOriginalWindow)throw std::runtime_error("Registered menu diagnostic could not retain original view HWND");
+        }
     }
     ~HiddenView() {
+        diagnosticOriginalFolderView.Reset();
         view.Reset();
         if (browser) { if (cookie) browser->Unadvise(cookie); browser->Destroy(); browser.Reset(); }
         events.Reset();
@@ -139,7 +559,7 @@ void onPrivateDesktop(const std::function<void()>& body, bool registerGuard = tr
     std::atomic<bool> complete{false};
     std::thread worker([&] {
         explorer::PrivateDesktop desktop;
-        bool initialized=false;
+        bool initialized=false;explorer::NativeApartmentOwner nativeApartment;
         try {
             if (registerGuard) {
                 succeeded(desktop.initialize(),"Attach guarded private provider desktop before native initialization");
@@ -152,13 +572,13 @@ void onPrivateDesktop(const std::function<void()>& body, bool registerGuard = tr
                 require(explorer::PrivateDesktop::current() == nullptr,
                         "Negative-control thread unexpectedly registered a guard");
             }
-            succeeded(OleInitialize(nullptr),"Initialize private provider STA");initialized=true;
+            succeeded(nativeApartment.initializeOle(),"Initialize private provider STA");initialized=true;
             body();
         } catch (...) { failure=std::current_exception(); }
         if(initialized){
             try{succeeded(drainStaWorkers(10000),"Drain actual STA provider/desktop leases before apartment shutdown");}
             catch(...){if(!failure)failure=std::current_exception();}
-            OleUninitialize();
+            nativeApartment.finishOrTerminate();
         }
         complete.store(true);
     });
@@ -407,7 +827,8 @@ void cancelledStateSiteApartmentLifetime() {
         std::atomic<bool> retained{false},cancelled{false},drained{false},closed{false};
         HRESULT status=E_PENDING;
         std::thread creator([&] {
-            status=CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);
+            explorer::NativeApartmentOwner nativeApartment;
+            status=nativeApartment.initializeSta();
             if(FAILED(status))return;
             {
                 ComPtr<IShellItem> folder;
@@ -434,7 +855,7 @@ void cancelledStateSiteApartmentLifetime() {
             }
             const auto drain=drainStaWorkers(10000);
             if(SUCCEEDED(status)&&FAILED(drain))status=drain;
-            CoUninitialize();closed=true;
+            nativeApartment.finishOrTerminate();closed=true;
         });
         creator.join();
         succeeded(status,"Start real native pending state on an independent owning STA");
@@ -607,14 +1028,14 @@ void nativeSearchLocationDelegatesAndTargets() {
     std::atomic<bool> complete{false};
     std::thread worker([&] {
         HDESK previous = GetThreadDesktop(GetCurrentThreadId()),desktop = nullptr;
-        bool initialized = false;
+        bool initialized = false;explorer::NativeApartmentOwner nativeApartment;
         try {
             GUID id{}; succeeded(CoCreateGuid(&id),"Private Search-location desktop identity");
             wchar_t name[40]{};
             require(StringFromGUID2(id,name,40) != 0,"Format private Search-location desktop identity");
             desktop = CreateDesktopW((std::wstring(L"ExplorerSearchLocation-")+name).c_str(),nullptr,nullptr,0,GENERIC_ALL,nullptr);
             require(desktop && SetThreadDesktop(desktop),"Attach private Search-location desktop before native initialization");
-            succeeded(OleInitialize(nullptr),"Initialize private Search-location STA");
+            succeeded(nativeApartment.initializeOle(),"Initialize private Search-location STA");
             initialized = true;
             {
                 Fixture fixture;
@@ -719,7 +1140,7 @@ void nativeSearchLocationDelegatesAndTargets() {
                 require(!IsWindowVisible(host.owner),"Read-only Search providers displayed the owned host");
             }
         } catch (...) { failure = std::current_exception(); }
-        if (initialized) OleUninitialize();
+        if (initialized) nativeApartment.finishOrTerminate();
         if (desktop && SetThreadDesktop(previous)) CloseDesktop(desktop);
         complete.store(true);
     });
@@ -1204,13 +1625,17 @@ HRESULT finishStateBatch(NamespaceCommandStateTask& task,std::vector<NamespaceSe
     return task.pollSelectionVerbBatch(result);
 }
 
-void nativeLeafStateMenuEquivalence(std::span<const DWORD> counts) {
-    onPrivateDesktop([counts] {
+void nativeLeafStateMenuEquivalence(std::span<const DWORD> counts, unsigned mixtureMask = 3, unsigned registrationMask = 3) {
+    onPrivateDesktop([counts,mixtureMask,registrationMask] {
+        require(mixtureMask>=1&&mixtureMask<=3&&registrationMask>=1&&registrationMask<=3,
+                "Native menu-state partition has invalid mixture or provider mask");
         Fixture fixture;const auto before=read(fixture.text),zipBefore=read(fixture.archive);
         const auto clipboard=GetClipboardSequenceNumber();
         const auto clipboardOwnerBefore=GetClipboardOwner();
         const auto folder=item(fixture.root),text=item(fixture.text),directory=item(fixture.directory);
-        HiddenView host(folder.Get());
+        const std::array<fs::path,3> readyPaths{fixture.text,fixture.archive,fixture.directory};
+        HiddenView host(folder.Get(),readyPaths,(registrationMask&2u)!=0);
+        host.waitForOwnedMembers();
         struct Identities {
             PIDLIST_ABSOLUTE text=nullptr,directory=nullptr,parent=nullptr;
             ~Identities(){CoTaskMemFree(text);CoTaskMemFree(directory);CoTaskMemFree(parent);}
@@ -1234,7 +1659,27 @@ void nativeLeafStateMenuEquivalence(std::span<const DWORD> counts) {
             }
             return states;
         };
+        const auto emitDifferences=[](const char* stage,DWORD count,bool mixed,bool registered,
+            const std::multimap<std::wstring,UINT>& expected,const std::multimap<std::wstring,UINT>& actual) {
+            if(expected==actual)return;
+            std::cout<<"Native canonical comparison mismatch stage="<<stage<<" count="<<count
+                <<" mixed="<<mixed<<" registered="<<registered<<" expectedRows="<<expected.size()
+                <<" actualRows="<<actual.size()<<std::endl;
+            std::set<std::wstring> verbs;
+            for(const auto& row:expected)verbs.insert(row.first);
+            for(const auto& row:actual)verbs.insert(row.first);
+            for(const auto& verb:verbs) {
+                const auto before=expected.equal_range(verb),after=actual.equal_range(verb);
+                if(std::vector(before.first,before.second)==std::vector(after.first,after.second))continue;
+                std::wcout<<L"Native canonical differing verb="<<verb<<L" expected=";
+                for(auto row=before.first;row!=before.second;++row)std::wcout<<row->second<<L",";
+                std::wcout<<L" actual=";
+                for(auto row=after.first;row!=after.second;++row)std::wcout<<row->second<<L",";
+                std::wcout<<std::endl;
+            }
+        };
         for(const DWORD count:counts)for(const bool mixed:{false,true}) {
+            if(!(mixtureMask&(mixed?2u:1u)))continue;
             if(count==1&&mixed)continue;
             std::vector<PCIDLIST_ABSOLUTE> ids(count,identities.text);
             if(mixed)ids.back()=identities.directory;
@@ -1245,26 +1690,153 @@ void nativeLeafStateMenuEquivalence(std::span<const DWORD> counts) {
             DWORD retained=0;succeeded(selected->GetCount(&retained),"Read original full native root-leaf count");
             require(retained==count,"Native root-leaf comparison truncated its original selection");
             for(const bool registered:{false,true}) {
+                if(!(registrationMask&(registered?2u:1u)))continue;
+                const auto diagnosticBoundary=[&](const char* stage,const char* operation,const char* edge,HRESULT hr=E_PENDING) {
+                    if(registered)host.recordRegisteredMenuBoundary(stage,operation,edge,selected.Get(),count,mixed,hr);
+                };
+                const auto diagnosticCall=[&](const char* stage,const char* operation,const auto& call) {
+                    diagnosticBoundary(stage,operation,"before");
+                    const HRESULT hr=call();
+                    diagnosticBoundary(stage,operation,"after",hr);
+                    return hr;
+                };
+                const auto diagnosticRelease=[&](const char* stage,const char* operation,const auto& release) {
+                    diagnosticBoundary(stage,operation,"before");
+                    release();
+                    diagnosticBoundary(stage,operation,"after",S_OK);
+                };
+                const auto diagnosticMenuCreate=[&](const char* stage,const auto& create) {
+                    if(!registered)return create(nullptr);
+                    NativeContextMenuCreateObserver observer;
+                    auto record=[&](const NativeContextMenuCreateBoundary& event) {
+                        std::cout<<"Native creation boundary diagnosticOnly=1 stage="<<stage
+                            <<" operation="<<event.operation<<" edge="<<(event.after?"after":"before")
+                            <<" nativeCallAttempted="<<event.attempted
+                            <<" rawHRESULT="<<static_cast<ULONG>(event.operationResult)
+                            <<" generation="<<event.generation<<" sequence="<<event.sequence
+                            <<" sourceCurrentBeforeObserver="<<event.sourceCurrent<<std::endl;
+                        diagnosticBoundary(stage,event.operation,event.after?"after":"before",event.operationResult);
+                    };
+                    observer.state=&record;
+                    observer.record=+[](void* state,const NativeContextMenuCreateBoundary& event) {
+                        (*static_cast<decltype(record)*>(state))(event);
+                    };
+                    const HRESULT hr=create(&observer);
+                    const auto& receipt=observer.receipt;
+                    std::cout<<"Native creation receipt diagnosticOnly=1 stage="<<stage
+                        <<" creationHRESULT="<<static_cast<ULONG>(receipt.creationResult)
+                        <<" diagnosticHRESULT="<<static_cast<ULONG>(receipt.diagnosticResult)
+                        <<" observerThrew="<<receipt.observerThrew<<" sourceCurrentAtReturn="<<receipt.sourceCurrent
+                        <<" lastOperation="<<(receipt.last.operation?receipt.last.operation:"none")
+                        <<" lastEdge="<<(receipt.last.after?"after":"before")
+                        <<" lastAttempted/rawHRESULT="<<receipt.last.attempted<<"/"<<static_cast<ULONG>(receipt.last.operationResult)
+                        <<" lastNativeFailureOperation="<<(receipt.lastNativeFailure.operation?receipt.lastNativeFailure.operation:"none")
+                        <<" lastNativeFailureAttempted/rawHRESULT="<<receipt.lastNativeFailure.attempted
+                        <<"/"<<static_cast<ULONG>(receipt.lastNativeFailure.operationResult)
+                        <<" firstDiagnosticFailureOperation="<<(receipt.firstDiagnosticFailure.operation?receipt.firstDiagnosticFailure.operation:"none")
+                        <<" firstDiagnosticFailureEdge="<<(receipt.firstDiagnosticFailure.after?"after":"before")
+                        <<" firstDiagnosticFailureAttempted/rawHRESULT="<<receipt.firstDiagnosticFailure.attempted
+                        <<"/"<<static_cast<ULONG>(receipt.firstDiagnosticFailure.operationResult)<<std::endl;
+                    return hr;
+                };
                 const auto createContext=[&](IContextMenu** result) {
                     if(!registered)return selected->BindToHandler(nullptr,BHID_SFUIObject,IID_IContextMenu,reinterpret_cast<void**>(result));
                     DEFCONTEXTMENU definition{};definition.pidlFolder=identities.parent;definition.psf=parent.Get();
                     definition.cidl=count;definition.apidl=children.data();definition.cKeys=1;definition.aKeys=&registry.key;
                     return SHCreateDefaultContextMenu(&definition,IID_IContextMenu,reinterpret_cast<void**>(result));
                 };
-                ComPtr<IContextMenu> full;succeeded(createContext(&full),"Create original full-array native comparison menu");
+                ComPtr<IContextMenu> full;succeeded(diagnosticCall("full","providerCreation",[&]{return createContext(&full);}),"Create original full-array native comparison menu");
+                diagnosticBoundary("full","queryAndSite","before");
                 const auto normalStarted=std::chrono::steady_clock::now();
                 const UINT nativeFlags=CMF_EXTENDEDVERBS|(registered?0:CMF_ITEMMENU);
-                NativeContextMenu normal;succeeded(normal.create(nullptr,full.Get(),host.view.Get(),nativeFlags),
-                    "Read native synchronous-cascade comparison truth without invocation");
+                NativeContextMenu normal;const auto normalRead=diagnosticMenuCreate("full",[&](NativeContextMenuCreateObserver* observer){return observer?normal.create(nullptr,full.Get(),host.view.Get(),nativeFlags,*observer):normal.create(nullptr,full.Get(),host.view.Get(),nativeFlags);});
                 const auto normalMicros=std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-normalStarted).count();
-                std::vector<ContextMenuEntry> original;succeeded(normal.enumerate(original,false),"Read original actual native leaf states");
-                normal.reset();full.Reset();
-                ComPtr<IContextMenu> stateContext;succeeded(createContext(&stateContext),"Create fresh original-target native leaf-state menu");
+                diagnosticBoundary("full","queryAndSite","after",normalRead);
+                succeeded(normalRead,"Read native synchronous-cascade comparison truth without invocation");
+                std::vector<ContextMenuEntry> original;succeeded(diagnosticCall("full","snapshot",[&]{return normal.enumerate(original,false);}),"Read original actual native leaf states");
+                diagnosticRelease("full","menuRelease",[&]{normal.reset();});
+                diagnosticRelease("full","providerRelease",[&]{full.Reset();});
+                const auto diagnoseMismatch=[&](const char* stage) {
+                    // Failure-only evidence. This never repairs or retries the
+                    // captured comparison and cannot replace its strict failure.
+                    try {
+                        const auto diagnosticView=host.view;const auto diagnosticBrowser=host.browser;
+                        const auto describeView=[&](const char* phase) {
+                            ComPtr<IFolderView2> folderView;const auto folderViewRead=diagnosticView.As(&folderView);
+                            int allCount=-1,selectedCount=-1;DWORD arrayCount=MAXDWORD;
+                            const auto allRead=SUCCEEDED(folderViewRead)&&folderView?folderView->ItemCount(SVGIO_ALLVIEW,&allCount):E_NOINTERFACE;
+                            const auto selectedRead=SUCCEEDED(folderViewRead)&&folderView?folderView->ItemCount(SVGIO_SELECTION,&selectedCount):E_NOINTERFACE;
+                            ComPtr<IShellItemArray> selection;
+                            const auto selectionRead=SUCCEEDED(folderViewRead)&&folderView?folderView->GetSelection(FALSE,&selection):E_NOINTERFACE;
+                            const auto selectionCountRead=selection?selection->GetCount(&arrayCount):E_NOINTERFACE;
+                            ComPtr<IShellItem> currentFolder;
+                            const auto folderRead=SUCCEEDED(folderViewRead)&&folderView?folderView->GetFolder(IID_PPV_ARGS(&currentFolder)):E_NOINTERFACE;
+                            int folderComparison=std::numeric_limits<int>::min();
+                            const auto folderIdentityRead=currentFolder?currentFolder->Compare(folder.Get(),SICHINT_CANONICAL,&folderComparison):E_NOINTERFACE;
+                            ComPtr<IShellView> currentView;
+                            const auto currentViewRead=diagnosticBrowser?diagnosticBrowser->GetCurrentView(IID_PPV_ARGS(&currentView)):E_NOINTERFACE;
+                            ComPtr<IUnknown> originalIdentity,currentIdentity;
+                            const auto originalIdentityRead=diagnosticView.As(&originalIdentity);
+                            const auto currentIdentityRead=currentView?currentView.As(&currentIdentity):E_NOINTERFACE;
+                            HWND nativeWindow=nullptr;const auto windowRead=diagnosticView->GetWindow(&nativeWindow);
+                            DWORD process=0;SetLastError(ERROR_SUCCESS);
+                            const auto thread=nativeWindow?GetWindowThreadProcessId(nativeWindow,&process):0;
+                            const auto windowError=GetLastError();
+                            const auto desktop=PrivateDesktop::current();
+                            const auto privateRead=desktop?desktop->verifyIsolation():E_ACCESSDENIED;
+                            std::cout<<"Native mismatch passive view stage="<<stage<<" phase="<<phase
+                                <<" folderViewHRESULT="<<static_cast<ULONG>(folderViewRead)<<" folderViewPresent="<<static_cast<bool>(folderView)
+                                <<" allHRESULT/count="<<static_cast<ULONG>(allRead)<<"/"<<allCount
+                                <<" selectedHRESULT/count="<<static_cast<ULONG>(selectedRead)<<"/"<<selectedCount
+                                <<" selectionHRESULT/present/countHRESULT/count="<<static_cast<ULONG>(selectionRead)<<"/"<<static_cast<bool>(selection)
+                                <<"/"<<static_cast<ULONG>(selectionCountRead)<<"/"<<arrayCount
+                                <<" folderHRESULT/present/identityHRESULT/compare="<<static_cast<ULONG>(folderRead)<<"/"<<static_cast<bool>(currentFolder)
+                                <<"/"<<static_cast<ULONG>(folderIdentityRead)<<"/"<<folderComparison
+                                <<" currentViewHRESULT/present/identityHRESULTs/same="<<static_cast<ULONG>(currentViewRead)<<"/"<<static_cast<bool>(currentView)
+                                <<"/"<<static_cast<ULONG>(originalIdentityRead)<<","<<static_cast<ULONG>(currentIdentityRead)
+                                <<"/"<<(originalIdentity&&currentIdentity&&originalIdentity.Get()==currentIdentity.Get())
+                                <<" originalViewStillCurrent="<<(host.view.Get()==diagnosticView.Get())
+                                <<" windowHRESULT/HWND/PID/TID/error/creatorOwned="<<static_cast<ULONG>(windowRead)<<"/"<<reinterpret_cast<UINT_PTR>(nativeWindow)
+                                <<"/"<<process<<"/"<<thread<<"/"<<windowError<<"/"
+                                <<(nativeWindow&&process==GetCurrentProcessId()&&thread==GetCurrentThreadId()&&IsChild(host.owner,nativeWindow))
+                                <<" owner/active/focus/ownerVisible="<<reinterpret_cast<UINT_PTR>(host.owner)<<"/"<<reinterpret_cast<UINT_PTR>(GetActiveWindow())
+                                <<"/"<<reinterpret_cast<UINT_PTR>(GetFocus())<<"/"<<IsWindowVisible(host.owner)
+                                <<" privateHRESULT="<<static_cast<ULONG>(privateRead)<<std::endl;
+                        };
+                        describeView("beforeFreshUnrestricted");
+                        ComPtr<IContextMenu> freshContext;
+                        const auto contextRead=diagnosticCall("freshUnrestricted","providerCreation",[&]{return createContext(&freshContext);});
+                        NativeContextMenu freshMenu;
+                        const auto queryRead=SUCCEEDED(contextRead)&&freshContext?
+                            diagnosticCall("freshUnrestricted","queryAndSite",[&]{return diagnosticMenuCreate("freshUnrestricted",[&](NativeContextMenuCreateObserver* observer){return observer?freshMenu.create(nullptr,freshContext.Get(),diagnosticView.Get(),nativeFlags,*observer):freshMenu.create(nullptr,freshContext.Get(),diagnosticView.Get(),nativeFlags);});}):E_NOINTERFACE;
+                        std::vector<ContextMenuEntry> freshEntries;
+                        const auto snapshotRead=SUCCEEDED(queryRead)?diagnosticCall("freshUnrestricted","snapshot",[&]{return freshMenu.enumerate(freshEntries,false);}):E_PENDING;
+                        const auto freshLeaves=leaves(freshEntries);
+                        const auto originalLeaves=leaves(original);
+                        std::cout<<"Native mismatch fresh unrestricted stage="<<stage<<" count="<<count<<" mixed="<<mixed<<" registered="<<registered
+                            <<" inputFlags="<<nativeFlags<<" contextHRESULT/present="<<static_cast<ULONG>(contextRead)<<"/"<<static_cast<bool>(freshContext)
+                            <<" queryHRESULT/snapshotHRESULT="<<static_cast<ULONG>(queryRead)<<"/"<<static_cast<ULONG>(snapshotRead)
+                            <<" fullLeafRows="<<freshLeaves.size()<<" exactOriginalComparison="<<(snapshotRead==S_OK&&freshLeaves==originalLeaves)<<std::endl;
+                        if(snapshotRead==S_OK)emitDifferences("freshUnrestrictedVsOriginal",count,mixed,registered,originalLeaves,freshLeaves);
+                        diagnosticRelease("freshUnrestricted","menuRelease",[&]{freshMenu.reset();});
+                        diagnosticRelease("freshUnrestricted","providerRelease",[&]{freshContext.Reset();});
+                        describeView("afterFreshUnrestrictedAndRelease");
+                    } catch(const std::exception& error) {
+                        std::cerr<<"Native mismatch diagnostic failed stage="<<stage<<" detail="<<error.what()
+                            <<"; original strict comparison remains failed"<<std::endl;
+                    } catch(...) {
+                        std::cerr<<"Native mismatch diagnostic failed stage="<<stage
+                            <<"; original strict comparison remains failed"<<std::endl;
+                    }
+                };
+                ComPtr<IContextMenu> stateContext;succeeded(diagnosticCall("leafState","providerCreation",[&]{return createContext(&stateContext);}),"Create fresh original-target native leaf-state menu");
+                diagnosticBoundary("leafState","queryAndSite","before");
                 const auto stateStarted=std::chrono::steady_clock::now();
-                NativeContextMenu state;succeeded(state.createLeafState(stateContext.Get(),host.view.Get(),nativeFlags),
-                    "Read same native target/site without forcing cascade population");
+                NativeContextMenu state;const auto stateRead=diagnosticMenuCreate("leafState",[&](NativeContextMenuCreateObserver* observer){return observer?state.createLeafState(stateContext.Get(),host.view.Get(),nativeFlags,false,*observer):state.createLeafState(stateContext.Get(),host.view.Get(),nativeFlags);});
                 const auto stateMicros=std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-stateStarted).count();
-                std::vector<ContextMenuEntry> snapshot;succeeded(state.enumerate(snapshot,false),"Read unpopulated actual native leaf states");
+                diagnosticBoundary("leafState","queryAndSite","after",stateRead);
+                succeeded(stateRead,"Read same native target/site without forcing cascade population");
+                std::vector<ContextMenuEntry> snapshot;succeeded(diagnosticCall("leafState","snapshot",[&]{return state.enumerate(snapshot,false);}),"Read unpopulated actual native leaf states");
                 if(registered) {
                     const auto all=leaves(original),lazy=leaves(snapshot);
                     const auto range=all.equal_range(L"windows.removeproperties"),other=lazy.equal_range(L"windows.removeproperties");
@@ -1278,12 +1850,13 @@ void nativeLeafStateMenuEquivalence(std::span<const DWORD> counts) {
                     <<" synchronousQuery_us="<<normalMicros<<" stateQuery_us="<<stateMicros<<'\n';
                 require(state.invoke(state.firstCommand())==E_ACCESSDENIED,
                     "Read-only root state comparison could activate a native command");
-                state.reset();stateContext.Reset();
-                ComPtr<IContextMenu> restrictedContext;succeeded(createContext(&restrictedContext),
+                diagnosticRelease("leafState","menuRelease",[&]{state.reset();});
+                diagnosticRelease("leafState","providerRelease",[&]{stateContext.Reset();});
+                ComPtr<IContextMenu> restrictedContext;succeeded(diagnosticCall("noResource","providerCreation",[&]{return createContext(&restrictedContext);}),
                     "Retain the same full native array/site for the no-resource state comparison");
-                NativeContextMenu restricted;succeeded(restricted.createLeafState(restrictedContext.Get(),host.view.Get(),nativeFlags,true),
+                NativeContextMenu restricted;succeeded(diagnosticCall("noResource","queryAndSiteAndRestrictions",[&]{return diagnosticMenuCreate("noResource",[&](NativeContextMenuCreateObserver* observer){return observer?restricted.createLeafState(restrictedContext.Get(),host.view.Get(),nativeFlags,true,*observer):restricted.createLeafState(restrictedContext.Get(),host.view.Get(),nativeFlags,true);});}),
                     "Read native association/dynamic leaf truth without unrelated built-in operations");
-                std::vector<ContextMenuEntry> restrictedEntries;succeeded(restricted.enumerate(restrictedEntries,false),
+                std::vector<ContextMenuEntry> restrictedEntries;succeeded(diagnosticCall("noResource","snapshot",[&]{return restricted.enumerate(restrictedEntries,false);}),
                     "Read actual restricted native leaves without invoking or populating cascades");
                 const auto nonResource=[&](const std::vector<ContextMenuEntry>& values) {
                     auto result=leaves(values);
@@ -1297,21 +1870,27 @@ void nativeLeafStateMenuEquivalence(std::span<const DWORD> counts) {
                     });
                     return result;
                 };
-                require(nonResource(original)==nonResource(restrictedEntries),
+                const auto originalNonResource=nonResource(original),restrictedNonResource=nonResource(restrictedEntries);
+                emitDifferences("noResource",count,mixed,registered,originalNonResource,restrictedNonResource);
+                if(originalNonResource!=restrictedNonResource)diagnoseMismatch("noResource");
+                require(originalNonResource==restrictedNonResource,
                     "Native no-resource restriction changed a non-resource canonical leaf's presence, multiplicity, disabled or checked state");
                 require(restricted.invoke(restricted.firstCommand())==E_ACCESSDENIED,
                     "Restricted leaf-state query permitted native invocation");
-                restricted.reset();
+                diagnosticRelease("noResource","menuRelease",[&]{restricted.reset();});
                 if(count==1||count==10000) {
-                    NativeContextMenu followup;succeeded(followup.create(nullptr,restrictedContext.Get(),host.view.Get(),nativeFlags),
+                    NativeContextMenu followup;succeeded(diagnosticCall("retainedNormalFollowup","queryAndSite",[&]{return followup.create(nullptr,restrictedContext.Get(),host.view.Get(),nativeFlags);}),
                         "Reuse the exact restricted native provider for an ordinary complete menu");
-                    std::vector<ContextMenuEntry> restored;succeeded(followup.enumerate(restored,false),
+                    std::vector<ContextMenuEntry> restored;succeeded(diagnosticCall("retainedNormalFollowup","snapshot",[&]{return followup.enumerate(restored,false);}),
                         "Read canonical IDs and resource leaves after native restriction restoration");
-                    require(leaves(original)==leaves(restored),
+                    const auto originalLeaves=leaves(original),restoredLeaves=leaves(restored);
+                    emitDifferences("normalFollowup",count,mixed,registered,originalLeaves,restoredLeaves);
+                    if(originalLeaves!=restoredLeaves)diagnoseMismatch("normalFollowup");
+                    require(originalLeaves==restoredLeaves,
                         "Retained provider normal-menu followup lost native resource or non-resource canonical states");
-                    followup.reset();
+                    diagnosticRelease("retainedNormalFollowup","menuRelease",[&]{followup.reset();});
                 }
-                restrictedContext.Reset();
+                diagnosticRelease("noResource","providerRelease",[&]{restrictedContext.Reset();});
                 if(!registered) {
                     // Exercise the real worker, full CIDA and actual site for
                     // every catalog static fallback (including absent aliases),
@@ -2166,17 +2745,26 @@ int runNativeMenuStateTests(NativeMenuStateBucket bucket) {
     static constexpr std::array<DWORD,1> stressCounts{10000u};
     std::span<const DWORD> counts;
     const char* label = nullptr;
+    unsigned mixtureMask = 3, registrationMask = 3;
     switch (bucket) {
     case NativeMenuStateBucket::All: counts = allCounts; label = "all 1/2/16/5001/10000"; break;
     case NativeMenuStateBucket::Small: counts = smallCounts; label = "small 1/2/16"; break;
     case NativeMenuStateBucket::Large: counts = largeCounts; label = "large 5001"; break;
     case NativeMenuStateBucket::Stress: counts = stressCounts; label = "stress 10000"; break;
+    case NativeMenuStateBucket::StressFilesNative:
+        counts = stressCounts; label = "stress 10000 file-only native"; mixtureMask = 1; registrationMask = 1; break;
+    case NativeMenuStateBucket::StressFilesRegistered:
+        counts = stressCounts; label = "stress 10000 file-only registered"; mixtureMask = 1; registrationMask = 2; break;
+    case NativeMenuStateBucket::StressMixedNative:
+        counts = stressCounts; label = "stress 10000 mixed native"; mixtureMask = 2; registrationMask = 1; break;
+    case NativeMenuStateBucket::StressMixedRegistered:
+        counts = stressCounts; label = "stress 10000 mixed registered"; mixtureMask = 2; registrationMask = 2; break;
     default:
         std::cerr << "FAIL: invalid native menu-state bucket\n";
         return 2;
     }
     try {
-        nativeLeafStateMenuEquivalence(counts);
+        nativeLeafStateMenuEquivalence(counts, mixtureMask, registrationMask);
         std::cout << "PASS: native root-leaf state versus synchronous cascades on full " << label << " targets\n";
         return 0;
     } catch(const std::exception& error) {

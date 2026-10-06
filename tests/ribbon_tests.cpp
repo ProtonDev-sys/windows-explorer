@@ -1,8 +1,10 @@
+#include "explorer/native_apartment.hpp"
 #include "explorer/ribbon.hpp"
 #include "explorer/commands.hpp"
 #include "explorer/namespace_actions.hpp"
 #include "explorer/headless_visual.hpp"
 #include "state_file_security_fixture.hpp"
+#include "native_icon_reference.hpp"
 #include <UIRibbonPropertyHelpers.h>
 #include <propvarutil.h>
 #include <commctrl.h>
@@ -20,6 +22,7 @@
 #include <uiautomation.h>
 #include <future>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <shlobj.h>
 #include <shlwapi.h>
@@ -32,89 +35,10 @@ void succeeded(HRESULT result,const char* message){if(FAILED(result))throw std::
 void pump(){const auto end=GetTickCount64()+150;do{MSG message{};while(PeekMessageW(&message,nullptr,0,0,PM_REMOVE)){TranslateMessage(&message);DispatchMessageW(&message);}MsgWaitForMultipleObjectsEx(0,nullptr,5,QS_ALLINPUT,MWMO_INPUTAVAILABLE);}while(GetTickCount64()<end);}
 struct Window{HWND handle=nullptr;~Window(){if(handle)DestroyWindow(handle);}};
 struct Variant{PROPVARIANT value{};~Variant(){PropVariantClear(&value);}};
-struct Icon {
-    HICON handle=nullptr;
-    ~Icon(){if(handle)DestroyIcon(handle);}
-};
-struct IconRaster {
-    HBITMAP bitmap=nullptr;
-    HDC dc=nullptr;
-    HGDIOBJ previous=nullptr;
-    ~IconRaster(){
-        if(dc){if(previous&&previous!=HGDI_ERROR)SelectObject(dc,previous);DeleteDC(dc);}
-        if(bitmap)DeleteObject(bitmap);
-    }
-};
-std::vector<BYTE> bitmapPixels(HBITMAP bitmap,UINT pixels) {
-    require(GdiFlush()!=FALSE,"Flush native icon raster before reading pixels");
-    DIBSECTION section{};
-    require(bitmap&&GetObjectW(bitmap,sizeof(section),&section)==sizeof(section),"Read actual native icon DIB section");
-    const auto& actual=section.dsBm;
-    require(actual.bmWidth==static_cast<LONG>(pixels)&&actual.bmHeight==static_cast<LONG>(pixels)&&actual.bmBitsPixel==32&&actual.bmPlanes==1&&
-        actual.bmWidthBytes==static_cast<LONG>(pixels*4)&&actual.bmBits&&section.dsBmih.biBitCount==32&&
-        section.dsBmih.biCompression==BI_RGB&&section.dsBmih.biPlanes==1&&
-        (section.dsBmih.biHeight==static_cast<LONG>(pixels)||section.dsBmih.biHeight==-static_cast<LONG>(pixels)),
-        "Native icon DIB dimensions, stride, orientation, or format changed");
-    BITMAPINFO info{};info.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);info.bmiHeader.biWidth=static_cast<LONG>(pixels);
-    info.bmiHeader.biHeight=-static_cast<LONG>(pixels);info.bmiHeader.biPlanes=1;info.bmiHeader.biBitCount=32;
-    info.bmiHeader.biCompression=BI_RGB;
-    IconRaster readback;readback.dc=CreateCompatibleDC(nullptr);
-    require(readback.dc!=nullptr,"Create native icon readback DC");
-    std::vector<BYTE> bytes(static_cast<size_t>(pixels)*pixels*4);
-    require(GetDIBits(readback.dc,bitmap,0,pixels,bytes.data(),&info,DIB_RGB_COLORS)==static_cast<int>(pixels),
-        "Read every native icon bitmap scanline");
-    const auto* stored=static_cast<const BYTE*>(actual.bmBits);
-    std::vector<BYTE> raw(bytes.size());
-    // Both the production ownership-transferred bitmap and this independent
-    // raster are created with negative height. GetObject reports positive
-    // height on the observed native implementation, so do not infer storage
-    // orientation from that returned sign. Require its actual raw RGB rows to
-    // equal the independently requested top-down GetDIBits rows before using
-    // all four stored bytes, including alpha, for the exact comparison.
-    std::memcpy(raw.data(),stored,raw.size());
-    for(size_t pixel=0;pixel<raw.size();pixel+=4)
-        require(std::memcmp(bytes.data()+pixel,raw.data()+pixel,3)==0,"Native top-down GetDIBits RGB readback differs from stored pixels");
-    return raw;
-}
-std::vector<BYTE> iconPixels(HICON icon,UINT pixels) {
-    BITMAPINFO info{};info.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);info.bmiHeader.biWidth=static_cast<LONG>(pixels);
-    info.bmiHeader.biHeight=-static_cast<LONG>(pixels);info.bmiHeader.biPlanes=1;info.bmiHeader.biBitCount=32;
-    info.bmiHeader.biCompression=BI_RGB;
-    IconRaster raster;void* bits=nullptr;
-    raster.bitmap=CreateDIBSection(nullptr,&info,DIB_RGB_COLORS,&bits,nullptr,0);
-    require(raster.bitmap&&bits,"Create independent native icon raster");
-    raster.dc=CreateCompatibleDC(nullptr);require(raster.dc!=nullptr,"Create independent native icon drawing DC");
-    raster.previous=SelectObject(raster.dc,raster.bitmap);
-    require(raster.previous&&raster.previous!=HGDI_ERROR,"Select independent native icon raster");
-    std::memset(bits,0,static_cast<size_t>(pixels)*pixels*4);
-    require(DrawIconEx(raster.dc,0,0,icon,static_cast<int>(pixels),static_cast<int>(pixels),0,nullptr,DI_NORMAL)!=FALSE,
-        "Draw independently extracted native icon");
-    const auto restored=SelectObject(raster.dc,raster.previous);
-    require(restored&&restored!=HGDI_ERROR,"Deselect independent native icon raster before reading pixels");
-    raster.previous=nullptr;
-    return bitmapPixels(raster.bitmap,pixels);
-}
-std::vector<BYTE> singleIconPixels(const std::wstring& path,int resource,UINT pixels) {
-    Icon icon;
-    const auto packedSize=MAKELONG(pixels,0);
-    const HRESULT status=SHDefExtractIconW(path.c_str(),resource,0,&icon.handle,nullptr,packedSize);
-    if(FAILED(status)||!icon.handle) {
-        auto module=std::wstring_view(path);
-        if(const auto separator=module.find_last_of(L"\\/");separator!=std::wstring_view::npos)
-            module.remove_prefix(separator+1);
-        std::wcerr<<L"Native icon reference failure api=SHDefExtractIconW module="<<module
-            <<L" resourceIndex="<<resource<<L" requestedPixels="<<pixels<<L" flags=0 packedSize="<<packedSize
-            <<L" HRESULT="<<static_cast<ULONG>(status)<<L" iconPresent="<<(icon.handle!=nullptr)<<std::endl;
-    }
-    succeeded(status,"Independent original single-size native icon extraction");
-    require(icon.handle!=nullptr,"Original single-size native icon is missing");
-    return iconPixels(icon.handle,pixels);
-}
-std::vector<BYTE> ribbonImagePixels(IUIImage* image,UINT pixels) {
-    require(image!=nullptr,"Actual Ribbon cached native image is missing");
-    HBITMAP bitmap=nullptr;succeeded(image->GetBitmap(&bitmap),"Get actual Ribbon cached bitmap");
-    return bitmapPixels(bitmap,pixels);
-}
+using native_icon_reference::Icon;
+using native_icon_reference::iconPixels;
+using native_icon_reference::singleIconReference;
+using native_icon_reference::requireImageContract;
 void nativeIconCacheEquivalence(explorer::NativeRibbon& ribbon,HWND window) {
     // All extraction and image/cache calls stay on the fixture's creator STA.
     const auto* desktop=explorer::PrivateDesktop::current();
@@ -139,10 +63,14 @@ void nativeIconCacheEquivalence(explorer::NativeRibbon& ribbon,HWND window) {
     const UINT largePixels=static_cast<UINT>(MulDiv(32,static_cast<int>(dpi),96));
     const UINT smallPixels=static_cast<UINT>(MulDiv(16,static_cast<int>(dpi),96));
     size_t publicBytes=0,requestedPairBytes=0;
+    size_t publicAvailableSizes=0,publicUnavailableSizes=0;
+    size_t requestedPairAvailableSizes=0,requestedPairUnavailableSizes=0,requestedPairFallbacks=0;
     for(const auto& source:sources) {
         const auto path=(std::filesystem::path(system.data())/source.module).wstring();
-        const auto largeReference=singleIconPixels(path,source.resource,largePixels);
-        const auto smallReference=singleIconPixels(path,source.resource,smallPixels);
+        const auto largeReference=singleIconReference(path,source.resource,largePixels);
+        const auto smallReference=singleIconReference(path,source.resource,smallPixels);
+        for(const auto* reference:{&largeReference,&smallReference})
+            if(SUCCEEDED(reference->imageStatus()))++publicAvailableSizes;else ++publicUnavailableSizes;
         for(const bool largeFirst:{true,false}) {
             // Dot-qualified absolute spellings make test keys independent of
             // startup specifications. Each order uses a distinct cold key.
@@ -151,18 +79,16 @@ void nativeIconCacheEquivalence(explorer::NativeRibbon& ribbon,HWND window) {
             std::array<Microsoft::WRL::ComPtr<IUIImage>,2> images;
             for(const bool large:{largeFirst,!largeFirst}) {
                 const size_t index=large?0:1;
-                succeeded(ribbon.itemImage(specification,large,&images[index]),"Actual cold-order Ribbon item image");
-                const auto bytes=ribbonImagePixels(images[index].Get(),large?largePixels:smallPixels);
-                require(bytes==(large?largeReference:smallReference),"Actual combined/cache image differs from original single-size pixels");
-                publicBytes+=bytes.size();
+                const auto status=ribbon.itemImage(specification,large,&images[index]);
+                publicBytes+=requireImageContract(status,images[index].Get(),large?largeReference:smallReference,
+                    large?largePixels:smallPixels);
             }
             for(int repeat=0;repeat<2;++repeat)for(const bool large:{true,false}) {
                 Microsoft::WRL::ComPtr<IUIImage> cached;
-                succeeded(ribbon.itemImage(specification,large,&cached),"Actual Ribbon item cache hit");
+                const auto status=ribbon.itemImage(specification,large,&cached);
+                publicBytes+=requireImageContract(status,cached.Get(),large?largeReference:smallReference,
+                    large?largePixels:smallPixels);
                 require(cached.Get()==images[large?0:1].Get(),"Actual Ribbon item cache replaced an existing native image");
-                const auto bytes=ribbonImagePixels(cached.Get(),large?largePixels:smallPixels);
-                require(bytes==(large?largeReference:smallReference),"Repeated Ribbon cache hit changed a native pixel");
-                publicBytes+=bytes.size();
             }
         }
         // These real native comparisons cover 125%, 150%, and 200% sizes
@@ -170,13 +96,29 @@ void nativeIconCacheEquivalence(explorer::NativeRibbon& ribbon,HWND window) {
         // this fixture does not alter monitor or global DPI configuration.
         for(const auto sizes:std::array{std::pair{40U,20U},std::pair{48U,24U},std::pair{64U,32U}}) {
             Icon largeIcon,smallIcon;
-            succeeded(SHDefExtractIconW(path.c_str(),source.resource,0,&largeIcon.handle,&smallIcon.handle,MAKELONG(sizes.first,sizes.second)),
-                "Independent requested-pair native extraction");
-            require(largeIcon.handle&&smallIcon.handle,"Requested native pair is incomplete");
-            const auto largeBytes=iconPixels(largeIcon.handle,sizes.first),smallBytes=iconPixels(smallIcon.handle,sizes.second);
-            require(largeBytes==singleIconPixels(path,source.resource,sizes.first)&&
-                smallBytes==singleIconPixels(path,source.resource,sizes.second),"Requested native size pair changed original raster bytes");
-            requestedPairBytes+=largeBytes.size()+smallBytes.size();
+            const auto pairStatus=SHDefExtractIconW(path.c_str(),source.resource,0,&largeIcon.handle,&smallIcon.handle,
+                MAKELONG(sizes.first,sizes.second));
+            std::cout<<"Native paired icon contract module="<<std::filesystem::path(source.module).string()<<" resourceIndex="<<source.resource
+                <<" largePixels="<<sizes.first<<" smallPixels="<<sizes.second<<" HRESULT="<<static_cast<ULONG>(pairStatus)
+                <<" largePresent="<<(largeIcon.handle!=nullptr)<<" smallPresent="<<(smallIcon.handle!=nullptr)<<'\n';
+            for(const bool large:{true,false}) {
+                const UINT pixels=large?sizes.first:sizes.second;
+                const auto reference=singleIconReference(path,source.resource,pixels);
+                const auto requested=large?largeIcon.handle:smallIcon.handle;
+                HRESULT actual=S_OK;std::vector<BYTE> bytes;
+                if(FAILED(pairStatus)||!requested) {
+                    // Exercise the same real single-size fallback the product
+                    // uses, including failed pair calls with partial outputs.
+                    const auto fallback=singleIconReference(path,source.resource,pixels);
+                    require(fallback.extraction==reference.extraction&&fallback.iconPresent==reference.iconPresent,
+                        "Repeated native single-size fallback changed HRESULT or HICON availability");
+                    actual=fallback.imageStatus();bytes=fallback.pixels;++requestedPairFallbacks;
+                } else bytes=iconPixels(requested,pixels);
+                require(actual==reference.imageStatus(),"Requested native pair/fallback changed original normalized image HRESULT");
+                require(bytes==reference.pixels,"Requested native pair/fallback changed original RGBA pixels or failed output");
+                if(SUCCEEDED(actual))++requestedPairAvailableSizes;else ++requestedPairUnavailableSizes;
+                requestedPairBytes+=bytes.size();
+            }
         }
     }
     explorer::NamespaceCommandMetadata copy;
@@ -189,13 +131,16 @@ void nativeIconCacheEquivalence(explorer::NativeRibbon& ribbon,HWND window) {
     const auto copyCharacters=ExpandEnvironmentStringsW(copyLocation.c_str(),expandedCopy.data(),static_cast<DWORD>(expandedCopy.size()));
     require(copyCharacters&&copyCharacters<=expandedCopy.size(),"Expand independent native Copy icon location");
     for(const bool large:{true,false}) {
+        const UINT pixels=large?largePixels:smallPixels;
+        const auto reference=singleIconReference(expandedCopy.data(),copyResource,pixels);
         Microsoft::WRL::ComPtr<IUIImage> command,item,repeated;
-        succeeded(ribbon.commandImage(explorer::Copy,large,&command),"Actual public Copy command image");
-        succeeded(ribbon.itemImage(copy.icon,large,&item),"Actual Copy metadata item image");
-        succeeded(ribbon.commandImage(explorer::Copy,large,&repeated),"Actual public Copy command cache hit");
+        const auto commandStatus=ribbon.commandImage(explorer::Copy,large,&command);
+        requireImageContract(commandStatus,command.Get(),reference,pixels);
+        const auto itemStatus=ribbon.itemImage(copy.icon,large,&item);
+        requireImageContract(itemStatus,item.Get(),reference,pixels);
+        const auto repeatedStatus=ribbon.commandImage(explorer::Copy,large,&repeated);
+        requireImageContract(repeatedStatus,repeated.Get(),reference,pixels);
         require(command.Get()==item.Get()&&command.Get()==repeated.Get(),"Native command and item image paths use different caches");
-        require(ribbonImagePixels(command.Get(),large?largePixels:smallPixels)==
-            singleIconPixels(expandedCopy.data(),copyResource,large?largePixels:smallPixels),"Native Copy cache differs from original single-size raster");
     }
     const auto missing=(std::filesystem::temp_directory_path()/
         (L"WindowsExplorer-MissingIcon-"+std::to_wstring(GetCurrentProcessId())+L"-"+std::to_wstring(GetTickCount64()))/L"absent.dll").wstring();
@@ -214,9 +159,13 @@ void nativeIconCacheEquivalence(explorer::NativeRibbon& ribbon,HWND window) {
                 "Actual missing icon/file changed original single-size HRESULT or output");
         }
     }
-    std::cout<<"PASS: 23 native icon public caches at HWND DPI="<<dpi<<" ("<<largePixels<<'/'<<smallPixels
-        <<"), both cold request orders and repeated hits; "<<publicBytes<<" exact public bytes; independent 40/20, 48/24, 64/32 pairs "
-        <<requestedPairBytes<<" exact bytes; missing resource/file HRESULTs\n";
+    require(publicAvailableSizes+publicUnavailableSizes==sources.size()*2&&
+        requestedPairAvailableSizes+requestedPairUnavailableSizes==sources.size()*6,"Native icon contract coverage is incomplete");
+    std::cout<<"PASS: "<<sources.size()<<" native icon specifications at HWND DPI="<<dpi<<" ("<<largePixels<<'/'<<smallPixels
+        <<"), "<<publicAvailableSizes<<" available and "<<publicUnavailableSizes<<" unavailable size contracts; both cold request orders and repeated results; "
+        <<publicBytes<<" exact public RGBA bytes; independent 40/20, 48/24, 64/32 pairs "<<requestedPairAvailableSizes
+        <<" available and "<<requestedPairUnavailableSizes<<" unavailable size contracts, "<<requestedPairFallbacks<<" actual single-size fallbacks; "
+        <<requestedPairBytes<<" exact RGBA bytes; missing resource/file HRESULTs\n";
 }
 class LabelReferenceHandler final : public IUIApplication, public IUICommandHandler {
 public:
@@ -313,21 +262,67 @@ HRESULT ownedAutomation(HWND window,std::function<HRESULT(IUIAutomation*)> actio
         if(!SetThreadDesktop(desktop)){promise->set_value(HRESULT_FROM_WIN32(GetLastError()));return;}
         const auto initialized=CoInitializeEx(nullptr,COINIT_MULTITHREADED);
         if(FAILED(initialized)){promise->set_value(initialized);return;}
-        HRESULT hr=E_FAIL;
-        {
-            Microsoft::WRL::ComPtr<IUIAutomation2> automation;
-            hr=CoCreateInstance(CLSID_CUIAutomation8,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&automation));
-            if(SUCCEEDED(hr)) {
-                automation->put_AutoSetFocus(FALSE);automation->put_ConnectionTimeout(1000);automation->put_TransactionTimeout(2000);
-                hr=action(automation.Get());
-            }
+        auto hr=CoEnableCallCancellation(nullptr);
+        if(SUCCEEDED(hr)) {
+            try {
+                Microsoft::WRL::ComPtr<IUIAutomation2> automation;
+                hr=CoCreateInstance(CLSID_CUIAutomation8,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&automation));
+                if(SUCCEEDED(hr)) {
+                    hr=automation->put_AutoSetFocus(FALSE);
+                    if(SUCCEEDED(hr))hr=automation->put_ConnectionTimeout(1000);
+                    if(SUCCEEDED(hr))hr=automation->put_TransactionTimeout(2000);
+                    if(SUCCEEDED(hr))hr=action(automation.Get());
+                }
+            }catch(const std::bad_alloc&){hr=E_OUTOFMEMORY;}catch(...){hr=E_FAIL;}
+            const auto disabled=CoDisableCallCancellation(nullptr);
+            if(SUCCEEDED(hr)&&FAILED(disabled))hr=disabled;
         }
         CoUninitialize();promise->set_value(hr);
     });
+    HANDLE threadHandle=worker.native_handle();
+    const auto threadId=GetThreadId(threadHandle);
+    const auto threadIdentityError=threadId?ERROR_SUCCESS:GetLastError();
+    const auto fatal=[&](HRESULT status,const char* stage) {
+        std::cerr<<"FATAL: owned native Ribbon automation "<<stage<<" HRESULT="<<static_cast<ULONG>(status)
+            <<" thread="<<threadId<<"; retaining desktop/COM/fixture resources"<<std::endl;
+        TerminateProcess(GetCurrentProcess(),10);std::_Exit(10);
+    };
+    const auto waitUntil=[&](ULONGLONG deadline) {
+        for(;;) {
+            const auto waited=WaitForSingleObject(threadHandle,0);
+            if(waited==WAIT_OBJECT_0)return true;
+            if(waited!=WAIT_TIMEOUT) {
+                const auto status=waited==WAIT_FAILED?HRESULT_FROM_WIN32(GetLastError()):E_UNEXPECTED;
+                fatal(status,"kernel wait failed");
+            }
+            const auto now=GetTickCount64();if(now>=deadline)return false;
+            MSG message{};
+            for(unsigned count=0;count<64&&PeekMessageW(&message,nullptr,0,0,PM_REMOVE);++count) {
+                TranslateMessage(&message);DispatchMessageW(&message);
+            }
+            DWORD index=0;
+            const auto afterPump=GetTickCount64();
+            const auto remaining=afterPump<deadline?deadline-afterPump:0;
+            const auto dispatched=CoWaitForMultipleHandles(COWAIT_DISPATCH_CALLS|COWAIT_DISPATCH_WINDOW_MESSAGES,
+                static_cast<DWORD>(std::min<ULONGLONG>(remaining,10)),1,&threadHandle,&index);
+            if(FAILED(dispatched)&&dispatched!=RPC_S_CALLPENDING)fatal(dispatched,"COM-dispatch wait failed");
+            if(SUCCEEDED(dispatched)&&index!=0)fatal(E_UNEXPECTED,"kernel wait returned an invalid index");
+        }
+    };
+    if(!threadId)fatal(HRESULT_FROM_WIN32(threadIdentityError),"thread identity unavailable");
     const auto deadline=GetTickCount64()+6000;
-    while(result.wait_for(std::chrono::milliseconds(0))!=std::future_status::ready&&GetTickCount64()<deadline)pump();
-    if(result.wait_for(std::chrono::milliseconds(0))!=std::future_status::ready){worker.detach();return HRESULT_FROM_WIN32(ERROR_TIMEOUT);}
-    worker.join();return result.get();
+    const bool completed=waitUntil(deadline);
+    if(!completed) {
+        // Cancellation requests do not establish native completion. Observe
+        // the actual kernel thread exit before releasing its borrowed owner.
+        const auto cancelled=CoCancelCall(threadId,0);
+        std::cerr<<"Owned native Ribbon automation deadline: cancellation="<<static_cast<ULONG>(cancelled)<<std::endl;
+        if(!waitUntil(GetTickCount64()+500))fatal(HRESULT_FROM_WIN32(ERROR_TIMEOUT),"did not exit after cancellation");
+    }
+    worker.join();
+    if(result.wait_for(std::chrono::milliseconds(0))!=std::future_status::ready)return E_UNEXPECTED;
+    const auto status=result.get();
+    return completed?status:HRESULT_FROM_WIN32(ERROR_TIMEOUT);
 }
 HRESULT namedElement(IUIAutomation* automation,HWND window,const wchar_t* name,IUIAutomationElement** output) {
     if(!output)return E_POINTER;*output=nullptr;
@@ -895,6 +890,7 @@ HRESULT checkOwnedGalleryRow(HWND window,const wchar_t* name,bool enabled,bool i
             if(!invoke)return S_OK;
             Microsoft::WRL::ComPtr<IUIAutomationInvokePattern> command;
             hr=row->GetCurrentPatternAs(UIA_InvokePatternId,IID_PPV_ARGS(&command));
+            if(SUCCEEDED(hr)&&!command)return E_NOINTERFACE;
             return SUCCEEDED(hr)?command->Invoke():hr;
         }
         return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
@@ -905,7 +901,8 @@ int main(int argc,char** argv){
     SetErrorMode(SEM_FAILCRITICALERRORS|SEM_NOOPENFILEERRORBOX);
     explorer::PrivateDesktop desktop;
     if(FAILED(desktop.initialize()))return 2;
-    const auto initialized=OleInitialize(nullptr);if(FAILED(initialized))return 3;
+    explorer::NativeApartmentOwner nativeApartment;
+    const auto initialized=nativeApartment.initializeOle();if(FAILED(initialized))return 3;
     int result=0;
     bool stock=false,iconOnly=false;
     for(int index=1;index<argc;++index) {
@@ -944,8 +941,13 @@ int main(int argc,char** argv){
         };
         callbacks.items=[&](UINT id){
             std::vector<explorer::RibbonItem> items;
-            if(id==explorer::RibbonExtractToGallery)for(UINT i=0;i<54;++i)
-                items.push_back({i,L"Folder "+std::to_wstring(i),false,L"imageres.dll,-3",L"Owned mocked destination",destinationEnabled});
+            if(id==explorer::RibbonExtractToGallery)for(UINT i=0;i<54;++i) {
+                explorer::RibbonItem row{i,L"Folder "+std::to_wstring(i),false,L"imageres.dll,-3",L"Owned mocked destination",destinationEnabled};
+                // Two original provider entries were hidden/separators. The
+                // visible collection must retain each remaining native index.
+                row.invocationIndex=i+2;
+                items.push_back(std::move(row));
+            }
             if(id==explorer::RibbonCopyMenu) {
                 ++copyItemsQueries;
                 if(!copySourceReady)return items;
@@ -954,11 +956,9 @@ int main(int argc,char** argv){
                     callbackInvalidation=ribbon.invalidateState(explorer::Copy);
                     callbackFlush=ribbon.flush();
                 }
-                explorer::RibbonItem cascade{0,L"Owned destination group",false,L"imageres.dll,-3"};
-                explorer::RibbonItem leaf{0,L"Owned nested destination",false,L"imageres.dll,-3"};
-                leaf.invocationIndex=41;cascade.children.push_back(std::move(leaf));
-                cascade.invocationIndex=17;
-                items.push_back(std::move(cascade));
+                explorer::RibbonItem destination{0,L"Owned destination group",false,L"imageres.dll,-3"};
+                destination.invocationIndex=17;
+                items.push_back(std::move(destination));
                 items.push_back({1,L"Owned disabled destination",false,{}, {},false});
             }
             if(id==explorer::RibbonOpenWith) {
@@ -979,10 +979,24 @@ int main(int argc,char** argv){
             return items;
         };
         callbacks.heightChanged=[&](UINT){++heightEvents;};
+        const auto exerciseDestinationRefresh=[&](IUICollection* commands) {
+            for(unsigned generation=0;generation<12;++generation) {
+                destinationEnabled=(generation&1)!=0;
+                succeeded(ribbon.invalidateItems(explorer::RibbonExtractToGallery),"Refresh retained native destination source generation");
+                succeeded(ribbon.flush(),"Commit recycled native destination commands");pump();
+                Microsoft::WRL::ComPtr<IUnknown> refreshed;Microsoft::WRL::ComPtr<IUISimplePropertySet> properties;
+                succeeded(commands->GetItem(0,&refreshed),"Recycled destination identity");succeeded(refreshed.As(&properties),"Recycled destination properties");
+                Variant id;succeeded(properties->GetValue(UI_PKEY_CommandId,&id.value),"Recycled native command ID");ULONG command=0;succeeded(PropVariantToUInt32(id.value,&command),"Recycled ID type");
+                require(command>=0x9000&&command<0x9036,"A refreshed destination leaked its native command-ID allocation");
+                Variant enabled;succeeded(ribbon.framework()->GetUICommandProperty(command,UI_PKEY_Enabled,&enabled.value),"Recycled destination enabled state");
+                BOOL actual=FALSE;succeeded(PropVariantToBoolean(enabled.value,&actual),"Recycled enabled type");require((actual!=FALSE)==destinationEnabled,"Recycled command retained stale provider state");
+            }
+            destinationEnabled=true;
+        };
         succeeded(ribbon.initialize(window.handle,GetModuleHandleW(nullptr),std::move(callbacks),stock?explorer::RibbonLayout::InstalledWindows10:explorer::RibbonLayout::Authored),"Native framework initialization");
         if(stock&&ribbon.layout()!=explorer::RibbonLayout::InstalledWindows10) {
             std::cout<<"SKIP: installed Windows 10 build19045 layout is unavailable, HRESULT="<<static_cast<ULONG>(ribbon.installedLayoutStatus())<<'\n';
-            ribbon.reset();DestroyWindow(window.handle);window.handle=nullptr;OleUninitialize();return 77;
+            ribbon.reset();DestroyWindow(window.handle);window.handle=nullptr;nativeApartment.finishOrTerminate();return 77;
         }
         require(ribbon.valid()&&ribbon.height()>20&&heightEvents>0,"Native Ribbon view/height callback");
         require(!IsWindowVisible(window.handle),"Host was shown");
@@ -990,7 +1004,7 @@ int main(int argc,char** argv){
         if(iconOnly) {
             bool visibleInput=true;succeeded(desktop.visibleWindowsOnInputDesktop(visibleInput),"Icon-only input desktop window guard");
             require(!visibleInput,"Native icon comparison created a visible input desktop window");
-            ribbon.reset();DestroyWindow(window.handle);window.handle=nullptr;OleUninitialize();return 0;
+            ribbon.reset();DestroyWindow(window.handle);window.handle=nullptr;nativeApartment.finishOrTerminate();return 0;
         }
         // Render solely on the non-input private desktop. This cannot surface
         // a window on the user's desktop and supplies normal native paint/layout.
@@ -1398,18 +1412,7 @@ int main(int argc,char** argv){
             succeeded(extractCommands->GetItem(0,&extractRaw),"Native destination command");succeeded(extractRaw.As(&extractItem),"Native destination properties");
             Variant extractId;succeeded(extractItem->GetValue(UI_PKEY_CommandId,&extractId.value),"Native destination identity");ULONG destination=0;succeeded(PropVariantToUInt32(extractId.value,&destination),"Native destination identity type");
             Variant destinationState;succeeded(ribbon.framework()->GetUICommandProperty(destination,UI_PKEY_Enabled,&destinationState.value),"Runtime destination command registration");
-            for(unsigned generation=0;generation<12;++generation) {
-                destinationEnabled=(generation&1)!=0;
-                succeeded(ribbon.invalidateItems(explorer::RibbonExtractToGallery),"Refresh retained native destination source generation");
-                succeeded(ribbon.flush(),"Commit recycled native destination commands");pump();
-                Microsoft::WRL::ComPtr<IUnknown> refreshed;Microsoft::WRL::ComPtr<IUISimplePropertySet> properties;
-                succeeded(extractCommands->GetItem(0,&refreshed),"Recycled destination identity");succeeded(refreshed.As(&properties),"Recycled destination properties");
-                Variant id;succeeded(properties->GetValue(UI_PKEY_CommandId,&id.value),"Recycled native command ID");ULONG command=0;succeeded(PropVariantToUInt32(id.value,&command),"Recycled ID type");
-                require(command>=0x9000&&command<0x9036,"A refreshed destination leaked its native command-ID allocation");
-                Variant enabled;succeeded(ribbon.framework()->GetUICommandProperty(command,UI_PKEY_Enabled,&enabled.value),"Recycled destination enabled state");
-                BOOL actual=FALSE;succeeded(PropVariantToBoolean(enabled.value,&actual),"Recycled enabled type");require((actual!=FALSE)==destinationEnabled,"Recycled command retained stale provider state");
-            }
-            destinationEnabled=true;
+            exerciseDestinationRefresh(extractCommands.Get());
             succeeded(ribbon.setContexts(explorer::RibbonContext::None),"Destination gallery cleanup");succeeded(ribbon.selectTab(explorer::RibbonHomeTab),"Restore Home command gallery tab");pump();
             SetActiveWindow(window.handle);
             explorer::RibbonCollectionReadback openRead;
@@ -1454,14 +1457,29 @@ int main(int argc,char** argv){
                 require(command>=0x9000&&command<=0xfffe,"Dynamic command escaped the native 16-bit command range");
                 Variant enabled;succeeded(ribbon.framework()->GetUICommandProperty(command,UI_PKEY_Enabled,&enabled.value),"Dynamic native provider enabled readback");BOOL value=FALSE;succeeded(PropVariantToBoolean(enabled.value,&value),"Dynamic enabled type");require((value!=FALSE)==(index==0),"Dynamic provider disabled state was ignored");
             }
+            Microsoft::WRL::ComPtr<IUnknown> parentRaw;Microsoft::WRL::ComPtr<IUISimplePropertySet> parent;
+            succeeded(commands->GetItem(0,&parentRaw),"Owned native destination parent");succeeded(parentRaw.As(&parent),"Owned native destination parent properties");
+            Variant parentIdentity,parentType;
+            succeeded(parent->GetValue(UI_PKEY_CommandId,&parentIdentity.value),"Owned native destination command identity");
+            succeeded(parent->GetValue(UI_PKEY_CommandType,&parentType.value),"Owned native destination command type");
+            ULONG parentId=0,nativeType=0;
+            succeeded(PropVariantToUInt32(parentIdentity.value,&parentId),"Owned native destination identity type");
+            succeeded(PropVariantToUInt32(parentType.value,&nativeType),"Owned native destination type value");
+            Variant childSource;
+            const auto childSourceStatus=ribbon.framework()->GetUICommandProperty(parentId,UI_PKEY_ItemsSource,&childSource.value);
+            std::cout<<"Native ACTION ItemsSource parent/type/HRESULT/VT/present="<<parentId<<'/'<<nativeType<<'/'<<static_cast<ULONG>(childSourceStatus)<<'/'<<childSource.value.vt<<'/'<<(childSource.value.punkVal!=nullptr)<<std::endl;
+            require(nativeType==UI_COMMANDTYPE_ACTION&&childSourceStatus==HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED)&&
+                childSource.value.vt==VT_EMPTY&&!childSource.value.punkVal,"Native ACTION unexpectedly admitted a nested item source");
             succeeded(checkOwnedGalleryRow(window.handle,L"Owned disabled destination",false,false),"Actual native disabled destination row");
             succeeded(galleryExpansionState(window.handle,L"Copy to",expanded),"Native Copy-to state after actual visible rows");
             succeeded(galleryExpansionState(window.handle,L"Copy to",collapsed,true),"Native Copy-to collapse readback");pump();
             std::cout<<"Native Copy-to ExpandCollapse states: before="<<before<<" after-visible-rows="<<expanded<<" after-collapse="<<collapsed<<'\n';
             require(before==ExpandCollapseState_Collapsed&&collapsed==ExpandCollapseState_Collapsed,"Native Copy-to popup did not collapse");
             succeeded(expandOwnedGallery(window.handle,L"Copy to"),"Reopen native Copy-to retained destination gallery");pump();
-            succeeded(checkOwnedGalleryRow(window.handle,L"Owned destination group",true,true),"Actual native destination cascade dispatch");
-            require(itemExecutions==1&&lastItemCommand==explorer::RibbonCopyMenu&&lastItem==17,"Native gallery lost the retained provider path token");
+            const auto parentExecutionsBefore=itemExecutions;
+            succeeded(checkOwnedGalleryRow(window.handle,L"Owned destination group",true,true),"Actual native destination parent dispatch");
+            require(itemExecutions==parentExecutionsBefore+1&&itemExecutions==1&&lastItemCommand==explorer::RibbonCopyMenu&&lastItem==17,
+                "Native gallery lost the retained provider parent path token or invoked more than once");
         }
         Variant enabled;succeeded(ribbon.framework()->GetUICommandProperty(explorer::Copy,UI_PKEY_Enabled,&enabled.value),"Copy disabled readback");
         BOOL enabledFlag=TRUE;succeeded(PropVariantToBoolean(enabled.value,&enabledFlag),"Copy enabled type");require(!enabledFlag,"Disabled command ignored");
@@ -1512,10 +1530,83 @@ int main(int argc,char** argv){
         Variant destinations;succeeded(ribbon.framework()->GetUICommandProperty(explorer::RibbonExtractToGallery,UI_PKEY_ItemsSource,&destinations.value),"Retained destination gallery items");
         Microsoft::WRL::ComPtr<IUICollection> destinationItems;succeeded(destinations.value.punkVal->QueryInterface(IID_PPV_ARGS(&destinationItems)),"Destination gallery collection");
         UINT destinationCount=0;succeeded(destinationItems->GetCount(&destinationCount),"Destination overflow count");require(destinationCount==54,"Destination gallery lost overflow items");
+        explorer::RibbonCollectionReadback destinationRead;
+        succeeded(ribbon.collectionReadback(explorer::RibbonExtractToGallery,destinationRead),"Actual Extract-to native command type");
+        require(destinationRead.registered&&destinationRead.nativeType==UI_COMMANDTYPE_COMMANDCOLLECTION,"Extract-to is not a native command gallery");
+        if(!stock)exerciseDestinationRefresh(destinationItems.Get());
         Microsoft::WRL::ComPtr<IUnknown> firstDestination;Microsoft::WRL::ComPtr<IUISimplePropertySet> firstDestinationProperties;
         succeeded(destinationItems->GetItem(0,&firstDestination),"Destination image item");succeeded(firstDestination.As(&firstDestinationProperties),"Destination item properties");
         Variant category;succeeded(firstDestinationProperties->GetValue(UI_PKEY_CategoryId,&category.value),"Uncategorized item contract");
         ULONG categoryIndex=0;succeeded(PropVariantToUInt32(category.value,&categoryIndex),"Category type");require(categoryIndex==UI_COLLECTION_INVALIDINDEX,"Uncategorized gallery item has a fake category");
+        const auto verifyDestinationEnabled=[&](bool expected) {
+            const auto beforeRefreshExecutions=itemExecutions;
+            destinationEnabled=expected;
+            succeeded(ribbon.invalidateItems(explorer::RibbonExtractToGallery),"Refresh owned Extract-to destination availability");
+            succeeded(ribbon.flush(),"Commit owned Extract-to destination availability");pump();
+            UINT refreshedCount=0;
+            succeeded(destinationItems->GetCount(&refreshedCount),"Refreshed Extract-to destination count");
+            require(refreshedCount==54,"Availability refresh lost destination rows");
+            const auto rowAvailability=ownedAutomation(window.handle,[handle=window.handle,expected](IUIAutomation* automation) {
+                Microsoft::WRL::ComPtr<IUIAutomationElement> row;
+                auto status=namedElement(automation,handle,L"Folder 0",&row);
+                if(FAILED(status))return status;
+                BOOL enabled=FALSE,offscreen=TRUE;RECT bounds{};
+                status=row->get_CurrentIsEnabled(&enabled);
+                if(SUCCEEDED(status))status=row->get_CurrentIsOffscreen(&offscreen);
+                if(SUCCEEDED(status))status=row->get_CurrentBoundingRectangle(&bounds);
+                std::cout<<"Extract-to availability diagnostic expected/actual="<<expected<<'/'<<enabled
+                    <<" HRESULT="<<static_cast<ULONG>(status)<<" offscreen="<<offscreen
+                    <<" width/height="<<bounds.right-bounds.left<<'/'<<bounds.bottom-bounds.top<<std::endl;
+                if(FAILED(status))return status;
+                return (enabled!=FALSE)==expected&&!offscreen&&bounds.right>bounds.left&&bounds.bottom>bounds.top?S_OK:E_UNEXPECTED;
+            });
+            std::cout<<"Extract-to availability refresh callbacks before/after="<<beforeRefreshExecutions<<'/'<<itemExecutions<<std::endl;
+            succeeded(rowAvailability,"Actual owned Extract-to destination availability");
+            require(itemExecutions==beforeRefreshExecutions,"Destination availability refresh invoked an operation");
+        };
+        verifyDestinationEnabled(false);
+        verifyDestinationEnabled(true);
+        const auto beforeDestinationExecution=itemExecutions;
+        const auto beforeDestinationCommand=lastItemCommand,beforeDestinationIndex=lastItem;
+        struct DestinationActivationReadback {
+            HRESULT invokePattern=E_PENDING,selectionPattern=E_PENDING,legacyPattern=E_PENDING;
+            HRESULT activation=E_PENDING,countAfter=E_PENDING;
+            bool invokePresent=false,selectionPresent=false,legacyPresent=false;
+            UINT count=0;
+        } destinationReadback;
+        const auto destinationActivation=ownedAutomation(window.handle,[handle=window.handle,&destinationReadback](IUIAutomation* automation) {
+            Microsoft::WRL::ComPtr<IUIAutomationElement> row;
+            auto status=namedElement(automation,handle,L"Folder 0",&row);
+            if(FAILED(status))return status;
+            BOOL enabled=FALSE,offscreen=TRUE;
+            status=row->get_CurrentIsEnabled(&enabled);
+            if(SUCCEEDED(status))status=row->get_CurrentIsOffscreen(&offscreen);
+            if(FAILED(status))return status;
+            if(!enabled||offscreen)return E_UNEXPECTED;
+            Microsoft::WRL::ComPtr<IUIAutomationInvokePattern> invoke;
+            Microsoft::WRL::ComPtr<IUIAutomationSelectionItemPattern> selection;
+            Microsoft::WRL::ComPtr<IUIAutomationLegacyIAccessiblePattern> legacy;
+            destinationReadback.invokePattern=row->GetCurrentPatternAs(UIA_InvokePatternId,IID_PPV_ARGS(&invoke));
+            destinationReadback.selectionPattern=row->GetCurrentPatternAs(UIA_SelectionItemPatternId,IID_PPV_ARGS(&selection));
+            destinationReadback.legacyPattern=row->GetCurrentPatternAs(UIA_LegacyIAccessiblePatternId,IID_PPV_ARGS(&legacy));
+            destinationReadback.invokePresent=invoke!=nullptr;
+            destinationReadback.selectionPresent=selection!=nullptr;
+            destinationReadback.legacyPresent=legacy!=nullptr;
+            status=destinationReadback.invokePattern;
+            if(SUCCEEDED(status))status=invoke?invoke->Invoke():E_NOINTERFACE;
+            destinationReadback.activation=status;
+            return status;
+        });
+        destinationReadback.countAfter=destinationItems->GetCount(&destinationReadback.count);
+        std::cout<<"Extract-to activation diagnostic stock="<<stock<<" worker/action="<<static_cast<ULONG>(destinationActivation)<<'/'<<static_cast<ULONG>(destinationReadback.activation)
+            <<" executions before/after="<<beforeDestinationExecution<<'/'<<itemExecutions
+            <<" command before/after="<<beforeDestinationCommand<<'/'<<lastItemCommand<<" index before/after="<<beforeDestinationIndex<<'/'<<lastItem
+            <<" Invoke/Selection/Legacy HRESULT="<<static_cast<ULONG>(destinationReadback.invokePattern)<<'/'<<static_cast<ULONG>(destinationReadback.selectionPattern)<<'/'<<static_cast<ULONG>(destinationReadback.legacyPattern)
+            <<" Invoke/Selection/Legacy present="<<destinationReadback.invokePresent<<'/'<<destinationReadback.selectionPresent<<'/'<<destinationReadback.legacyPresent
+            <<" collection before/after HRESULT/count="<<destinationCount<<'/'<<static_cast<ULONG>(destinationReadback.countAfter)<<'/'<<destinationReadback.count<<std::endl;
+        succeeded(destinationActivation,"Actual owned Extract-to row activation");
+        require(itemExecutions==beforeDestinationExecution+1&&lastItemCommand==explorer::RibbonExtractToGallery&&lastItem==2,
+            "The first visible Extract-to row did not invoke its original native provider index");
         succeeded(ribbon.setContexts(explorer::RibbonContext::None),"Scene context cleanup");succeeded(ribbon.setQuickAccessBelow(false),"Scene QAT cleanup");MoveWindow(window.handle,0,0,1000,700,TRUE);pump();
         std::vector<UINT> qat;succeeded(ribbon.quickAccessCommands(qat),"Native QAT readback");require(qat==std::vector<UINT>{explorer::Properties,explorer::NewFolder},"Windows 10 default QAT differs");
         const std::array<UINT,3> custom{explorer::Copy,explorer::Properties,explorer::NewFolder};succeeded(ribbon.setQuickAccessCommands(custom),"Custom native QAT");
@@ -1587,5 +1678,5 @@ int main(int argc,char** argv){
         std::error_code ignored;std::filesystem::remove_all(temporary,ignored);
         std::cout<<"PASS: native Windows 10 Ribbon, exact command resources, all view modes, context, QAT, persistence, isolation\n";
     }catch(const std::exception& error){std::cerr<<"FAIL: "<<error.what()<<'\n';result=1;}
-    OleUninitialize();return result;
+    nativeApartment.finishOrTerminate();return result;
 }
