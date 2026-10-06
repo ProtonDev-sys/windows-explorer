@@ -292,7 +292,7 @@ HRESULT knownFolderScope(IShellItem* scope, GUID& identifier) {
     int comparison = 1;
     hr = scope->Compare(exact.Get(), SICHINT_CANONICAL, &comparison);
     if (FAILED(hr)) return hr;
-    return comparison == 0 ? folder->GetId(&identifier) : unsupported;
+    return hr == S_OK && comparison == 0 ? folder->GetId(&identifier) : unsupported;
 }
 
 HRESULT rulesFromArray(IShellItemArray* source, bool recursive, std::vector<SearchScopeRule>& result) {
@@ -309,7 +309,10 @@ HRESULT rulesFromArray(IShellItemArray* source, bool recursive, std::vector<Sear
     return S_OK;
 }
 
-HRESULT normalizeRules(const std::vector<SearchScopeRule>& source, std::vector<SearchScopeRule>& result) {
+enum class ScopeDomainValidation { PhysicalLive, NativeDescriptor };
+
+HRESULT normalizeRules(const std::vector<SearchScopeRule>& source, std::vector<SearchScopeRule>& result,
+                       ScopeDomainValidation validation) {
     if (source.empty() || source.size() > 256) return unsupported;
     bool included = false;
     for (const auto& rule : source) {
@@ -334,7 +337,13 @@ HRESULT normalizeRules(const std::vector<SearchScopeRule>& source, std::vector<S
     for (const auto& rule : result) {
         if (!rule.excluded && !needsIncludeDomains) continue;
         std::wstring path;
-        const auto hr = filesystemScope(rule.folder.Get(), path);
+        auto hr = filesystemScope(rule.folder.Get(), path);
+        if (FAILED(hr) && validation == ScopeDomainValidation::NativeDescriptor && !rule.excluded) {
+            // The documented saved scope carries each known folder's depth.
+            // The file-free factory instead needs physical include predicates.
+            GUID identifier{};
+            hr = knownFolderScope(rule.folder.Get(), identifier);
+        }
         if (FAILED(hr)) return hr;
     }
     if (!included) return unsupported;
@@ -780,7 +789,6 @@ HRESULT scopeIncludeXml(IShellItem* scope, bool recursive, bool excluded, std::w
         if (percent != std::wstring::npos && path.find(L'%', percent + 1) != std::wstring::npos) return unsupported;
         hr = appendAttribute(xml, L"path", path);
     } else {
-        if (!recursive) return unsupported;
         GUID folder{};
         if (FAILED(knownFolderScope(scope, folder))) return unsupported;
         wchar_t identifier[40]{};
@@ -1202,7 +1210,7 @@ HRESULT createSearchFolderForScopeRules(const std::wstring& query,
 
         ComPtr<IShellItemArray> scopes;
         std::vector<SearchScopeRule> rules;
-        hr = normalizeRules(scope, rules);
+        hr = normalizeRules(scope, rules, ScopeDomainValidation::PhysicalLive);
         if (SUCCEEDED(hr)) hr = includedArray(rules, &scopes);
         if (FAILED(hr)) return hr;
         {
@@ -1260,7 +1268,7 @@ HRESULT saveSearchForScopeRules(const std::wstring& query, const std::vector<Sea
         auto hr = queryText(query, text);
         if (FAILED(hr)) return hr;
         std::vector<SearchScopeRule> searchScopes;
-        hr = normalizeRules(scopes, searchScopes);
+        hr = normalizeRules(scopes, searchScopes, ScopeDomainValidation::NativeDescriptor);
         if (FAILED(hr)) return hr;
         ComPtr<ICondition> condition;
         ComPtr<IQuerySolution> resolver;

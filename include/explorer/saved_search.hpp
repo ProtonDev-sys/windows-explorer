@@ -21,7 +21,8 @@ struct SavedSearchMetadata {
     std::optional<SearchFileProperties> fileProperties;
 };
 
-// The caller initializes COM. Supports verified union scopes, recursive child
+// The caller initializes COM. Supports exact known-folder includes with their
+// original individual depths, verified mixed union scopes, recursive child
 // exclusions and physical shallow/equal-root/direct-child exclusions protected
 // by their exact native guard, native kind unions and unresolved conditions. Unsupported or
 // provider-dependent external shapes remain available in the native viewer;

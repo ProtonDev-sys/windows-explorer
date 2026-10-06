@@ -73,7 +73,10 @@ HRESULT createSearchFolderForScopeRules(const std::wstring& query,
 // attributes and native compression. Read-only, reparse and EFS targets are
 // refused; existing handles that deny deletion retain their sharing error.
 // Filesystem folders, exact known-folder roots and native Library location
-// unions are supported. Unsupported scope/condition shapes return
+// unions are supported, including shallow known-folder includes and mixed
+// include depths carried by the native descriptor. The file-free live factory
+// above retains its physical-domain restriction. Virtual exclusions and
+// physical protective guards keep their existing limits. Unsupported shapes return
 // ERROR_NOT_SUPPORTED before creating the file.
 enum class SearchSaveMode { CreateNew, UserConfirmed };
 HRESULT saveSearch(const std::wstring& query, IShellItem* scope, bool recursive,
