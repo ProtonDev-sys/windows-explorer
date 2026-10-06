@@ -28,7 +28,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Path artifacts -Force | Out-Null
           $reportPath = Join-Path $PWD 'artifacts/native-copy-paste-control.xml'
-          ctest --test-dir build -C Release -R '^native_original_copy_paste_control$' --no-tests=error --output-on-failure --output-junit $reportPath 2>&1 | Tee-Object -FilePath artifacts/native-copy-paste-control.log
+          ctest --test-dir build -C Release -R '^native_original_copy_paste_control$' --no-tests=error --verbose --test-output-size-passed 1048576 --test-output-size-failed 1048576 --output-junit $reportPath 2>&1 | Tee-Object -FilePath artifacts/native-copy-paste-control.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           [xml]$transferReport = Get-Content -LiteralPath $reportPath -Raw
           $transferCases = @($transferReport.testsuite.testcase)
@@ -45,4 +45,5 @@ jobs:
           path: |
             artifacts/native-copy-paste-control.xml
             artifacts/native-copy-paste-control.log
+            build/Testing/Temporary/LastTest.log
           if-no-files-found: warn
