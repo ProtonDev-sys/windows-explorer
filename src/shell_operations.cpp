@@ -282,13 +282,25 @@ HRESULT ShellOperations::invoke(HWND owner, IShellItemArray* selection, const wc
 }
 
 HRESULT ShellOperations::copyToClipboard(HWND, IShellItemArray* selection, bool cut, IDataObject** published) {
-    HRESULT hr = checkSelection(selection);
+    // Native binding and attribute reads can reenter the caller. Keep the
+    // original whole selection alive rather than consulting a later view.
+    ComPtr<IShellItemArray> retained = selection;
+    HRESULT hr = checkSelection(retained.Get());
     if (FAILED(hr)) return hr;
     ComPtr<IDataObject> data;
-    hr = selection->BindToHandler(nullptr, BHID_DataObject, IID_PPV_ARGS(&data));
+    hr = retained->BindToHandler(nullptr, BHID_DataObject, IID_PPV_ARGS(&data));
     if (FAILED(hr)) return hr;
-    hr = setEffect(data.Get(), CFSTR_PREFERREDDROPEFFECT,
-                   cut ? DROPEFFECT_MOVE : DROPEFFECT_COPY);
+    DWORD preferred = cut ? DROPEFFECT_MOVE : DROPEFFECT_COPY;
+    if (!cut) {
+        SFGAOF attributes = 0;
+        const HRESULT capability = retained->GetAttributes(
+            static_cast<SIATTRIBFLAGS>(SIATTRIBFLAGS_AND | SIATTRIBFLAGS_ALLITEMS),
+            SFGAO_CANLINK, &attributes);
+        // Only the original array's complete native capability authorizes
+        // advertising links. Unknown/unlinkable selections still permit Copy.
+        if (capability == S_OK && (attributes & SFGAO_CANLINK)) preferred |= DROPEFFECT_LINK;
+    }
+    hr = setEffect(data.Get(), CFSTR_PREFERREDDROPEFFECT, preferred);
     if (SUCCEEDED(hr)) hr = publishClipboard(data.Get());
     if (SUCCEEDED(hr) && published) *published = data.Detach();
     return hr;

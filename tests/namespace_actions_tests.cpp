@@ -550,8 +550,56 @@ struct NativeBackgroundView {
         if(!expectedMembers.empty()) {
             ComPtr<IFolderView2> folderView;succeeded(view.As(&folderView),"Read original native membership readiness view");
             unsigned observations=0;int lastCount=-2;HRESULT lastStatus=E_PENDING;
+            std::array<bool,10> rejectionLogged{};
+            const auto reject=[&](unsigned reason,const char* name,int index,HRESULT status,bool present,PCUIDLIST_RELATIVE child=nullptr) noexcept {
+                if(reason>=rejectionLogged.size()||rejectionLogged[reason])return;
+                rejectionLogged[reason]=true;
+                try {
+                    std::cout<<"NativeBackground readinessReject reason="<<name<<" observation="<<observations<<" row="<<index
+                        <<" HRESULT="<<static_cast<unsigned long>(status)<<" outputPresent="<<present
+                        <<" childBytes="<<(child?ILGetSize(child):0)<<" elapsedMs="<<(GetTickCount64()-(deadline-5000))
+                        <<" deadlineReached="<<(GetTickCount64()>=deadline)<<'\n'<<std::flush;
+                    if(reason!=3||!child||GetTickCount64()>=deadline||!sourceCurrent(folderView.Get()))return;
+                    // Extra reads are diagnostics only after the original byte
+                    // equality predicate has already rejected this actual row.
+                    ComPtr<IShellItem> row;const auto rowRead=folderView->GetItem(index,IID_PPV_ARGS(&row));
+                    PWSTR rawPath=nullptr;const auto pathRead=rowRead==S_OK&&row?row->GetDisplayName(SIGDN_FILESYSPATH,&rawPath):E_NOINTERFACE;
+                    std::unique_ptr<wchar_t,decltype(&CoTaskMemFree)> path(rawPath,CoTaskMemFree);
+                    const auto owned=pathRead==S_OK&&path?std::find_if(expectedMembers.begin(),expectedMembers.end(),
+                        [&](const auto& member){return member.path==fs::path(path.get());}):expectedMembers.end();
+                    FILE_ID_INFO identity{};
+                    const auto identityRead=owned!=expectedMembers.end()?readIdentity(owned->path,identity):E_ACCESSDENIED;
+                    const bool ownedIdentity=identityRead==S_OK&&owned!=expectedMembers.end()&&sameIdentity(identity,owned->identity);
+                    const bool currentBefore=sourceCurrent(folderView.Get());
+                    std::cout<<"NativeBackground readinessReject rowGetItemHRESULT="<<static_cast<unsigned long>(rowRead)
+                        <<" rowPresent="<<(row!=nullptr)<<" displayPathHRESULT="<<static_cast<unsigned long>(pathRead)
+                        <<" displayPathPresent="<<(path!=nullptr)<<" ownedPathIndex="<<(owned==expectedMembers.end()?-1:static_cast<int>(owned-expectedMembers.begin()))
+                        <<" identityHRESULT="<<static_cast<unsigned long>(identityRead)<<" ownedFileIDMatches="<<ownedIdentity
+                        <<" sourceCurrent="<<currentBefore<<'\n';
+                    printIdentity("readiness-byte-rejection","actual-row-owned-path",static_cast<size_t>(index),identityRead,identity);
+                    if(!ownedIdentity||!currentBefore||GetTickCount64()>=deadline){std::cout<<std::flush;return;}
+                    ComPtr<IShellFolder> nativeFolder;const auto folderRead=folderView->GetFolder(IID_PPV_ARGS(&nativeFolder));
+                    std::cout<<"NativeBackground readinessReject nativeFolderHRESULT="<<static_cast<unsigned long>(folderRead)
+                        <<" nativeFolderPresent="<<(nativeFolder!=nullptr)<<'\n';
+                    for(size_t member=0;folderRead==S_OK&&nativeFolder&&member<expectedMembers.size()&&GetTickCount64()<deadline;++member) {
+                        if(!sourceCurrent(folderView.Get()))break;
+                        const auto expectedChild=ILFindLastID(expectedMembers[member].pidl.get());
+                        const bool byteEqual=ILIsEqual(child,expectedChild);
+                        const auto canonical=nativeFolder->CompareIDs(SHCIDS_CANONICALONLY,child,expectedChild);
+                        const int order=SUCCEEDED(canonical)?static_cast<short>(HRESULT_CODE(canonical)):0;
+                        const bool currentAfter=sourceCurrent(folderView.Get());
+                        std::cout<<"NativeBackground readinessReject canonicalDiagnosticOnly=1 row="<<index<<" expectedMember="<<member
+                            <<" rawPIDLByteEqual="<<byteEqual<<" nativeCompareHRESULT="<<static_cast<unsigned long>(canonical)
+                            <<" nativeCompareSucceeded="<<SUCCEEDED(canonical)<<" nativeCanonicalOrder="<<order
+                            <<" expectedChildBytes="<<ILGetSize(expectedChild)<<" expectedTargetByteEqual="<<ILIsEqual(expectedChild,ILFindLastID(targetId.get()))
+                            <<" sourceCurrentAfter="<<currentAfter<<'\n';
+                        if(!currentAfter)break;
+                    }
+                    std::cout<<std::flush;
+                } catch(...) {std::cout<<"NativeBackground readinessReject diagnosticException=1\n"<<std::flush;}
+            };
             const auto ready=[&] {
-                if(GetTickCount64()>=deadline)return false;
+                if(GetTickCount64()>=deadline){reject(0,"deadline",-1,E_PENDING,false);return false;}
                 require(sourceCurrent(folderView.Get()),"Owned native membership lost its private source/view");
                 int count=-1;const auto status=folderView->ItemCount(SVGIO_ALLVIEW,&count);++observations;
                 if(status!=lastStatus||count!=lastCount) {
@@ -559,23 +607,26 @@ struct NativeBackgroundView {
                         <<" expected="<<expectedMembers.size()<<" elapsedMs="<<(GetTickCount64()-(deadline-5000))<<'\n'<<std::flush;
                     lastStatus=status;lastCount=count;
                 }
-                if(status!=S_OK||count!=static_cast<int>(expectedMembers.size()))return false;
+                if(status!=S_OK||count!=static_cast<int>(expectedMembers.size())){reject(1,"all-view-count",-1,status,false);return false;}
                 std::vector<bool> matched(expectedMembers.size());bool targetAvailable=false;
                 for(int index=0;index<count;++index) {
                     PITEMID_CHILD rawChild=nullptr;const auto childRead=folderView->Item(index,&rawChild);Pidl child(rawChild);
-                    if(childRead!=S_OK||!child)return false;
+                    if(childRead!=S_OK||!child){reject(2,"native-child-read",index,childRead,child!=nullptr,child.get());return false;}
                     const auto found=std::find_if(expectedMembers.begin(),expectedMembers.end(),[&](const auto& member){return ILIsEqual(child.get(),ILFindLastID(member.pidl.get()));});
-                    if(found==expectedMembers.end())return false;
-                    const auto memberIndex=static_cast<size_t>(found-expectedMembers.begin());if(matched[memberIndex])return false;
-                    ComPtr<IShellItem> row;if(folderView->GetItem(index,IID_PPV_ARGS(&row))!=S_OK||!row)return false;
+                    if(found==expectedMembers.end()){reject(3,"native-child-byte-identity",index,childRead,true,child.get());return false;}
+                    const auto memberIndex=static_cast<size_t>(found-expectedMembers.begin());if(matched[memberIndex]){reject(4,"duplicate-owned-member",index,S_OK,true);return false;}
+                    ComPtr<IShellItem> row;const auto rowRead=folderView->GetItem(index,IID_PPV_ARGS(&row));
+                    if(rowRead!=S_OK||!row){reject(5,"native-row-read",index,rowRead,row!=nullptr);return false;}
                     PWSTR rawPath=nullptr;const auto pathRead=row->GetDisplayName(SIGDN_FILESYSPATH,&rawPath);
                     std::unique_ptr<wchar_t,decltype(&CoTaskMemFree)> path(rawPath,CoTaskMemFree);
-                    if(pathRead!=S_OK||!path||fs::path(path.get())!=found->path)return false;
+                    if(pathRead!=S_OK||!path||fs::path(path.get())!=found->path){reject(6,"native-display-path",index,pathRead,path!=nullptr);return false;}
                     FILE_ID_INFO identity{};const auto identityRead=readIdentity(found->path,identity);
-                    if(identityRead!=S_OK||!sameIdentity(identity,found->identity))return false;
+                    if(identityRead!=S_OK||!sameIdentity(identity,found->identity)){reject(7,"owned-file-identity",index,identityRead,true);return false;}
                     matched[memberIndex]=true;targetAvailable=targetAvailable||ILIsEqual(child.get(),ILFindLastID(targetId.get()));
                 }
-                return targetAvailable&&sourceCurrent(folderView.Get())&&GetTickCount64()<deadline;
+                const bool result=targetAvailable&&sourceCurrent(folderView.Get())&&GetTickCount64()<deadline;
+                if(!result)reject(targetAvailable?9:8,targetAvailable?"final-source-or-deadline":"target-child-byte-identity",-1,E_PENDING,targetAvailable);
+                return result;
             };
             const auto now=GetTickCount64();const auto remaining=now<deadline?static_cast<DWORD>(deadline-now):0;
             const bool membershipReady=remaining&&pumpPrivateNamespaceUntil(ready,remaining);

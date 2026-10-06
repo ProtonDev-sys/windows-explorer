@@ -1282,6 +1282,78 @@ void nativeLeafStateMenuEquivalence(std::span<const DWORD> counts, unsigned mixt
                 const auto normalMicros=std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-normalStarted).count();
                 std::vector<ContextMenuEntry> original;succeeded(normal.enumerate(original,false),"Read original actual native leaf states");
                 normal.reset();full.Reset();
+                const auto diagnoseMismatch=[&](const char* stage) {
+                    // Failure-only evidence. This never repairs or retries the
+                    // captured comparison and cannot replace its strict failure.
+                    try {
+                        const auto diagnosticView=host.view;const auto diagnosticBrowser=host.browser;
+                        const auto describeView=[&](const char* phase) {
+                            ComPtr<IFolderView2> folderView;const auto folderViewRead=diagnosticView.As(&folderView);
+                            int allCount=-1,selectedCount=-1;DWORD arrayCount=MAXDWORD;
+                            const auto allRead=SUCCEEDED(folderViewRead)&&folderView?folderView->ItemCount(SVGIO_ALLVIEW,&allCount):E_NOINTERFACE;
+                            const auto selectedRead=SUCCEEDED(folderViewRead)&&folderView?folderView->ItemCount(SVGIO_SELECTION,&selectedCount):E_NOINTERFACE;
+                            ComPtr<IShellItemArray> selection;
+                            const auto selectionRead=SUCCEEDED(folderViewRead)&&folderView?folderView->GetSelection(FALSE,&selection):E_NOINTERFACE;
+                            const auto selectionCountRead=selection?selection->GetCount(&arrayCount):E_NOINTERFACE;
+                            ComPtr<IShellItem> currentFolder;
+                            const auto folderRead=SUCCEEDED(folderViewRead)&&folderView?folderView->GetFolder(IID_PPV_ARGS(&currentFolder)):E_NOINTERFACE;
+                            int folderComparison=std::numeric_limits<int>::min();
+                            const auto folderIdentityRead=currentFolder?currentFolder->Compare(folder.Get(),SICHINT_CANONICAL,&folderComparison):E_NOINTERFACE;
+                            ComPtr<IShellView> currentView;
+                            const auto currentViewRead=diagnosticBrowser?diagnosticBrowser->GetCurrentView(IID_PPV_ARGS(&currentView)):E_NOINTERFACE;
+                            ComPtr<IUnknown> originalIdentity,currentIdentity;
+                            const auto originalIdentityRead=diagnosticView.As(&originalIdentity);
+                            const auto currentIdentityRead=currentView?currentView.As(&currentIdentity):E_NOINTERFACE;
+                            HWND nativeWindow=nullptr;const auto windowRead=diagnosticView->GetWindow(&nativeWindow);
+                            DWORD process=0;SetLastError(ERROR_SUCCESS);
+                            const auto thread=nativeWindow?GetWindowThreadProcessId(nativeWindow,&process):0;
+                            const auto windowError=GetLastError();
+                            const auto desktop=PrivateDesktop::current();
+                            const auto privateRead=desktop?desktop->verifyIsolation():E_ACCESSDENIED;
+                            std::cout<<"Native mismatch passive view stage="<<stage<<" phase="<<phase
+                                <<" folderViewHRESULT="<<static_cast<ULONG>(folderViewRead)<<" folderViewPresent="<<static_cast<bool>(folderView)
+                                <<" allHRESULT/count="<<static_cast<ULONG>(allRead)<<"/"<<allCount
+                                <<" selectedHRESULT/count="<<static_cast<ULONG>(selectedRead)<<"/"<<selectedCount
+                                <<" selectionHRESULT/present/countHRESULT/count="<<static_cast<ULONG>(selectionRead)<<"/"<<static_cast<bool>(selection)
+                                <<"/"<<static_cast<ULONG>(selectionCountRead)<<"/"<<arrayCount
+                                <<" folderHRESULT/present/identityHRESULT/compare="<<static_cast<ULONG>(folderRead)<<"/"<<static_cast<bool>(currentFolder)
+                                <<"/"<<static_cast<ULONG>(folderIdentityRead)<<"/"<<folderComparison
+                                <<" currentViewHRESULT/present/identityHRESULTs/same="<<static_cast<ULONG>(currentViewRead)<<"/"<<static_cast<bool>(currentView)
+                                <<"/"<<static_cast<ULONG>(originalIdentityRead)<<","<<static_cast<ULONG>(currentIdentityRead)
+                                <<"/"<<(originalIdentity&&currentIdentity&&originalIdentity.Get()==currentIdentity.Get())
+                                <<" originalViewStillCurrent="<<(host.view.Get()==diagnosticView.Get())
+                                <<" windowHRESULT/HWND/PID/TID/error/creatorOwned="<<static_cast<ULONG>(windowRead)<<"/"<<reinterpret_cast<UINT_PTR>(nativeWindow)
+                                <<"/"<<process<<"/"<<thread<<"/"<<windowError<<"/"
+                                <<(nativeWindow&&process==GetCurrentProcessId()&&thread==GetCurrentThreadId()&&IsChild(host.owner,nativeWindow))
+                                <<" owner/active/focus/ownerVisible="<<reinterpret_cast<UINT_PTR>(host.owner)<<"/"<<reinterpret_cast<UINT_PTR>(GetActiveWindow())
+                                <<"/"<<reinterpret_cast<UINT_PTR>(GetFocus())<<"/"<<IsWindowVisible(host.owner)
+                                <<" privateHRESULT="<<static_cast<ULONG>(privateRead)<<std::endl;
+                        };
+                        describeView("beforeFreshUnrestricted");
+                        ComPtr<IContextMenu> freshContext;
+                        const auto contextRead=createContext(&freshContext);
+                        NativeContextMenu freshMenu;
+                        const auto queryRead=SUCCEEDED(contextRead)&&freshContext?
+                            freshMenu.create(nullptr,freshContext.Get(),diagnosticView.Get(),nativeFlags):E_NOINTERFACE;
+                        std::vector<ContextMenuEntry> freshEntries;
+                        const auto snapshotRead=SUCCEEDED(queryRead)?freshMenu.enumerate(freshEntries,false):E_PENDING;
+                        const auto freshLeaves=leaves(freshEntries);
+                        const auto originalLeaves=leaves(original);
+                        std::cout<<"Native mismatch fresh unrestricted stage="<<stage<<" count="<<count<<" mixed="<<mixed<<" registered="<<registered
+                            <<" inputFlags="<<nativeFlags<<" contextHRESULT/present="<<static_cast<ULONG>(contextRead)<<"/"<<static_cast<bool>(freshContext)
+                            <<" queryHRESULT/snapshotHRESULT="<<static_cast<ULONG>(queryRead)<<"/"<<static_cast<ULONG>(snapshotRead)
+                            <<" fullLeafRows="<<freshLeaves.size()<<" exactOriginalComparison="<<(snapshotRead==S_OK&&freshLeaves==originalLeaves)<<std::endl;
+                        if(snapshotRead==S_OK)emitDifferences("freshUnrestrictedVsOriginal",count,mixed,registered,originalLeaves,freshLeaves);
+                        freshMenu.reset();freshContext.Reset();
+                        describeView("afterFreshUnrestrictedAndRelease");
+                    } catch(const std::exception& error) {
+                        std::cerr<<"Native mismatch diagnostic failed stage="<<stage<<" detail="<<error.what()
+                            <<"; original strict comparison remains failed"<<std::endl;
+                    } catch(...) {
+                        std::cerr<<"Native mismatch diagnostic failed stage="<<stage
+                            <<"; original strict comparison remains failed"<<std::endl;
+                    }
+                };
                 ComPtr<IContextMenu> stateContext;succeeded(createContext(&stateContext),"Create fresh original-target native leaf-state menu");
                 const auto stateStarted=std::chrono::steady_clock::now();
                 NativeContextMenu state;succeeded(state.createLeafState(stateContext.Get(),host.view.Get(),nativeFlags),
@@ -1322,6 +1394,7 @@ void nativeLeafStateMenuEquivalence(std::span<const DWORD> counts, unsigned mixt
                 };
                 const auto originalNonResource=nonResource(original),restrictedNonResource=nonResource(restrictedEntries);
                 emitDifferences("noResource",count,mixed,registered,originalNonResource,restrictedNonResource);
+                if(originalNonResource!=restrictedNonResource)diagnoseMismatch("noResource");
                 require(originalNonResource==restrictedNonResource,
                     "Native no-resource restriction changed a non-resource canonical leaf's presence, multiplicity, disabled or checked state");
                 require(restricted.invoke(restricted.firstCommand())==E_ACCESSDENIED,
@@ -1334,6 +1407,7 @@ void nativeLeafStateMenuEquivalence(std::span<const DWORD> counts, unsigned mixt
                         "Read canonical IDs and resource leaves after native restriction restoration");
                     const auto originalLeaves=leaves(original),restoredLeaves=leaves(restored);
                     emitDifferences("normalFollowup",count,mixed,registered,originalLeaves,restoredLeaves);
+                    if(originalLeaves!=restoredLeaves)diagnoseMismatch("normalFollowup");
                     require(originalLeaves==restoredLeaves,
                         "Retained provider normal-menu followup lost native resource or non-resource canonical states");
                     followup.reset();
