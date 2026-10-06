@@ -1236,6 +1236,25 @@ void nativeLeafStateMenuEquivalence(std::span<const DWORD> counts, unsigned mixt
             }
             return states;
         };
+        const auto emitDifferences=[](const char* stage,DWORD count,bool mixed,bool registered,
+            const std::multimap<std::wstring,UINT>& expected,const std::multimap<std::wstring,UINT>& actual) {
+            if(expected==actual)return;
+            std::cout<<"Native canonical comparison mismatch stage="<<stage<<" count="<<count
+                <<" mixed="<<mixed<<" registered="<<registered<<" expectedRows="<<expected.size()
+                <<" actualRows="<<actual.size()<<std::endl;
+            std::set<std::wstring> verbs;
+            for(const auto& row:expected)verbs.insert(row.first);
+            for(const auto& row:actual)verbs.insert(row.first);
+            for(const auto& verb:verbs) {
+                const auto before=expected.equal_range(verb),after=actual.equal_range(verb);
+                if(std::vector(before.first,before.second)==std::vector(after.first,after.second))continue;
+                std::wcout<<L"Native canonical differing verb="<<verb<<L" expected=";
+                for(auto row=before.first;row!=before.second;++row)std::wcout<<row->second<<L",";
+                std::wcout<<L" actual=";
+                for(auto row=after.first;row!=after.second;++row)std::wcout<<row->second<<L",";
+                std::wcout<<std::endl;
+            }
+        };
         for(const DWORD count:counts)for(const bool mixed:{false,true}) {
             if(!(mixtureMask&(mixed?2u:1u)))continue;
             if(count==1&&mixed)continue;
@@ -1301,7 +1320,9 @@ void nativeLeafStateMenuEquivalence(std::span<const DWORD> counts, unsigned mixt
                     });
                     return result;
                 };
-                require(nonResource(original)==nonResource(restrictedEntries),
+                const auto originalNonResource=nonResource(original),restrictedNonResource=nonResource(restrictedEntries);
+                emitDifferences("noResource",count,mixed,registered,originalNonResource,restrictedNonResource);
+                require(originalNonResource==restrictedNonResource,
                     "Native no-resource restriction changed a non-resource canonical leaf's presence, multiplicity, disabled or checked state");
                 require(restricted.invoke(restricted.firstCommand())==E_ACCESSDENIED,
                     "Restricted leaf-state query permitted native invocation");
@@ -1311,7 +1332,9 @@ void nativeLeafStateMenuEquivalence(std::span<const DWORD> counts, unsigned mixt
                         "Reuse the exact restricted native provider for an ordinary complete menu");
                     std::vector<ContextMenuEntry> restored;succeeded(followup.enumerate(restored,false),
                         "Read canonical IDs and resource leaves after native restriction restoration");
-                    require(leaves(original)==leaves(restored),
+                    const auto originalLeaves=leaves(original),restoredLeaves=leaves(restored);
+                    emitDifferences("normalFollowup",count,mixed,registered,originalLeaves,restoredLeaves);
+                    require(originalLeaves==restoredLeaves,
                         "Retained provider normal-menu followup lost native resource or non-resource canonical states");
                     followup.reset();
                 }

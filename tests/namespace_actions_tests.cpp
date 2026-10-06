@@ -425,12 +425,92 @@ public:
 };
 
 struct NativeBackgroundView {
+    struct PidlDelete {
+        using pointer=LPITEMIDLIST;
+        void operator()(pointer value) const noexcept {CoTaskMemFree(value);}
+    };
+    using Pidl=std::unique_ptr<ITEMIDLIST,PidlDelete>;
+    struct OwnedMember {fs::path path;FILE_ID_INFO identity{};Pidl pidl;};
     HWND owner=nullptr;
     DWORD cookie=0;
     ComPtr<IExplorerBrowser> browser;
     ComPtr<IShellView> view;
     ComPtr<BackgroundNavigationEvents> events;
-    void initialize(IShellItem* folder) {
+    ComPtr<IShellItem> expectedFolder;
+    std::vector<OwnedMember> expectedMembers;
+    Pidl expectedFolderId,targetId;
+    static HRESULT readIdentity(const fs::path& path,FILE_ID_INFO& identity) {
+        struct File {HANDLE value=INVALID_HANDLE_VALUE;~File(){if(value!=INVALID_HANDLE_VALUE)CloseHandle(value);}}file;
+        file.value=CreateFileW(path.c_str(),FILE_READ_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
+                               nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT,nullptr);
+        if(file.value==INVALID_HANDLE_VALUE)return HRESULT_FROM_WIN32(GetLastError());
+        if(!GetFileInformationByHandleEx(file.value,FileIdInfo,&identity,sizeof(identity)))return HRESULT_FROM_WIN32(GetLastError());
+        return S_OK;
+    }
+    static bool sameIdentity(const FILE_ID_INFO& left,const FILE_ID_INFO& right) {
+        return left.VolumeSerialNumber==right.VolumeSerialNumber&&
+            std::memcmp(left.FileId.Identifier,right.FileId.Identifier,sizeof(left.FileId.Identifier))==0;
+    }
+    static void printIdentity(const char* phase,const char* origin,size_t index,HRESULT status,const FILE_ID_INFO& identity) {
+        std::array<char,33> encoded{};constexpr char digits[]="0123456789abcdef";
+        for(size_t byte=0;byte<16;++byte){encoded[2*byte]=digits[identity.FileId.Identifier[byte]>>4];encoded[2*byte+1]=digits[identity.FileId.Identifier[byte]&15];}
+        std::cout<<"NativeBackground identity phase="<<phase<<" origin="<<origin<<" member="<<index<<" HRESULT="<<static_cast<unsigned long>(status)
+            <<" volume="<<identity.VolumeSerialNumber<<" FileID="<<encoded.data()<<'\n';
+    }
+    bool sourceCurrent(IFolderView2* folderView,const char* phase=nullptr) {
+        const auto desktop=explorer::PrivateDesktop::current();
+        if(!desktop||FAILED(desktop->verifyIsolation())||!owner||!IsWindow(owner)||IsWindowVisible(owner))return false;
+        ComPtr<IShellItem> folder;const auto folderRead=folderView->GetFolder(IID_PPV_ARGS(&folder));
+        int order=1;const auto compare=folder?folder->Compare(expectedFolder.Get(),SICHINT_CANONICAL,&order):E_NOINTERFACE;
+        PIDLIST_ABSOLUTE raw=nullptr;const auto pidlRead=folder?SHGetIDListFromObject(folder.Get(),&raw):E_NOINTERFACE;Pidl folderId(raw);
+        HWND child=nullptr;const auto windowRead=view->GetWindow(&child);DWORD process=0;
+        const auto thread=child?GetWindowThreadProcessId(child,&process):0;
+        DWORD ownerProcess=0;const auto ownerThread=GetWindowThreadProcessId(owner,&ownerProcess);
+        const bool exactFolder=SUCCEEDED(pidlRead)&&folderId&&ILIsEqual(expectedFolderId.get(),folderId.get());
+        ComPtr<IShellView> current;const auto currentRead=browser->GetCurrentView(IID_PPV_ARGS(&current));
+        const bool exact=currentRead==S_OK&&current.Get()==view.Get()&&folderRead==S_OK&&compare==S_OK&&order==0&&exactFolder&&
+            windowRead==S_OK&&child&&IsChild(owner,child)&&thread==GetCurrentThreadId()&&process==GetCurrentProcessId()&&
+            ownerThread==GetCurrentThreadId()&&ownerProcess==GetCurrentProcessId()&&
+            !IsWindowVisible(owner)&&SUCCEEDED(desktop->verifyIsolation());
+        if(phase)std::cout<<"NativeBackground fence phase="<<phase<<" currentViewHRESULT="<<static_cast<unsigned long>(currentRead)
+            <<" sameView="<<(current.Get()==view.Get())<<" folderHRESULT="<<static_cast<unsigned long>(folderRead)
+            <<" folderCompareHRESULT="<<static_cast<unsigned long>(compare)<<" folderOrder="<<order
+            <<" folderPidlHRESULT="<<static_cast<unsigned long>(pidlRead)<<" exactFolderPIDL="<<exactFolder
+            <<" windowHRESULT="<<static_cast<unsigned long>(windowRead)<<" viewHWND="<<reinterpret_cast<uintptr_t>(child)
+            <<" viewPID="<<process<<" viewTID="<<thread<<" ownerHWND="<<reinterpret_cast<uintptr_t>(owner)
+            <<" ownerPID="<<ownerProcess<<" ownerTID="<<ownerThread<<" exactPrivateOwnerView="<<exact<<'\n'<<std::flush;
+        return exact;
+    }
+    void selectionDiagnostic(const char* phase) {
+        ComPtr<IFolderView2> folderView;succeeded(view.As(&folderView),"Read exact initialized native selection view");
+        require(sourceCurrent(folderView.Get(),phase),"Native selection diagnostic lost its original private folder/view");
+        int all=-1,count=-1;const auto allRead=folderView->ItemCount(SVGIO_ALLVIEW,&all);
+        const auto countRead=folderView->ItemCount(SVGIO_SELECTION,&count);
+        ComPtr<IShellItemArray> selected;const auto selectionRead=folderView->GetSelection(FALSE,&selected);
+        DWORD selectedCount=MAXDWORD;const auto arrayRead=selected?selected->GetCount(&selectedCount):E_NOINTERFACE;
+        std::cout<<"NativeBackground selection phase="<<phase<<" allHRESULT="<<static_cast<unsigned long>(allRead)<<" all="<<all
+            <<" selectedHRESULT="<<static_cast<unsigned long>(countRead)<<" selected="<<count
+            <<" arrayHRESULT="<<static_cast<unsigned long>(selectionRead)<<" arrayCountHRESULT="<<static_cast<unsigned long>(arrayRead)
+            <<" arrayCount="<<selectedCount<<" currentPrivateFolderView=1\n";
+        if(arrayRead==S_OK&&selectedCount<=expectedMembers.size())for(DWORD index=0;index<selectedCount;++index) {
+            ComPtr<IShellItem> selectedItem;auto status=selected->GetItemAt(index,&selectedItem);PWSTR raw=nullptr;
+            if(status==S_OK&&selectedItem)status=selectedItem->GetDisplayName(SIGDN_FILESYSPATH,&raw);
+            else if(SUCCEEDED(status))status=E_UNEXPECTED;
+            std::unique_ptr<wchar_t,decltype(&CoTaskMemFree)> path(raw,CoTaskMemFree);FILE_ID_INFO identity{};
+            if(status==S_OK&&path) {
+                const auto found=std::find_if(expectedMembers.begin(),expectedMembers.end(),[&](const auto& member){return member.path==fs::path(path.get());});
+                status=found!=expectedMembers.end()?readIdentity(found->path,identity):E_ACCESSDENIED;
+            }else if(SUCCEEDED(status))status=E_UNEXPECTED;
+            printIdentity(phase,"native-selected",index,status,identity);
+        }
+        for(size_t index=0;index<expectedMembers.size();++index) {
+            FILE_ID_INFO identity{};const auto status=readIdentity(expectedMembers[index].path,identity);printIdentity(phase,"owned-source",index,status,identity);
+            require(status==S_OK&&sameIdentity(identity,expectedMembers[index].identity),"Native selection changed an original owned source FileID");
+        }
+        require(sourceCurrent(folderView.Get(),phase),"Native selection readbacks changed the original private folder/view");
+        std::cout<<std::flush;
+    }
+    void initialize(IShellItem* folder,std::vector<fs::path> ownedPaths={},IShellItem* target=nullptr) {
         const auto desktop=explorer::PrivateDesktop::current();
         require(desktop&&SUCCEEDED(desktop->verifyIsolation()),"Create native background view only on the owned private desktop");
         owner=CreateWindowExW(0,L"STATIC",L"owned read-only native background fixture",WS_POPUP,
@@ -443,11 +523,68 @@ struct NativeBackgroundView {
         succeeded(browser->Initialize(owner,&bounds,&settings),"Initialize native background browser without displaying it");
         events=Microsoft::WRL::Make<BackgroundNavigationEvents>();require(events!=nullptr,"Create native background navigation observer");
         succeeded(browser->Advise(events.Get(),&cookie),"Observe native background navigation completion");
+        if(!ownedPaths.empty()) {
+            require(target!=nullptr&&ownedPaths.size()<=64,"Owned native membership readiness requires a bounded exact target");expectedFolder=folder;
+            PIDLIST_ABSOLUTE rawFolder=nullptr,rawTarget=nullptr;
+            const auto folderRead=SHGetIDListFromObject(folder,&rawFolder);expectedFolderId.reset(rawFolder);
+            succeeded(folderRead,"Retain exact expected native folder identity");
+            const auto targetRead=SHGetIDListFromObject(target,&rawTarget);targetId.reset(rawTarget);
+            succeeded(targetRead,"Retain exact expected native selection identity");
+            require(expectedFolderId&&targetId,"Expected native folder/target PIDLs must be nonnull");
+            for(auto& path:ownedPaths) {
+                OwnedMember member;member.path=std::move(path);
+                succeeded(readIdentity(member.path,member.identity),"Capture original owned native readiness FileID");
+                auto expected=item(member.path);PIDLIST_ABSOLUTE raw=nullptr;
+                const auto rowRead=SHGetIDListFromObject(expected.Get(),&raw);member.pidl.reset(raw);
+                succeeded(rowRead,"Capture original owned native row PIDL");
+                require(member.pidl!=nullptr,"Expected owned native row PIDL must be nonnull");
+                expectedMembers.push_back(std::move(member));
+            }
+        }
         succeeded(browser->BrowseToObject(folder,SBSP_ABSOLUTE),"Browse native background namespace without invoking a command");
+        const auto deadline=GetTickCount64()+5000;
         require(pumpPrivateNamespaceUntil([&]{return events->complete;},5000),"Native background navigation exceeded bounded wait");
         succeeded(events->status,"Read actual native background navigation result");
         succeeded(browser->GetCurrentView(IID_PPV_ARGS(&view)),"Read actual native background view site");
         require(!IsWindowVisible(owner),"Native background browser displayed its owner");
+        if(!expectedMembers.empty()) {
+            ComPtr<IFolderView2> folderView;succeeded(view.As(&folderView),"Read original native membership readiness view");
+            unsigned observations=0;int lastCount=-2;HRESULT lastStatus=E_PENDING;
+            const auto ready=[&] {
+                if(GetTickCount64()>=deadline)return false;
+                require(sourceCurrent(folderView.Get()),"Owned native membership lost its private source/view");
+                int count=-1;const auto status=folderView->ItemCount(SVGIO_ALLVIEW,&count);++observations;
+                if(status!=lastStatus||count!=lastCount) {
+                    std::cout<<"NativeBackground readiness allHRESULT="<<static_cast<unsigned long>(status)<<" actual="<<count
+                        <<" expected="<<expectedMembers.size()<<" elapsedMs="<<(GetTickCount64()-(deadline-5000))<<'\n'<<std::flush;
+                    lastStatus=status;lastCount=count;
+                }
+                if(status!=S_OK||count!=static_cast<int>(expectedMembers.size()))return false;
+                std::vector<bool> matched(expectedMembers.size());bool targetAvailable=false;
+                for(int index=0;index<count;++index) {
+                    PITEMID_CHILD rawChild=nullptr;const auto childRead=folderView->Item(index,&rawChild);Pidl child(rawChild);
+                    if(childRead!=S_OK||!child)return false;
+                    const auto found=std::find_if(expectedMembers.begin(),expectedMembers.end(),[&](const auto& member){return ILIsEqual(child.get(),ILFindLastID(member.pidl.get()));});
+                    if(found==expectedMembers.end())return false;
+                    const auto memberIndex=static_cast<size_t>(found-expectedMembers.begin());if(matched[memberIndex])return false;
+                    ComPtr<IShellItem> row;if(folderView->GetItem(index,IID_PPV_ARGS(&row))!=S_OK||!row)return false;
+                    PWSTR rawPath=nullptr;const auto pathRead=row->GetDisplayName(SIGDN_FILESYSPATH,&rawPath);
+                    std::unique_ptr<wchar_t,decltype(&CoTaskMemFree)> path(rawPath,CoTaskMemFree);
+                    if(pathRead!=S_OK||!path||fs::path(path.get())!=found->path)return false;
+                    FILE_ID_INFO identity{};const auto identityRead=readIdentity(found->path,identity);
+                    if(identityRead!=S_OK||!sameIdentity(identity,found->identity))return false;
+                    matched[memberIndex]=true;targetAvailable=targetAvailable||ILIsEqual(child.get(),ILFindLastID(targetId.get()));
+                }
+                return targetAvailable&&sourceCurrent(folderView.Get())&&GetTickCount64()<deadline;
+            };
+            const auto now=GetTickCount64();const auto remaining=now<deadline?static_cast<DWORD>(deadline-now):0;
+            const bool membershipReady=remaining&&pumpPrivateNamespaceUntil(ready,remaining);
+            if(!membershipReady)selectionDiagnostic("initialization-not-ready");
+            require(membershipReady,"Original native owned membership/target did not become ready within initialization budget");
+            std::cout<<"NativeBackground readiness completeOwnedFileIDs="<<expectedMembers.size()<<" targetChildAvailable=1 observations="<<observations<<'\n'<<std::flush;
+            selectionDiagnostic("before-original-selection");
+            require(GetTickCount64()<deadline,"Native owned readiness readbacks exceeded original initialization budget");
+        }
     }
     ~NativeBackgroundView() {
         // Keep the native view/HWND alive through exact canceled-worker exit;
@@ -744,16 +881,22 @@ void nativeVideoCastParentState() {
     validateCastVideo(source);const auto clipboard=GetClipboardSequenceNumber();
     SHELLSTATE settings{};constexpr DWORD settingsMask=SSF_SHOWALLOBJECTS|SSF_SHOWSUPERHIDDEN|SSF_SHOWEXTENSIONS|SSF_NOCONFIRMRECYCLE;
     SHGetSetSettings(&settings,settingsMask,FALSE);
-    auto folder=item(fixture.root),video=item(source);NativeBackgroundView host;host.initialize(folder.Get());
+    auto folder=item(fixture.root),video=item(source);NativeBackgroundView host;
+    host.initialize(folder.Get(),{fixture.image,fixture.program,fixture.disc,fixture.text,source},video.Get());
     ComPtr<IFolderView2> folderView;succeeded(host.view.As(&folderView),"Read actual native Cast fixture folder view");
     struct Pidl {PIDLIST_ABSOLUTE value=nullptr;~Pidl(){CoTaskMemFree(value);}}videoPidl;
     succeeded(SHGetIDListFromObject(video.Get(),&videoPidl.value),"Retain actual owned video identity for native selection");
-    succeeded(host.view->SelectItem(ILFindLastID(videoPidl.value),SVSI_SELECT|SVSI_DESELECTOTHERS|SVSI_FOCUSED),"Select only owned video in actual native view");
+    host.selectionDiagnostic("video-before-original-selection");
+    const auto selectStatus=host.view->SelectItem(ILFindLastID(videoPidl.value),SVSI_SELECT|SVSI_DESELECTOTHERS|SVSI_FOCUSED);
+    std::cout<<"NativeBackground selection action=video HRESULT="<<static_cast<unsigned long>(selectStatus)<<" requests=1\n"<<std::flush;
+    succeeded(selectStatus,"Select only owned video in actual native view");
     ComPtr<IShellItemArray> selected;
-    require(pumpPrivateNamespaceUntil([&]{
+    const bool selectionReady=pumpPrivateNamespaceUntil([&]{
         selected.Reset();if(FAILED(folderView->GetSelection(FALSE,&selected))||!selected)return false;
         DWORD count=0;return SUCCEEDED(selected->GetCount(&count))&&count==1;
-    },5000),"Actual native Cast video selection exceeded bounded wait");
+    },5000);
+    host.selectionDiagnostic("video-after-original-selection");
+    require(selectionReady,"Actual native Cast video selection exceeded bounded wait");
     ComPtr<IShellItem> actual;succeeded(selected->GetItemAt(0,&actual),"Read exact original Cast selection member");
     int order=1;succeeded(actual->Compare(video.Get(),SICHINT_CANONICAL,&order),"Compare original native selected video identity");require(order==0,"Native Cast view selected another fixture item");
     explorer::NamespaceSelectionKinds kinds;succeeded(explorer::namespaceSelectionKinds(selected.Get(),&kinds),"Read actual native Cast video kind");
@@ -1822,7 +1965,8 @@ void asyncNativeKindAndOriginalView() {
     const auto sourceBytes=read(source),textBytes=read(fixture.text);
     const auto clipboard=GetClipboardSequenceNumber();
     const auto folder=item(fixture.root),music=item(source),text=item(fixture.text);
-    NativeBackgroundView host;host.initialize(folder.Get());
+    NativeBackgroundView host;
+    host.initialize(folder.Get(),{fixture.image,fixture.program,fixture.disc,fixture.text,source},music.Get());
     NamespaceDrainGuard drain;
     ComPtr<IFolderView2> view;succeeded(host.view.As(&view),"Retain original native Kind selection view");
     struct PidlDeleter {
@@ -1834,9 +1978,14 @@ void asyncNativeKindAndOriginalView() {
     succeeded(SHGetIDListFromObject(music.Get(),&rawMusic),"Read exact owned Music PIDL");Pidl musicId(rawMusic);
     succeeded(SHGetIDListFromObject(text.Get(),&rawText),"Read exact owned nonmedia PIDL");Pidl textId(rawText);
     succeeded(SHGetIDListFromObject(folder.Get(),&rawFolder),"Retain exact native folder PIDL");Pidl folderId(rawFolder);
-    succeeded(host.view->SelectItem(ILFindLastID(musicId.get()),SVSI_SELECT|SVSI_DESELECTOTHERS|SVSI_NOTAKEFOCUS),
+    host.selectionDiagnostic("music-before-original-selection");
+    const auto selectStatus=host.view->SelectItem(ILFindLastID(musicId.get()),SVSI_SELECT|SVSI_DESELECTOTHERS|SVSI_NOTAKEFOCUS);
+    std::cout<<"NativeBackground selection action=music HRESULT="<<static_cast<unsigned long>(selectStatus)<<" requests=1\n"<<std::flush;
+    succeeded(selectStatus,
               "Select exactly the owned native Music identity");
-    require(pumpPrivateNamespaceUntil([&]{int count=-1;return view->ItemCount(SVGIO_SELECTION,&count)==S_OK&&count==1;},2000),
+    const bool selectionReady=pumpPrivateNamespaceUntil([&]{int count=-1;return view->ItemCount(SVGIO_SELECTION,&count)==S_OK&&count==1;},2000);
+    host.selectionDiagnostic("music-after-original-selection");
+    require(selectionReady,
             "Original native Music selection was not ready");
     ComPtr<IShellItemArray> selected;succeeded(view->GetSelection(FALSE,&selected),"Retain original native selected array");
     ComPtr<IDataObject> data;succeeded(selected->BindToHandler(nullptr,BHID_DataObject,IID_PPV_ARGS(&data)),"Read complete selected native CIDA without clipboard publication");
