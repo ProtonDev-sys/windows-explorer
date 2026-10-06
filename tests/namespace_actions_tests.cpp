@@ -5,13 +5,18 @@
 
 #include <shlobj.h>
 #include <objbase.h>
+#include <propkey.h>
+#include <propvarutil.h>
 #include <winioctl.h>
+#include <vfw.h>
 #include <wrl/implements.h>
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -454,6 +459,370 @@ struct NativeBackgroundView {
     }
 };
 
+struct CastFileSnapshot {
+    FILE_ID_INFO identity{};
+    FILE_BASIC_INFO basic{};
+    FILE_STANDARD_INFO standard{};
+};
+
+CastFileSnapshot castFileSnapshot(const fs::path& path) {
+    struct File {HANDLE value=INVALID_HANDLE_VALUE;~File(){if(value!=INVALID_HANDLE_VALUE)CloseHandle(value);}}file;
+    file.value=CreateFileW(path.c_str(),FILE_READ_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
+                           nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT,nullptr);
+    require(file.value!=INVALID_HANDLE_VALUE,"Open only owned Cast fixture identity");
+    CastFileSnapshot result;
+    require(GetFileInformationByHandleEx(file.value,FileIdInfo,&result.identity,sizeof(result.identity))&&
+            GetFileInformationByHandleEx(file.value,FileBasicInfo,&result.basic,sizeof(result.basic))&&
+            GetFileInformationByHandleEx(file.value,FileStandardInfo,&result.standard,sizeof(result.standard)),
+            "Read complete owned Cast fixture identity/metadata");
+    require(!(result.basic.FileAttributes&FILE_ATTRIBUTE_REPARSE_POINT)&&!result.standard.Directory,
+            "Cast fixture must remain an owned ordinary file");
+    return result;
+}
+
+bool sameCastFile(const CastFileSnapshot& left,const CastFileSnapshot& right) {
+    return left.identity.VolumeSerialNumber==right.identity.VolumeSerialNumber&&
+        std::memcmp(left.identity.FileId.Identifier,right.identity.FileId.Identifier,sizeof(left.identity.FileId.Identifier))==0;
+}
+
+std::vector<BYTE> castVideoBytes() {
+    const auto u16=[](std::vector<BYTE>& bytes,std::uint16_t value){bytes.push_back(static_cast<BYTE>(value));bytes.push_back(static_cast<BYTE>(value>>8));};
+    const auto u32=[](std::vector<BYTE>& bytes,std::uint32_t value){for(unsigned shift=0;shift<32;shift+=8)bytes.push_back(static_cast<BYTE>(value>>shift));};
+    const auto four=[](std::vector<BYTE>& bytes,const char* value){for(unsigned index=0;index<4;++index)bytes.push_back(static_cast<BYTE>(value[index]));};
+    const auto chunk=[&](std::vector<BYTE>& bytes,const char* tag,const std::vector<BYTE>& payload){
+        four(bytes,tag);u32(bytes,static_cast<std::uint32_t>(payload.size()));bytes.insert(bytes.end(),payload.begin(),payload.end());
+        if(payload.size()&1)bytes.push_back(0);
+    };
+    // Same complete, uncompressed 2x2 DIB AVI recipe as visual_fixture_builder;
+    // read-only native AVI parsing below validates the real frame and index.
+    std::vector<BYTE> main,stream,bitmap;
+    for(const auto value:std::array<std::uint32_t,14>{1000000,16,0,0x10,1,0,1,16,2,2,0,0,0,0})u32(main,value);
+    four(stream,"vids");four(stream,"DIB ");u32(stream,0);u16(stream,0);u16(stream,0);
+    for(const auto value:std::array<std::uint32_t,8>{0,1,1,0,1,16,0xffffffffu,0})u32(stream,value);
+    u16(stream,0);u16(stream,0);u16(stream,2);u16(stream,2);
+    u32(bitmap,40);u32(bitmap,2);u32(bitmap,2);u16(bitmap,1);u16(bitmap,24);
+    for(const auto value:std::array<std::uint32_t,6>{0,16,0,0,0,0})u32(bitmap,value);
+    std::vector<BYTE> streams;four(streams,"strl");chunk(streams,"strh",stream);chunk(streams,"strf",bitmap);
+    std::vector<BYTE> headers;four(headers,"hdrl");chunk(headers,"avih",main);chunk(headers,"LIST",streams);
+    const std::vector<BYTE> pixels{0x20,0x60,0xc0,0x20,0x60,0xc0,0,0,0xc0,0x60,0x20,0xc0,0x60,0x20,0,0};
+    std::vector<BYTE> movie;four(movie,"movi");chunk(movie,"00db",pixels);
+    std::vector<BYTE> index;four(index,"00db");u32(index,0x10);u32(index,4);u32(index,16);
+    std::vector<BYTE> body;four(body,"AVI ");chunk(body,"LIST",headers);chunk(body,"LIST",movie);chunk(body,"idx1",index);
+    std::vector<BYTE> result;chunk(result,"RIFF",body);return result;
+}
+
+void validateCastVideo(const fs::path& path) {
+    struct Avi {
+        PAVIFILE file=nullptr;PAVISTREAM stream=nullptr;
+        Avi(){AVIFileInit();}
+        ~Avi(){if(stream)AVIStreamRelease(stream);if(file)AVIFileRelease(file);AVIFileExit();}
+    }avi;
+    succeeded(AVIFileOpenW(&avi.file,path.c_str(),OF_READ|OF_SHARE_DENY_WRITE,nullptr),"Parse owned Cast AVI without playback");
+    succeeded(AVIFileGetStream(avi.file,&avi.stream,streamtypeVIDEO,0),"Read owned Cast video stream");
+    AVISTREAMINFOW info{};succeeded(AVIStreamInfoW(avi.stream,&info,sizeof(info)),"Read actual native AVI dimensions");
+    std::array<BYTE,16> frame{};LONG bytes=0,samples=0;
+    succeeded(AVIStreamRead(avi.stream,0,1,frame.data(),static_cast<LONG>(frame.size()),&bytes,&samples),"Read owned Cast AVI frame without decoding/player UI");
+    require(info.dwLength==1&&info.rcFrame.right==2&&info.rcFrame.bottom==2&&samples==1&&bytes==16,
+            "Owned Cast AVI lacks its complete native frame");
+}
+
+void verifyCastCida(IDataObject* data,const CastFileSnapshot& expected) {
+    const auto format=RegisterClipboardFormatW(CFSTR_SHELLIDLIST);require(format!=0,"Register identification format without touching clipboard");
+    FORMATETC request{static_cast<CLIPFORMAT>(format),nullptr,DVASPECT_CONTENT,-1,TYMED_HGLOBAL};
+    struct Medium {STGMEDIUM value{};~Medium(){ReleaseStgMedium(&value);}}medium;
+    succeeded(data->GetData(&request,&medium.value),"Read original native owned-selection CIDA");
+    require(medium.value.tymed==TYMED_HGLOBAL&&medium.value.hGlobal,"Native Cast CIDA medium is invalid");
+    const auto size=GlobalSize(medium.value.hGlobal);require(size>=3*sizeof(UINT)&&size<=1024*1024,"Native Cast CIDA size bound");
+    struct Lock {HGLOBAL value;const BYTE* bytes;~Lock(){if(bytes)GlobalUnlock(value);}}lock{
+        medium.value.hGlobal,static_cast<const BYTE*>(GlobalLock(medium.value.hGlobal))};
+    require(lock.bytes!=nullptr,"Lock bounded native Cast CIDA");
+    UINT count=0;std::memcpy(&count,lock.bytes,sizeof(count));require(count==1,"Cast CIDA lost its complete one-item selection");
+    std::array<UINT,2> offsets{};std::memcpy(offsets.data(),lock.bytes+sizeof(UINT),sizeof(offsets));
+    using Pidl=std::unique_ptr<ITEMIDLIST,decltype(&CoTaskMemFree)>;
+    const auto copy=[&](UINT offset){
+        require(offset>=3*sizeof(UINT)&&offset<size&&offset%alignof(USHORT)==0,"Native Cast CIDA offset bound");
+        size_t end=offset;
+        for(;;){require(size-end>=sizeof(USHORT),"Native Cast CIDA PIDL terminator bound");USHORT length=0;
+            std::memcpy(&length,lock.bytes+end,sizeof(length));if(!length){end+=sizeof(length);break;}
+            require(length>=sizeof(length)&&length<=size-end,"Native Cast CIDA item bound");end+=length;}
+        auto owned=static_cast<ITEMIDLIST*>(CoTaskMemAlloc(end-offset));require(owned!=nullptr,"Copy bounded original native Cast PIDL");
+        std::memcpy(owned,lock.bytes+offset,end-offset);return Pidl(owned,CoTaskMemFree);
+    };
+    auto parent=copy(offsets[0]),child=copy(offsets[1]);
+    struct AbsolutePidl {PIDLIST_ABSOLUTE value=nullptr;~AbsolutePidl(){CoTaskMemFree(value);}}absolute{ILCombine(parent.get(),child.get())};
+    require(absolute.value!=nullptr,"Combine original native Cast parent/child identity");
+    ComPtr<IShellItem> source;succeeded(SHCreateItemFromIDList(absolute.value,IID_PPV_ARGS(&source)),"Read actual native Cast CIDA member");
+    PWSTR raw=nullptr;succeeded(source->GetDisplayName(SIGDN_FILESYSPATH,&raw),"Read only owned Cast CIDA filesystem identity");
+    std::unique_ptr<wchar_t,decltype(&CoTaskMemFree)> path(raw,CoTaskMemFree);require(path!=nullptr,"Owned Cast CIDA path is null");
+    require(sameCastFile(castFileSnapshot(path.get()),expected),"Cast CIDA substituted a different native FileID");
+}
+
+struct CastMenuSnapshot {
+    HRESULT status=E_PENDING,siteStatus=E_NOINTERFACE;
+    CLSID identifier{};
+    UINT id=0,state=0;bool submenu=false,parentEnabled=false,derivedEnabled=false;
+    unsigned children=0,enabledLeaves=0,maximumDepth=0;
+};
+
+struct CastVisibleWindow {
+    HWND window=nullptr,owner=nullptr;
+    DWORD process=0,thread=0;
+    HDESK threadDesktop=nullptr;
+    std::array<char,256> name{};
+};
+
+struct CastVisibilityBaseline {
+    std::array<CastVisibleWindow,128> windows{};
+    size_t count=0;
+};
+
+CastVisibilityBaseline readCastIsolation(HWND owner,const char* checkpoint) {
+    const auto desktop=explorer::PrivateDesktop::current();require(desktop!=nullptr,"Cast metadata requires its owned private desktop");
+    succeeded(desktop->verifyIsolation(),"Keep Cast metadata on its unchanged private/input desktop");
+    bool inputVisible=true;succeeded(desktop->visibleWindowsOnInputDesktop(inputVisible),"Observe actual Cast input-desktop visibility");
+    struct Observation {
+        const char* checkpoint;const std::wstring* desktopName;
+        CastVisibilityBaseline result;
+        unsigned total=0,visibleForeign=0;
+        bool identitiesValid=true,overflow=false;
+    }observation{checkpoint,&desktop->name()};
+    SetLastError(ERROR_SUCCESS);
+    const auto enumerated=EnumDesktopWindows(GetThreadDesktop(GetCurrentThreadId()),[](HWND window,LPARAM context)->BOOL {
+        auto& observed=*reinterpret_cast<Observation*>(context);++observed.total;
+        DWORD process=0;const auto thread=GetWindowThreadProcessId(window,&process);
+        if(!IsWindowVisible(window)){SetLastError(ERROR_SUCCESS);return TRUE;}
+        if(process!=GetCurrentProcessId()){++observed.visibleForeign;SetLastError(ERROR_SUCCESS);return TRUE;}
+        std::array<char,256> name{};SetLastError(ERROR_SUCCESS);
+        const auto classLength=GetClassNameA(window,name.data(),static_cast<int>(name.size()));const auto classError=GetLastError();
+        RECT rect{};SetLastError(ERROR_SUCCESS);const auto rectRead=GetWindowRect(window,&rect);const auto rectError=GetLastError();
+        const auto style=GetWindowLongPtrW(window,GWL_STYLE),extended=GetWindowLongPtrW(window,GWL_EXSTYLE);
+        const auto nativeOwner=GetWindow(window,GW_OWNER);
+        SetLastError(ERROR_SUCCESS);const auto threadDesktop=GetThreadDesktop(thread);const auto desktopError=GetLastError();
+        std::array<wchar_t,256> desktopName{};DWORD needed=0;SetLastError(ERROR_SUCCESS);
+        const auto desktopRead=threadDesktop?GetUserObjectInformationW(threadDesktop,UOI_NAME,desktopName.data(),
+            static_cast<DWORD>(sizeof(desktopName)),&needed):FALSE;
+        const auto desktopNameError=GetLastError();
+        const bool desktopMatches=desktopRead&&needed>=sizeof(wchar_t)&&needed<=sizeof(desktopName)&&
+            needed%sizeof(wchar_t)==0&&desktopName[needed/sizeof(wchar_t)-1]==L'\0'&&
+            std::wstring_view(desktopName.data(),needed/sizeof(wchar_t)-1)==*observed.desktopName;
+        observed.identitiesValid=observed.identitiesValid&&thread!=0&&classLength>0&&rectRead&&desktopMatches;
+        if(observed.result.count<observed.result.windows.size())
+            observed.result.windows[observed.result.count++]={window,nativeOwner,process,thread,threadDesktop,name};
+        else observed.overflow=true;
+        std::cout<<"CastState visiblePrivate checkpoint="<<observed.checkpoint
+            <<" hwnd="<<reinterpret_cast<uintptr_t>(window)<<" process="<<process<<" thread="<<thread
+            <<" class="<<name.data()<<" classLength="<<classLength<<" classError="<<classError
+            <<" owner="<<reinterpret_cast<uintptr_t>(nativeOwner)<<" rectRead="<<rectRead<<" rectError="<<rectError
+            <<" left="<<rect.left<<" top="<<rect.top<<" right="<<rect.right<<" bottom="<<rect.bottom
+            <<" style="<<static_cast<DWORD>(style)<<" exStyle="<<static_cast<DWORD>(extended)
+            <<" nativeThreadDesktop="<<reinterpret_cast<uintptr_t>(threadDesktop)<<" desktopError="<<desktopError
+            <<" desktopRead="<<desktopRead<<" desktopNameError="<<desktopNameError<<" samePrivateDesktop="<<desktopMatches<<'\n'<<std::flush;
+        SetLastError(ERROR_SUCCESS);
+        return TRUE;
+    },reinterpret_cast<LPARAM>(&observation));
+    const auto enumerationError=GetLastError();const auto ownerVisible=IsWindowVisible(owner);
+    std::cout<<"CastState isolation checkpoint="<<checkpoint<<" enumerated="<<enumerated<<" enumerationError="<<enumerationError
+        <<" visited="<<observation.total<<" visibleOwned="<<observation.result.count<<" visibleForeign="<<observation.visibleForeign
+        <<" identitiesValid="<<observation.identitiesValid<<" overflow="<<observation.overflow
+        <<" inputVisible="<<inputVisible<<" fixtureOwnerVisible="<<ownerVisible<<'\n'<<std::flush;
+    require(enumerated!=FALSE,"Read native Cast desktop windows while its hidden owner remains alive");
+    require(!inputVisible&&!ownerVisible&&observation.visibleForeign==0&&observation.identitiesValid&&!observation.overflow,
+            "Cast fixture visibility lacks exact own-process/native-thread/private-desktop provenance");
+    succeeded(desktop->verifyIsolation(),"Reverify private/input desktop after Cast visibility enumeration");
+    succeeded(desktop->visibleWindowsOnInputDesktop(inputVisible),"Recheck input visibility after Cast native-window identities");
+    require(!inputVisible&&!IsWindowVisible(owner),"Cast visibility read displayed input UI or its fixture owner");
+    return observation.result;
+}
+
+void verifyCastIsolation(HWND owner,const char* checkpoint,const CastVisibilityBaseline& baseline) {
+    const auto current=readCastIsolation(owner,checkpoint);
+    bool unchanged=current.count==baseline.count;
+    for(size_t index=0;index<current.count;++index){
+        const auto& actual=current.windows[index];
+        const auto matching=std::find_if(baseline.windows.begin(),baseline.windows.begin()+baseline.count,[&](const auto& original){
+            return actual.window==original.window&&actual.owner==original.owner&&actual.process==original.process&&
+                actual.thread==original.thread&&actual.threadDesktop==original.threadDesktop&&actual.name==original.name;
+        });
+        unchanged=unchanged&&matching!=baseline.windows.begin()+baseline.count;
+    }
+    std::cout<<"CastState baseline checkpoint="<<checkpoint<<" expectedVisible="<<baseline.count
+        <<" actualVisible="<<current.count<<" exactNativeWindowSet="<<unchanged<<'\n'<<std::flush;
+    require(unchanged,"Read-only Cast provider changed the settled exact visible native-window baseline");
+}
+
+CastMenuSnapshot readCastMenu(const wchar_t* association,const char* diagnostic,NativeBackgroundView& host,IDataObject* data,
+                              const CastVisibilityBaseline& baseline) {
+    CastMenuSnapshot result;
+    std::cout<<"CastState association="<<diagnostic<<" stage=before-provider-isolation\n"<<std::flush;
+    verifyCastIsolation(host.owner,"before-provider",baseline);
+    std::cout<<"CastState association="<<diagnostic<<" stage=registry\n";
+    struct Key {HKEY value=nullptr;~Key(){if(value)RegCloseKey(value);}}key;
+    const auto opened=RegOpenKeyExW(HKEY_CLASSES_ROOT,association,0,KEY_READ,&key.value);
+    if(opened!=ERROR_SUCCESS){result.status=HRESULT_FROM_WIN32(opened);return result;}
+    std::array<wchar_t,128> handler{};DWORD bytes=static_cast<DWORD>(sizeof(handler));
+    const auto readHandler=RegGetValueW(key.value,L"shellex\\ContextMenuHandlers\\PlayTo",nullptr,RRF_RT_REG_SZ,
+                                       nullptr,handler.data(),&bytes);
+    if(readHandler!=ERROR_SUCCESS){result.status=HRESULT_FROM_WIN32(readHandler);return result;}
+    require(bytes>=2*sizeof(wchar_t)&&bytes<=sizeof(handler)&&handler[(bytes/sizeof(wchar_t))-1]==0,
+            "Installed Cast handler registration lacks a bounded CLSID");
+    CLSID identifier{};succeeded(CLSIDFromString(handler.data(),&identifier),"Read actual installed Cast handler CLSID");result.identifier=identifier;
+    ComPtr<IContextMenu> context;std::cout<<"CastState association="<<diagnostic<<" stage=create-provider\n";
+    result.status=CoCreateInstance(identifier,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&context));
+    if(FAILED(result.status))return result;
+    ComPtr<IShellExtInit> initialize;succeeded(context.As(&initialize),"Read native Cast initialization contract");
+    std::cout<<"CastState association="<<diagnostic<<" stage=initialize\n";
+    succeeded(initialize->Initialize(nullptr,data,key.value),"Initialize real Cast handler with original selection and exact association key");
+    explorer::NativeContextMenu menu;std::cout<<"CastState association="<<diagnostic<<" stage=query-menu\n";
+    // Preserve this isolated handler's original QueryContextMenu flags. The
+    // later snapshot never sends WM_INITMENUPOPUP to the artificial root.
+    succeeded(menu.create(host.owner,context.Get(),host.view.Get(),CMF_NORMAL),"Query isolated real Cast handler with original synchronous-cascade flags and native view site");
+    ComPtr<IObjectWithSite> sited;
+    result.siteStatus=context.As(&sited);
+    if(SUCCEEDED(result.siteStatus)){
+        ComPtr<IUnknown> actual,expected;result.siteStatus=sited->GetSite(IID_PPV_ARGS(&actual));
+        succeeded(host.view.As(&expected),"Read original Cast native view COM identity");
+        if(SUCCEEDED(result.siteStatus))require(actual.Get()==expected.Get(),"Cast handler received a different native view site");
+    }
+    std::vector<explorer::ContextMenuEntry> entries;
+    std::cout<<"CastState association="<<diagnostic<<" stage=snapshot-native-parent\n";
+    succeeded(menu.enumerate(entries,false),"Read actual native Cast parent before any popup initialization");
+    const auto readParent=[&](const char* phase) {
+        const explorer::ContextMenuEntry* parent=nullptr;
+        for(const auto& entry:entries)if(!entry.separator()){
+            std::cout<<"CastState association="<<diagnostic<<" phase="<<phase<<" parentCandidateId="<<entry.id<<" parentCandidateState="<<entry.state
+                <<" parentCandidateEnabled="<<entry.enabled()<<" parentCandidateSubmenu="<<entry.submenu<<'\n';
+            require(!parent,"Isolated Cast handler returned ambiguous parent commands");parent=&entry;
+        }
+        require(parent&&parent->id&&parent->id<=0x7fff,"Isolated Cast handler has no retained native parent ordinal");
+        MENUITEMINFOW metadata{sizeof(metadata)};metadata.fMask=MIIM_STATE|MIIM_SUBMENU|MIIM_ID;
+        require(GetMenuItemInfoW(menu.menu(),parent->id,FALSE,&metadata)!=FALSE,"Read raw native Cast parent menu state");
+        require(metadata.wID==parent->id&&metadata.fState==parent->state&&(metadata.hSubMenu!=nullptr)==parent->submenu,
+                "Cast metadata disagrees with the original native parent menu");
+        std::cout<<"CastState association="<<diagnostic<<" phase="<<phase<<" rawParentId="<<metadata.wID<<" rawParentState="<<metadata.fState
+            <<" rawParentSubmenu="<<reinterpret_cast<uintptr_t>(metadata.hSubMenu)<<" rootWM_INIT=0\n"<<std::flush;
+        result.id=metadata.wID;result.state=metadata.fState;result.submenu=metadata.hSubMenu!=nullptr;
+        result.parentEnabled=parent->enabled();
+        return parent;
+    };
+    const auto* parent=readParent("before-population");
+    if(parent->enabled()&&parent->submenu) {
+        const auto command=parent->id;
+        std::cout<<"CastState association="<<diagnostic<<" stage=populate-exact-enabled-parent parentId="<<command<<'\n'<<std::flush;
+        succeeded(menu.enumerateForCommand(command,entries),"Populate only the actual enabled native Cast submenu without displaying or invoking it");
+        parent=readParent("after-population");
+        require(parent->id==command,"Native Cast submenu population replaced the original parent ordinal");
+    } else {
+        std::cout<<"CastState association="<<diagnostic<<" stage=parent-population-not-applicable enabled="<<parent->enabled()
+            <<" submenu="<<parent->submenu<<" popupAttempts=0\n"<<std::flush;
+    }
+    unsigned budget=4096;
+    std::function<void(const std::vector<explorer::ContextMenuEntry>&,unsigned,bool)> count;
+    count=[&](const auto& rows,unsigned depth,bool ancestorsEnabled){
+        require(depth<=16,"Native Cast children exceed bounded depth");
+        for(const auto& row:rows){require(budget!=0,"Native Cast children exceed bounded count");--budget;
+            if(row.separator())continue;++result.children;result.maximumDepth=(std::max)(result.maximumDepth,depth);
+            const bool enabled=ancestorsEnabled&&row.enabled();
+            if(row.submenu)count(row.children,depth+1,enabled);else if(enabled)++result.enabledLeaves;}
+    };
+    count(parent->children,1,true);
+    result.derivedEnabled=result.parentEnabled&&(!result.submenu||result.enabledLeaves!=0);result.status=S_OK;
+    std::cout<<"CastState association="<<diagnostic<<" parentId="<<result.id<<" parentState="<<result.state
+        <<" parentEnabled="<<result.parentEnabled<<" submenu="<<result.submenu<<" childCount="<<result.children
+        <<" enabledLeaves="<<result.enabledLeaves<<" maximumDepth="<<result.maximumDepth
+        <<" hostLeafDerivedEnabled="<<result.derivedEnabled<<" siteHRESULT="<<static_cast<unsigned long>(result.siteStatus)<<'\n';
+    std::cout<<"CastState association="<<diagnostic<<" stage=after-menu-isolation\n"<<std::flush;
+    verifyCastIsolation(host.owner,"after-menu",baseline);
+    return result;
+}
+
+void nativeVideoCastParentState() {
+    std::cout<<"CastState stage=owned-valid-avi\n";
+    Fixture fixture;const auto source=fixture.root/L"owned Cast video.avi";const auto bytes=castVideoBytes();
+    {std::ofstream output(source,std::ios::binary);output.write(reinterpret_cast<const char*>(bytes.data()),static_cast<std::streamsize>(bytes.size()));
+        require(output.good(),"Create complete owned Cast video without overwriting other files");}
+    const auto before=castFileSnapshot(source);const auto originalBytes=read(source),originalText=read(fixture.text);
+    validateCastVideo(source);const auto clipboard=GetClipboardSequenceNumber();
+    SHELLSTATE settings{};constexpr DWORD settingsMask=SSF_SHOWALLOBJECTS|SSF_SHOWSUPERHIDDEN|SSF_SHOWEXTENSIONS|SSF_NOCONFIRMRECYCLE;
+    SHGetSetSettings(&settings,settingsMask,FALSE);
+    auto folder=item(fixture.root),video=item(source);NativeBackgroundView host;host.initialize(folder.Get());
+    ComPtr<IFolderView2> folderView;succeeded(host.view.As(&folderView),"Read actual native Cast fixture folder view");
+    struct Pidl {PIDLIST_ABSOLUTE value=nullptr;~Pidl(){CoTaskMemFree(value);}}videoPidl;
+    succeeded(SHGetIDListFromObject(video.Get(),&videoPidl.value),"Retain actual owned video identity for native selection");
+    succeeded(host.view->SelectItem(ILFindLastID(videoPidl.value),SVSI_SELECT|SVSI_DESELECTOTHERS|SVSI_FOCUSED),"Select only owned video in actual native view");
+    ComPtr<IShellItemArray> selected;
+    require(pumpPrivateNamespaceUntil([&]{
+        selected.Reset();if(FAILED(folderView->GetSelection(FALSE,&selected))||!selected)return false;
+        DWORD count=0;return SUCCEEDED(selected->GetCount(&count))&&count==1;
+    },5000),"Actual native Cast video selection exceeded bounded wait");
+    ComPtr<IShellItem> actual;succeeded(selected->GetItemAt(0,&actual),"Read exact original Cast selection member");
+    int order=1;succeeded(actual->Compare(video.Get(),SICHINT_CANONICAL,&order),"Compare original native selected video identity");require(order==0,"Native Cast view selected another fixture item");
+    explorer::NamespaceSelectionKinds kinds;succeeded(explorer::namespaceSelectionKinds(selected.Get(),&kinds),"Read actual native Cast video kind");
+    require(kinds.count==1&&kinds.video&&!kinds.music,"Valid AVI did not supply the native Video context");
+    ComPtr<IDataObject> data;succeeded(selected->BindToHandler(nullptr,BHID_DataObject,IID_PPV_ARGS(&data)),"Retain original native Cast selection data object");
+    verifyCastCida(data.Get(),before);
+    // Native Shell/input helpers may finish creating their owned private HWNDs
+    // after navigation. Settle them before the first provider exists; no class
+    // name is exempted from exact baseline identity/owner preservation later.
+    const auto settleStarted=GetTickCount64();
+    require(pumpPrivateNamespaceUntil([&]{
+        const auto desktop=explorer::PrivateDesktop::current();bool inputVisible=true;
+        succeeded(desktop->visibleWindowsOnInputDesktop(inputVisible),"Keep input desktop invisible while settling native fixture helpers");
+        require(!inputVisible&&!IsWindowVisible(host.owner),"Settling native Cast fixture displayed input UI or its owner");
+        return GetTickCount64()-settleStarted>=450;
+    },500),"Settle native fixture messages within the bounded pre-provider window");
+    const auto settleElapsed=GetTickCount64()-settleStarted;
+    std::cout<<"CastState stage=settled-before-provider elapsedMilliseconds="<<settleElapsed<<'\n'<<std::flush;
+    require(settleElapsed<=500,"Native fixture settlement exceeded its 500 ms admission budget");
+    const auto visibilityBaseline=readCastIsolation(host.owner,"baseline-before-any-cast-provider");
+    const auto audio=readCastMenu(L"SystemFileAssociations\\audio","audio",host,data.Get(),visibilityBaseline);
+    verifyCastCida(data.Get(),before);
+    const auto videoState=readCastMenu(L"SystemFileAssociations\\video","video",host,data.Get(),visibilityBaseline);
+    verifyCastCida(data.Get(),before);
+    verifyCastIsolation(host.owner,"before-production-state",visibilityBaseline);
+    DWORD nativeSelectionCount=0;SFGAOF nativeSelectionAttributes=0;
+    succeeded(selected->GetCount(&nativeSelectionCount),"Read original whole-array Cast selection count");
+    const auto nativeAttributesStatus=selected->GetAttributes(static_cast<SIATTRIBFLAGS>(SIATTRIBFLAGS_AND|SIATTRIBFLAGS_ALLITEMS),
+        SFGAO_FILESYSTEM|SFGAO_FOLDER|SFGAO_LINK,&nativeSelectionAttributes);
+    succeeded(nativeAttributesStatus,"Read original whole-array Cast attributes without sampling");
+    require(nativeSelectionCount==1,"Original whole-array Cast selection no longer contains only the owned video");
+    explorer::NativeNamespaceActions actions;succeeded(actions.initialize(host.owner,{folder,selected,host.view}),"Retain same original video array/native site for production Cast state");
+    explorer::NamespaceCommandState state;std::cout<<"CastState stage=production-state\n";
+    const auto status=actions.queryActionState(NamespaceAction::CastToDevice,&state);const auto facts=actions.facts();
+    std::cout<<"CastState audioHRESULT="<<static_cast<unsigned long>(audio.status)<<" videoHRESULT="<<static_cast<unsigned long>(videoState.status)
+        <<" sameProviderClass="<<(SUCCEEDED(audio.status)&&SUCCEEDED(videoState.status)&&IsEqualCLSID(audio.identifier,videoState.identifier))
+        <<" productionHRESULT="<<static_cast<unsigned long>(status)<<" nativeState="<<state.state
+        <<" productionEnabled="<<(SUCCEEDED(status)&&state.enabled())<<" selectionCount="<<facts.selectionCount
+        <<" physicalFiles="<<facts.physicalFiles<<" media="<<facts.media<<" castItems="<<facts.castItems
+        <<" fallbackAvailable="<<facts.castHandlerAvailable<<" fallbackEnabled="<<facts.castHandlerEnabled
+        <<" fallbackSubmenu="<<facts.castHandlerSubmenu<<" fallbackId="<<facts.castCommandId<<'\n';
+    const bool sameNativeProvider=audio.status==S_OK&&videoState.status==S_OK&&IsEqualCLSID(audio.identifier,videoState.identifier);
+    if(sameNativeProvider)require(status==S_OK&&facts.castHandlerAvailable,
+        "Production rejected the independently available same-class native Cast handler for the original whole array");
+    if(facts.castHandlerAvailable&&audio.status==S_OK)require(status==S_OK&&
+        state.state==static_cast<EXPCMDSTATE>(audio.derivedEnabled?ECS_ENABLED:ECS_DISABLED)&&state.enabled()==facts.castHandlerEnabled&&
+        facts.castHandlerEnabled==audio.derivedEnabled&&facts.castCommandId==audio.id&&facts.castHandlerSubmenu==audio.submenu,
+        "Production Cast admission/ordinal/submenu/state differs from the actual audio-initialized native menu reduction");
+    require(!facts.castHandlerAvailable||(audio.status==S_OK&&videoState.status==S_OK),"Available native Cast fallback could not be independently compared");
+    require(facts.selectionCount==nativeSelectionCount&&facts.nativeAttributesStatus==nativeAttributesStatus&&
+        facts.nativeAttributes==nativeSelectionAttributes&&facts.detailedTargetsKnown&&facts.filesystem&&facts.physicalFiles&&
+        !facts.physicalFolders&&facts.media&&facts.castItems,
+        "Production Cast eligibility lost the original complete native video array facts");
+    const auto after=castFileSnapshot(source);SHELLSTATE current{};SHGetSetSettings(&current,settingsMask,FALSE);
+    const auto desktop=explorer::PrivateDesktop::current();bool visible=true;
+    succeeded(desktop->verifyIsolation(),"Preserve exact private/input desktop during Cast metadata reads");
+    succeeded(desktop->visibleWindowsOnInputDesktop(visible),"Inspect input-desktop visibility after native Cast readback");
+    require(!visible&&!IsWindowVisible(host.owner)&&GetClipboardSequenceNumber()==clipboard&&read(source)==originalBytes&&read(fixture.text)==originalText&&
+        sameCastFile(before,after)&&before.basic.CreationTime.QuadPart==after.basic.CreationTime.QuadPart&&
+        before.basic.LastWriteTime.QuadPart==after.basic.LastWriteTime.QuadPart&&before.basic.FileAttributes==after.basic.FileAttributes&&
+        before.standard.EndOfFile.QuadPart==after.standard.EndOfFile.QuadPart&&
+        current.fShowAllObjects==settings.fShowAllObjects&&current.fShowSuperHidden==settings.fShowSuperHidden&&
+        current.fShowExtensions==settings.fShowExtensions&&current.fNoConfirmRecycle==settings.fNoConfirmRecycle,
+        "Native Cast state read changed source identities/content/settings/clipboard or input visibility");
+    verifyCastCida(data.Get(),before);
+    verifyCastIsolation(host.owner,"after-production-state",visibilityBaseline);
+    std::cout<<"CastState sourceNativeVideo=1 frameSamples=1 frameBytes=16 exactCidaFileID=1 sourceUnchanged=1 settingsUnchanged=1 noInputUI=1\n";
+}
+
 void nativeRecyclePropertiesBackgroundState() {
     const auto clipboard=GetClipboardSequenceNumber();
     Fixture fixture;const auto before=read(fixture.text);
@@ -714,6 +1083,391 @@ void targetTypesAndFeatureMatrix() {
         require(!explorer::namespaceActionLabel(static_cast<NamespaceAction>(index)).empty(), "Namespace action is missing descriptive metadata");
 }
 
+class PlanningMenu final : public Microsoft::WRL::RuntimeClass<
+    Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::ClassicCom>,
+    Microsoft::WRL::ChainInterfaces<IContextMenu3,IContextMenu2,IContextMenu>> {
+public:
+    unsigned queries=0,rootMessages=0,unrelatedMessages=0,libraryMessages=0,nestedMessages=0,containerMessages=0,invocations=0,message2Calls=0,message3Calls=0;
+    UINT flags=0,first=0;
+    HMENU root=nullptr,unrelated=nullptr,library=nullptr,nested=nullptr,container=nullptr;
+    HRESULT libraryStatus=S_OK;
+    bool failUnrelated=true,disabledLibrary=false,disabledContainer=false,nestedDuplicate=false,ambiguousLibrary=false;
+    bool anonymousLibrary=false,duplicateLibraryId=false;
+    std::function<void()> duringLibrary;
+
+    static HRESULT insert(HMENU menu,UINT position,UINT id,const wchar_t* label,UINT state=MFS_ENABLED,HMENU child=nullptr) {
+        MENUITEMINFOW info{sizeof(info)};
+        info.fMask=MIIM_ID|MIIM_STRING|MIIM_STATE|MIIM_SUBMENU;
+        info.wID=id;info.dwTypeData=const_cast<wchar_t*>(label);info.fState=state;info.hSubMenu=child;
+        if(InsertMenuItemW(menu,position,TRUE,&info))return S_OK;
+        const auto error=GetLastError();return HRESULT_FROM_WIN32(error?error:ERROR_GEN_FAILURE);
+    }
+    static HRESULT cascade(HMENU menu,UINT position,UINT id,const wchar_t* label,UINT state,HMENU* child) {
+        *child=CreatePopupMenu();if(!*child)return E_OUTOFMEMORY;
+        const auto hr=insert(menu,position,id,label,state,*child);
+        if(FAILED(hr)){DestroyMenu(*child);*child=nullptr;}return hr;
+    }
+    HRESULT STDMETHODCALLTYPE QueryContextMenu(HMENU menu,UINT position,UINT begin,UINT last,UINT queryFlags) override {
+        ++queries;root=menu;first=begin;flags=queryFlags;
+        if(last<first+23)return E_INVALIDARG;
+        rootMessages=unrelatedMessages=libraryMessages=nestedMessages=containerMessages=message2Calls=message3Calls=0;
+        unrelated=library=nested=container=nullptr;
+        HRESULT hr=insert(root,position,first+2,L"Owned translated leaf",MFS_DEFAULT|MFS_CHECKED);
+        if(SUCCEEDED(hr))hr=cascade(root,position+1,first+8,L"Unrelated translated cascade",MFS_ENABLED,&unrelated);
+        if(SUCCEEDED(hr))hr=cascade(root,position+2,first+10,L"Requested translated cascade",disabledLibrary?MFS_DISABLED:MFS_ENABLED,&library);
+        if(SUCCEEDED(hr))hr=cascade(root,position+3,first+14,L"Owned ancestor",disabledContainer?MFS_DISABLED:MFS_ENABLED,&container);
+        if(SUCCEEDED(hr))hr=insert(container,0,first+15,L"Owned nested leaf");
+        if(SUCCEEDED(hr)&&ambiguousLibrary)hr=insert(root,position+4,first+20,L"Ambiguous canonical peer");
+        if(SUCCEEDED(hr)&&duplicateLibraryId)hr=insert(root,position+4,first+10,L"Duplicate native ordinal");
+        return FAILED(hr)?hr:MAKE_HRESULT(SEVERITY_SUCCESS,0,24);
+    }
+    HRESULT STDMETHODCALLTYPE InvokeCommand(CMINVOKECOMMANDINFO*) override {++invocations;return E_ACCESSDENIED;}
+    HRESULT STDMETHODCALLTYPE GetCommandString(UINT_PTR ordinal,UINT requested,UINT*,LPSTR text,UINT capacity) override {
+        if(requested!=GCS_VERBW)return E_NOTIMPL;
+        const wchar_t* verb=nullptr;
+        switch(ordinal) {
+        case 2:verb=L"rotate90";break;
+        case 8:verb=L"PlayTo";break;
+        case 10:case 20:if(anonymousLibrary)return E_NOTIMPL;verb=L"Windows.includeinlibrary";break;
+        case 14:verb=L"ownedcontainer";break;
+        case 15:verb=nestedDuplicate?L"rotate90":L"rotate270";break;
+        case 13:verb=L"ownednested";break;
+        default:return E_NOTIMPL;
+        }
+        return wcscpy_s(reinterpret_cast<wchar_t*>(text),capacity,verb)?E_FAIL:S_OK;
+    }
+    HRESULT message(UINT message,WPARAM raw,LPARAM packed) {
+        if(message!=WM_INITMENUPOPUP||HIWORD(packed))return E_NOTIMPL;
+        const auto menu=reinterpret_cast<HMENU>(raw);
+        if(menu==root){++rootMessages;return S_OK;}
+        if(menu==unrelated) {
+            ++unrelatedMessages;if(LOWORD(packed)!=1)return E_INVALIDARG;
+            if(failUnrelated)return E_ACCESSDENIED;
+            return GetMenuItemCount(unrelated)?S_OK:insert(unrelated,0,first+9,L"Real unrelated provider choice");
+        }
+        if(menu==container){++containerMessages;return LOWORD(packed)==3?S_OK:E_INVALIDARG;}
+        if(menu==library) {
+            ++libraryMessages;if(LOWORD(packed)!=2)return E_INVALIDARG;
+            if(duringLibrary)duringLibrary();
+            if(libraryStatus!=S_OK)return libraryStatus;
+            if(GetMenuItemCount(library))return S_OK;
+            HRESULT hr=insert(library,0,first+11,L"Owned native default",MFS_DEFAULT|MFS_CHECKED);
+            if(SUCCEEDED(hr))hr=insert(library,1,first+12,L"Owned native disabled",MFS_DISABLED);
+            if(SUCCEEDED(hr))hr=cascade(library,2,first+13,L"Owned nested cascade",MFS_ENABLED,&nested);
+            return hr;
+        }
+        if(menu==nested) {
+            ++nestedMessages;if(LOWORD(packed)!=2)return E_INVALIDARG;
+            return GetMenuItemCount(nested)?S_OK:insert(nested,0,first+17,L"Owned native nested choice");
+        }
+        return E_INVALIDARG;
+    }
+    HRESULT STDMETHODCALLTYPE HandleMenuMsg(UINT message,WPARAM raw,LPARAM packed) override {++message2Calls;return this->message(message,raw,packed);}
+    HRESULT STDMETHODCALLTYPE HandleMenuMsg2(UINT message,WPARAM raw,LPARAM packed,LRESULT* result) override {
+        ++message3Calls;if(!result)return E_POINTER;*result=0;return this->message(message,raw,packed);
+    }
+};
+
+class PlanningSelection final : public Microsoft::WRL::RuntimeClass<
+    Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::ClassicCom>,IShellItemArray> {
+public:
+    ComPtr<PlanningMenu> provider=Microsoft::WRL::Make<PlanningMenu>();
+    ComPtr<IShellItem> selected;
+    HRESULT STDMETHODCALLTYPE BindToHandler(IBindCtx*,REFGUID handler,REFIID iid,void** output) override {
+        if(!output)return E_POINTER;*output=nullptr;
+        return handler==BHID_SFUIObject&&provider?provider->QueryInterface(iid,output):E_NOINTERFACE;
+    }
+    HRESULT STDMETHODCALLTYPE GetPropertyStore(GETPROPERTYSTOREFLAGS,REFIID,void** output) override {
+        if(!output)return E_POINTER;*output=nullptr;return E_NOTIMPL;
+    }
+    HRESULT STDMETHODCALLTYPE GetPropertyDescriptionList(REFPROPERTYKEY,REFIID,void** output) override {
+        if(!output)return E_POINTER;*output=nullptr;return E_NOTIMPL;
+    }
+    HRESULT STDMETHODCALLTYPE GetAttributes(SIATTRIBFLAGS,SFGAOF mask,SFGAOF* output) override {
+        if(!output)return E_POINTER;*output=0;return selected?selected->GetAttributes(mask,output):E_NOTIMPL;
+    }
+    HRESULT STDMETHODCALLTYPE GetCount(DWORD* output) override {if(!output)return E_POINTER;*output=1;return S_OK;}
+    HRESULT STDMETHODCALLTYPE GetItemAt(DWORD index,IShellItem** output) override {
+        if(!output)return E_POINTER;*output=nullptr;
+        return !index&&selected?selected.CopyTo(output):E_INVALIDARG;
+    }
+    HRESULT STDMETHODCALLTYPE EnumItems(IEnumShellItems** output) override {if(!output)return E_POINTER;*output=nullptr;return E_NOTIMPL;}
+};
+
+void targetedNativeMenuPlanningAndFullInspection() {
+    const std::array<std::wstring_view,1> rotate{L"ROTATE90"},library{L"Windows.includeinlibrary"},left{L"rotate270"};
+    auto selected=Microsoft::WRL::Make<PlanningSelection>();require(selected&&selected->provider,"Allocate owned planning provider");
+    auto provider=selected->provider;provider->nestedDuplicate=true;
+    explorer::NativeContextMenu menu;
+    succeeded(menu.createSelectionForPlanning(nullptr,selected.Get(),nullptr,CMF_EXTENDEDVERBS),"Create exact native planning menu");
+    require(!(provider->flags&CMF_SYNCCASCADEMENU)&&(provider->flags&CMF_ITEMMENU)&&(provider->flags&CMF_EXTENDEDVERBS),
+            "Planning changed provider flags beyond synchronous cascade population");
+    std::vector<explorer::ContextMenuEntry> entries;
+    succeeded(menu.enumerateForVerbs(rotate,entries),"Inspect actual known leaf without populating unrelated failing branch");
+    require(entries.size()==4&&provider->rootMessages==0&&provider->unrelatedMessages==0&&provider->libraryMessages==0&&provider->containerMessages==0,
+            "Known leaf planning initialized a root or unrelated native cascade");
+    auto facts=selectedFile(L"C:\\owned\\image.bmp");facts.images=true;NamespaceInvocationPlan plan;
+    succeeded(explorer::planNamespaceAction(NamespaceAction::RotateRight,facts,entries,{},&plan),"Preserve shallow native canonical authority");
+    require(plan.commandId==provider->first+2&&plan.checked&&plan.enabled&&!plan.submenu,"Leaf default/state/ordinal or shallow precedence changed");
+    succeeded(menu.enumerateForVerbs(library,entries),"Populate only requested exact native cascade and its descendants");
+    require(provider->libraryMessages==1&&provider->nestedMessages==1&&provider->unrelatedMessages==0&&provider->rootMessages==0&&provider->containerMessages==0,
+            "Requested native branch populated an unrelated popup or repeated a descendant");
+    require(entries[2].children.size()==3&&entries[2].children[0].id==provider->first+11&&
+            (entries[2].children[0].state&(MFS_DEFAULT|MFS_CHECKED))==(MFS_DEFAULT|MFS_CHECKED)&&
+            !entries[2].children[1].enabled()&&entries[2].children[2].children.size()==1&&
+            entries[2].children[2].children[0].id==provider->first+17,"Native child default/disabled/hierarchy/ordinal changed");
+    succeeded(menu.enumerateForVerbs(library,entries),"Reuse already initialized requested native cascade");
+    require(provider->libraryMessages==1&&provider->nestedMessages==1,"Exact branch query retried native delayed population");
+    provider->failUnrelated=false;
+    succeeded(menu.enumerate(entries),"Explicit complete native menu inspection remains available");
+    require(provider->rootMessages==1&&provider->unrelatedMessages==1&&provider->containerMessages==1&&entries[1].children.size()==1,
+            "Explicit full inspection returned a partial planning snapshot");
+    require(provider->invocations==0,"Read-only native planning activated a provider command");
+
+    provider->nestedDuplicate=false;provider->disabledContainer=true;provider->disabledLibrary=true;
+    succeeded(menu.createSelectionForPlanning(nullptr,selected.Get()),"Create native disabled ancestor/cascade fixture");
+    succeeded(menu.enumerateForVerbs(left,entries),"Read nested native leaf below disabled ancestor");
+    succeeded(explorer::planNamespaceAction(NamespaceAction::RotateLeft,facts,entries,{},&plan),"Preserve disabled ancestor authority");
+    require(!plan.enabled&&provider->containerMessages==0&&provider->unrelatedMessages==0,"Nested leaf bypassed native disabled ancestor or initialized it");
+    succeeded(menu.enumerateForVerbs(library,entries),"Read disabled exact cascade without activating it");
+    require(provider->libraryMessages==0&&entries[2].children.empty(),"Disabled native cascade was initialized");
+
+    provider->disabledContainer=provider->disabledLibrary=false;provider->ambiguousLibrary=true;
+    succeeded(menu.createSelectionForPlanning(nullptr,selected.Get()),"Create native ambiguous cascade fixture");
+    require(menu.enumerateForVerbs(library,entries)==E_UNEXPECTED&&entries.empty()&&provider->libraryMessages==0,
+            "Ambiguous canonical branch was initialized or accepted");
+    provider->ambiguousLibrary=false;provider->libraryStatus=HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+    succeeded(menu.createSelectionForPlanning(nullptr,selected.Get()),"Create native failing requested cascade fixture");
+    require(menu.enumerateForVerbs(library,entries)==provider->libraryStatus&&entries.empty()&&provider->libraryMessages==1&&provider->unrelatedMessages==0,
+            "Requested native failure was hidden or unrelated native branch initialized");
+    require(menu.enumerateForVerbs(library,entries)==provider->libraryStatus&&provider->libraryMessages==1,
+            "Failed requested native cascade was retried");
+    const std::array<std::wstring_view,1> malformed{std::wstring_view(L"owned\0bad",9)};
+    require(menu.enumerateForVerbs(malformed,entries)==E_INVALIDARG&&entries.empty(),"Embedded-NUL canonical alias was accepted");
+    const std::array<std::wstring_view,1> unknown{L"label-only-not-a-native-verb"};
+    succeeded(menu.enumerateForVerbs(unknown,entries),"Unknown canonical alias stays unpopulated");
+    require(provider->unrelatedMessages==0&&provider->rootMessages==0,"Unknown canonical alias guessed an unrelated branch");
+
+    for(const auto nativeStatus:{E_NOTIMPL,S_FALSE}) {
+        provider->libraryStatus=nativeStatus;
+        succeeded(menu.createSelectionForPlanning(nullptr,selected.Get()),"Create strict native message-status fixture");
+        const auto expected=nativeStatus==S_FALSE?E_UNEXPECTED:nativeStatus;
+        require(menu.enumerateForVerbs(library,entries)==expected&&entries.empty()&&provider->libraryMessages==1&&
+                provider->message3Calls==1&&provider->message2Calls==0,
+                "Native CM3 failure/status was hidden by an alternate CM2 dispatch");
+        require(menu.enumerateForVerbs(library,entries)==expected&&entries.empty()&&provider->libraryMessages==1&&
+                provider->message3Calls==1&&provider->message2Calls==0,
+                "Failed native message admission was retried or published");
+    }
+
+    provider->libraryStatus=S_OK;
+    succeeded(menu.createSelectionForPlanning(nullptr,selected.Get()),"Create reentrant native requested branch fixture");
+    provider->duringLibrary=[&]{menu.reset();};
+    require(menu.enumerateForVerbs(library,entries)==E_ABORT&&entries.empty(),"Replaced native menu published a stale planned branch");
+    provider->duringLibrary={};
+
+    succeeded(menu.createSelectionForPlanning(nullptr,selected.Get()),"Create reentrant same-branch attempt fixture");
+    HRESULT recursive=S_OK;
+    provider->duringLibrary=[&]{std::vector<explorer::ContextMenuEntry> ignored;recursive=menu.enumerateForVerbs(library,ignored);};
+    succeeded(menu.enumerateForVerbs(library,entries),"Complete one original native cascade attempt after reentrant query");
+    require(recursive==E_PENDING&&provider->libraryMessages==1&&provider->nestedMessages==1,
+            "Reentrant planning repeated a native popup initialization");
+    provider->duringLibrary={};
+
+    Fixture fixture;auto folder=item(fixture.root);selected->selected=item(fixture.image);
+    explorer::NativeNamespaceActions actions;
+    succeeded(actions.initialize(nullptr,{folder,selected,{}}),"Initialize exact planner with owned native item and mock menu provider");
+    provider->failUnrelated=true;
+    const auto beforeQueries=provider->queries;
+    succeeded(actions.planInvocation(NamespaceAction::RotateRight,&plan),"Namespace leaf plan avoids unrelated failing native cascade");
+    require(provider->rootMessages==0&&provider->unrelatedMessages==0&&provider->queries==beforeQueries+1&&plan.commandId==provider->first+2,
+            "Namespace exact planning used a fully populated or unrelated native menu");
+    provider->failUnrelated=false;
+    succeeded(actions.selectionEntries(entries),"Explicit namespace full inspection upgrades its partial retained snapshot");
+    require(provider->rootMessages==1&&provider->unrelatedMessages==1&&entries[1].children.size()==1,
+            "Partial namespace cache was incorrectly marked fully populated");
+    const auto allMessages=provider->rootMessages+provider->unrelatedMessages+provider->libraryMessages+provider->nestedMessages+provider->containerMessages;
+    succeeded(actions.selectionEntries(entries),"Reuse actual completed full namespace snapshot");
+    succeeded(actions.planInvocation(NamespaceAction::RotateRight,&plan),"Full namespace snapshot preserves later leaf planning");
+    require(allMessages==provider->rootMessages+provider->unrelatedMessages+provider->libraryMessages+provider->nestedMessages+provider->containerMessages&&provider->invocations==0,
+            "Full-cache lookup repeated menu initialization or invoked a provider");
+    actions.reset();selected->selected=folder;provider->libraryStatus=HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+    succeeded(actions.initialize(nullptr,{folder,selected,{}}),"Initialize owned folder with failing native requested cascade");
+    require(actions.planInvocation(NamespaceAction::IncludeInLibrary,&plan)==provider->libraryStatus&&provider->libraryMessages==1&&provider->unrelatedMessages==0,
+            "Registered fallback hid an authoritative requested native cascade failure");
+    require(actions.planInvocation(NamespaceAction::IncludeInLibrary,&plan)==provider->libraryStatus&&provider->libraryMessages==1,
+            "Namespace planner retried an already failed native branch");
+}
+
+void anonymousNativeBranchPlanning() {
+    auto provider=Microsoft::WRL::Make<PlanningMenu>();require(provider!=nullptr,"Allocate anonymous native branch provider");
+    provider->anonymousLibrary=true;
+    explorer::NativeContextMenu menu;
+    std::vector<explorer::ContextMenuEntry> entries;
+    succeeded(menu.createForPlanning(nullptr,provider.Get(),nullptr,CMF_EXTENDEDVERBS),"Create isolated anonymous native planning menu");
+    require(!(provider->flags&CMF_SYNCCASCADEMENU)&&(provider->flags&CMF_EXTENDEDVERBS),"Anonymous planning changed unrelated QueryContextMenu flags");
+    succeeded(menu.enumerate(entries,false),"Read original anonymous parent state without any popup notification");
+    require(entries.size()==4&&entries[2].id==provider->first+10&&entries[2].canonicalVerb.empty()&&entries[2].submenu&&
+            entries[2].children.empty()&&provider->message3Calls==0&&provider->message2Calls==0,"Anonymous native snapshot invented authority or initialized a popup");
+    const auto actualId=entries[2].id;
+    succeeded(menu.enumerateForCommand(actualId,entries),"Populate only the actual anonymous provider parent ordinal");
+    require(provider->rootMessages==0&&provider->unrelatedMessages==0&&provider->containerMessages==0&&provider->libraryMessages==1&&
+            provider->nestedMessages==1&&entries[2].children.size()==3&&entries[2].children[0].id==provider->first+11&&
+            (entries[2].children[0].state&(MFS_DEFAULT|MFS_CHECKED))==(MFS_DEFAULT|MFS_CHECKED)&&!entries[2].children[1].enabled()&&
+            entries[2].children[2].children.size()==1&&entries[2].children[2].children[0].id==provider->first+17,
+            "Anonymous branch lost exact native positions, children/default/state or initialized the artificial root");
+    succeeded(menu.enumerateForCommand(actualId,entries),"Reuse completed exact anonymous branch");
+    require(provider->libraryMessages==1&&provider->nestedMessages==1,"Anonymous branch population was retried");
+    provider->disabledLibrary=true;
+    succeeded(menu.createForPlanning(nullptr,provider.Get()),"Create actual disabled anonymous parent");
+    succeeded(menu.enumerateForCommand(provider->first+10,entries),"Preserve disabled native parent without notification");
+    require(!entries[2].enabled()&&entries[2].children.empty()&&provider->message3Calls==0&&provider->message2Calls==0,
+            "Disabled anonymous parent was populated or replaced by invented enabled state");
+    provider->disabledLibrary=false;provider->duplicateLibraryId=true;
+    succeeded(menu.createForPlanning(nullptr,provider.Get()),"Create ambiguous actual native ordinal");
+    require(menu.enumerateForCommand(provider->first+10,entries)==E_UNEXPECTED&&entries.empty()&&provider->message3Calls==0,
+            "Duplicate anonymous ordinal was accepted or initialized");
+    provider->duplicateLibraryId=false;
+    succeeded(menu.createForPlanning(nullptr,provider.Get()),"Create exact native ordinal validation fixture");
+    require(menu.enumerateForCommand(0,entries)==E_INVALIDARG&&entries.empty()&&
+            menu.enumerateForCommand(0x8000,entries)==E_INVALIDARG&&entries.empty()&&
+            menu.enumerateForCommand(provider->first+23,entries)==HRESULT_FROM_WIN32(ERROR_NOT_FOUND)&&entries.empty()&&provider->message3Calls==0,
+            "Missing or invalid anonymous ordinal guessed an unrelated submenu");
+    for(const auto nativeStatus:{E_NOTIMPL,S_FALSE}) {
+        provider->libraryStatus=nativeStatus;
+        succeeded(menu.createForPlanning(nullptr,provider.Get()),"Create anonymous native notification failure fixture");
+        const auto expected=nativeStatus==S_FALSE?E_UNEXPECTED:nativeStatus;
+        require(menu.enumerateForCommand(provider->first+10,entries)==expected&&entries.empty()&&provider->message3Calls==1&&provider->message2Calls==0&&
+                menu.enumerateForCommand(provider->first+10,entries)==expected&&entries.empty()&&provider->message3Calls==1,
+                "Anonymous native notification failure was hidden, retried or published");
+    }
+    provider->libraryStatus=S_OK;
+    succeeded(menu.createForPlanning(nullptr,provider.Get()),"Create anonymous native same-branch reentry fixture");
+    HRESULT recursive=S_OK;
+    provider->duringLibrary=[&]{std::vector<explorer::ContextMenuEntry> ignored;recursive=menu.enumerateForCommand(provider->first+10,ignored);};
+    succeeded(menu.enumerateForCommand(provider->first+10,entries),"Complete original anonymous branch after recursive inspection");
+    require(recursive==E_PENDING&&provider->libraryMessages==1&&provider->nestedMessages==1&&provider->invocations==0,
+            "Anonymous native reentry retried initialization or activated a provider");
+    provider->duringLibrary={};
+    succeeded(menu.createForPlanning(nullptr,provider.Get()),"Create anonymous native replacement fixture");
+    provider->duringLibrary=[&]{menu.reset();};
+    require(menu.enumerateForCommand(provider->first+10,entries)==E_ABORT&&entries.empty(),"Retired anonymous native menu published a stale branch");
+    provider->duringLibrary={};
+}
+
+void nativeCastParentPlanningAndOwnerControls() {
+    Fixture fixture;
+    const auto originalBytes=read(fixture.image),originalText=read(fixture.text);
+    const auto before=castFileSnapshot(fixture.image);
+    auto folder=item(fixture.root),image=item(fixture.image);auto selection=array(image.Get());
+    ComPtr<IDataObject> data;succeeded(selection->BindToHandler(nullptr,BHID_DataObject,IID_PPV_ARGS(&data)),"Bind original owned bitmap Cast data object");
+    require(data!=nullptr,"Native Cast data object returned no interface");verifyCastCida(data.Get(),before);
+    struct Key {HKEY value=nullptr;~Key(){if(value)RegCloseKey(value);}}key;
+    require(RegOpenKeyExW(HKEY_CLASSES_ROOT,L"SystemFileAssociations\\image",0,KEY_READ,&key.value)==ERROR_SUCCESS,"Open exact image association for native Cast parent controls");
+    std::array<wchar_t,128> registration{};DWORD bytes=static_cast<DWORD>(sizeof(registration));
+    require(RegGetValueW(key.value,L"shellex\\ContextMenuHandlers\\PlayTo",nullptr,RRF_RT_REG_SZ,nullptr,registration.data(),&bytes)==ERROR_SUCCESS&&
+            bytes>=2*sizeof(wchar_t)&&bytes<=sizeof(registration)&&bytes%sizeof(wchar_t)==0&&registration[bytes/sizeof(wchar_t)-1]==0,
+            "Read exact bounded registered image Cast CLSID");
+    CLSID identifier{};succeeded(CLSIDFromString(registration.data(),&identifier),"Parse actual registered image Cast CLSID");
+    NativeBackgroundView host;host.initialize(folder.Get());
+    struct Pidl {PIDLIST_ABSOLUTE value=nullptr;~Pidl(){CoTaskMemFree(value);}}location;
+    const auto view=host.view;succeeded(SHGetIDListFromObject(folder.Get(),&location.value),"Retain actual native Cast control location");
+    require(location.value!=nullptr,"Native Cast control location has no PIDL");
+    struct ArmReadback {
+        HRESULT factory=E_PENDING,initializationInterface=E_PENDING,initialization=E_PENDING,query=E_PENDING,snapshot=E_PENDING;
+        HRESULT parentStatus=E_PENDING,branch=E_PENDING;
+        UINT commandCount=0,id=0,state=0;
+        size_t rows=0,parents=0,children=0;
+        bool contextPresent=false,initializerPresent=false,submenu=false,enabled=false,rawMatches=false,branchAttempted=false;
+    };
+    std::array<ArmReadback,3> arms{};
+    for(unsigned arm=0;arm<3;++arm) {
+        auto& observed=arms[arm];
+        const auto owner=arm?host.owner:nullptr;IUnknown* site=arm==2?view.Get():nullptr;
+        ComPtr<IContextMenu> context;
+        observed.factory=CoCreateInstance(identifier,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&context));observed.contextPresent=context!=nullptr;
+        ComPtr<IShellExtInit> initialize;
+        if(SUCCEEDED(observed.factory)&&context)observed.initializationInterface=context.As(&initialize);
+        observed.initializerPresent=initialize!=nullptr;
+        if(SUCCEEDED(observed.initializationInterface)&&initialize)
+            observed.initialization=initialize->Initialize(nullptr,data.Get(),key.value);
+        explorer::NativeContextMenu menu;
+        if(SUCCEEDED(observed.initialization))observed.query=menu.create(owner,context.Get(),site,CMF_NORMAL);
+        observed.commandCount=menu.commandCount();
+        std::vector<explorer::ContextMenuEntry> entries;
+        if(SUCCEEDED(observed.query))observed.snapshot=menu.enumerate(entries,false);
+        observed.rows=entries.size();
+        const explorer::ContextMenuEntry* parent=nullptr;
+        for(const auto& row:entries)if(!row.separator()){++observed.parents;if(!parent)parent=&row;}
+        if(SUCCEEDED(observed.snapshot)) {
+            if(!observed.parents)observed.parentStatus=HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+            else if(observed.parents!=1)observed.parentStatus=E_UNEXPECTED;
+            else if(!parent->id||parent->id>0x7fff)observed.parentStatus=HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+            else {
+                observed.parentStatus=S_OK;observed.id=parent->id;observed.state=parent->state;
+                observed.submenu=parent->submenu;observed.enabled=parent->enabled();observed.children=parent->children.size();
+                MENUITEMINFOW raw{sizeof(raw)};raw.fMask=MIIM_ID|MIIM_STATE|MIIM_SUBMENU;
+                observed.rawMatches=GetMenuItemInfoW(menu.menu(),observed.id,FALSE,&raw)&&raw.wID==observed.id&&
+                    raw.fState==observed.state&&(raw.hSubMenu!=nullptr)==observed.submenu;
+            }
+        }
+        std::cout<<"CastPlanning arm="<<arm<<" owner="<<reinterpret_cast<uintptr_t>(owner)<<" site="<<(site!=nullptr)
+                 <<" queryFlags="<<(CMF_NORMAL|CMF_SYNCCASCADEMENU)
+                 <<" factory="<<static_cast<unsigned long>(observed.factory)<<" initializer="<<static_cast<unsigned long>(observed.initializationInterface)
+                 <<" initialize="<<static_cast<unsigned long>(observed.initialization)<<" query="<<static_cast<unsigned long>(observed.query)
+                 <<" snapshot="<<static_cast<unsigned long>(observed.snapshot)<<" parentHRESULT="<<static_cast<unsigned long>(observed.parentStatus)
+                 <<" nativeCommands="<<observed.commandCount<<" rows="<<observed.rows<<" parents="<<observed.parents
+                 <<" nativeId="<<observed.id<<" state="<<observed.state<<" submenu="<<observed.submenu<<" children="<<observed.children<<" rootWM_INIT=0\n"<<std::flush;
+        // Unsited/missing-owner arms are read-only metadata controls. Only the
+        // actual owned view/site arm requests the enabled provider subgroup.
+        if(arm==2&&observed.parentStatus==S_OK&&observed.enabled&&observed.submenu) {
+            observed.branchAttempted=true;observed.branch=menu.enumerateForCommand(observed.id,entries);
+            if(observed.branch==S_OK) {
+                size_t parents=0;parent=nullptr;for(const auto& row:entries)if(!row.separator()){++parents;if(!parent)parent=&row;}
+                if(parents!=1||!parent||parent->id!=observed.id)observed.branch=E_ABORT;
+            }
+            std::cout<<"CastPlanning arm="<<arm<<" branchHRESULT="<<static_cast<unsigned long>(observed.branch)<<'\n'<<std::flush;
+        }
+        // Teardown can also call the native site. Observe original view/source
+        // only after this arm's original menu has detached its site.
+        menu.reset();
+        ComPtr<IShellView> actualView;succeeded(host.browser->GetCurrentView(IID_PPV_ARGS(&actualView)),"Read original native view after Cast control snapshot");
+        ComPtr<IFolderView2> folderView;succeeded(actualView.As(&folderView),"Read original Cast control folder view");
+        ComPtr<IShellItem> actualFolder;succeeded(folderView->GetFolder(IID_PPV_ARGS(&actualFolder)),"Read actual Cast control location after native callback");
+        Pidl actualLocation;succeeded(SHGetIDListFromObject(actualFolder.Get(),&actualLocation.value),"Read current native Cast control PIDL");
+        require(actualView.Get()==view.Get()&&actualLocation.value&&ILIsEqual(location.value,actualLocation.value)&&!IsWindowVisible(host.owner),
+                "Read-only Cast parent controls changed original view/location or displayed their owner");
+        verifyCastCida(data.Get(),before);
+    }
+    // Every original arm has now been captured under the same QueryContextMenu
+    // flags. Native absence is capability evidence, never an enabled parent or
+    // proof that a requested enabled Cast subgroup was covered.
+    for(size_t arm=0;arm<arms.size();++arm) {
+        const auto& observed=arms[arm];
+        succeeded(observed.factory,"Read actual original Cast control factory result");require(observed.contextPresent,"Native Cast control factory returned no interface");
+        succeeded(observed.initializationInterface,"Read actual original Cast control initialization interface");require(observed.initializerPresent,"Native Cast initializer interface is absent");
+        succeeded(observed.initialization,"Read original Cast control initialization result");
+        succeeded(observed.query,"Read original Cast control QueryContextMenu result");
+        succeeded(observed.snapshot,"Read original unpopulated Cast control snapshot result");
+        if(observed.parentStatus==HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED)) {
+            require(observed.parents==0&&observed.commandCount==0&&observed.id==0&&!observed.branchAttempted,
+                    "Absent actual Cast parent was fabricated or initialized");
+            std::cout<<"COVERED: Cast native capability absence arm="<<arm<<" parentHRESULT="<<static_cast<unsigned long>(observed.parentStatus)
+                     <<"; enabled native subgroup NOT COVERED\n"<<std::flush;
+        } else {
+            succeeded(observed.parentStatus,"Read exact original Cast control parent authority");
+            require(observed.parents==1&&observed.rawMatches,"Original Cast parent lost unique actual native ordinal/state");
+            if(observed.branchAttempted)succeeded(observed.branch,"Read actual enabled Cast subgroup result without rescue");
+            else require(arm!=2||!observed.enabled||!observed.submenu,"Enabled actual native site subgroup was skipped");
+        }
+    }
+    const auto after=castFileSnapshot(fixture.image);
+    require(sameCastFile(before,after)&&before.basic.CreationTime.QuadPart==after.basic.CreationTime.QuadPart&&
+            before.basic.LastWriteTime.QuadPart==after.basic.LastWriteTime.QuadPart&&before.basic.ChangeTime.QuadPart==after.basic.ChangeTime.QuadPart&&
+            before.basic.FileAttributes==after.basic.FileAttributes&&before.standard.EndOfFile.QuadPart==after.standard.EndOfFile.QuadPart&&
+            read(fixture.image)==originalBytes&&read(fixture.text)==originalText,"Native Cast parent controls changed exact owned source identity, metadata or bytes");
+}
+
 void nativeFixtureCapabilitiesAndHeadlessGuard() {
     Fixture fixture;
     const auto imageBefore = read(fixture.image);
@@ -910,6 +1664,223 @@ public:
         if(!result)return E_POINTER;*result=nullptr;return E_NOTIMPL;
     }
 };
+
+// This custom namespace publishes only its documented aggregate property
+// authority. Standard GIT/FTM marshaling must retain it instead of replacing
+// it with a filesystem/CIDA selection or asking for individual items.
+class KindAggregateSelection final : public Microsoft::WRL::RuntimeClass<
+    Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::ClassicCom>,IShellItemArray,IPropertyStore,Microsoft::WRL::FtmBase> {
+public:
+    std::atomic<DWORD> count{100001},propertyThread{0},requested{GPS_DEFAULT};
+    std::atomic<unsigned> stores{0},values{0},itemReads{0},binds{0};
+    std::atomic<bool> entered{false},hold{false};
+    HRESULT countStatus=S_OK,storeStatus=S_OK,valueStatus=S_OK;
+    bool malformed=false,changeCount=false;
+    std::vector<std::wstring> kinds{L"Music",L"audio"};
+    HANDLE release=CreateEventW(nullptr,TRUE,FALSE,nullptr);
+    ~KindAggregateSelection(){if(release)CloseHandle(release);}
+    HRESULT STDMETHODCALLTYPE BindToHandler(IBindCtx*,REFGUID,REFIID,void** output) override {
+        ++binds;if(!output)return E_POINTER;*output=nullptr;return E_NOTIMPL;
+    }
+    HRESULT STDMETHODCALLTYPE GetPropertyStore(GETPROPERTYSTOREFLAGS flags,REFIID iid,void** output) override {
+        ++stores;requested=static_cast<DWORD>(flags);
+        if(!output)return E_POINTER;*output=nullptr;
+        return FAILED(storeStatus)?storeStatus:QueryInterface(iid,output);
+    }
+    HRESULT STDMETHODCALLTYPE GetPropertyDescriptionList(REFPROPERTYKEY,REFIID,void** output) override {
+        if(!output)return E_POINTER;*output=nullptr;return E_NOTIMPL;
+    }
+    HRESULT STDMETHODCALLTYPE GetAttributes(SIATTRIBFLAGS flags,SFGAOF mask,SFGAOF* output) override {
+        if(!output)return E_POINTER;
+        if(flags!=static_cast<SIATTRIBFLAGS>(SIATTRIBFLAGS_AND|SIATTRIBFLAGS_ALLITEMS))return E_INVALIDARG;
+        *output=mask&SFGAO_FILESYSTEM;return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetCount(DWORD* output) override {
+        if(!output)return E_POINTER;if(FAILED(countStatus))return countStatus;
+        *output=count.load();return countStatus;
+    }
+    HRESULT STDMETHODCALLTYPE GetItemAt(DWORD,IShellItem** output) override {
+        ++itemReads;if(!output)return E_POINTER;*output=nullptr;return E_UNEXPECTED;
+    }
+    HRESULT STDMETHODCALLTYPE EnumItems(IEnumShellItems** output) override {
+        if(!output)return E_POINTER;*output=nullptr;return E_NOTIMPL;
+    }
+    HRESULT STDMETHODCALLTYPE GetAt(DWORD index,PROPERTYKEY* output) override {
+        if(!output)return E_POINTER;if(index)return E_INVALIDARG;*output=PKEY_Kind;return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetValue(REFPROPERTYKEY key,PROPVARIANT* output) override {
+        ++values;propertyThread=GetCurrentThreadId();entered=true;
+        if(hold.load()) {
+            const auto waited=WaitForSingleObject(release,3000);
+            if(waited!=WAIT_OBJECT_0)return waited==WAIT_TIMEOUT?HRESULT_FROM_WIN32(ERROR_TIMEOUT):HRESULT_FROM_WIN32(GetLastError());
+        }
+        if(!output)return E_POINTER;if(FAILED(valueStatus))return valueStatus;
+        if(!IsEqualPropertyKey(key,PKEY_Kind))return E_INVALIDARG;
+        if(changeCount)count=100000;
+        if(malformed){output->vt=VT_I4;output->lVal=1;return S_OK;}
+        if(kinds.empty()){output->vt=VT_EMPTY;return S_OK;}
+        std::vector<const wchar_t*> names;for(const auto& kind:kinds)names.push_back(kind.c_str());
+        return InitPropVariantFromStringVector(names.data(),static_cast<ULONG>(names.size()),output);
+    }
+    HRESULT STDMETHODCALLTYPE SetValue(REFPROPERTYKEY,REFPROPVARIANT) override {return E_ACCESSDENIED;}
+    HRESULT STDMETHODCALLTYPE Commit() override {return E_ACCESSDENIED;}
+};
+
+bool sameKinds(const explorer::NamespaceSelectionKinds& left,const explorer::NamespaceSelectionKinds& right) {
+    return left.count==right.count&&left.music==right.music&&left.video==right.video;
+}
+
+void asyncCustomKindAuthorityAndFailures() {
+    Fixture fixture;const auto folder=item(fixture.root);
+    const auto textBefore=read(fixture.text),imageBefore=read(fixture.image);
+    const auto clipboard=GetClipboardSequenceNumber();
+    const auto selected=Microsoft::WRL::Make<KindAggregateSelection>();
+    require(selected&&selected->release,"Create bounded custom aggregate and its cancellation gate");
+    explorer::NativeNamespaceActions actions;
+    succeeded(actions.initialize(nullptr,{folder,selected,folder}),"Retain full original custom aggregate and exact site");
+    struct Drain {
+        KindAggregateSelection* selected;
+        ~Drain(){SetEvent(selected->release);drainNamespaceWorkers("custom aggregate before retained namespace teardown");}
+    }drain{selected.Get()};
+    std::unique_ptr<explorer::NamespaceCommandStateTask> task;
+    const auto start=[&] {
+        task.reset();selected->entered=false;
+        succeeded(actions.startSelectionKindsTask(&task),"Start original aggregate Kind independently of native command menus");
+        require(task!=nullptr,"Kind start succeeded without a native task");
+    };
+    const auto finish=[&](explorer::NamespaceSelectionKinds* output) {
+        require(pumpPrivateNamespaceUntil([&]{return task->completed();},4000),"Aggregate Kind worker exceeded its bounded completion wait");
+        return task->pollSelectionKinds(output);
+    };
+    start();explorer::NamespaceSelectionKinds actual;
+    require(finish(&actual)==S_OK&&actual.count==100001&&actual.music&&!actual.video,
+            "Original 100001-item custom aggregate Kind was replaced, capped or lost");
+    require(selected->stores.load()==1&&selected->values.load()==1&&selected->itemReads.load()==0&&selected->binds.load()==0&&
+            selected->requested.load()==static_cast<DWORD>(GPS_FASTPROPERTIESONLY|GPS_BESTEFFORT)&&
+            selected->propertyThread.load()!=GetCurrentThreadId(),
+            "Kind worker exported CIDA, enumerated items, changed fast flags or ran its agile aggregate on the creator");
+    explorer::NamespaceCommandState wrong;wrong.state=ECS_CHECKED;wrong.selectionCount=17;
+    std::vector<explorer::NamespaceSelectionVerbState> wrongBatch(1);wrongBatch.front().verb=L"unchanged";
+    require(task->poll(&wrong)==E_INVALIDARG&&wrong.state==ECS_CHECKED&&wrong.selectionCount==17&&
+            task->pollSelectionVerbBatch(&wrongBatch)==E_INVALIDARG&&wrongBatch.front().verb==L"unchanged"&&
+            task->pollSelectionKinds(nullptr)==E_POINTER,"Kind task accepted another result mode or changed failure output");
+    const auto retainedTask=task.get();
+    require(explorer::NamespaceCommandStateTask::startSelectionKinds(nullptr,folder.Get(),&task)==E_POINTER&&
+            task.get()==retainedTask,"Invalid Kind start replaced the existing actual task");
+    explorer::NamespaceCommandStateTimings timings;
+    succeeded(task->pollTimings(&timings),"Read actual Kind worker phase timing");
+    require(timings.workerMicroseconds>=timings.kindReadMicroseconds&&timings.menuQueryMicroseconds==0&&
+            timings.dataObjectExportMicroseconds==0,"Kind task ran a native menu or identity export phase");
+    const explorer::NamespaceSelectionKinds sentinel{47,true,true};
+    HRESULT foreignRead=S_OK;auto foreignOutput=sentinel;
+    std::thread foreign([&]{foreignRead=task->pollSelectionKinds(&foreignOutput);});foreign.join();
+    require(foreignRead==RPC_E_WRONG_THREAD&&sameKinds(foreignOutput,sentinel),
+            "Kind result crossed its creator apartment or changed a rejected foreign-thread output");
+    for(const auto failure:{E_PENDING,E_ACCESSDENIED}) {
+        selected->valueStatus=failure;start();actual=sentinel;
+        require(finish(&actual)==failure&&task->completed()&&sameKinds(actual,sentinel),
+                "Completed native Kind failure stayed falsely pending or changed prior output");
+    }
+    selected->valueStatus=S_OK;selected->malformed=true;start();actual=sentinel;
+    require(finish(&actual)==HRESULT_FROM_WIN32(ERROR_INVALID_DATA)&&sameKinds(actual,sentinel),
+            "Malformed original aggregate Kind invented contextual state");
+    selected->malformed=false;selected->changeCount=true;start();actual=sentinel;
+    require(finish(&actual)==HRESULT_FROM_WIN32(ERROR_RETRY)&&sameKinds(actual,sentinel),
+            "Kind worker published a selection whose native count changed during its property read");
+    selected->changeCount=false;selected->count=100001;selected->countStatus=E_ACCESSDENIED;
+    start();actual=sentinel;
+    require(finish(&actual)==E_ACCESSDENIED&&sameKinds(actual,sentinel),"Failed native count was mistaken for an empty selection");
+    selected->countStatus=S_OK;selected->count=0;
+    const auto storesBefore=selected->stores.load();start();actual=sentinel;
+    require(finish(&actual)==S_OK&&sameKinds(actual,{})&&selected->stores.load()==storesBefore,
+            "Actual known-zero selection retained media context or accessed properties");
+    selected->count=100001;selected->hold=true;
+    require(ResetEvent(selected->release)!=FALSE,"Arm only the owned aggregate worker gate");start();
+    require(pumpPrivateNamespaceUntil([&]{return selected->entered.load();},3000),"Actual original aggregate did not enter its bounded worker read");
+    actual=sentinel;
+    require(!task->completed()&&task->pollSelectionKinds(&actual)==E_PENDING&&sameKinds(actual,sentinel),
+            "Unfinished original aggregate read reported completed native state");
+    task->cancel();
+    require(task->pollSelectionKinds(&actual)==HRESULT_FROM_WIN32(ERROR_CANCELLED)&&sameKinds(actual,sentinel),
+            "Cancelled Kind worker published its original pending property read");
+    require(SetEvent(selected->release)!=FALSE,"Release the original cancelled aggregate call");
+    require(pumpPrivateNamespaceUntil([&]{return task->completed();},3000),"Cancelled Kind worker did not release its actual native lease");
+    selected->hold=false;task.reset();drainNamespaceWorkers("join cancelled aggregate Kind before facade reuse");
+    succeeded(actions.initialize(nullptr,{folder,{},folder}),"Retain real folder fallback with no selected items");
+    require(actions.startSelectionKindsTask(&task)==E_INVALIDARG&&!task,
+            "Kind facade classified the current-folder fallback as a selected item");
+    actions.reset();
+    require(selected->itemReads.load()==0&&selected->binds.load()==0&&read(fixture.text)==textBefore&&
+            read(fixture.image)==imageBefore&&GetClipboardSequenceNumber()==clipboard,
+            "Custom Kind classification replaced its original authority or changed owned files/clipboard");
+}
+
+void asyncNativeKindAndOriginalView() {
+    Fixture fixture;const auto source=fixture.root/L"owned music.mp3";
+    std::ofstream(source,std::ios::binary)<<"owned fast Kind fixture; never decoded, played or invoked";
+    const auto sourceBefore=castFileSnapshot(source),textBefore=castFileSnapshot(fixture.text);
+    const auto sourceBytes=read(source),textBytes=read(fixture.text);
+    const auto clipboard=GetClipboardSequenceNumber();
+    const auto folder=item(fixture.root),music=item(source),text=item(fixture.text);
+    NativeBackgroundView host;host.initialize(folder.Get());
+    NamespaceDrainGuard drain;
+    ComPtr<IFolderView2> view;succeeded(host.view.As(&view),"Retain original native Kind selection view");
+    struct PidlDeleter {
+        using pointer=LPITEMIDLIST;
+        void operator()(pointer value) const noexcept {CoTaskMemFree(value);}
+    };
+    using Pidl=std::unique_ptr<ITEMIDLIST,PidlDeleter>;
+    PIDLIST_ABSOLUTE rawMusic=nullptr,rawText=nullptr,rawFolder=nullptr;
+    succeeded(SHGetIDListFromObject(music.Get(),&rawMusic),"Read exact owned Music PIDL");Pidl musicId(rawMusic);
+    succeeded(SHGetIDListFromObject(text.Get(),&rawText),"Read exact owned nonmedia PIDL");Pidl textId(rawText);
+    succeeded(SHGetIDListFromObject(folder.Get(),&rawFolder),"Retain exact native folder PIDL");Pidl folderId(rawFolder);
+    succeeded(host.view->SelectItem(ILFindLastID(musicId.get()),SVSI_SELECT|SVSI_DESELECTOTHERS|SVSI_NOTAKEFOCUS),
+              "Select exactly the owned native Music identity");
+    require(pumpPrivateNamespaceUntil([&]{int count=-1;return view->ItemCount(SVGIO_SELECTION,&count)==S_OK&&count==1;},2000),
+            "Original native Music selection was not ready");
+    ComPtr<IShellItemArray> selected;succeeded(view->GetSelection(FALSE,&selected),"Retain original native selected array");
+    ComPtr<IDataObject> data;succeeded(selected->BindToHandler(nullptr,BHID_DataObject,IID_PPV_ARGS(&data)),"Read complete selected native CIDA without clipboard publication");
+    verifyCastCida(data.Get(),sourceBefore);
+    explorer::NativeNamespaceActions actions;
+    succeeded(actions.initialize(host.owner,{folder,selected,host.view}),"Initialize exact original native media array and site");
+    std::unique_ptr<explorer::NamespaceCommandStateTask> task;
+    succeeded(actions.startSelectionKindsTask(&task),"Start native selected Kind using cached original-array registration");
+    require(pumpPrivateNamespaceUntil([&]{return task->completed();},4000),"Native Kind exceeded independent readiness wait");
+    explorer::NamespaceSelectionKinds actual,expected;
+    succeeded(explorer::namespaceSelectionKinds(selected.Get(),&expected),"Read independent native selected Kind intersection");
+    require(task->pollSelectionKinds(&actual)==S_OK&&sameKinds(actual,expected)&&actual.count==1&&actual.music&&!actual.video,
+            "Worker Kind differs from the actual original native selection property store");
+    task.reset();
+    std::vector<PCIDLIST_ABSOLUTE> identities(258,musicId.get());identities.back()=textId.get();
+    ComPtr<IShellItemArray> full;
+    succeeded(SHCreateShellItemArrayFromIDLists(static_cast<UINT>(identities.size()),identities.data(),&full),
+              "Create actual full native media array with final nonmedia counterexample");
+    succeeded(explorer::NamespaceCommandStateTask::startSelectionKinds(full.Get(),host.view.Get(),&task),"Start complete native large-array Kind without menu reconstruction");
+    require(pumpPrivateNamespaceUntil([&]{return task->completed();},4000),"Complete native large-array Kind exceeded bounded readiness");
+    succeeded(explorer::namespaceSelectionKinds(full.Get(),&expected),"Read original complete native large-array property intersection");
+    require(task->pollSelectionKinds(&actual)==S_OK&&sameKinds(actual,expected)&&actual.count==258&&!actual.music&&!actual.video,
+            "Async native Kind omitted its final nonmedia identity or reused stale Music context");
+    task.reset();drainNamespaceWorkers("native Kind completion before original view preservation proof");
+    ComPtr<IShellItemArray> after;succeeded(view->GetSelection(FALSE,&after),"Read preserved original native selected array");
+    ComPtr<IDataObject> afterData;succeeded(after->BindToHandler(nullptr,BHID_DataObject,IID_PPV_ARGS(&afterData)),"Read preserved actual selected CIDA");
+    verifyCastCida(afterData.Get(),sourceBefore);
+    ComPtr<IShellItem> actualFolder;succeeded(view->GetFolder(IID_PPV_ARGS(&actualFolder)),"Read original native Kind folder after worker teardown");
+    int order=1;succeeded(actualFolder->Compare(folder.Get(),SICHINT_CANONICAL,&order),"Compare exact original native folder identity");
+    PIDLIST_ABSOLUTE rawAfterFolder=nullptr;
+    succeeded(SHGetIDListFromObject(actualFolder.Get(),&rawAfterFolder),"Read actual retained native folder PIDL after Kind work");
+    Pidl afterFolder(rawAfterFolder);
+    ComPtr<IShellView> current;succeeded(host.browser->GetCurrentView(IID_PPV_ARGS(&current)),"Retain actual original browser view after Kind completion");
+    const auto sourceAfter=castFileSnapshot(source),textAfter=castFileSnapshot(fixture.text);
+    require(order==0&&afterFolder&&ILIsEqual(folderId.get(),afterFolder.get())&&current.Get()==host.view.Get()&&!IsWindowVisible(host.owner)&&sameCastFile(sourceBefore,sourceAfter)&&
+            sameCastFile(textBefore,textAfter)&&sourceBefore.basic.CreationTime.QuadPart==sourceAfter.basic.CreationTime.QuadPart&&
+            sourceBefore.basic.LastWriteTime.QuadPart==sourceAfter.basic.LastWriteTime.QuadPart&&
+            sourceBefore.basic.FileAttributes==sourceAfter.basic.FileAttributes&&sourceBefore.standard.EndOfFile.QuadPart==sourceAfter.standard.EndOfFile.QuadPart&&
+            textBefore.basic.CreationTime.QuadPart==textAfter.basic.CreationTime.QuadPart&&
+            textBefore.basic.LastWriteTime.QuadPart==textAfter.basic.LastWriteTime.QuadPart&&textBefore.basic.FileAttributes==textAfter.basic.FileAttributes&&
+            textBefore.standard.EndOfFile.QuadPart==textAfter.standard.EndOfFile.QuadPart&&read(source)==sourceBytes&&read(fixture.text)==textBytes&&
+            GetClipboardSequenceNumber()==clipboard,"Native Kind worker changed original selection/view/source or private clipboard");
+    actions.reset();
+}
 
 void aggregateLargeSelectionAndProviderGuards() {
     Fixture fixture;const auto folder=item(fixture.root);
@@ -1357,18 +2328,36 @@ void largeSelectionParentSnapshotFacts() {
 }
 } // namespace
 
+int runNamespaceCastStateTests() {
+    try {
+        onPrivateNamespaceDesktop(nativeVideoCastParentState);
+        std::cout<<"PASS: Namespace actions: actual Video Cast parent state, association/site comparison and unchanged owned source\n";
+        return 0;
+    } catch(const std::exception& error) {
+        std::cerr<<"FAIL: Namespace actions: actual Video Cast parent state: "<<error.what()<<'\n';
+    } catch(...) {
+        std::cerr<<"FAIL: Namespace actions: actual Video Cast parent state: unknown exception\n";
+    }
+    return 1;
+}
+
 int runNamespaceActionTests() {
     const std::vector<std::pair<const char*, std::function<void()>>> tests{
         {"semantic target guards and exact canonical verbs",semanticPlanningAndCanonicalVerbs},
         {"disabled ancestors, ambiguous handlers and native cascades",disabledMenusAndAmbiguousHandlers},
         {"drive and simulated Recycle Bin action planning",destructiveAndOptionalActionPlanning},
         {"sharing, application, network and media routes",targetTypesAndFeatureMatrix},
+        {"exact native leaf/cascade planning, failure isolation and partial/full menu caches",targetedNativeMenuPlanningAndFullInspection},
+        {"anonymous exact native-ID branch planning, disabled state, failures and reentry",anonymousNativeBranchPlanning},
+        {"actual registered Cast capability absence/parent snapshots and hidden native view/site controls",[]{onPrivateNamespaceDesktop(nativeCastParentPlanningAndOwnerControls);}},
         {"native fixture capabilities, STA lifetime and headless activation guard",nativeFixtureCapabilitiesAndHeadlessGuard},
         {"Windows command resources and read-only drive enumeration",metadataAndReadOnlyDriveEnumeration},
         {"all eight native localized View gallery titles and icon resources",nativeViewGalleryResources},
         {"actual Recycle Bin Properties native background-menu state and invocation guards",[]{onPrivateNamespaceDesktop(nativeRecyclePropertiesBackgroundState);}},
         {"actual standard-GIT lookup cancellation and initialized final release",[]{onPrivateNamespaceDesktop(realGitLookupCancellationLifetime);}},
         {"exact target registration reuse, standalone ownership and native marshal reentry",[]{onPrivateNamespaceDesktop(exactTargetRegistrationReuseAndReentry);}},
+        {"async original 100001-item Kind authority, native failures, cancellation and known-zero guard",[]{onPrivateNamespaceDesktop(asyncCustomKindAuthorityAndFailures);}},
+        {"async actual native Kind, full media counterexample and unchanged original view/CIDA",[]{onPrivateNamespaceDesktop(asyncNativeKindAndOriginalView);}},
         {"full 100001-item aggregate attributes, provider site and activation guards",[]{onPrivateNamespaceDesktop(aggregateLargeSelectionAndProviderGuards);}},
         {"real native 100001-item arrays with final file, link and virtual counterexamples",[]{onPrivateNamespaceDesktop(nativeLargeArrayTailCounterexamples);}},
         {"large same-parent selection facts, boundaries, other parents and removed items",[]{onPrivateNamespaceDesktop(largeSelectionParentSnapshotFacts);}},

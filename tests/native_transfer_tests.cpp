@@ -1029,7 +1029,10 @@ public:
             << " sourceContentMatches=" << sourceContentMatches << " sourceModifiedMatches=" << sourceModifiedMatches
             << " expectedSourceBytes=" << source_.bytes.size() << std::endl;
         describeShortcutHdrop("native-copy-capture", "consumer", consumer.Get(), source_);
-        require(preferredEffect == DROPEFFECT_COPY && sourceExists && sourceIdentityMatches &&
+        // DROPEFFECT is a flag set: Microsoft requires masked comparisons.
+        // https://learn.microsoft.com/en-us/windows/win32/com/dropeffect-constants
+        require((preferredEffect & DROPEFFECT_COPY) != 0 && (preferredEffect & DROPEFFECT_MOVE) == 0 &&
+            sourceExists && sourceIdentityMatches &&
             sourceContentMatches && sourceModifiedMatches,
             "Original native Copy changed its exact selection/effect/source");
         require(ownedPublication(), "Original native Copy publication changed during capture");
@@ -1181,6 +1184,13 @@ void verifyShortcut(const Source& source, const fs::path& shortcut) {
         "Native shortcut target/source differs from owned original");
 }
 void drop(Browser& browser, const Source& source, const fs::path& destination, DWORD requested, DWORD keys) {
+    require((keys & ~(MK_CONTROL | MK_SHIFT)) == 0,
+        "Left-drag fixture keys must contain only Control/Shift modifiers");
+    // QueryContinueDrag continues while the initiating button is held and
+    // requests Drop when it is released; retain modifiers across that release.
+    // https://learn.microsoft.com/en-us/windows/win32/api/oleidl/nf-oleidl-idropsource-querycontinuedrag
+    const DWORD dragKeys = keys | MK_LBUTTON;
+    const DWORD dropKeys = keys;
     const auto selection = sourceArray({&source}); ComPtr<IDataObject> data;
     succeeded(nativeCall("selection.BindToHandler.DataObject", [&] { return selection->BindToHandler(nullptr, BHID_DataObject, IID_PPV_ARGS(&data)); }, "drop", requested), "Bind original native drop data object");
     verifyCida(data.Get(), {&source});
@@ -1198,8 +1208,9 @@ void drop(Browser& browser, const Source& source, const fs::path& destination, D
             << " asyncModeHRESULT=" << static_cast<ULONG>(asynchronousModeStatus) << " asyncMode=" << asynchronousMode
             << " operationHRESULT=" << static_cast<ULONG>(operationStatus) << " operationActive=" << operationActive
             << " sourcePreserved=" << preserved(source) << " sourceBytes=" << source.bytes.size()
-            << " dragEnterKeys=" << keys << " dragOverKeys=" << keys << " dropKeys=" << keys
-            << " leftButton=" << ((keys & MK_LBUTTON) != 0) << " rightButton=" << ((keys & MK_RBUTTON) != 0) << std::endl;
+            << " dragEnterKeys=" << dragKeys << " dragOverKeys=" << dragKeys << " dropKeys=" << dropKeys
+            << " dragLeftButton=" << ((dragKeys & MK_LBUTTON) != 0) << " dropLeftButton=" << ((dropKeys & MK_LBUTTON) != 0)
+            << " rightButton=" << ((dragKeys & MK_RBUTTON) != 0) << std::endl;
     }
     explorer::BreadcrumbDropOptions options; options.site = browser.view;
     options.hitTest = [destination = browser.folder](POINTL, IShellItem** result) -> HRESULT {
@@ -1219,11 +1230,11 @@ void drop(Browser& browser, const Source& source, const fs::path& destination, D
     require(ClientToScreen(browser.owner, &point) != FALSE, "Read owned drop screen point");
     const POINTL position{point.x, point.y}; DWORD effect = requested;
     OperationLease operation;
-    succeeded(nativeCall("IDropTarget.DragEnter", [&] { return controller->DragEnter(data.Get(), keys, position, &effect); }, "drop", requested), "Forward actual native DragEnter");
+    succeeded(nativeCall("IDropTarget.DragEnter", [&] { return controller->DragEnter(data.Get(), dragKeys, position, &effect); }, "drop", requested), "Forward actual native DragEnter");
     require((effect & (DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK)) == requested, "Native DragEnter did not accept requested action");
-    effect = requested; succeeded(nativeCall("IDropTarget.DragOver", [&] { return controller->DragOver(keys, position, &effect); }, "drop", requested), "Forward actual native DragOver");
+    effect = requested; succeeded(nativeCall("IDropTarget.DragOver", [&] { return controller->DragOver(dragKeys, position, &effect); }, "drop", requested), "Forward actual native DragOver");
     require((effect & (DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK)) == requested, "Native DragOver changed requested action");
-    effect = requested; succeeded(nativeCall("IDropTarget.Drop", [&] { return controller->Drop(data.Get(), keys, position, &effect); }, "drop", requested), "Forward actual native Drop");
+    effect = requested; succeeded(nativeCall("IDropTarget.Drop", [&] { return controller->Drop(data.Get(), dropKeys, position, &effect); }, "drop", requested), "Forward actual native Drop");
     const DWORD completedEffect = effect & (DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK);
     // An optimized move has already moved the original and can return NONE,
     // avoiding a second source-side deletion. Exact source/output identity is

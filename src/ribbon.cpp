@@ -241,6 +241,7 @@ HRESULT selectNativeTab(IUIAutomation* automation, const TabSelection& request) 
     if(request.cancelled)return E_ABORT;
     ComPtr<IUIAutomationSelectionItemPattern> selection;
     hr=element->GetCurrentPatternAs(UIA_SelectionItemPatternId,IID_PPV_ARGS(&selection));if(FAILED(hr))return hr;
+    if(!selection)return E_NOINTERFACE;
     BOOL selected=FALSE;hr=selection->get_CurrentIsSelected(&selected);
     if(FAILED(hr)||selected)return hr;
     if(request.cancelled)return E_ABORT;
@@ -789,6 +790,11 @@ struct NativeRibbon::Impl {
                 if((id==RibbonNewMenu||id==RibbonExtractToGallery||id==RibbonFrequentPlaces||id==RecentSearches||id==SearchDateMenu||id==SearchKindMenu||id==SearchSizeMenu||id==RibbonSearchOtherProperties)&&key&&IsEqualPropertyKey(*key,UI_PKEY_SelectedItem)){
                     ULONG selected=0;const auto hr=value?PropVariantToUInt32(*value,&selected):E_POINTER;
                     if(FAILED(hr)||selected>=4096)return E_INVALIDARG;
+                    if(id==RibbonExtractToGallery) {
+                        const auto indices=owner_.collectionInvocationIndices.find(originalId);
+                        if(indices==owner_.collectionInvocationIndices.end()||selected>=indices->second.size())return E_INVALIDARG;
+                        selected=indices->second[selected];
+                    }
                     return owner_.callbacks.executeItem?owner_.callbacks.executeItem(id,selected):E_NOTIMPL;
                 }
                 if(id==RibbonHelpButton)id=RibbonHelp;
@@ -825,12 +831,6 @@ struct NativeRibbon::Impl {
                         ComPtr<IUIImage> image;const auto hr=owner_.imageSpec(item.image,IsEqualPropertyKey(key,UI_PKEY_LargeImage),image);
                         return SUCCEEDED(hr)?UIInitPropertyFromImage(key,image.Get(),value):hr;
                     }
-                    if(IsEqualPropertyKey(key,UI_PKEY_ItemsSource)&&!item.children.empty()) {
-                        if(!current||current->vt!=VT_UNKNOWN||!current->punkVal)return E_INVALIDARG;
-                        ComPtr<IUICollection> collection;const auto hr=current->punkVal->QueryInterface(IID_PPV_ARGS(&collection));
-                        return SUCCEEDED(hr)?owner_.replaceCollection(dynamic->second.parent,originalId,UI_COMMANDTYPE_COMMANDCOLLECTION,item.children,collection.Get()):hr;
-                    }
-                    if(IsEqualPropertyKey(key,UI_PKEY_Categories))return owner_.replaceCategories(item.children,current);
                     return E_NOTIMPL;
                 }
                 id=owner_.applicationId(id);
@@ -951,17 +951,16 @@ struct NativeRibbon::Impl {
     }
     HRESULT replaceCollection(UINT parent,UINT nativeParent,UI_COMMANDTYPE type,const std::vector<RibbonItem>& items,IUICollection* collection) {
         if(!collection)return E_POINTER;if(items.size()>4096)return E_INVALIDARG;
+        const bool dynamicCollection=type==UI_COMMANDTYPE_COMMANDCOLLECTION&&
+            (layout==RibbonLayout::InstalledWindows10||parent==RibbonExtractToGallery);
         // Clear/Add can notify native listeners. Keep selection and invocation
         // indexes unavailable until the complete replacement has succeeded.
         collectionInvocationIndices[nativeParent].clear();
         auto hr=collection->Clear();if(FAILED(hr))return hr;
         std::vector<UINT> indices;indices.reserve(items.size());
-        if(layout==RibbonLayout::InstalledWindows10) {
-            std::vector<UINT> oldParents{nativeParent};
+        if(dynamicCollection) {
             for(auto entry=dynamicCommands.begin();entry!=dynamicCommands.end();) {
-                // A nested collection owns its descendants by the native parent ID.
-                if(std::find(oldParents.begin(),oldParents.end(),entry->second.nativeParent)==oldParents.end()) {++entry;continue;}
-                oldParents.push_back(entry->first);
+                if(entry->second.nativeParent!=nativeParent) {++entry;continue;}
                 const auto& item=entry->second.item;
                 availableDynamicCommands[item.checkable?UI_COMMANDTYPE_BOOLEAN:UI_COMMANDTYPE_ACTION].push_back(entry->first);
                 entry=dynamicCommands.erase(entry);
@@ -973,24 +972,22 @@ struct NativeRibbon::Impl {
             ComPtr<IUIImage> picture;
             if(!item.image.empty())imageSpec(item.image,false,picture);
             else if(parent==RibbonLayoutGallery||parent==RibbonShareGallery)image(item.command,false,picture);
-            if(layout==RibbonLayout::InstalledWindows10) {
-                if(type==UI_COMMANDTYPE_COMMANDCOLLECTION) {
-                    // The installed native command galleries use 16-bit IDs.
-                    // Recycle only the same immutable command type after its
-                    // previous collection has been cleared, then invalidate
-                    // every cached property before exposing the replacement.
-                    const auto itemType=item.checkable?UI_COMMANDTYPE_BOOLEAN:UI_COMMANDTYPE_ACTION;
-                    auto& available=availableDynamicCommands[itemType];
-                    UINT id=0;
-                    if(!available.empty()) {id=available.back();available.pop_back();}
-                    else {if(nextDynamicCommand>0xfffe)return HRESULT_FROM_WIN32(ERROR_NO_SYSTEM_RESOURCES);id=nextDynamicCommand++;}
-                    dynamicCommands.insert_or_assign(id,DynamicCommand{parent,item.invocationIndex==UI_COLLECTION_INVALIDINDEX?index:item.invocationIndex,nativeParent,item});
-                    item.command=id;
-                } else {const auto translated=nativeId(item.command);if(translated)item.command=translated;}
-            }
+            if(dynamicCollection) {
+                // Native command galleries use 16-bit IDs in either layout.
+                // Recycle only the same immutable command type after its
+                // previous collection has been cleared, then invalidate
+                // every cached property before exposing the replacement.
+                const auto itemType=item.checkable?UI_COMMANDTYPE_BOOLEAN:UI_COMMANDTYPE_ACTION;
+                auto& available=availableDynamicCommands[itemType];
+                UINT id=0;
+                if(!available.empty()) {id=available.back();available.pop_back();}
+                else {if(nextDynamicCommand>0xfffe)return HRESULT_FROM_WIN32(ERROR_NO_SYSTEM_RESOURCES);id=nextDynamicCommand++;}
+                dynamicCommands.insert_or_assign(id,DynamicCommand{parent,item.invocationIndex==UI_COLLECTION_INVALIDINDEX?index:item.invocationIndex,nativeParent,item});
+                item.command=id;
+            } else if(layout==RibbonLayout::InstalledWindows10) {const auto translated=nativeId(item.command);if(translated)item.command=translated;}
             ComPtr<IUISimplePropertySet> properties;properties.Attach(new Item(std::move(item),false,picture.Get()));
             hr=collection->Add(properties.Get());if(FAILED(hr))return hr;
-            if(layout==RibbonLayout::InstalledWindows10&&type==UI_COMMANDTYPE_COMMANDCOLLECTION) {
+            if(dynamicCollection) {
                 Variant command;ULONG id=0;
                 if(SUCCEEDED(properties->GetValue(UI_PKEY_CommandId,&command.value))&&SUCCEEDED(PropVariantToUInt32(command.value,&id)))
                     requestInvalidation(id,UI_INVALIDATIONS_ALLPROPERTIES,nullptr);

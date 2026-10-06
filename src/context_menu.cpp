@@ -2,6 +2,8 @@
 
 #include <shlobj.h>
 #include <array>
+#include <algorithm>
+#include <climits>
 #include <memory>
 #include <new>
 
@@ -49,11 +51,61 @@ void findCommand(HMENU root, UINT id, unsigned depth, unsigned& budget,
         }
     }
 }
+
+bool sameVerb(std::wstring_view left, std::wstring_view right) noexcept {
+    return left.size() == right.size() && left.size() <= INT_MAX &&
+        CompareStringOrdinal(left.data(), static_cast<int>(left.size()), right.data(),
+                             static_cast<int>(right.size()), TRUE) == CSTR_EQUAL;
+}
+
+void findVerb(const std::vector<ContextMenuEntry>& entries, std::wstring_view verb,
+              std::vector<UINT>& path, std::vector<UINT>& found, unsigned& matches,
+              bool ancestorsEnabled, bool& enabled, size_t& matchedDepth) {
+    for (size_t index = 0; index < entries.size(); ++index) {
+        const auto& entry = entries[index];
+        path.push_back(static_cast<UINT>(index));
+        const bool usable = ancestorsEnabled && entry.enabled();
+        if (!entry.separator() && sameVerb(entry.canonicalVerb, verb)) {
+            if (path.size() < matchedDepth) {
+                matches = 1; found = path; enabled = usable; matchedDepth = path.size();
+            } else if (path.size() == matchedDepth) ++matches;
+        }
+        findVerb(entry.children, verb, path, found, matches, usable, enabled, matchedDepth);
+        path.pop_back();
+    }
+}
+
+unsigned commandOccurrences(const std::vector<ContextMenuEntry>& entries, UINT id) noexcept {
+    unsigned count = 0;
+    for (const auto& entry : entries) {
+        if (!entry.separator() && entry.id == id) ++count;
+        count += commandOccurrences(entry.children, id);
+    }
+    return count;
+}
+
+void findCommandPath(const std::vector<ContextMenuEntry>& entries, UINT id,
+                     std::vector<UINT>& path, std::vector<UINT>& found, unsigned& matches,
+                     bool ancestorsEnabled, bool& enabled) {
+    for (size_t index = 0; index < entries.size(); ++index) {
+        const auto& entry = entries[index];
+        path.push_back(static_cast<UINT>(index));
+        const bool usable = ancestorsEnabled && entry.enabled();
+        if (!entry.separator() && entry.id == id) {
+            ++matches;
+            if (matches == 1) { found = path; enabled = usable; }
+        }
+        findCommandPath(entry.children, id, path, found, matches, usable, enabled);
+        path.pop_back();
+    }
+}
 } // namespace
 
 NativeContextMenu::~NativeContextMenu() { reset(); }
 
 void NativeContextMenu::reset() noexcept {
+    ++generation_;
+    plannedPopups_.clear();
     // The handler owns owner-draw item data, so retain its interfaces until the
     // complete root menu (including borrowed submenus) has been destroyed.
     if (menu_) DestroyMenu(menu_);
@@ -80,12 +132,19 @@ HRESULT NativeContextMenu::createLeafState(IContextMenu* context, IUnknown* site
     return createImpl(nullptr, context, site, flags, true, omitResourceVerbs);
 }
 
+HRESULT NativeContextMenu::createForPlanning(HWND owner, IContextMenu* context,
+                                            IUnknown* site, UINT flags) {
+    return createImpl(owner, context, site, flags, false, false, false);
+}
+
 HRESULT NativeContextMenu::createImpl(HWND owner, IContextMenu* context, IUnknown* site,
-                                     UINT flags, bool leafStateOnly, bool omitResourceVerbs) {
+                                     UINT flags, bool leafStateOnly, bool omitResourceVerbs,
+                                     bool synchronousCascades) {
     // Retain inputs first: a caller may rebuild using this object's current menu.
     ComPtr<IContextMenu> retained = context;
     ComPtr<IUnknown> retainedSite = site;
     reset();
+    const auto generation = generation_;
     if (!retained) return E_INVALIDARG;
     owner_ = owner;
     thread_ = GetCurrentThreadId();
@@ -94,8 +153,10 @@ HRESULT NativeContextMenu::createImpl(HWND owner, IContextMenu* context, IUnknow
     context_.As(&context2_);
     context_.As(&context3_);
     context_.As(&objectWithSite_);
+    if (generation != generation_) return E_ABORT;
     if (retainedSite && objectWithSite_) {
         const HRESULT hr = objectWithSite_->SetSite(retainedSite.Get());
+        if (generation != generation_) return E_ABORT;
         if (FAILED(hr)) { reset(); return hr; }
         siteAttached_ = true;
     }
@@ -129,15 +190,17 @@ HRESULT NativeContextMenu::createImpl(HWND owner, IContextMenu* context, IUnknow
         reset(); return hr;
     }
     popup_ = menu_;
-    // Real popups need populated cascades. A read-only leaf-state worker never
-    // opens those cascades, so avoid requesting their synchronous enumeration.
-    const UINT nativeFlags = leafStateOnly ? flags & ~CMF_SYNCCASCADEMENU : flags | CMF_SYNCCASCADEMENU;
-    const HRESULT hr = context_->QueryContextMenu(menu_, 0, firstCommand_, lastCommand_,
+    // Ordinary popups retain synchronous cascades. Exact planning and the
+    // read-only leaf worker inspect native metadata before any branch request.
+    const UINT nativeFlags = leafStateOnly || !synchronousCascades
+        ? flags & ~CMF_SYNCCASCADEMENU : flags | CMF_SYNCCASCADEMENU;
+    const HRESULT hr = retained->QueryContextMenu(menu_, 0, firstCommand_, lastCommand_,
                                                  nativeFlags);
     // A custom namespace can retain this same provider for a later normal
     // popup. Restrict only this query; canonical readback below must still use
     // the native menu that was just created, with the provider's original flags.
     const HRESULT restored = restrictedResources ? configuration->SetMenuRestrictions(previous) : S_OK;
+    if (generation != generation_) return E_ABORT;
     if (FAILED(hr)) { reset(); return hr; }
     if (FAILED(restored)) { reset(); return restored; }
     commandCount_ = HRESULT_CODE(hr);
@@ -171,6 +234,19 @@ HRESULT NativeContextMenu::createSelection(HWND owner, IShellItemArray* selectio
     ComPtr<IContextMenu> context;
     hr = selection->BindToHandler(nullptr, BHID_SFUIObject, IID_PPV_ARGS(&context));
     return FAILED(hr) ? hr : create(owner, context.Get(), site, flags | CMF_ITEMMENU);
+}
+
+HRESULT NativeContextMenu::createSelectionForPlanning(HWND owner, IShellItemArray* selection,
+                                                      IUnknown* site, UINT flags) {
+    reset();
+    if (!selection) return E_INVALIDARG;
+    DWORD count = 0;
+    HRESULT hr = selection->GetCount(&count);
+    if (FAILED(hr)) return hr;
+    if (!count) return E_INVALIDARG;
+    ComPtr<IContextMenu> context;
+    hr = selection->BindToHandler(nullptr, BHID_SFUIObject, IID_PPV_ARGS(&context));
+    return FAILED(hr) ? hr : createForPlanning(owner, context.Get(), site, flags | CMF_ITEMMENU);
 }
 
 HRESULT NativeContextMenu::createNewItems(HWND owner, IShellItem* folder, IUnknown* site,
@@ -238,14 +314,16 @@ bool NativeContextMenu::selectableCommand(UINT id) const noexcept {
 
 std::wstring NativeContextMenu::canonicalVerb(UINT id) const {
     if (id < firstCommand_ || id - firstCommand_ >= commandCount_) return {};
+    const auto retained = context_;
+    if (!retained) return {};
     std::array<wchar_t, 512> wide{};
-    HRESULT hr = context_->GetCommandString(id - firstCommand_, GCS_VERBW, nullptr,
+    HRESULT hr = retained->GetCommandString(id - firstCommand_, GCS_VERBW, nullptr,
                                             reinterpret_cast<LPSTR>(wide.data()),
                                             static_cast<UINT>(wide.size()));
     wide.back() = L'\0';
     if (SUCCEEDED(hr)) return wide.data();
     std::array<char, 512> ansi{};
-    hr = context_->GetCommandString(id - firstCommand_, GCS_VERBA, nullptr, ansi.data(),
+    hr = retained->GetCommandString(id - firstCommand_, GCS_VERBA, nullptr, ansi.data(),
                                     static_cast<UINT>(ansi.size()));
     ansi.back() = '\0';
     if (FAILED(hr)) return {};
@@ -257,13 +335,19 @@ std::wstring NativeContextMenu::canonicalVerb(UINT id) const {
 HRESULT NativeContextMenu::enumerateMenu(HMENU menu, UINT position, unsigned depth,
                                          unsigned& budget,
                                          std::vector<ContextMenuEntry>& entries,
-                                         bool populate) {
+                                         bool populate, bool strictMessages) {
     if (depth > maximumDepth || !budget) return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+    const auto generation = generation_;
     if (populate) {
-        LRESULT ignored = 0;
-        handleMessage(WM_INITMENUPOPUP, reinterpret_cast<WPARAM>(menu),
-                      MAKELPARAM(position, FALSE), ignored);
+        if (strictMessages) {
+            const HRESULT hr = initializeForPlanning(menu, position);
+            if (FAILED(hr)) return hr;
+        } else {
+            LRESULT ignored = 0;
+            handleMessage(WM_INITMENUPOPUP, reinterpret_cast<WPARAM>(menu),MAKELPARAM(position, FALSE), ignored);
+        }
     }
+    if (generation != generation_) return E_ABORT;
     const int count = GetMenuItemCount(menu);
     if (count < 0) return menuError();
     for (int i = 0; i < count; ++i) {
@@ -286,14 +370,135 @@ HRESULT NativeContextMenu::enumerateMenu(HMENU menu, UINT position, unsigned dep
             entry.label.resize(info.cch);
         }
         if (!entry.separator()) entry.canonicalVerb = canonicalVerb(entry.id);
+        if (generation != generation_) return E_ABORT;
         if (info.hSubMenu) {
             const HRESULT hr = enumerateMenu(info.hSubMenu, static_cast<UINT>(i), depth + 1,
-                                             budget, entry.children, populate);
+                                             budget, entry.children,
+                                             populate && (!strictMessages || entry.enabled()), strictMessages);
             if (FAILED(hr)) return hr;
         }
+        if (generation != generation_) return E_ABORT;
         entries.push_back(std::move(entry));
     }
     return S_OK;
+}
+
+HRESULT NativeContextMenu::initializeForPlanning(HMENU menu, UINT position) {
+    if (!context_ || !menu_ || !ownsMenu(menu)) return E_INVALIDARG;
+    if (thread_ != GetCurrentThreadId()) return RPC_E_WRONG_THREAD;
+    if (leafStateOnly_) return E_ACCESSDENIED;
+    const auto prior = std::find_if(plannedPopups_.begin(), plannedPopups_.end(),
+                                   [menu](const PlannedPopup& popup) { return popup.menu == menu; });
+    if (prior != plannedPopups_.end()) return prior->status;
+    // Publish the pending attempt before the native callback. Reentrant exact
+    // planning cannot initialize this same popup a second time.
+    plannedPopups_.push_back({menu, E_PENDING});
+    const auto generation = generation_;
+    const auto retained = context_;
+    const auto retained3 = context3_;
+    const auto retained2 = context2_;
+    HRESULT hr = S_OK; // A static IContextMenu has no delayed-message contract.
+    if (retained3) {
+        LRESULT ignored = 0;
+        hr = retained3->HandleMenuMsg2(WM_INITMENUPOPUP, reinterpret_cast<WPARAM>(menu),
+                                     MAKELPARAM(position, FALSE), &ignored);
+        if (generation != generation_) return E_ABORT;
+    } else if (retained2) {
+        hr = retained2->HandleMenuMsg(WM_INITMENUPOPUP, reinterpret_cast<WPARAM>(menu),
+                                     MAKELPARAM(position, FALSE));
+    }
+    if (generation != generation_ || context_.Get() != retained.Get() || !ownsMenu(menu)) return E_ABORT;
+    if (SUCCEEDED(hr) && hr != S_OK) hr = E_UNEXPECTED;
+    const auto completed = std::find_if(plannedPopups_.begin(), plannedPopups_.end(),
+                                       [menu](const PlannedPopup& popup) { return popup.menu == menu; });
+    if (completed == plannedPopups_.end()) return E_ABORT;
+    completed->status = hr;
+    return hr;
+}
+
+HRESULT NativeContextMenu::enumerateForVerbs(std::span<const std::wstring_view> verbs,
+                                            std::vector<ContextMenuEntry>& entries) {
+    return enumerateForTarget(verbs, 0, entries);
+}
+
+HRESULT NativeContextMenu::enumerateForCommand(UINT actualNativeId, std::vector<ContextMenuEntry>& entries) {
+    if (actualNativeId < firstCommand_ || actualNativeId > lastCommand_) { entries.clear(); return E_INVALIDARG; }
+    return enumerateForTarget({}, actualNativeId, entries);
+}
+
+HRESULT NativeContextMenu::enumerateForTarget(std::span<const std::wstring_view> verbs, UINT actualNativeId,
+                                             std::vector<ContextMenuEntry>& entries) {
+    entries.clear();
+    if (!context_ || !menu_) return E_UNEXPECTED;
+    if (thread_ != GetCurrentThreadId()) return RPC_E_WRONG_THREAD;
+    if (verbs.size() > maximumEntries) return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+    for (const auto verb : verbs)
+        if (verb.empty() || verb.size() >= 512 || verb.find(L'\0') != std::wstring_view::npos) return E_INVALIDARG;
+    try {
+        const auto generation = generation_;
+        const auto retained = context_;
+        std::vector<ContextMenuEntry> snapshot;
+        unsigned budget = maximumEntries;
+        HRESULT hr = enumerateMenu(popup_, 0, 0, budget, snapshot, false);
+        if (FAILED(hr)) return hr;
+        const size_t requests = actualNativeId ? 1 : verbs.size();
+        for (size_t request = 0; request < requests; ++request) {
+            std::vector<UINT> path, found;
+            unsigned matches = 0;
+            bool enabled = false;
+            if (actualNativeId) findCommandPath(snapshot, actualNativeId, path, found, matches, true, enabled);
+            else {
+                size_t matchedDepth = maximumDepth + 2;
+                findVerb(snapshot, verbs[request], path, found, matches, true, enabled, matchedDepth);
+            }
+            if (matches > 1) return E_UNEXPECTED;
+            if (!matches) {
+                if (actualNativeId) return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+                continue;
+            }
+            HMENU branch = popup_;
+            const std::vector<ContextMenuEntry>* level = &snapshot;
+            unsigned depth = 0;
+            UINT position = 0;
+            const ContextMenuEntry* matched = nullptr;
+            for (const auto index : found) {
+                if (index >= level->size()) return E_UNEXPECTED;
+                matched = &(*level)[index];
+                MENUITEMINFOW native{sizeof(native)};
+                native.fMask = MIIM_ID | MIIM_SUBMENU;
+                if (!GetMenuItemInfoW(branch, index, TRUE, &native)) return menuError();
+                if (native.wID != matched->id || (native.hSubMenu != nullptr) != matched->submenu) return E_ABORT;
+                position = index;
+                branch = native.hSubMenu;
+                level = &matched->children;
+                ++depth;
+            }
+            if (!matched || matched->id < firstCommand_ || matched->id - firstCommand_ >= commandCount_)
+                return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+            if (commandOccurrences(snapshot, matched->id) != 1) return E_UNEXPECTED;
+            if (matched && matched->submenu && enabled) {
+                if (leafStateOnly_) return E_ACCESSDENIED;
+                std::vector<ContextMenuEntry> populated;
+                // Account for entries outside this branch when applying the
+                // same complete-tree bound used by ordinary enumeration.
+                unsigned oldBranchCount = maximumEntries;
+                std::vector<ContextMenuEntry> oldBranch;
+                hr = enumerateMenu(branch, position, depth, oldBranchCount, oldBranch, false);
+                if (FAILED(hr)) return hr;
+                budget += maximumEntries - oldBranchCount;
+                hr = enumerateMenu(branch, position, depth, budget, populated, true, true);
+                if (FAILED(hr)) return hr;
+                snapshot.clear(); budget = maximumEntries;
+                hr = enumerateMenu(popup_, 0, 0, budget, snapshot, false);
+                if (FAILED(hr)) return hr;
+            }
+            break; // Original ordered-alias authority, including disabled rows.
+        }
+        if (generation != generation_ || context_.Get() != retained.Get()) return E_ABORT;
+        entries.swap(snapshot);
+        return S_OK;
+    } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
+      catch (...) { return E_FAIL; }
 }
 
 HRESULT NativeContextMenu::enumerate(std::vector<ContextMenuEntry>& entries, bool populate) {

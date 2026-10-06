@@ -60,7 +60,9 @@ void realInstalledResources() {
         Case{UiText::SearchCue,L"ExplorerFrame.dll",13830},Case{UiText::RefreshTooltip,L"ExplorerFrame.dll",12662},
         Case{UiText::NavigationButtons,L"ExplorerFrame.dll",34817},Case{UiText::AddressToolbar,L"ExplorerFrame.dll",34816},
         Case{UiText::AllLocations,L"ExplorerFrame.dll",34818},Case{UiText::MinimiseRibbon,L"uiribbon.dll",6104},
-        Case{UiText::MinimiseRibbonTooltip,L"uiribbon.dll",6100},Case{UiText::ExpandRibbonTooltip,L"uiribbon.dll",6101}};
+        Case{UiText::MinimiseRibbonTooltip,L"uiribbon.dll",6100},Case{UiText::ExpandRibbonTooltip,L"uiribbon.dll",6101},
+        Case{UiText::PreviewPaneName,L"shell32.dll",38228},Case{UiText::PreviewSelectFile,L"shell32.dll",38245},
+        Case{UiText::PreviewUnavailable,L"shell32.dll",38246}};
     const auto languages=actualLanguages();const auto audited=auditedBuild();
     for(const auto& test:cases) {
         explorer::UiString value;succeeded(explorer::loadUiString(test.key,&value),"Load named host UI string");

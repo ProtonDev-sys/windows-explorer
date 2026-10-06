@@ -309,6 +309,8 @@ int ExplorerApp::headlessBenchmark(const std::filesystem::path& report, const He
             // emptying the message queue does not prove those states are ready.
             waitPhase = action;
             pumpUntil([this] { pollCommandStates(); return !commandStatesPending(); }, 45000);
+            requireBenchmark(selectionKindsRequest_.status==S_OK&&selectionKinds_.count==static_cast<DWORD>(expected)&&
+                !selectionKindsRequest_.pending,"Native complete-selection Kind result did not finish for the actual selection");
             for(const auto& [id,capability]:commandCapabilities_) {
                 if(capability.status==E_PENDING) {
                     std::fprintf(stderr,"Benchmark provider returned unresolved state after worker completion: id=%u HRESULT=0x%08lX\n",
@@ -409,6 +411,10 @@ int ExplorerApp::headlessBenchmark(const std::filesystem::path& report, const He
                    << ",\"selectionStatusMs\":" << work.selectionStatusMs
                    << ",\"selectionHostEligibilityMs\":" << work.selectionHostEligibilityMs
                    << ",\"selectionKindsMs\":" << work.selectionKindsMs
+                   << ",\"selectionKindsSchedulingMs\":" << work.selectionKindsSchedulingMs
+                   << ",\"selectionKindsPublicationMs\":" << work.selectionKindsPublicationMs
+                   << ",\"selectionKindsReadyDelayMs\":" << work.selectionKindsReadyDelayMs
+                   << ",\"selectionKindsStatus\":" << static_cast<long>(work.selectionKindsStatus)
                    << ",\"namespacePreparationMs\":" << work.namespacePreparationMs
                    << ",\"providerCatalogMs\":" << work.providerCatalogMs
                    << ",\"stateTaskSchedulingMs\":" << work.stateTaskSchedulingMs
@@ -420,9 +426,11 @@ int ExplorerApp::headlessBenchmark(const std::filesystem::path& report, const He
                 if(workerIndex)output << ',';
                 const auto& worker=work.completedStateWorkers[workerIndex];
                 output << "{\"command\":" << worker.command << ",\"selectionBatch\":" << (worker.selectionBatch?"true":"false")
+                       << ",\"selectionKinds\":" << (worker.selectionKinds?"true":"false")
                        << ",\"status\":" << static_cast<long>(worker.status)
                        << ",\"timingStatus\":" << static_cast<long>(worker.timingStatus)
                        << ",\"workerMs\":" << worker.native.workerMicroseconds/1000.0
+                       << ",\"kindReadMs\":" << worker.native.kindReadMicroseconds/1000.0
                        << ",\"dataObjectExportMs\":" << worker.native.dataObjectExportMicroseconds/1000.0
                        << ",\"identityConstructionMs\":" << worker.native.identityConstructionMicroseconds/1000.0
                        << ",\"contextBindMs\":" << worker.native.contextBindMicroseconds/1000.0

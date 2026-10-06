@@ -1204,8 +1204,10 @@ HRESULT finishStateBatch(NamespaceCommandStateTask& task,std::vector<NamespaceSe
     return task.pollSelectionVerbBatch(result);
 }
 
-void nativeLeafStateMenuEquivalence(std::span<const DWORD> counts) {
-    onPrivateDesktop([counts] {
+void nativeLeafStateMenuEquivalence(std::span<const DWORD> counts, unsigned mixtureMask = 3, unsigned registrationMask = 3) {
+    onPrivateDesktop([counts,mixtureMask,registrationMask] {
+        require(mixtureMask>=1&&mixtureMask<=3&&registrationMask>=1&&registrationMask<=3,
+                "Native menu-state partition has invalid mixture or provider mask");
         Fixture fixture;const auto before=read(fixture.text),zipBefore=read(fixture.archive);
         const auto clipboard=GetClipboardSequenceNumber();
         const auto clipboardOwnerBefore=GetClipboardOwner();
@@ -1235,6 +1237,7 @@ void nativeLeafStateMenuEquivalence(std::span<const DWORD> counts) {
             return states;
         };
         for(const DWORD count:counts)for(const bool mixed:{false,true}) {
+            if(!(mixtureMask&(mixed?2u:1u)))continue;
             if(count==1&&mixed)continue;
             std::vector<PCIDLIST_ABSOLUTE> ids(count,identities.text);
             if(mixed)ids.back()=identities.directory;
@@ -1245,6 +1248,7 @@ void nativeLeafStateMenuEquivalence(std::span<const DWORD> counts) {
             DWORD retained=0;succeeded(selected->GetCount(&retained),"Read original full native root-leaf count");
             require(retained==count,"Native root-leaf comparison truncated its original selection");
             for(const bool registered:{false,true}) {
+                if(!(registrationMask&(registered?2u:1u)))continue;
                 const auto createContext=[&](IContextMenu** result) {
                     if(!registered)return selected->BindToHandler(nullptr,BHID_SFUIObject,IID_IContextMenu,reinterpret_cast<void**>(result));
                     DEFCONTEXTMENU definition{};definition.pidlFolder=identities.parent;definition.psf=parent.Get();
@@ -2166,17 +2170,26 @@ int runNativeMenuStateTests(NativeMenuStateBucket bucket) {
     static constexpr std::array<DWORD,1> stressCounts{10000u};
     std::span<const DWORD> counts;
     const char* label = nullptr;
+    unsigned mixtureMask = 3, registrationMask = 3;
     switch (bucket) {
     case NativeMenuStateBucket::All: counts = allCounts; label = "all 1/2/16/5001/10000"; break;
     case NativeMenuStateBucket::Small: counts = smallCounts; label = "small 1/2/16"; break;
     case NativeMenuStateBucket::Large: counts = largeCounts; label = "large 5001"; break;
     case NativeMenuStateBucket::Stress: counts = stressCounts; label = "stress 10000"; break;
+    case NativeMenuStateBucket::StressFilesNative:
+        counts = stressCounts; label = "stress 10000 file-only native"; mixtureMask = 1; registrationMask = 1; break;
+    case NativeMenuStateBucket::StressFilesRegistered:
+        counts = stressCounts; label = "stress 10000 file-only registered"; mixtureMask = 1; registrationMask = 2; break;
+    case NativeMenuStateBucket::StressMixedNative:
+        counts = stressCounts; label = "stress 10000 mixed native"; mixtureMask = 2; registrationMask = 1; break;
+    case NativeMenuStateBucket::StressMixedRegistered:
+        counts = stressCounts; label = "stress 10000 mixed registered"; mixtureMask = 2; registrationMask = 2; break;
     default:
         std::cerr << "FAIL: invalid native menu-state bucket\n";
         return 2;
     }
     try {
-        nativeLeafStateMenuEquivalence(counts);
+        nativeLeafStateMenuEquivalence(counts, mixtureMask, registrationMask);
         std::cout << "PASS: native root-leaf state versus synchronous cascades on full " << label << " targets\n";
         return 0;
     } catch(const std::exception& error) {

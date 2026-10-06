@@ -14,6 +14,7 @@ enum class UiText {
     AddressBar, AddressName, SearchBox, SearchAction, SearchCue,
     Refresh, RefreshTooltip, NavigationButtons, AddressToolbar, AllLocations,
     MinimiseRibbon, MinimiseRibbonTooltip, ExpandRibbon, ExpandRibbonTooltip,
+    PreviewPaneName, PreviewSelectFile, PreviewUnavailable,
     Count
 };
 enum class UiStringProvenance { Native, AuthorFallback };

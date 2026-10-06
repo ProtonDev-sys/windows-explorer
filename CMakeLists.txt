@@ -11,6 +11,7 @@ add_library(explorer_core STATIC src/core.cpp src/shell_operations.cpp src/searc
 target_include_directories(explorer_core PUBLIC include)
 target_sources(explorer_core PRIVATE src/app_commands.cpp src/search_history.cpp src/address_history.cpp src/typed_address.cpp src/live_search.cpp src/search_presentation_store.cpp src/selection.cpp src/ribbon_features.cpp src/worker_sta.cpp)
 target_sources(explorer_core PRIVATE src/state_file.cpp src/search_refinement.cpp src/search_window.cpp src/ui_strings.cpp src/ui_direction.cpp)
+target_sources(explorer_core PRIVATE src/focus_keyboard.cpp src/startup_desktop.cpp)
 target_compile_definitions(explorer_core PUBLIC UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
 target_link_libraries(explorer_core PUBLIC ole32 oleaut32 shell32 shlwapi propsys uuid comctl32 user32 advapi32 gdi32 windowscodecs dwmapi uxtheme msimg32 xmllite)
 
@@ -41,7 +42,7 @@ add_library(explorer_ribbon STATIC src/ribbon.cpp)
 target_include_directories(explorer_ribbon PUBLIC include)
 target_compile_definitions(explorer_ribbon PUBLIC UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
 target_link_libraries(explorer_ribbon PUBLIC explorer_core ole32 shell32 shlwapi propsys uuid user32 advapi32 gdi32 oleacc uiautomationcore)
-add_executable(WindowsExplorer WIN32 src/main.cpp src/app.cpp src/ribbon_app.cpp src/headless_smoke.cpp src/headless_benchmark.cpp src/headless_crash.cpp resources/app.rc)
+add_executable(WindowsExplorer WIN32 src/main.cpp src/app.cpp src/app_preview.cpp src/preview_host.cpp src/ribbon_app.cpp src/headless_smoke.cpp src/preview_diagnostics.cpp src/headless_window_isolation.cpp src/headless_benchmark.cpp src/headless_crash.cpp resources/app.rc)
 target_sources(WindowsExplorer PRIVATE "${RIBBON_GENERATED_DIR}/ribbon.rc")
 add_dependencies(WindowsExplorer explorer_ribbon_resources)
 target_include_directories(WindowsExplorer PRIVATE "${RIBBON_GENERATED_DIR}")
@@ -61,10 +62,13 @@ endif()
 include(CTest)
 if(BUILD_TESTING)
   add_executable(explorer_tests tests/core_tests.cpp tests/shell_operations_tests.cpp tests/input_tests.cpp tests/item_actions_tests.cpp tests/search_tests.cpp tests/context_menu_tests.cpp tests/quick_access_tests.cpp tests/saved_search_tests.cpp tests/library_tests.cpp tests/namespace_actions_tests.cpp tests/breadcrumb_tests.cpp)
-  target_link_libraries(explorer_tests PRIVATE explorer_core)
+  target_link_libraries(explorer_tests PRIVATE explorer_core vfw32)
   target_sources(explorer_tests PRIVATE tests/app_commands_tests.cpp tests/search_history_tests.cpp tests/address_history_tests.cpp tests/typed_address_tests.cpp tests/worker_sta_tests.cpp tests/search_refinement_tests.cpp tests/ui_strings_tests.cpp tests/ui_direction_tests.cpp)
   if(MSVC)
     target_compile_options(explorer_tests PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    # Native Shell/UI fixtures use the same Common Controls activation version
+    # as the application, while retaining their existing DPI/OS/long-path mode.
+    target_link_options(explorer_tests PRIVATE "/MANIFESTDEPENDENCY:\"type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
     target_compile_options(explorer_tests PRIVATE "$<$<CONFIG:Release>:/Zi>")
     target_link_options(explorer_tests PRIVATE "$<$<CONFIG:Release>:/DEBUG:FULL>"
       "$<$<CONFIG:Release>:/OPT:REF>" "$<$<CONFIG:Release>:/OPT:ICF>"
@@ -74,16 +78,44 @@ if(BUILD_TESTING)
   # Provider calls have their own bounded deadlines. Large repeated native
   # menu comparisons run separately so they cannot hide core-suite failures.
   set_tests_properties(core_and_shell_operations PROPERTIES TIMEOUT 120)
+  # These independent native providers retain their own fixture/call bounds;
+  # each gets a fresh guarded process rather than consuming Core's margin.
+  add_test(NAME native_saved_search_metadata COMMAND explorer_tests --saved-search-only)
+  set_tests_properties(native_saved_search_metadata PROPERTIES TIMEOUT 60)
+  add_test(NAME native_library_operations COMMAND explorer_tests --library-only)
+  set_tests_properties(native_library_operations PROPERTIES TIMEOUT 90)
+  add_test(NAME native_namespace_actions COMMAND explorer_tests --namespace-only)
+  set_tests_properties(native_namespace_actions PROPERTIES TIMEOUT 45)
   add_test(NAME native_app_commands COMMAND explorer_tests --app-commands-only)
   set_tests_properties(native_app_commands PROPERTIES TIMEOUT 90)
   add_test(NAME native_menu_state_small COMMAND explorer_tests --menu-state-small)
   add_test(NAME native_menu_state_large COMMAND explorer_tests --menu-state-large)
-  add_test(NAME native_menu_state_stress COMMAND explorer_tests --menu-state-stress)
-  set_tests_properties(native_menu_state_small native_menu_state_large native_menu_state_stress PROPERTIES TIMEOUT 90)
+  # The same four 10k-item mixture/provider comparisons keep all original
+  # assertions and native per-call bounds in independently guarded processes.
+  # --menu-state-stress still runs the original combined diagnostic on demand.
+  add_test(NAME native_menu_state_stress_files_native COMMAND explorer_tests --menu-state-stress-files-native)
+  add_test(NAME native_menu_state_stress_files_registered COMMAND explorer_tests --menu-state-stress-files-registered)
+  add_test(NAME native_menu_state_stress_mixed_native COMMAND explorer_tests --menu-state-stress-mixed-native)
+  add_test(NAME native_menu_state_stress_mixed_registered COMMAND explorer_tests --menu-state-stress-mixed-registered)
+  set_tests_properties(native_menu_state_small native_menu_state_large
+    native_menu_state_stress_files_native native_menu_state_stress_files_registered
+    native_menu_state_stress_mixed_native native_menu_state_stress_mixed_registered PROPERTIES TIMEOUT 90)
   add_executable(native_selection_tests tests/selection_tests.cpp)
   target_link_libraries(native_selection_tests PRIVATE explorer_core)
   add_test(NAME native_view_selection COMMAND native_selection_tests)
   set_tests_properties(native_view_selection PROPERTIES TIMEOUT 45)
+  add_executable(native_focus_keyboard_tests tests/focus_keyboard_tests.cpp)
+  target_link_libraries(native_focus_keyboard_tests PRIVATE explorer_core)
+  add_test(NAME native_focus_keyboard COMMAND native_focus_keyboard_tests)
+  set_tests_properties(native_focus_keyboard PROPERTIES TIMEOUT 30)
+  # Compatibility experiment only: its exit status describes execution and
+  # source preservation; JSON reports layout compatibility separately. Root's
+  # headless driver supplies a 60-second process bound. It is not a CTest pass.
+  add_executable(preview_layout_tests tests/preview_layout_tests.cpp)
+  target_link_libraries(preview_layout_tests PRIVATE explorer_core oleacc)
+  if(MSVC)
+    target_link_options(preview_layout_tests PRIVATE "/MANIFESTDEPENDENCY:\"type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
+  endif()
   # WIN32 avoids creating a console before the inherited-context child can
   # attach to its private desktop. It exercises the production launch flags.
   add_executable(search_window_tests WIN32 tests/search_window_tests.cpp)
@@ -98,6 +130,11 @@ if(BUILD_TESTING)
   add_test(NAME installed_ribbon_features COMMAND ribbon_features_tests)
   set_tests_properties(installed_ribbon_features PROPERTIES TIMEOUT 15)
   add_test(NAME hidden_shell_host COMMAND WindowsExplorer --headless-smoke --report ${CMAKE_BINARY_DIR}/headless-smoke.json)
+  add_test(NAME hidden_library_shell_host COMMAND WindowsExplorer --headless-library-smoke
+    --report ${CMAKE_BINARY_DIR}/headless-smoke-library.json)
+  set_tests_properties(hidden_library_shell_host PROPERTIES TIMEOUT 90)
+  add_test(NAME native_video_cast_state COMMAND explorer_tests --cast-state-only)
+  set_tests_properties(native_video_cast_state PROPERTIES TIMEOUT 30)
   # Includes bounded native Details/Preview realization and actual UIA teardown.
   set_tests_properties(hidden_shell_host PROPERTIES TIMEOUT 150)
   add_executable(explorer_ribbon_tests tests/ribbon_tests.cpp "${RIBBON_GENERATED_DIR}/ribbon.rc")
@@ -122,11 +159,14 @@ if(BUILD_TESTING)
     add_test(NAME installed_shell_host COMMAND WindowsExplorer --headless-smoke --installed-ribbon
       --report ${CMAKE_BINARY_DIR}/headless-smoke-installed.json)
     set_tests_properties(installed_shell_host PROPERTIES TIMEOUT 150)
+    add_test(NAME installed_library_shell_host COMMAND WindowsExplorer --headless-library-smoke --installed-ribbon
+      --report ${CMAKE_BINARY_DIR}/headless-smoke-library-installed.json)
+    set_tests_properties(installed_library_shell_host PROPERTIES TIMEOUT 90)
   endif()
   add_executable(headless_visual_tests tests/headless_visual_tests.cpp)
   target_link_libraries(headless_visual_tests PRIVATE explorer_core)
   add_executable(visual_fixture_builder tests/visual_fixture_builder.cpp)
-  target_link_libraries(visual_fixture_builder PRIVATE explorer_core vfw32)
+  target_link_libraries(visual_fixture_builder PRIVATE explorer_core vfw32 bcrypt)
   add_test(NAME private_desktop_visual_capture COMMAND headless_visual_tests)
   set_tests_properties(private_desktop_visual_capture PROPERTIES TIMEOUT 45)
   add_executable(headless_crash_tests tests/headless_crash_tests.cpp src/headless_crash.cpp)
@@ -178,7 +218,7 @@ if(BUILD_TESTING)
     set_tests_properties(native_theme_installed PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
   endif()
   if(MSVC)
-    foreach(target native_selection_tests ribbon_features_tests explorer_ribbon_tests ribbon_recent_items_tests headless_visual_tests headless_crash_tests search_presentation_tests live_search_tests visual_fixture_builder native_history_tests native_search_options_tests native_view_persistence_tests native_transfer_tests theme_tests)
+    foreach(target native_selection_tests native_focus_keyboard_tests preview_layout_tests ribbon_features_tests explorer_ribbon_tests ribbon_recent_items_tests headless_visual_tests headless_crash_tests search_presentation_tests live_search_tests visual_fixture_builder native_history_tests native_search_options_tests native_view_persistence_tests native_transfer_tests theme_tests)
       target_compile_options(${target} PRIVATE /W4 /permissive- /utf-8 /EHsc)
     endforeach()
   endif()

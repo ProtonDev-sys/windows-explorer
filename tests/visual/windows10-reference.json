@@ -1423,7 +1423,7 @@
       "height": 503,
       "layoutDpi": 96,
       "dpiEvidence": "Publisher cropped the real Windows10 band, did not record build/DPI. Captures use actual96DPI and identical crop pixels; drop shadow excluded, source caption/body not inferred.",
-      "state": "Expanded Compressed native band in an owned ZIP namespace with its actual text member selected. Native MRU destinations differ from the publisher's profile; unrecorded enabled-state differences remain compared.",
+      "state": "Comparison: expanded Compressed native band in an owned Downloads containing folder with Archive.zip selected, matching the source's Downloads caption, disabled Extract-to destination gallery and enabled Extract all. Independent primary capture remains inside the owned ZIP with its actual text member selected. Native MRU destination artwork can differ from the publisher's profile; all icon/state pixels, crops, masks and thresholds remain compared unchanged.",
       "regions": [
         {
           "name": "compressed-ribbon",

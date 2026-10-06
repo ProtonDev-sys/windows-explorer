@@ -9,6 +9,7 @@
 #include <iomanip>
 #include <iterator>
 #include <limits>
+#include <new>
 #include <sstream>
 #include <string_view>
 
@@ -150,6 +151,7 @@ Preferences loadPreferences(const std::filesystem::path& path) {
             startupPolicySpecified = true;
         }
         else if (key == "searchWidth") result.searchWidth = integerOr(value, defaults.searchWidth, 90, 4096);
+        else if (key == "previewWidth") result.previewWidth = integerOr(value, defaults.previewWidth, 120, 4096);
         else if (key == "showHidden") result.showHidden = booleanOr(value, defaults.showHidden);
         else if (key == "showExtensions") result.showExtensions = booleanOr(value, defaults.showExtensions);
         else if (key == "ribbonCollapsed") result.ribbonCollapsed = booleanOr(value, defaults.ribbonCollapsed);
@@ -168,31 +170,40 @@ Preferences loadPreferences(const std::filesystem::path& path) {
     return result;
 }
 
+HRESULT savePreferencesStatus(const std::filesystem::path& path, const Preferences& preferences) noexcept {
+    try {
+        if (path.empty() || preferences.startupLocation.empty() || preferences.startupLocation.size() > maximumLocationLength || preferences.startupLocation.find(L'\0') != std::wstring::npos) return E_INVALIDARG;
+        const auto encodedLocation = utf8(preferences.startupLocation);
+        if (encodedLocation.empty()) return E_INVALIDARG;
+        const Preferences defaults;
+        const auto view = static_cast<int>(preferences.view);
+        std::ostringstream output;
+        output << "# WindowsExplorer settings (UTF-8).\nversion=1\n" << std::boolalpha
+            << "navigationPane=" << preferences.navigationPane << '\n'
+            << "previewPane=" << preferences.previewPane << '\n'
+            << "detailsPane=" << preferences.detailsPane << '\n'
+            << "expandToCurrent=" << preferences.expandToCurrent << '\n'
+            << "showAllFolders=" << preferences.showAllFolders << '\n'
+            << "showLibraries=" << preferences.showLibraries << '\n'
+            << "useWindowsStartup=" << preferences.useWindowsStartup << '\n'
+            << "searchWidth=" << preferences.searchWidth << '\n'
+            << "previewWidth=" << (preferences.previewWidth >= 120 && preferences.previewWidth <= 4096 ? preferences.previewWidth : defaults.previewWidth) << '\n'
+            << "showHidden=" << preferences.showHidden << '\n'
+            << "showExtensions=" << preferences.showExtensions << '\n'
+            << "ribbonCollapsed=" << preferences.ribbonCollapsed << '\n'
+            << "view=" << (view >= 0 && view <= 7 ? view : static_cast<int>(defaults.view)) << '\n'
+            << "windowWidth=" << (preferences.windowWidth >= 640 && preferences.windowWidth <= 7680 ? preferences.windowWidth : defaults.windowWidth) << '\n'
+            << "windowHeight=" << (preferences.windowHeight >= 480 && preferences.windowHeight <= 4320 ? preferences.windowHeight : defaults.windowHeight) << '\n'
+            << "startupLocation=" << escapeLocation(encodedLocation) << '\n';
+        if (!output) return E_FAIL;
+        const auto contents = output.str();
+        return writeStateFileAtomic(path, std::string_view(contents));
+    } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
+    catch (...) { return E_FAIL; }
+}
+
 bool savePreferences(const std::filesystem::path& path, const Preferences& preferences) {
-    if (path.empty() || preferences.startupLocation.empty() || preferences.startupLocation.size() > maximumLocationLength || preferences.startupLocation.find(L'\0') != std::wstring::npos) return false;
-    const auto encodedLocation = utf8(preferences.startupLocation);
-    if (encodedLocation.empty()) return false;
-    const Preferences defaults;
-    const auto view = static_cast<int>(preferences.view);
-    std::ostringstream output;
-    output << "# WindowsExplorer settings (UTF-8).\nversion=1\n" << std::boolalpha
-        << "navigationPane=" << preferences.navigationPane << '\n'
-        << "previewPane=" << preferences.previewPane << '\n'
-        << "detailsPane=" << preferences.detailsPane << '\n'
-        << "expandToCurrent=" << preferences.expandToCurrent << '\n'
-        << "showAllFolders=" << preferences.showAllFolders << '\n'
-        << "showLibraries=" << preferences.showLibraries << '\n'
-        << "useWindowsStartup=" << preferences.useWindowsStartup << '\n'
-        << "searchWidth=" << preferences.searchWidth << '\n'
-        << "showHidden=" << preferences.showHidden << '\n'
-        << "showExtensions=" << preferences.showExtensions << '\n'
-        << "ribbonCollapsed=" << preferences.ribbonCollapsed << '\n'
-        << "view=" << (view >= 0 && view <= 7 ? view : static_cast<int>(defaults.view)) << '\n'
-        << "windowWidth=" << (preferences.windowWidth >= 640 && preferences.windowWidth <= 7680 ? preferences.windowWidth : defaults.windowWidth) << '\n'
-        << "windowHeight=" << (preferences.windowHeight >= 480 && preferences.windowHeight <= 4320 ? preferences.windowHeight : defaults.windowHeight) << '\n'
-        << "startupLocation=" << escapeLocation(encodedLocation) << '\n';
-    const auto contents = output.str();
-    return SUCCEEDED(writeStateFileAtomic(path, std::string_view(contents)));
+    return SUCCEEDED(savePreferencesStatus(path, preferences));
 }
 
 std::wstring trim(const std::wstring& text) {

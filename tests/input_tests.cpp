@@ -130,7 +130,7 @@ void modifierConflictsAndSystemKeys() {
 
     // AltGr is reported as Ctrl+Alt on common keyboard layouts. It must never
     // activate host commands while the user enters a character.
-    constexpr std::array altGrKeys{'A', 'C', 'D', 'E', 'F', 'L', 'N', 'P', 'V', 'W', 'X'};
+    constexpr std::array altGrKeys{'A', 'C', 'D', 'E', 'F', 'L', 'N', 'P', 'V', 'W', 'X', 'Y', 'Z'};
     for (const UINT key : altGrKeys) {
         for (const bool shift : {false, true}) {
             expect({key, true, shift, true}, false, std::nullopt, "AltGr must not dispatch host commands");
@@ -163,9 +163,9 @@ void viewLayoutChords() {
 }
 
 void nativeKeysRemainNative() {
-    // Enter/Tab/Escape and undo/redo remain available to native controls;
-    // unsupported host Undo/Redo helpers must not intercept native shortcuts.
-    constexpr std::array<UINT, 7> keys{VK_ESCAPE, VK_TAB, VK_SPACE, 'Z', 'Y', 'Q', VK_F12};
+    // Enter/Tab/Escape remain available to native controls. Undo/Redo have
+    // explicit host mappings with an independent text-editing contract below.
+    constexpr std::array<UINT, 5> keys{VK_ESCAPE, VK_TAB, VK_SPACE, 'Q', VK_F12};
     for (const UINT key : keys) {
         for (unsigned modifiers = 0; modifiers < 8; ++modifiers) {
             const Chord chord{key, (modifiers & 1) != 0, (modifiers & 2) != 0, (modifiers & 4) != 0};
@@ -177,6 +177,20 @@ void nativeKeysRemainNative() {
     expect({VK_RETURN, false, false, false}, true, std::nullopt, "The edit control owns Enter to commit its text");
     expect({0, false, false, false}, false, std::nullopt, "A missing key must not dispatch a command");
     expect({0xffffffffU, true, true, true}, true, std::nullopt, "An invalid key must not dispatch a command");
+}
+
+void historyChordsAndEditing() {
+    struct Mapping { UINT key; Command command; };
+    constexpr std::array mappings{Mapping{'Z', explorer::Undo}, Mapping{'Y', explorer::Redo}};
+    for (const auto& mapping : mappings) {
+        for (unsigned modifiers = 0; modifiers < 8; ++modifiers) {
+            const Chord chord{mapping.key, (modifiers & 1) != 0, (modifiers & 2) != 0, (modifiers & 4) != 0};
+            const std::optional<Command> expected = modifiers == 1 ?
+                std::optional<Command>(mapping.command) : std::nullopt;
+            expect(chord, false, expected, "Only exact Ctrl+Z/Y can dispatch native file-history commands");
+            expect(chord, true, std::nullopt, "Undo/Redo in address/search/rename/RichEdit controls must remain text editing");
+        }
+    }
 }
 
 void focusAndFullscreenModifiers() {
@@ -295,6 +309,68 @@ void focusCycleSubsetInvariants() {
         }
     }
 }
+
+void previewFocusOrderAndSubsets() {
+    using explorer::FocusRegion;
+    static_assert(static_cast<unsigned>(FocusRegion::FolderView) == 0);
+    static_assert(static_cast<unsigned>(FocusRegion::Sorting) == 1);
+    static_assert(static_cast<unsigned>(FocusRegion::Status) == 2);
+    static_assert(static_cast<unsigned>(FocusRegion::Toolbar) == 3);
+    static_assert(static_cast<unsigned>(FocusRegion::Navigation) == 4);
+    static_assert(static_cast<unsigned>(FocusRegion::Preview) == 5);
+    const explorer::FocusAvailability all{true, true, true, true, true, true};
+    constexpr std::array forward{FocusRegion::Preview, FocusRegion::Sorting, FocusRegion::Status,
+        FocusRegion::Toolbar, FocusRegion::Navigation, FocusRegion::FolderView};
+    std::optional<FocusRegion> current = FocusRegion::FolderView;
+    for (const auto expected : forward) {
+        expectFocus(current, false, all, expected, "Owned Preview participates after content in the authored forward cycle");
+        expectFocus(expected, true, all, current, "Owned Preview participates in the exact reverse authored cycle");
+        current = expected;
+    }
+    expectFocus(std::nullopt, false, all, FocusRegion::FolderView, "Preview does not change the unknown forward starting region");
+    expectFocus(std::nullopt, true, all, FocusRegion::Navigation, "Preview does not change the unknown backward starting region");
+    const explorer::FocusAvailability hidden;
+    expectFocus(FocusRegion::Preview, false, hidden, FocusRegion::Sorting, "A newly hidden Preview advances from its original position");
+    expectFocus(FocusRegion::Preview, true, hidden, FocusRegion::FolderView, "A newly hidden Preview retreats from its original position");
+
+    // Keep the original five-region subset proof intact, then exercise every
+    // subset with Preview available, including Preview as the only region.
+    constexpr std::array regions{FocusRegion::FolderView, FocusRegion::Sorting, FocusRegion::Status,
+        FocusRegion::Toolbar, FocusRegion::Navigation, FocusRegion::Preview};
+    const auto require = [](bool passed, const char* description) {
+        ++assertions;
+        if (!passed) throw std::runtime_error(description);
+    };
+    for (unsigned subset = 32; subset < 64; ++subset) {
+        const explorer::FocusAvailability available{
+            (subset & 1) != 0, (subset & 2) != 0, (subset & 4) != 0,
+            (subset & 8) != 0, (subset & 16) != 0, true};
+        unsigned count = 0;
+        for (unsigned index = 0; index < regions.size(); ++index)
+            if ((subset & (1U << index)) != 0) ++count;
+        for (unsigned start = 0; start < regions.size(); ++start) {
+            if ((subset & (1U << start)) == 0) continue;
+            for (const bool backwards : {false, true}) {
+                current = regions[start];
+                unsigned visited = 0;
+                for (unsigned step = 0; step < count; ++step) {
+                    const auto next = explorer::cycleFocusRegion(current, backwards, available);
+                    require(next.has_value(), "An available Preview cycle always yields a target");
+                    const auto index = static_cast<unsigned>(*next);
+                    require(index < regions.size(), "The Preview cycle target must be a defined region");
+                    const auto bit = 1U << index;
+                    require((subset & bit) != 0, "The Preview cycle skips unavailable regions");
+                    require((visited & bit) == 0, "A Preview cycle visits each available region exactly once");
+                    require(explorer::cycleFocusRegion(next, !backwards, available) == current,
+                        "Every available Preview cycle step is reversible");
+                    visited |= bit;
+                    current = next;
+                }
+                require(visited == subset && current == regions[start], "A complete Preview cycle covers the exact set and returns to its start");
+            }
+        }
+    }
+}
 } // namespace
 
 int runInputTests() {
@@ -305,9 +381,11 @@ int runInputTests() {
         Test{"modifier conflicts, system keys, and AltGr", modifierConflictsAndSystemKeys},
         Test{"eight view-layout shortcuts", viewLayoutChords},
         Test{"unhandled native editing and Shell keys", nativeKeysRemainNative},
+        Test{"native file-history chords, text editing and all modifier boundaries", historyChordsAndEditing},
         Test{"F6 and fullscreen modifier precedence", focusAndFullscreenModifiers},
         Test{"focus order, wraparound, and unavailable regions", focusCycleOrderAndAvailability},
-        Test{"focus cycle invariants for all availability subsets", focusCycleSubsetInvariants}
+        Test{"focus cycle invariants for all availability subsets", focusCycleSubsetInvariants},
+        Test{"owned Preview authored focus order and all available subsets", previewFocusOrderAndSubsets}
     };
     assertions = 0;
     int failures = 0;

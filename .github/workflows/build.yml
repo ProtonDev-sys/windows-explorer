@@ -12,7 +12,9 @@ jobs:
   build:
     # Pin the image with VS2022 rather than inheriting future VS-only updates.
     runs-on: windows-2022
-    timeout-minutes: 20
+    # Covers the serialized native tests and pilot/final captures without
+    # extending any individual process's deadline.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
       - name: Build native C++ application

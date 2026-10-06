@@ -37,7 +37,6 @@ struct RibbonItem {
     bool enabled = true;
     bool checked = false;
     UINT invocationIndex = UI_COLLECTION_INVALIDINDEX;
-    std::vector<RibbonItem> children;
     bool checkable = false;
     UINT category = UI_COLLECTION_INVALIDINDEX;
 };

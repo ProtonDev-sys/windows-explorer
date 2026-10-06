@@ -17,6 +17,7 @@
 #include "explorer/search_window.hpp"
 #include "explorer/live_search.hpp"
 #include "explorer/ui_direction.hpp"
+#include "explorer/preview_host.hpp"
 #include <shlobj.h>
 #include <commctrl.h>
 #include <shobjidl.h>
@@ -38,6 +39,49 @@ struct PidlDeleter {
     void operator()(pointer p) const noexcept { CoTaskMemFree(p); }
 };
 using Pidl = std::unique_ptr<ITEMIDLIST, PidlDeleter>;
+
+// Dedicated headless pane-host provenance. Fixed storage, no interface/service
+// behavior changes; counts include QueryInterface delegated by QueryService.
+struct HeadlessPaneHostingRequests {
+    struct FrameQuery { HRESULT result = E_PENDING; UINT calls = 0; };
+    struct ServiceQuery { GUID service{}, iid{}; HRESULT result = E_PENDING; UINT calls = 0; };
+    struct PaneQuery { GUID pane{}; HRESULT result = E_PENDING; DWORD flags = 0; bool outputPresent = false; UINT calls = 0; };
+    std::array<FrameQuery, 32> frameQueries{};
+    std::array<ServiceQuery, 64> services{};
+    std::array<PaneQuery, 32> panes{};
+    UINT frameCount = 0, serviceCount = 0, paneCount = 0;
+    bool overflow = false;
+    void increment(UINT& calls) noexcept {
+        if (calls == ~UINT{0}) overflow = true; else ++calls;
+    }
+    void frame(REFIID iid, HRESULT result) noexcept {
+        if (iid != IID_IPreviewHandlerFrame) return;
+        for (UINT index = 0; index < frameCount; ++index) if (frameQueries[index].result == result) {
+            increment(frameQueries[index].calls); return;
+        }
+        if (frameCount == frameQueries.size()) { overflow = true; return; }
+        frameQueries[frameCount++] = {result, 1};
+    }
+    void service(REFGUID sid, REFIID iid, HRESULT result) noexcept {
+        for (UINT index = 0; index < serviceCount; ++index) {
+            auto& row = services[index];
+            if (row.service == sid && row.iid == iid && row.result == result) { increment(row.calls); return; }
+        }
+        if (serviceCount == services.size()) { overflow = true; return; }
+        services[serviceCount++] = {sid, iid, result, 1};
+    }
+    void pane(REFEXPLORERPANE paneId, HRESULT result, const EXPLORERPANESTATE* state) noexcept {
+        const DWORD flags = state ? static_cast<DWORD>(*state) : 0;
+        for (UINT index = 0; index < paneCount; ++index) {
+            auto& row = panes[index];
+            if (row.pane == paneId && row.result == result && row.flags == flags && row.outputPresent == (state != nullptr)) {
+                increment(row.calls); return;
+            }
+        }
+        if (paneCount == panes.size()) { overflow = true; return; }
+        panes[paneCount++] = {paneId, result, flags, state != nullptr, 1};
+    }
+};
 enum class AddressContextCommand : UINT { Edit = 1280, Copy = 1281, CopyText = 1282, DeleteHistory = 1283 };
 struct AddressContextSnapshot {
     Pidl location;
@@ -58,6 +102,7 @@ struct VisualScene {
 struct HeadlessStateWorkerTiming {
     UINT command = 0;
     bool selectionBatch = false;
+    bool selectionKinds = false;
     HRESULT status = E_PENDING;
     HRESULT timingStatus = E_PENDING;
     NamespaceCommandStateTimings native;
@@ -71,6 +116,10 @@ struct HeadlessCommandTimings {
     double selectionStatusMs = 0;
     double selectionHostEligibilityMs = 0;
     double selectionKindsMs = 0;
+    double selectionKindsSchedulingMs = 0;
+    double selectionKindsPublicationMs = 0;
+    double selectionKindsReadyDelayMs = 0;
+    HRESULT selectionKindsStatus = S_OK;
     double namespacePreparationMs = 0;
     double providerCatalogMs = 0;
     double stateTaskSchedulingMs = 0;
@@ -94,15 +143,16 @@ public:
     HRESULT prepareSearchWindowContext(const SearchWindowContext& context);
     int run(int showCommand);
     int headlessBenchmark(const std::filesystem::path& report, const HeadlessStartupTimings& startup);
-    int headlessSmoke(const std::filesystem::path& report);
+    int headlessSmoke(const std::filesystem::path& report, bool libraryOnly = false);
     int headlessVisual(const PrivateDesktop& desktop, const std::filesystem::path& screenshot,
                        const std::filesystem::path& report, const VisualScene& scene);
     HWND window() const noexcept { return window_; }
     HRESULT shutdownStatus() const noexcept { return shutdownStatus_; }
+    HRESULT shutdownPreview() noexcept;
     HeadlessCommandTimings headlessCommandTimings() const noexcept { return commandTimings_; }
-    HeadlessCommandTimings lastHeadlessCommandTimings() const noexcept { return lastCommandTimings_; }
-    void resetHeadlessCommandTimings() noexcept { if(headless_){commandTimings_={};lastCommandTimings_={};} }
+    void resetHeadlessCommandTimings() noexcept { if(headless_)commandTimings_={}; }
     bool commandStatesPending() const noexcept {
+        if(selectionKindsRequest_.pending)return true;
         if(selectionStateBatch_||!commandStateTasks_.empty())return true;
         for(const auto& entry:commandCapabilities_)
             if(entry.second.status==E_PENDING&&!entry.second.slowStateCompleted)return true;
@@ -133,6 +183,8 @@ public:
     HRESULT STDMETHODCALLTYPE ShouldShow(IShellFolder*, PCIDLIST_ABSOLUTE, PCUITEMID_CHILD) override;
     HRESULT STDMETHODCALLTYPE GetEnumFlags(IShellFolder*, PCIDLIST_ABSOLUTE, HWND*, DWORD*) override;
 private:
+    static constexpr UINT PreviewResult = WM_APP + 7;
+    static constexpr UINT PreviewChange = WM_APP + 8;
     HRESULT openLongSavedSearch(IShellItem* item, const std::wstring& typedAddress = {});
     ~ExplorerApp();
     HRESULT shutdownStatus_ = S_OK;
@@ -141,6 +193,23 @@ private:
     LRESULT onMessage(UINT, WPARAM, LPARAM);
     HRESULT createControls();
     void layout();
+    HRESULT createPreviewPane();
+    struct PreviewCallScope {
+        ExplorerApp& owner;
+        bool retained=false;
+        explicit PreviewCallScope(ExplorerApp& value) noexcept;
+        ~PreviewCallScope();
+    };
+    void layoutPreviewPane(RECT& browserBounds);
+    std::uint64_t invalidatePreview(PreviewEmptyReason reason = PreviewEmptyReason::None) noexcept;
+    void updatePreviewTarget();
+    HRESULT updatePreviewVisuals();
+    void pollPreview();
+    bool previewSourceCurrent(bool readNative);
+    HRESULT previewAccelerator(std::uint64_t epoch, const MSG& message);
+    bool previewHasFocus() const;
+    void registerPreviewChanges();
+    void previewChanged(WPARAM, LPARAM);
     void rebuildRibbon();
     void rebuildQuickAccess();
     void updateCommands();
@@ -170,6 +239,9 @@ private:
     void advanceNavigationExpansion();
     void cancelCommandStates();
     void startPendingCommandStates();
+    void startPendingSelectionKinds();
+    void pollSelectionKinds();
+    bool selectionKindsSourceCurrent() const noexcept;
     void refreshFrequentPlaces();
     void cancelFrequentPlaces();
     void pollFrequentPlaces();
@@ -242,7 +314,7 @@ private:
     HRESULT showProperties(const wchar_t* page);
     void popup(UINT command, HWND anchor = nullptr);
     void showError(HRESULT hr, const wchar_t* action);
-    void persist();
+    HRESULT persist();
     void updateCaptionIcon();
     HRESULT refreshCabinetPolicy();
     void updateFrameTitle();
@@ -253,6 +325,8 @@ private:
     std::atomic<ULONG> references_{1};
     HINSTANCE instance_;
     bool headless_;
+    bool headlessPaneHostingTrace_ = false;
+    HeadlessPaneHostingRequests headlessPaneHostingRequests_;
     UiDirectionPolicy uiDirection_;
     // Declared only by an owned private headless fixture before any HWND exists.
     std::optional<bool> headlessDirectionOverride_;
@@ -266,6 +340,12 @@ private:
     bool pendingSearchBackground_ = false;
     bool checkboxes_ = false;
     bool ascending_ = true;
+    PROPERTYKEY sortProperty_{};
+    PROPERTYKEY groupProperty_{};
+    bool sortPropertyValid_ = false;
+    bool groupPropertyValid_ = false;
+    IFolderView2* orderStateView_ = nullptr;
+    unsigned long long orderStateNavigation_ = 0;
     bool selectionStateDirty_ = true;
     bool deferredUpdateQueued_ = false;
     bool commandRefreshActive_ = false;
@@ -297,7 +377,15 @@ private:
     bool typedAddressHistoryAllowed_ = true;
     bool typedAddressHistoryLoaded_ = false;
     HRESULT addressHistoryStatus_ = S_OK;
-    HeadlessCommandTimings commandTimings_,lastCommandTimings_;
+    HRESULT searchHistorySaveStatus_ = E_PENDING;
+    HRESULT pendingSearchHistorySaveError_ = S_OK;
+    struct PersistenceStatus {
+        HRESULT searchHistory = E_PENDING, addressHistory = E_PENDING;
+        HRESULT windowPlacement = E_PENDING, ribbonState = E_PENDING;
+        HRESULT preferences = E_PENDING, ribbonSettings = E_PENDING;
+        HRESULT result = E_PENDING;
+    } persistenceStatus_;
+    HeadlessCommandTimings commandTimings_;
     bool searchResizing_ = false;
     int searchDragOffset_ = 0;
     LONG_PTR windowStyle_ = 0;
@@ -306,6 +394,23 @@ private:
     HWND window_ = nullptr, nav_ = nullptr, address_ = nullptr;
     HWND breadcrumbs_ = nullptr, search_ = nullptr, addressActions_ = nullptr;
     HWND ribbonCollapse_=nullptr,ribbonCollapseTooltip_=nullptr;
+    HWND previewPane_=nullptr,previewRender_=nullptr,previewText_=nullptr;
+    std::wstring previewSelectText_,previewUnavailableText_;
+    std::unique_ptr<NativePreviewHost> previewHost_;
+    struct PreviewTicket {
+        ComPtr<IShellView> view;
+        ComPtr<IFolderView2> folderView;
+        Pidl location,item;
+        std::uint64_t epoch=0,revision=0;
+        unsigned navigation=0;
+    } previewTicket_;
+    std::uint64_t previewEpoch_=0;
+    bool previewDirty_=true,previewResizing_=false,previewPaneCreating_=false;
+    bool previewClosePending_=false,destroying_=false;
+    unsigned previewCallsActive_=0;
+    int previewDragOffset_=0;
+    RECT previewSplitter_{};
+    ULONG previewChangeCookie_=0;
     std::wstring ribbonCollapseTip_;
     std::map<UINT, std::wstring> navigationTooltipText_;
     HICON folderIcon_ = nullptr;
@@ -350,6 +455,23 @@ private:
     SFGAOF commandSelectionAttributes_=0;
     IShellView* commandSelectionView_=nullptr;
     NamespaceSelectionKinds selectionKinds_;
+    struct SelectionKindsRequest {
+        std::unique_ptr<NamespaceCommandStateTask> task;
+        ComPtr<IShellItemArray> selection;
+        ComPtr<IShellView> view;
+        ComPtr<IFolderView2> folderView;
+        Pidl location;
+        UINT64 generation = 0, sourceRevision = 0;
+        unsigned navigation = 0;
+        DWORD count = 0;
+        bool countKnown = false, useFacade = false, pending = false;
+        HRESULT status = S_OK;
+        double requestedAt = 0;
+    } selectionKindsRequest_;
+    // One-shot isolated native regression callback after real Kind worker
+    // release and before its captured-source publication fence.
+    std::function<void()> headlessBeforeKindsPublication_;
+    UINT64 commandSourceRevision_ = 0;
     std::map<UINT, AppCommandCapability> commandCapabilities_;
     std::map<UINT,std::unique_ptr<NamespaceCommandStateTask>> commandStateTasks_;
     ULONGLONG commandStateStartAt_ = 0;

@@ -1,5 +1,70 @@
 # Native headless visual verification
 
+The current reference audit finds no embedded ICC profile in the pinned Tech
+JPEGs or PC Assist/Microsoft Press PNGs. Untagged web images use sRGB; inventing
+an AdobeRGB transform is unsupported. [W3C color contract](https://www.w3.org/TR/css-color-4/#untagged).
+Computer and Compressed references have the same blue File interior as the
+native framework. Tech's teal File interior and colored bottom frame have
+unrecorded build/accent provenance. Its Share screenshot has one selected
+item/62 bytes, whereas the existing Quick Access control has no selection;
+that state mismatch cannot prove a command-eligibility defect. The command band
+and dynamic count are already masked, so it does not explain the remaining
+strict chrome failure. Existing references, masks and thresholds remain intact.
+
+The v102-r7 layout experiment preserves the full-width native footer while
+reapplying a public-view reservation after each native resize, for both LTR
+and RTL A/B/A views. This measured compatibility is not yet a production UI
+change or a strict screenshot pass. The production footer gap remains open.
+
+The v89 installed Compressed and Computer controls both pass native capture
+and fail the unchanged strict online-reference comparisons. Exact artifacts
+are `artifacts/visual/run-20261006-004300-cc82668109d5486096addb84286e478c`,
+executable SHA-256
+`96827501dbe8780055ccca5cdbbdfc504ebf6c0dfff32fe159fd607648652f23`.
+Failure-only group-property readbacks return `ERROR_NOT_SUPPORTED`, empty
+variants and no Boolean values for all three requested group identifiers.
+Those results do not establish a disabled-group cause for caption colors.
+The unsupported diagnostic has been removed; no native state, color, reference
+mask or comparison threshold was changed.
+
+The latest v85 installed-layout eleven-scene control completed on October 6,
+2026 in `artifacts/visual/run-20261005-235837-c386ebd8550e42049fe33fd10b6689ad`.
+Its immutable executable SHA-256 is
+`22ab1eaafc2c3120f43e1abe1353f597f99d873aa07c81b8b78a7ca361646a56`.
+All eleven native captures pass; strict online-reference comparisons pass Home
+and View and fail the remaining nine scenes. This subset does not replace the
+nineteen-scene coverage below. The preceding full v85 attempt timed out while
+the native fixture builder was creating its inputs, before any scene capture;
+that incomplete run supplies no screenshot evidence. New process receipts
+retain actual child PID, timeout and exit status, and phase diagnostics will
+localize the fixture failure in the next compiled run. Comparison thresholds,
+source masks and native availability remain unchanged.
+
+The integrated v64 installed-layout run on October 5, 2026 is
+`artifacts/visual/run-20261005-195124-4045f61663d24dda83be3f01a05df76a`,
+executable SHA256 `8cc5d768b67be4337a219b9364d76adff6e67984c6f47c0ffe41ea52f41f68e9`.
+All nineteen native captures passed; strict comparisons passed for Home, View,
+Picture, Search, Application and Music, failed for ten scenes, and were
+restricted for DiskImage, Shortcut and Library. The unchanged protocol/comparer
+hashes are `be56ed7190d098f4dca449437110a6ef0a862e20a1b82dc795f0559a0fe49ac4`
+and `51a9a5840ce7dc563f80527e1fd7a8571f2a18752911ed5e035dc49a1e20876b`.
+The earlier v64 authored run used a different Ribbon implementation and failed
+the Search popup plus fourteen comparisons. A current installed five-scene
+control passed Home, View, Music, Application and Search; it does not erase the
+authored failures. Use `-InstalledRibbon` to check the normal Windows 10 layout.
+
+Drive's missing Protect group follows the measured Home-edition feature state
+and installed no-BitLocker template `0x707`; the publisher's edition is unknown.
+Video's native playlist command returns `ERROR_NO_ASSOCIATION` for the actual
+valid owned AVI. The later owned v68 Cast controls independently read the real
+audio and video registered menus: both use the same native CLSID and return one
+disabled parent, zero children and zero enabled leaves. Production agrees, and
+source, FileID, CIDA, settings and input-desktop preservation pass. This supports
+the observed disabled state without establishing its device-related cause.
+The v64 inventory does not include Cast/playlist image HRESULTs, so absent
+artwork cannot yet be attributed to image extraction. These differences remain
+in strict pixel comparisons, and whole-application parity remains false.
+
 New report environments retain the full Windows build/update revision and both fixed numeric and textual resource versions of the native Explorer binaries. This identifies cumulative-update differences that the earlier `19045.0` environment field omitted. Historical source images still require their own build, theme, scale and command-state evidence; recording the target revision does not supply missing publisher provenance.
 
 The application has a dedicated `--headless-visual` mode. Before COM or any window is created, `PrivateDesktop` creates a uniquely named Windows desktop and attaches the UI thread. It deliberately requests no desktop-switch access and never activates that desktop. Visible native controls on that private desktop can paint normally while the user's input desktop remains unchanged. The application verifies isolation before displaying or capturing any window and checks that none of its process windows is visible on the input desktop. [Microsoft: SetThreadDesktop](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setthreaddesktop), [desktop access rights](https://learn.microsoft.com/en-us/windows/win32/winstation/desktop-security-and-access-rights)
@@ -133,3 +198,7 @@ Search first passed in the focused run `artifacts/visual/run-20261005-120015-fd6
 Independent installed-BML realization proves all four actual Search group captions, including an empty fourth group, and no Kind parent caption (`VT_EMPTY`). The Close-group-only correction and independent four-group comparison passed the installed native Ribbon gate; the separate Close-search leaf remains titled. Kind matches its independently read native provider title without claiming BML caption parity. The earlier v15 Search capture opened the saved view without a committed MRU; the corrected typed-query state now uses the source's genuine Enter interaction. Its native eligibility, masks, thresholds and artwork remain unchanged.
 
 Historical baseline: the October 4 full run used executable `797d82951bdc90c6052ba73391ad1f873df4f09eace5ca17aa64bf6c19dbc2b9` with the same protocol and comparer. All 19 native captures passed, while four strict scenes passed and 13 failed. The obsolete duplicate Share-with group caption was subsequently removed and verified in native rendered pixels. Historical artifacts remain under ignored `artifacts/visual/run-20261004-225731-519261879c784dafa83f65143784e924`; they do not replace the latest complete report. References, private-source images and PDBs are not publication artifacts.
+
+The focused v71 run `artifacts/visual/run-20261005-212533-2658c30c40384e94baeb0403947010c4` captures Share and both Compressed contexts successfully; both strict comparisons fail. The Compressed comparison now selects the owned intact ZIP in its containing Downloads folder, matching the online source's disabled destination gallery and enabled Extract all. Its independent inside-ZIP member capture remains. Exact native address equality uses the existing owned directory's long path; the ZIP hash and selected count are checked. The updated reference manifest changes only this fixture description. Images, crops, masks, thresholds and comparer remain unchanged. The capture script's hash is now recorded separately.
+
+Share's actual action-owned menu returns `ERROR_NOT_SUPPORTED` for Specific people and Remove access, while the separate generic CommandStore lookup returns `ERROR_NOT_FOUND`. Neither is an enabled native menu result. Email's action plan instead uses the SendTo Mail Recipient route; its direct registered state remains distinct. Complete target, bytes, attributes, owner/group/DACL and settings preservation checks pass. Compressed agreement is 97.4024%, edge F1 .903344 and mean RGB error 1.236890; native group-caption and destination artwork differences remain measured. These focused results do not supersede the nineteen-scene v64 run or establish complete visual parity.
