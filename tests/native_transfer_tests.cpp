@@ -872,7 +872,7 @@ struct ShortcutState {
     bool viewBackgroundEnabled = false;
 };
 ShortcutState describeShortcutState(Browser& browser, IDataObject* producer, const Source& source,
-                                    const char* phase, bool formats) {
+                                    const char* phase, bool formats, DWORD expectedPreference = DROPEFFECT_COPY) {
     // Inspect the normal registered leaf and independently created, fully
     // populated native folder background menu. Neither route invokes a leaf.
     ShortcutState result;
@@ -939,8 +939,8 @@ ShortcutState describeShortcutState(Browser& browser, IDataObject* producer, con
     const DWORD producerEffect = producer ? effectData(producer, CFSTR_PREFERREDDROPEFFECT) : MAXDWORD;
     const DWORD consumerEffect = effectData(consumer.Get(), CFSTR_PREFERREDDROPEFFECT);
     std::cout << "Native shortcut clipboard phase=" << phase << " completeCidaIdentityMatches=1 producerEffect="
-        << producerEffect << " consumerEffect=" << consumerEffect << std::endl;
-    require((!producer || producerEffect == DROPEFFECT_COPY) && consumerEffect == DROPEFFECT_COPY,
+        << producerEffect << " consumerEffect=" << consumerEffect << " expectedPreference=" << expectedPreference << std::endl;
+    require((!producer || producerEffect == expectedPreference) && consumerEffect == expectedPreference,
         "Paste Shortcut producer/consumer changed its native COPY preference");
     if (producer) describeShortcutHdrop(phase, "producer", producer, source);
     describeShortcutHdrop(phase, "consumer", consumer.Get(), source);
@@ -1036,6 +1036,10 @@ public:
             sourceContentMatches && sourceModifiedMatches,
             "Original native Copy changed its exact selection/effect/source");
         require(ownedPublication(), "Original native Copy publication changed during capture");
+        // Preserve the exact flags published by the native Copy command.
+        // A native COPY|LINK publication is distinct from the helper's
+        // explicitly authored COPY-only producer; later reads must match it.
+        preferredEffect_ = preferredEffect;
         captured_ = true;
         std::cout << "Native Copy ownership ownerPrivateSTA=1 sequence=" << sequence_
             << " exactCidaCopySource=1" << std::endl;
@@ -1043,6 +1047,7 @@ public:
     void verify() const {
         require(captured_ && ownedPublication(), "Original native Copy clipboard owner/sequence was replaced");
     }
+    DWORD preferredEffect() const { verify(); return preferredEffect_; }
     void clear() {
         verify();
         const auto deadline = GetTickCount64() + 2000;
@@ -1076,7 +1081,7 @@ private:
     }
     HWND frame_ = nullptr, owner_ = nullptr;
     const Source& source_;
-    DWORD before_ = 0, sequence_ = 0;
+    DWORD before_ = 0, sequence_ = 0, preferredEffect_ = MAXDWORD;
     bool captured_ = false, cleared_ = false;
     OperationLease operation_;
 };
@@ -1135,14 +1140,14 @@ void originalViewCopyControl(Browser& destination, Fixture& fixture) {
         SetActiveWindow(destination.owner);
         require(GetActiveWindow() == destination.owner, "Reactivate exact private native Copy destination frame");
         succeeded(nativeCall("view.UIActivate", [&] { return destination.view->UIActivate(SVUIA_ACTIVATE_NOFOCUS); }, "native-copy-destination"), "Reactivate exact native Copy destination view");
-        const auto initial = describeShortcutState(destination, nullptr, source, "native-copy-published", true);
+        const auto initial = describeShortcutState(destination, nullptr, source, "native-copy-published", true, publication.preferredEffect());
         bool ready = SUCCEEDED(initial.registeredStatus) && initial.registered.enabled;
         const auto started = GetTickCount64();
         while (!ready && GetTickCount64() - started < 5000) {
             pump(); publication.verify();
             ready = destination.plan(L"Windows.pastelink").enabled;
         }
-        const auto settled = describeShortcutState(destination, nullptr, source, "native-copy-settled", !ready);
+        const auto settled = describeShortcutState(destination, nullptr, source, "native-copy-settled", !ready, publication.preferredEffect());
         publication.verify();
         std::cout << "Native original Copy control registeredEnabled=" << settled.registered.enabled
             << " viewEnabled=" << settled.viewBackgroundEnabled << " viewMatches=" << settled.viewBackgroundMatches
