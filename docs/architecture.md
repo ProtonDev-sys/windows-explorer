@@ -4,7 +4,7 @@
 
 ## Native window and namespaces
 
-`ExplorerApp` is heap-owned with real atomic COM AddRef/Release lifetime. It owns the top-level HWND, native Ribbon host, navigation/address/search controls and `IExplorerBrowser`, and implements events, service discovery, pane visibility, common-dialog callbacks and folder filtering. Shutdown cancels tasks, detaches the actual view/browser sites and events, revokes drop registrations and releases native references during owner teardown. The Shell owns item enumeration/presentation, thumbnails, menus, footer and namespace extensions. Provider reuse preserves available native behavior; it does not prove complete Explorer.exe parity. [ExplorerBrowser](https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nn-shobjidl_core-iexplorerbrowser)
+`ExplorerApp` is heap-owned with real atomic COM AddRef/Release lifetime. It owns the top-level HWND, native Ribbon host, navigation/address/search controls and `IExplorerBrowser`, and implements events, service discovery, pane visibility, common-dialog callbacks and folder filtering. Shutdown cancels tasks, detaches the browser site and events, revokes drop registrations and releases native references during owner teardown. The browser owns the native Shell view and its site. The Shell owns item enumeration/presentation, thumbnails, menus, footer and namespace extensions. Provider reuse preserves available native behavior; it does not prove complete Explorer.exe parity. [ExplorerBrowser](https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nn-shobjidl_core-iexplorerbrowser)
 
 Navigation history stores absolute PIDLs. History commits only when the completed destination matches its pending request; failed navigation preserves the previous destination, and new navigation truncates the forward branch. The normal browser uses the `WindowsExplorer.Native` property bag and reads the actual restored layout rather than forcing one global mode on every folder. Headless browsers set `EBO_NOPERSISTVIEWSTATE` and initialize a deterministic fixture layout. Default startup follows read-only Windows `LaunchTo`, with Quick access as the default; an explicit app startup preference takes precedence.
 
@@ -23,6 +23,32 @@ Navigation-pane options use the actual tree service: pinned/show-all style, Libr
 Expansion tasks are bounded and invalidated by navigation. The Windows 10 F6/Shift+F6 ring is content, Details sorting buttons, native status view buttons, navigation/address/search toolbar, and navigation tree. Alt retains Ribbon navigation; Alt+D/Ctrl+L and Ctrl+E retain direct address/search access. The actual Shell frame owns its visible footer. Its status radios and Details split buttons receive only `IAccessible::accSelect(SELFLAG_TAKEFOCUS)` after native role, geometry, visibility and HWND ownership checks; successful focus requires the provider's focused-state readback. Discovery stops outside file/tree item lists. Toolbar Tab/Shift+Tab visits actual enabled visible buttons and edits, and Enter uses the existing command guards. F11 retains style/placement and uses the nearest monitor. Full accessibility, RTL and mixed-monitor equivalence require separate evidence. [Windows 10 screen-reader navigation](https://support.microsoft.com/en-us/accessibility/windows/use-a-screen-reader-to-explore-and-navigate-file-explorer-in-windows), [public accessible focus](https://learn.microsoft.com/en-us/windows/win32/api/oleacc/nf-oleacc-iaccessible-accselect)
 
 ## Command state and invocation
+
+During the exact original native WM_CLOSE dispatch, App RecentItems commits
+queue at most 64 decoded index/pinned values under the captured creator, HWND,
+view, folder, displayed-source and Ribbon epoch/binding authority. The queue
+retains no callback SAFEARRAY or replacement Shell array. Native Execute's S_OK
+means admission; it does not report the later host/Shell result. The original
+native lower returns before the queue is consumed and actual host callbacks run;
+the original App class close follows once. The separate host-drain guard coalesces
+an exact nested close without another native lower call. Each callback retains
+original source and release fences; framework retirement stops the tail, while
+App-only source revocation records the later E_ABORT. Exceptions become actual
+host failure results and still proceed to class cleanup. Immediate DestroyOwner
+still destroys the real HWND inside its host callback, outside the native lower.
+An owner destroyed by the native lower itself drops queued authority. Direct
+FrameworkDestroy-origin callbacks retain their separate synchronous path; the
+v180 authored Windows 11 WM_CLOSE pass does not certify that broader scope.
+
+Pin's host binding requires a real folder view and a nonempty complete selection,
+then delegates eligibility to actual `Windows.PinToHome` state with the ordinary
+`pintohome` fallback. Normal invocation preserves that full native selection and
+actual view site. The v185 five-case Windows 11 oracle compares both available
+native references independently, preserving original EnumDone, FileIDs, attributes,
+CIDA and delivered array order; it never invokes the provider or changes profile
+pins. File-only state is disabled and both mixed selection gestures deliver
+folder,file order. This read-only state proof does not certify persistence or
+arbitrary provider behavior.
 
 `app_commands` maps host/Ribbon IDs to host operations, contextual namespace actions or exact installed `Windows.*` keys and target scope. Semantic requirements exclude unrelated namespaces before queries. A registered key alone does not establish applicability. Native disabled/hidden/checked state, absent components, failures and `E_PENDING` remain distinct.
 

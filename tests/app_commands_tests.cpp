@@ -5,6 +5,7 @@
 #include "explorer/headless_visual.hpp"
 #include "explorer/worker_sta.hpp"
 #include "native_menu_state_tests.hpp"
+#include "actual_native_view_enumeration.hpp"
 
 #include <shlobj.h>
 #include <propkey.h>
@@ -86,10 +87,14 @@ struct Fixture {
 class NavigationEvents final : public Microsoft::WRL::RuntimeClass<
     Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::ClassicCom>,IExplorerBrowserEvents> {
 public:
-    bool finished = false;
+    bool finished = false,observeEnumeration=false;
     HRESULT status = E_PENDING;
+    native_view_fixture::ActualEnumeration enumeration;
     HRESULT STDMETHODCALLTYPE OnNavigationPending(PCIDLIST_ABSOLUTE) override { return S_OK; }
-    HRESULT STDMETHODCALLTYPE OnViewCreated(IShellView*) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE OnViewCreated(IShellView* originalView) override {
+        if(observeEnumeration)enumeration.attach(originalView);
+        return S_OK; // Preserve navigation; actual attachment failure rejects readiness.
+    }
     HRESULT STDMETHODCALLTYPE OnNavigationComplete(PCIDLIST_ABSOLUTE) override { finished = true; status = S_OK; return S_OK; }
     HRESULT STDMETHODCALLTYPE OnNavigationFailed(PCIDLIST_ABSOLUTE) override { finished = true; status = E_FAIL; return S_OK; }
 };
@@ -127,6 +132,8 @@ struct HiddenView {
     void waitForOwnedMembers(IShellItem* originalFolder,PCIDLIST_ABSOLUTE originalFolderId,const std::vector<ReadyMember>& expected) {
         require(originalFolder&&originalFolderId&&expected.size()==3&&browser&&view&&initializationDeadline,
             "Equivalence readiness requires exactly three original sources and its actual initialized view");
+        events->enumeration.emit("NativeMenu","navigation-complete");
+        require(events->enumeration.attachmentStatus()==S_OK,"Original native menu EnumDone attachment failed");
         ComPtr<IFolderView2> folderView;succeeded(view.As(&folderView),"Read original equivalence readiness folder view");
         const auto current=[&](const char* phase=nullptr) {
             const auto desktop=PrivateDesktop::current();
@@ -170,6 +177,8 @@ struct HiddenView {
         unsigned observations=0;int previousCount=-2;HRESULT previousRead=E_PENDING;
         std::array<bool,3> identityLogged{};
         const auto ready=[&] {
+            if(!events->enumeration.completed(view.Get()))return false;
+            const auto enumeration=events->enumeration.completedCount();
             if(GetTickCount64()>=initializationDeadline)return false;
             require(current(),"Equivalence readiness lost the original private folder/view");
             int count=-1;const auto countRead=folderView->ItemCount(SVGIO_ALLVIEW,&count);++observations;
@@ -214,7 +223,9 @@ struct HiddenView {
                 }
                 matched[memberIndex]=true;
             }
-            return std::all_of(matched.begin(),matched.end(),[](bool value){return value;})&&current()&&GetTickCount64()<initializationDeadline;
+            return std::all_of(matched.begin(),matched.end(),[](bool value){return value;})&&current()&&
+                events->enumeration.completed(view.Get())&&enumeration==events->enumeration.completedCount()&&
+                GetTickCount64()<initializationDeadline;
         };
         bool completed=ready();
         while(!completed&&GetTickCount64()<initializationDeadline) {
@@ -224,6 +235,7 @@ struct HiddenView {
             if(!completed&&GetTickCount64()<initializationDeadline)Sleep(1);
         }
         counts(completed?"ready-before-first-provider":"failed-before-first-provider");
+        events->enumeration.emit("NativeMenu","before-first-provider");
         require(completed&&current()&&GetTickCount64()<initializationDeadline,
             "Original complete owned menu view membership did not become ready within initialization budget");
         std::cout<<"NativeMenu readiness completeOwnedFileIDs=3 beforeFirstProvider=1 observations="<<observations<<'\n'<<std::flush;
@@ -522,6 +534,7 @@ struct HiddenView {
         succeeded(browser->Initialize(owner,&bounds,&settings),"Initialize actual hidden provider view");
         events = Microsoft::WRL::Make<NavigationEvents>();
         require(events != nullptr,"Create native navigation observer");
+        events->observeEnumeration=!ownedPaths.empty();
         succeeded(browser->Advise(events.Get(),&cookie),"Observe hidden native view navigation");
         succeeded(browser->BrowseToObject(folder,SBSP_ABSOLUTE),"Browse owned fixture without displaying a window");
         initializationDeadline=GetTickCount64()+5000;
@@ -540,6 +553,7 @@ struct HiddenView {
         }
     }
     ~HiddenView() {
+        if(events){events->observeEnumeration=false;events->enumeration.detachOrTerminate();}
         diagnosticOriginalFolderView.Reset();
         view.Reset();
         if (browser) { if (cookie) browser->Unadvise(cookie); browser->Destroy(); browser.Reset(); }
@@ -655,7 +669,7 @@ void applicabilityAndOutputContracts() {
     context.selectionAttributes &= ~SFGAO_CANRENAME;
     require(!appCommandApplicable(*appCommandBinding(Rename),context),"Provider rename restriction ignored");
     context.selectionCount = 2;
-    require(!appCommandApplicable(*appCommandBinding(Pin),context),"Single-target pin command accepted multiselect");
+    require(appCommandApplicable(*appCommandBinding(Pin),context),"Pin rejected complete native multiselect before provider state was queried");
     context.physicalDirectory = false;
     for (const auto command : {NewText,NewShortcut,Terminal})
         require(!appCommandApplicable(*appCommandBinding(command),context),"Virtual/archive folder accepted a physical destination action");
@@ -1625,6 +1639,267 @@ HRESULT finishStateBatch(NamespaceCommandStateTask& task,std::vector<NamespaceSe
     return task.pollSelectionVerbBatch(result);
 }
 
+
+struct MultiFolderPinObservation {
+    unsigned cases=0,nativeReferences=0,hostMismatches=0,providerFailures=0;
+};
+
+MultiFolderPinObservation nativeMultiFolderPinStateOracle() {
+    MultiFolderPinObservation observed;
+    onPrivateDesktop([&] {
+        Fixture fixture;
+        const auto originalText=read(fixture.text),originalZip=read(fixture.archive);
+        const auto root=fixture.root/L"pin state";
+        require(fs::create_directory(root),"Create exclusively owned Pin state scope");
+        const std::array<fs::path,3> paths{root/L"folder one",root/L"folder two",root/L"counterexample.txt"};
+        require(fs::create_directory(paths[0])&&fs::create_directory(paths[1]),"Create two independent owned Pin folders");
+        const std::string bytes="Owned read-only Pin state counterexample; no handler is invoked.";
+        for(size_t index=2;index<paths.size();++index){std::ofstream output(paths[index],std::ios::binary);output<<bytes;require(output.good(),"Create owned Pin state file");}
+        const auto folder=item(root);
+        const std::array<ComPtr<IShellItem>,3> members{item(paths[0]),item(paths[1]),item(paths[2])};
+        std::array<FILE_ID_INFO,3> identities{};
+        std::array<DWORD,3> attributes{};
+        for(size_t index=0;index<paths.size();++index) {
+            succeeded(HiddenView::readReadyIdentity(paths[index],identities[index]),"Retain complete original Pin member FileID");
+            attributes[index]=GetFileAttributesW(paths[index].c_str());
+            require(attributes[index]!=INVALID_FILE_ATTRIBUTES&&!(attributes[index]&FILE_ATTRIBUTE_REPARSE_POINT),
+                "Pin source is not an ordinary exclusively owned member");
+            require(((attributes[index]&FILE_ATTRIBUTE_DIRECTORY)!=0)==(index<2),"Pin folder/file fixture has wrong native attributes");
+            for(size_t previous=0;previous<index;++previous)
+                require(!HiddenView::sameReadyIdentity(identities[previous],identities[index]),"Pin members share an original FileID");
+        }
+        const auto clipboard=GetClipboardSequenceNumber();
+        const auto creatorProcess=GetCurrentProcessId(),creatorThread=GetCurrentThreadId();
+        HiddenView host(folder.Get(),paths);
+        host.waitForOwnedMembers();
+        const auto originalView=host.view;
+        const auto originalBrowser=host.browser;
+        ComPtr<IFolderView2> view;succeeded(originalView.As(&view),"Retain original enumerated Pin folder view");
+        const auto sourceCurrent=[&] {
+            bool inputUnchanged=false;
+            auto* desktop=PrivateDesktop::current();
+            require(desktop&&desktop->verifyIsolation(&inputUnchanged)==S_OK&&inputUnchanged,
+                "Pin state oracle lost private input-desktop isolation");
+            require(GetCurrentProcessId()==creatorProcess&&GetCurrentThreadId()==creatorThread&&
+                host.events->enumeration.completed(originalView.Get())&&
+                host.view.Get()==originalView.Get()&&host.browser.Get()==originalBrowser.Get()&&
+                host.owner&&IsWindow(host.owner)&&!IsWindowVisible(host.owner),
+                "Pin state oracle lost original creator/view/owner");
+            ComPtr<IShellView> current;succeeded(originalBrowser->GetCurrentView(IID_PPV_ARGS(&current)),
+                "Read exact current native Pin view");
+            require(current.Get()==originalView.Get(),"Native Pin state query replaced the original view");
+            ComPtr<IShellItem> currentFolder;succeeded(view->GetFolder(IID_PPV_ARGS(&currentFolder)),"Read current Pin parent");
+            int order=1;succeeded(currentFolder->Compare(folder.Get(),SICHINT_CANONICAL,&order),"Compare original Pin parent");
+            require(order==0,"Pin state query navigated away from the original owned parent");
+            HWND child=nullptr;succeeded(originalView->GetWindow(&child),"Read original Pin view HWND");
+            DWORD childProcess=0,ownerProcess=0;
+            const auto childThread=GetWindowThreadProcessId(child,&childProcess);
+            const auto ownerThread=GetWindowThreadProcessId(host.owner,&ownerProcess);
+            require(child&&IsChild(host.owner,child)&&childThread==creatorThread&&ownerThread==creatorThread&&
+                childProcess==creatorProcess&&ownerProcess==creatorProcess,"Pin oracle crossed its original owned HWND source");
+            for(size_t index=0;index<paths.size();++index) {
+                FILE_ID_INFO currentId{};succeeded(HiddenView::readReadyIdentity(paths[index],currentId),"Recheck complete original Pin FileID");
+                require(HiddenView::sameReadyIdentity(currentId,identities[index])&&
+                    GetFileAttributesW(paths[index].c_str())==attributes[index],"Pin state query changed an original FileID or full attributes");
+            }
+        };
+        const std::array<const char*,5> labels{"one-folder","two-folders","folder-and-file","file-selected-first","one-file"};
+        const std::array<std::array<size_t,2>,5> cases{{{0,0},{0,1},{0,2},{2,0},{2,2}}};
+        const std::array<DWORD,5> counts{1,2,2,2,1};
+        for(size_t caseIndex=0;caseIndex<cases.size();++caseIndex) {
+            const auto count=counts[caseIndex];
+            sourceCurrent();
+            succeeded(originalView->SelectItem(nullptr,SVSI_DESELECTOTHERS),"Clear only original private Pin view selection");
+            for(DWORD index=0;index<count;++index) {
+                const auto member=cases[caseIndex][index];
+                succeeded(originalView->SelectItem(ILFindLastID(host.readinessMembers[member].pidl.get()),SVSI_SELECT),
+                    "Select exact original owned Pin child");
+            }
+            const auto exactArray=[&](IShellItemArray* selected) {
+                sourceCurrent();
+                if(!selected)return false;
+                DWORD actualCount=0;const auto countRead=selected->GetCount(&actualCount);
+                if(countRead!=S_OK||actualCount!=count)return false;
+                std::array<bool,2> matched{};
+                for(DWORD index=0;index<actualCount;++index) {
+                    ComPtr<IShellItem> row;if(selected->GetItemAt(index,&row)!=S_OK||!row)return false;
+                    size_t member=count;
+                    for(DWORD expected=0;expected<count;++expected) {
+                        int order=1;const auto compare=row->Compare(members[cases[caseIndex][expected]].Get(),SICHINT_CANONICAL,&order);
+                        if(compare==S_OK&&order==0){if(member!=count)return false;member=expected;}
+                    }
+                    if(member==count||matched[member])return false;
+                    const auto owned=cases[caseIndex][member];
+                    // Canonical original owned membership admits this row's
+                    // reported path. Full original source IDs are fenced first.
+                    sourceCurrent();
+                    PWSTR raw=nullptr;const auto pathRead=row->GetDisplayName(SIGDN_FILESYSPATH,&raw);
+                    std::unique_ptr<wchar_t,decltype(&CoTaskMemFree)> path(raw,CoTaskMemFree);
+                    if(pathRead!=S_OK||!path||!*path)return false;
+                    FILE_ID_INFO nativeId{};
+                    const FILE_ID_INFO expectedId=identities[owned];
+                    const auto identityRead=HiddenView::readReadyIdentity(fs::path(path.get()),nativeId);
+                    if(identityRead!=S_OK)return false;
+                    if(!HiddenView::sameReadyIdentity(nativeId,expectedId))return false;
+                    matched[member]=true;
+                }
+                return std::all_of(matched.begin(),matched.begin()+count,[](bool value){return value;});
+            };
+            ComPtr<IShellItemArray> selected;
+            const auto deadline=GetTickCount64()+5000;
+            bool ready=false;HRESULT selectionRead=E_PENDING;
+            do {
+                sourceCurrent();
+                MSG message{};
+                while(GetTickCount64()<deadline&&PeekMessageW(&message,nullptr,0,0,PM_REMOVE)) {
+                    TranslateMessage(&message);DispatchMessageW(&message);
+                }
+                selected.Reset();selectionRead=view->Items(SVGIO_SELECTION,IID_PPV_ARGS(&selected));
+                ready=selectionRead==S_OK&&exactArray(selected.Get());
+                if(!ready&&GetTickCount64()<deadline)
+                    MsgWaitForMultipleObjectsEx(0,nullptr,1,QS_ALLINPUT,MWMO_ALERTABLE|MWMO_INPUTAVAILABLE);
+            }while(!ready&&GetTickCount64()<deadline);
+            std::cout<<"PinArityOracle case="<<labels[caseIndex]<<" sourceCount="<<count
+                <<" selectionHRESULT="<<static_cast<ULONG>(selectionRead)<<" exactOriginalFileIDs="<<ready
+                <<" creatorPID/TID="<<creatorProcess<<"/"<<creatorThread<<std::endl;
+            require(ready&&GetTickCount64()<deadline,"Original complete Pin selection did not become ready in bounded budget");
+            const auto retainedSelection=selected;
+            std::cout<<"PinArityOracle originalNativeArray case="<<labels[caseIndex]<<" order=";
+            for(DWORD position=0;position<count;++position){
+                ComPtr<IShellItem> actualRow;succeeded(retainedSelection->GetItemAt(position,&actualRow),"Read exact retained native Pin row order");
+                for(size_t member=0;member<members.size();++member){int order=1;if(actualRow->Compare(members[member].Get(),SICHINT_CANONICAL,&order)==S_OK&&order==0)std::cout<<member<<",";}
+            }
+            std::cout<<std::endl;
+            constexpr SFGAOF attributeMask=SFGAO_FOLDER|SFGAO_FILESYSTEM|SFGAO_LINK|SFGAO_CANCOPY|
+                SFGAO_CANMOVE|SFGAO_CANDELETE|SFGAO_CANRENAME|SFGAO_HASPROPSHEET;
+            SFGAOF aggregate=0;
+            const auto aggregateRead=selected->GetAttributes(
+                static_cast<SIATTRIBFLAGS>(SIATTRIBFLAGS_AND|SIATTRIBFLAGS_ALLITEMS),attributeMask,&aggregate);
+            require(aggregateRead==S_OK||aggregateRead==S_FALSE,"Read complete native Pin selection attribute authority");
+            require((aggregate&SFGAO_FILESYSTEM)&&((aggregate&SFGAO_FOLDER)!=0)==(caseIndex<2),
+                "Native Pin attribute aggregate omitted the whole-array file counterexample");
+            const auto selectionCurrent=[&] {
+                sourceCurrent();
+                require(selected.Get()==retainedSelection.Get()&&exactArray(retainedSelection.Get()),
+                    "Pin oracle replaced or changed its complete original selection array");
+                ComPtr<IShellItemArray> current;
+                succeeded(view->Items(SVGIO_SELECTION,IID_PPV_ARGS(&current)),"Read unchanged actual native Pin selection");
+                require(exactArray(current.Get()),"Native provider changed actual Pin view selection");
+            };
+            NativeNamespaceActions actions;
+            succeeded(actions.initialize(host.owner,{folder,retainedSelection,originalView}),"Attach full original Pin array and exact view site");
+            selectionCurrent();
+
+            NativeContextMenu ordinary;
+            const auto menuRead=ordinary.createSelection(host.owner,retainedSelection.Get(),originalView.Get(),CMF_EXTENDEDVERBS);
+            std::cout<<"PinArityOracle case="<<labels[caseIndex]<<" ordinaryMenuHRESULT="<<static_cast<ULONG>(menuRead)<<std::endl;
+            succeeded(menuRead,"Create independent full-selection native Pin menu without invoking it");
+            std::vector<ContextMenuEntry> entries;
+            const auto enumerationRead=ordinary.enumerate(entries,false);
+            succeeded(enumerationRead,"Read original native root Pin canonical leaves");
+            size_t leafCount=0;bool ordinaryEnabled=false,ordinaryChecked=false;
+            for(const auto& entry:entries)if(!entry.separator()&&_wcsicmp(entry.canonicalVerb.c_str(),L"pintohome")==0) {
+                ++leafCount;
+                require(!entry.submenu,"Native Pin canonical provider unexpectedly became a cascade");
+                ordinaryEnabled=entry.enabled();ordinaryChecked=(entry.state&MFS_CHECKED)!=0;
+            }
+            require(leafCount<=1,"Native Pin menu contains ambiguous duplicate canonical leaves");
+            const auto ordinaryStatus=leafCount?S_OK:HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+            selectionCurrent();
+            ordinary.reset();
+            selectionCurrent();
+
+            NamespaceCommandState direct;
+            const auto directInitialRead=namespaceCommandState(L"Windows.PinToHome",retainedSelection.Get(),originalView.Get(),&direct);
+            auto directRead=directInitialRead;
+            if(directRead==E_PENDING) {
+                std::unique_ptr<NamespaceCommandStateTask> pending;
+                const auto startRead=NamespaceCommandStateTask::start(
+                    L"Windows.PinToHome",retainedSelection.Get(),originalView.Get(),false,&pending);
+                if(startRead==S_OK) {
+                    NamespaceCommandState completed;directRead=finishStateTask(*pending,&completed);
+                    if(directRead==S_OK)direct=std::move(completed);
+                }else directRead=startRead;
+            }
+            selectionCurrent();
+            std::unique_ptr<NamespaceCommandStateTask> worker;
+            succeeded(NamespaceCommandStateTask::startSelectionVerb(L"pintohome",retainedSelection.Get(),originalView.Get(),&worker),
+                "Start original full-array native Pin canonical worker without invoking");
+            NamespaceCommandState workerState;
+            const auto workerRead=finishStateTask(*worker,&workerState);
+            selectionCurrent();
+            require(workerRead==ordinaryStatus,"Native Pin canonical worker changed actual absent/present status");
+            if(workerRead==S_OK)require(workerState.contextMenu&&workerState.identitySnapshot&&workerState.siteAttached&&
+                workerState.selectionCount==count&&workerState.enabled()==ordinaryEnabled&&workerState.checked()==ordinaryChecked,
+                "Native Pin worker lost full CIDA/site/count or exact canonical state");
+            worker.reset();
+
+            auto context=folderContext();context.selectionCount=count;context.selectionAttributes=aggregate;
+            const auto binding=appCommandBinding(Pin);require(binding.has_value(),"Pin source binding disappeared");
+            const bool applicable=appCommandApplicable(*binding,context);
+            AppCommandCapability app;
+            succeeded(queryAppCommand(actions,Pin,context,&app),"Read current App Pin capability without invoking");
+            const auto initialAppRead=app.status;
+            if(app.status==E_PENDING) {
+                std::unique_ptr<NamespaceCommandStateTask> pending;
+                succeeded(startAppCommandStateTask(actions,Pin,&pending),"Complete admitted actual App Pin state");
+                NamespaceCommandState completed;app.status=finishStateTask(*pending,&completed);
+                if(SUCCEEDED(app.status)){app.native=std::move(completed);app.enabled=app.native.enabled();app.checked=app.native.checked();}
+                selectionCurrent();
+            }
+            if(!applicable)require(app.status==HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED)&&!app.enabled&&!app.checked&&
+                app.native.selectionCount==0,"Current Pin applicability veto queried or enabled native state");
+            // Actual public CommandStore state is separate from ordinary
+            // context presence. The unresolved root-wide factory is not used:
+            // its unattempted full-menu HRESULT remains E_PENDING. A missing
+            // direct interface is not proof that the installed verb is absent.
+            const bool registeredAvailable=directRead==S_OK;
+            const bool ordinaryAvailable=ordinaryStatus==S_OK;
+            const bool referenceAvailable=registeredAvailable||ordinaryAvailable;
+            const auto differsFromApp=[&](bool enabled,bool checked) {
+                return (applicable&&app.status!=S_OK)||app.enabled!=enabled||app.checked!=checked;
+            };
+            const bool ordinaryMismatch=ordinaryAvailable&&differsFromApp(ordinaryEnabled,ordinaryChecked);
+            const bool directMismatch=registeredAvailable&&differsFromApp(direct.enabled(),direct.checked());
+            const bool referencesDisagree=ordinaryAvailable&&registeredAvailable&&
+                (ordinaryEnabled!=direct.enabled()||ordinaryChecked!=direct.checked());
+            const bool mismatch=ordinaryMismatch||directMismatch;
+            const bool registeredUnavailable=directRead==HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED)||
+                directRead==HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)||directRead==HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND)||
+                directRead==HRESULT_FROM_WIN32(ERROR_NO_ASSOCIATION)||directRead==E_NOINTERFACE||directRead==REGDB_E_CLASSNOTREG;
+            const bool providerFailure=!registeredAvailable&&!registeredUnavailable;
+            std::cout<<"PinArityOracle case="<<labels[caseIndex]<<" aggregateHRESULT="<<static_cast<ULONG>(aggregateRead)
+                <<" aggregateAttributes="<<aggregate<<" ordinaryCanonicalCount="<<leafCount
+                <<" ordinaryStatus="<<static_cast<ULONG>(ordinaryStatus)<<" ordinaryEnabled/checked="<<ordinaryEnabled<<"/"<<ordinaryChecked
+                <<" directInitialHRESULT="<<static_cast<ULONG>(directInitialRead)<<" directFinalHRESULT="<<static_cast<ULONG>(directRead)<<" directInitialized/site="<<direct.initialized<<"/"<<direct.siteAttached
+                <<" directEnabled/checked="<<direct.enabled()<<"/"<<direct.checked()
+                <<" registeredPublicStateAvailable="<<registeredAvailable
+                <<" registeredFullMenuAttempted=0 registeredFullMenuHRESULT="<<static_cast<ULONG>(E_PENDING)
+                <<" registeredFullMenuBlockedByRetainedFactoryCrash=1"
+                <<" workerHRESULT="<<static_cast<ULONG>(workerRead)<<" workerSnapshot/site/count="<<workerState.identitySnapshot<<"/"
+                <<workerState.siteAttached<<"/"<<workerState.selectionCount
+                <<" appApplicable="<<applicable<<" appInitialHRESULT="<<static_cast<ULONG>(initialAppRead)
+                <<" appFinalHRESULT="<<static_cast<ULONG>(app.status)<<" appEnabled/checked="<<app.enabled<<"/"<<app.checked
+                <<" referenceAvailable="<<referenceAvailable<<" ordinaryHostMismatch="<<ordinaryMismatch
+                <<" directHostMismatch="<<directMismatch<<" directOrdinaryDisagree="<<referencesDisagree
+                <<" hostMismatch="<<mismatch<<" nativeInvokes=0"<<std::endl;
+            ++observed.cases;observed.nativeReferences+=referenceAvailable?1u:0u;
+            observed.hostMismatches+=mismatch?1u:0u;observed.providerFailures+=providerFailure?1u:0u;
+            require(invokeAppNativeCommand(actions,Pin,context,true)==E_ACCESSDENIED,
+                "Headless Pin state oracle attempted provider invocation");
+            selectionCurrent();
+            actions.reset();selectionCurrent();
+        }
+        sourceCurrent();
+        require(read(paths[2])==bytes&&read(fixture.text)==originalText&&read(fixture.archive)==originalZip&&
+            fs::is_empty(paths[0])&&fs::is_empty(paths[1]),"Pin state oracle changed exclusively owned payloads");
+        require(GetClipboardSequenceNumber()==clipboard,"Pin state oracle observed changed shared clipboard sequence");
+        bool visible=true;succeeded(PrivateDesktop::current()->visibleWindowsOnInputDesktop(visible),"Read Pin oracle final input desktop visibility");
+        require(!visible&&!IsWindowVisible(host.owner),"Pin state oracle exposed native windows on input desktop");
+    });
+    return observed;
+}
+
 void nativeLeafStateMenuEquivalence(std::span<const DWORD> counts, unsigned mixtureMask = 3, unsigned registrationMask = 3) {
     onPrivateDesktop([counts,mixtureMask,registrationMask] {
         require(mixtureMask>=1&&mixtureMask<=3&&registrationMask>=1&&registrationMask<=3,
@@ -1692,7 +1967,10 @@ void nativeLeafStateMenuEquivalence(std::span<const DWORD> counts, unsigned mixt
             for(const bool registered:{false,true}) {
                 if(!(registrationMask&(registered?2u:1u)))continue;
                 const auto diagnosticBoundary=[&](const char* stage,const char* operation,const char* edge,HRESULT hr=E_PENDING) {
-                    if(registered)host.recordRegisteredMenuBoundary(stage,operation,edge,selected.Get(),count,mixed,hr);
+                    if(registered) {
+                        host.events->enumeration.emit("NativeMenu",operation);
+                        host.recordRegisteredMenuBoundary(stage,operation,edge,selected.Get(),count,mixed,hr);
+                    }
                 };
                 const auto diagnosticCall=[&](const char* stage,const char* operation,const auto& call) {
                     diagnosticBoundary(stage,operation,"before");
@@ -2705,6 +2983,18 @@ void handlerPresentationAndActivationGuards() {
 }
 } // namespace
 
+int runMultiFolderPinStateOracle() {
+    try {
+        const auto observed=nativeMultiFolderPinStateOracle();
+        std::cout<<"PinArityOracle summary cases="<<observed.cases<<" nativeReferences="<<observed.nativeReferences
+            <<" hostMismatches="<<observed.hostMismatches<<" providerFailures="<<observed.providerFailures<<std::endl;
+        if(observed.cases!=5||observed.providerFailures||observed.hostMismatches)return 1;
+        if(!observed.nativeReferences){std::cout<<"SKIP: no native Pin provider state was available on the original owned targets\n";return 77;}
+        std::cout<<"PASS: actual native Pin arity state and complete original owned selection/site; no invocation\n";
+        return 0;
+    }catch(const std::exception& error){std::cerr<<"FAIL: native Pin arity oracle: "<<error.what()<<'\n';return 1;}
+     catch(...){std::cerr<<"FAIL: native Pin arity oracle: unknown exception\n";return 1;}
+}
 int runAppCommandTests() {
     const std::vector<std::pair<const char*,std::function<void()>>> groups{
         {"complete unique command mapping and native scope",catalogCoverageAndExactRoutes},

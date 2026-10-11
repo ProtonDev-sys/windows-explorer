@@ -7,13 +7,52 @@ provider/API is used with its native availability and state; **Partial** identif
 a production or verification limit; **Gap** identifies missing behavior;
 **Unproven** identifies an unestablished comparison.
 
-Source audit: 2026-10-06. The latest complete local suite, v127, passed 34 targets,
+Source audit: 2026-10-07. The earlier complete Windows 10 local suite, v127, passed 34 targets,
 failed installed General, and correctly skipped five disposable-profile targets.
 The v136 authored and installed General processes pass, including the actual
 asynchronous Kind/navigation rejection and Open File Location checks. The
-870d5c5 hosted main job failed five
-of 34 targets; its separate actual transfer/drop processes passed. Current source
-changes need new hosted evidence.
+566ce07 hosted push and PR main jobs each record 31 passed, three failed and three
+skipped out of 37: namespace selection preservation and both registered-menu
+partitions fail. Mandatory 130-query App cache and strict QAT controls pass. The v167 local
+original enumeration controls pass namespace (22 groups / 2,669 assertions),
+App commands (18 groups / 3,664 assertions) and both registered-menu partitions
+in 59.58 seconds, with genuine original creator EnumDone receipts. Fresh Hosted
+acceptance remains required.
+Separate push transfer/drop pass; PR transfer fails and drop passes. Both fresh
+owned-profile jobs fail genuine Home admission, invoke nothing and restore the
+complete original four-pin inventory. The v164 native-setup-pin/App-unpin revision
+has compiled, but needs fresh Hosted evidence; App pin persistence is unmeasured.
+Earlier 870d5c5 negatives remain retained in verification.
+
+On the other PC's Windows 11, v180 passes four focused authored targets in
+45.58 seconds: the eleven original App close cases, both first-retain controls,
+App search backing lifetime, Ribbon and all six RecentItems controls. Queued
+native pin values reach the actual host only after the once-original native
+WM_CLOSE lower call returns; its S_OK is admission, distinct from later host
+results. Immediate owner destruction still occurs inside its actual host
+callback. The direct FrameworkDestroy-origin App/Shell callback path, installed
+App close on Windows 11 and fresh Windows 2022 acceptance remain unmeasured.
+The rejected v177 initialization trial faults all eight original factory-route
+targets and was reverted before v179; these route negatives remain unresolved.
+
+The v185 dedicated Pin state target passes five actual selection cases with
+five available native references, zero host mismatches and zero provider
+failures. App Pin now admits a complete nonempty native selection and lets the
+provider decide eligibility. Two folders and folder-plus-file are enabled;
+a file alone is disabled. Selecting the file first still delivers the actual
+native array in folder,file order, so no reverse-array claim is made. The full
+registered-menu route remains blocked by its retained factory fault. No Pin
+provider is invoked or profile state changed; actual persistence is unmeasured.
+
+The v186 Windows 11 strict nineteen-scene run fails eighteen scenes in
+106.34 seconds. Five primary native captures succeed; only Home, Computer,
+Network and Drive reach comparison and all four fail. Library keeps its genuine
+reference restriction. Thirteen capture processes exit with access violations;
+Search exits 7. Individual Home tab and navigation/address/search glyph regions
+pass, but no whole-scene comparison passes. These results remain separate from
+the earlier Windows 10 captures below. The v187 core target passes, while the
+authored QAT target completes genuine Add/Remove/order and 19/20 transitions,
+then fails because the actual twenty-first Add yields native count 21.
 
 The default v155 image target passes with production apartment ownership and
 184 exact first-current matches. Home and actual Computer association overrides
@@ -23,29 +62,49 @@ Normal OLE teardown completes without the temporary module-retention switch.
 The apartment contract and its separate actual two-creator module target pass.
 Both actual installed Ribbon hosts retain one already-loaded code reference per
 creator through their matching COM/OLE teardown and release it exactly once.
-The latest complete screenshot run, v134, has six passed comparisons,
-nine failures, three restricted references and one failed Search capture. The
-subsequent focused Search comparison passes. Exact UI parity and
+The earlier complete Windows 10 screenshot run, experimental v165, passes all nineteen
+native captures and four comparisons, fails twelve comparisons and retains three
+restricted references. Picture, Application, Music and Video pass; Search now
+captures successfully but fails comparison. Modern Home/Share/View fail at
+97.577610%, 97.464068% and 97.460900% agreement against the unchanged 98% gate.
+Both original theme targets pass in 2.45 seconds on that experimental snapshot.
+Its accepted public Light-highlight request changes zero File-interior pixels
+and was subsequently reverted. The captures belong to experiment EXE92be03…,
+not restored-source acceptance. Historical v134 and focused Search results
+remain retained. Fresh v167 Search after Theme rollback passes at
+0.9824210375875375 agreement; the complete v165 negatives remain. The later
+one-row caret source change has not been natively verified. Stock Explorer
+palette parity, exact UI parity and
 the final 24-run performance comparison remain unestablished.
 
 Read-only App pin-close fixtures now capture the actual batch at the earliest
 owned WM_CLOSE boundary. The v155 reset, initialize-entry and replacement cases
 complete. The v157 reentered WM_CLOSE assertions also complete, but the next
 immediate-owner-destruction case still crashes in native UIRibbon processing;
-the complete App close target is not accepted. Earlier
+the complete App close target on that snapshot is not accepted. The v162 exact native Ribbon-view
+COM lease also faults in that same immediate-owner-destruction case. The v168
+physical-App-retirement trial faults in the first enum-0 ordinary close in
+DUI70 RemoveListener; its raw target exits 0xc000041d / 5.80 seconds. That
+production trial was entirely reversed. The later v180 queue passes the original
+authored WM_CLOSE matrix; direct FrameworkDestroy-origin App callbacks remain
+unmeasured. The retained older faults are separate snapshot evidence. Earlier
 evidence showed the native procedure destroying the original HWND without App
 cleanup. Actual App profile persistence needs a separate
 disposable fixture. Search descriptors now use a bounded 128-entry resident
 cache without a lifetime quota and survive eviction and App close. Actual
 130-query stress targets pass in v143, consuming the retained original native
 cursor for the first time after close and independently rebinding the retained
-item and PIDL. Both v158 native QAT gestures open the real enabled Add popup
-through an owned native right-click. Popup path ownership is rejected before
-Invoke, so Add/Remove behavior remains unverified. Their rooted native Legacy
-identity bridge passes despite empty runtime IDs and distinct accessibility
-wrapper objects. The native resource oracle completes
-its read-only diagnosis, while missing first-image and equivalent label inputs
-remain unavailable and Explorer-host palette parity remains unproved.
+item and PIDL. The v160 authored lifetime/cache and installed lifetime subset
+passes in 67.89 seconds. Both v163 native QAT layouts perform actual Add/Remove,
+remove/readd ordering and 19/20 transitions through qualified original popup and
+Legacy authority; the unsupported disabled-row capacity assumption still fails.
+The v166 actual enabled twenty-first Add is invoked once and returns raw S_OK
+before deadline, then independent native GetCount exceeds twenty and both strict
+targets fail. No count clamp, synthetic row or removal substitutes for native
+acceptance. The older v158 pre-Invoke ownership rejection is retained. The v160
+Auto/Light oracle completes read-only diagnosis and exact raw fallback rasters,
+while genuine missing first images, equivalent native labels and Explorer-host
+palette/artwork remain unproved.
 Exact test scopes and
 retained negatives are in [verification](verification.md),
 with [visual](headless-visual.md), [performance](performance.md),
@@ -57,8 +116,8 @@ with [visual](headless-visual.md), [performance](performance.md),
 | --- | --- | --- | --- |
 | Native desktop process | Wired | Unicode x64 C++20 Win32/COM host, native Shell view, no web runtime | Warning-free build; hidden ownership/lifetime |
 | Home / Share / View / Computer / Network ribbon | Shell | Normal installed ExplorerFrame Ribbon through public LoadUI and exact command adapter; authored fallback; Computer/Network modes follow canonical namespace | Native control/property readback for both resources and declared online-reference comparisons |
-| Quick Access Toolbar | Partial | Targeted edits preserve actual whole rows, bindings and docking; the twenty-command chooser uses an owned checksummed order envelope around opaque native settings. Legacy raw streams retain native order; imported separators and context-menu gestures are untested | v119-r2 both-layout strict 5,153 and envelope 10,682 assertions pass; v124 rerun passes 5,158/10,682. Corruption, exact ID-set/count rollback, atomic failure, source/reentry and retired-generation checks pass; earlier raw-order/setup negatives remain retained |
-| Ribbon RecentItems pin commit | Partial | Ribbon permits one captured original pin transaction during synchronous Destroy with creator/window/atomic-entry fences; App close integration uses a captured original-item transaction; actual close-time batch delivery is unproven | v124 direct Ribbon authored/installed each pass four original native cases and two genuine Destroy reentry cases; v121 wrong-pin failures retained. Read-only App close fixtures currently fail: native ordinary commits precede close and are correctly denied headlessly. Actual profile persistence and strict App close matrix remain unverified |
+| Quick Access Toolbar | Partial | Targeted edits preserve actual whole rows, bindings and docking; the twenty-command chooser uses an owned checksummed order envelope around opaque native settings. Legacy raw streams retain native order; imported separators remain untested. Genuine context Add/Remove/order works in both layouts, but actual twenty-first Add exceeds the documented capacity | v119-r2 both-layout strict 5,153 and envelope 10,682 assertions pass; v124 rerun passes 5,158/10,682. Corruption, exact ID-set/count rollback, atomic failure, source/reentry and retired-generation checks pass; earlier raw-order/setup negatives remain retained. v166 both genuine gesture targets fail actual native capacity after raw S_OK Invoke |
+| Ribbon RecentItems pin commit | Partial | App queues only decoded original pin values during the exact native WM_CLOSE dispatch, drains after its native lower returns, then completes the original class close; source/epoch fences remain. Direct FrameworkDestroy-origin callbacks keep their separate synchronous path | v180 Windows 11 authored App passes eleven original close cases plus both first-retain controls, with actual host results separated from native admissions; six authored RecentItems controls pass. Earlier v162 owner-destruction and v168 retirement-trial faults remain historical negatives. Both 566ce07 Hosted jobs fail genuine Home admission, restore all four original pins and invoke nothing. Direct FrameworkDestroy-origin App/Shell destruction, installed App close on Windows 11 and actual App pin persistence remain unmeasured |
 | Minimize ribbon | Wired | Actual native minimized property, close-time readback and settings restoration | Hidden geometry/state and reopen persistence |
 | Contextual pages | Wired | Picture, Drive, Compressed, Search, Library, Recycle, Application, Shortcut, Music, Video and Disk Image pages | Actual item/context creation/removal and provider states |
 | Exact caption / address / search layout | Partial | Native caption/Ribbon plus host navigation controls; online-reference capture work tracked separately | Matched source dimensions/DPI; scene-specific pixel results |
@@ -98,7 +157,7 @@ with [visual](headless-visual.md), [performance](performance.md),
 | New library at Libraries root | Shell | Canonical Libraries root uses the actual Windows.newitem retained enabled Library leaf for native inline creation and Home button state/title | Read-only actual root state/child identity and real zero-valued ECF_DEFAULT flags; no user's Libraries creation |
 | Registered New / text / shortcut | Shell | Actual NewMenu, installed canonical .txt/NewLink ordinals and native shortcut wizard | Real enumeration/mock message/invocation lifetime; no wizard launch |
 | Paste / paste shortcut | Shell | Actual Windows.paste/pastelink background provider; E_PENDING completed on worker STA | Two fresh 212732e dedicated hosted transfer cases pass the strict actual Copy/Cut/Paste/PasteShortcut outputs and ownership checks; whole-workflow status remains separate. The historical isolated COPY5 experiment verifies actual PasteShortcut output but fails its final generic oracle. No local clipboard mutation |
-| Easy access | Shell | Native Library/pin/favorites/offline/map/sharing/security routes | Actual applicability/provider/service state; absent component disabled |
+| Easy access | Shell | Native Library/pin/favorites/offline/map/sharing/security routes; Pin preserves the complete nonempty selection and native provider eligibility | v185 Windows 11 Pin state: five cases/native references, zero mismatches/provider failures; full original selection/FileIDs/site preserved. File-only is disabled; both mixed selection gestures deliver folder,file native order. No invocation or persistence coverage; full registered-menu route remains unresolved |
 | Copy / Cut / Copy path | Wired | Original Shell data object / canonical Unicode path text; Copy includes LINK only for exact whole-array S_OK/CANLINK, unknown Copy stays COPY, and Cut stays MOVE | The f322 hosted controlled capability/identity cases pass before normal Paste times out. The later 212732e dedicated hosted transfer case passes with strict outputs/cleanup; historical failure and independent original-view Copy5/Paste control remain distinct |
 | Copy to / Move to | Shell | Native registered selection providers and exact cascades; host fixed-destination helper remains separate | Full provider destinations/state, owned silent results/collisions |
 | Delete / permanent delete | Shell | Exact Windows.recycle/Windows.PermanentDelete selection providers own normal policy/confirmation/history; custom host confirmation is bypassed | Actual pending-to-completed provider state versus native menu for full owned arrays; no native deletion or user's Bin mutation |

@@ -161,9 +161,31 @@ struct RibbonCollectionReadback {
 // Fixed opt-in observations of actual native RecentItems callbacks. The arrays
 // contain only values decoded by the existing production path; no SAFEARRAY is
 // read or manufactured by diagnostics. No observer callback or provider ref.
-enum class RibbonRecentItemsReceiptKind { Source, NormalCommit, NormalPinned, RetiredCommit, Reset };
+// Fixed creator-STA observations only; none supplies a command/source/action.
+enum class RibbonShutdownPhase : UINT {
+    Unknown, FixtureCloseBegin, FixtureOwnerDestroyBegin, FixtureOwnerDestroyReturned,
+    NativeLowerBegin, NativeLowerReturned, AppDestroyMessage, AppNcDestroyMessage,
+    CleanupBegin, PreviewBegin, PreviewReturned, RibbonResetBegin, RibbonResetReturned,
+    BrowserCleanupBegin, BrowserCleanupReturned, ViewSiteClearBegin, ViewSiteClearReturned,
+    ShellViewReleaseBegin, ShellViewReleaseReturned, BrowserDestroyBegin, BrowserDestroyReturned,
+    BrowserReleaseBegin, BrowserReleaseReturned, CleanupReturned,
+    ViewRetainBegin, ViewRetainReturned, ViewRetainDenied, ViewLeaseReleaseBegin, ViewLeaseReleaseReturned,
+    NativeViewDestroyResetBegin, NativeViewDestroyResetReturned, FrameworkDestroyBegin, FrameworkDestroyReturned
+};
+struct RibbonShutdownPhaseContext {
+    std::uintptr_t app=0,window=0,ownedWindow=0,originalWindow=0,browser=0,view=0,folder=0;
+    std::uint64_t hookGeneration=0,closeEntry=0,displayRevision=0;
+    UINT64 generation=0;unsigned navigation=0;
+    bool originalFrame=false,nativeCallActive=false,forwarded=false,destroyForwarded=false;
+    bool transaction=false,capturing=false,pinDispatching=false,sourceRevoked=false,cleanupStarted=false;
+};
+enum class RibbonRecentItemsReceiptKind { Source, NormalCommit, NormalPinned, RetiredCommit, Reset, ShutdownPhase };
 struct RibbonRecentItemsReceipt {
     RibbonRecentItemsReceiptKind kind=RibbonRecentItemsReceiptKind::Source;
+    RibbonShutdownPhase phase=RibbonShutdownPhase::Unknown;
+    RibbonShutdownPhaseContext app;
+    std::uintptr_t nativeOwner=0,nativeWindow=0,nativeFramework=0,nativeView=0,phaseObject=0;
+    bool messageActive=false,batchDispatching=false,destroyStarted=false,retirementDeferred=false,viewLifetimeRejected=false;
     std::uint64_t entryEpoch=0,exitEpoch=0,entryRevision=0,exitRevision=0;
     UINT initialCount=0,decodedCount=0,callbackCount=0,requestedIndex=UI_COLLECTION_INVALIDINDEX;
     ULONGLONG entryTick=0,exitTick=0;
@@ -180,6 +202,7 @@ struct RibbonRecentItemsDiagnostics {
     std::array<RibbonRecentItemsReceipt,64> receipts{};
     UINT count=0;
     bool overflow=false;
+    DWORD creatorThread=0; // assigned only by the creator's explicit diagnostic opt-in
 };
 
 enum class RibbonLayout { Authored, InstalledWindows10 };
@@ -209,6 +232,7 @@ public:
     // owner-window destruction/close continuation. Never retires a newer Impl.
     void finishOwnerWindowRetirement() noexcept;
     bool closeDispatchActive() const noexcept; // fixed metadata, no native calls
+    bool closeViewLifetimeRejected() const noexcept; // sticky original-scope AddRef fence result
     // Retire only the original close framework. A genuine newer publication
     // on another owned host must survive the old App window's cleanup.
     void resetClosingFramework() noexcept;
@@ -219,6 +243,8 @@ public:
     // readback performs no native calls and never supplies source/pin values.
     HRESULT enableRecentItemsDiagnostics();
     void recentItemsDiagnostics(RibbonRecentItemsDiagnostics& output) const noexcept;
+    // Existing opt-in fixed storage only; copies plain owned state, never calls providers.
+    void observeShutdownPhase(RibbonShutdownPhase,const RibbonShutdownPhaseContext&) const noexcept;
     bool valid() const noexcept;
     UINT height() const noexcept;
     HRESULT invalidate(UINT command = 0);

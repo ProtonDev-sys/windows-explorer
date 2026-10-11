@@ -4,7 +4,8 @@ param(
     [string]$Configuration = 'Release',
     [string]$BuildDirectory = '',
     [int]$Parallel = [Environment]::ProcessorCount,
-    [switch]$AppSearchResidentStress
+    [switch]$AppSearchResidentStress,
+    [switch]$AppShutdownPinResolution
 )
 
 $ErrorActionPreference = 'Stop'
@@ -30,6 +31,9 @@ else {
 $additionalConfigureOptions = @()
 if ($AppSearchResidentStress) {
     $additionalConfigureOptions += '-DEXPLORER_ENABLE_SEARCH_BACKING_RESIDENT_STRESS_TESTS=ON'
+}
+if ($AppShutdownPinResolution) {
+    $additionalConfigureOptions += '-DEXPLORER_ENABLE_APP_SHUTDOWN_PIN_RESOLUTION_TESTS=ON'
 }
 & $cmakePath -S $projectRoot -B $BuildDirectory -G 'Visual Studio 17 2022' -A x64 -DBUILD_TESTING=ON @additionalConfigureOptions 2>&1 | Tee-Object -FilePath $buildLog -Append
 if ($LASTEXITCODE -ne 0) { throw "CMake configuration failed (exit $LASTEXITCODE). See $buildLog" }

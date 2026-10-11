@@ -1137,6 +1137,8 @@ struct ExplorerApp::OwnedCloseFrame {
     // Exact original saved-native call only; never a pin/source authority.
     WNDPROC nativeReceiver=nullptr;
     bool nativeDispatchActive=false,deferredCloseRequested=false;
+    bool hostPinDrainActive=false,classCloseDeferred=false;
+    WNDPROC pinDrainReceiver=nullptr; // original once receiver, no native dispatch authority
 };
 struct ExplorerApp::ShutdownPinTransaction {
     struct Row {IShellItem* item=nullptr;std::wstring label,description;bool pinned=false;};
@@ -1147,6 +1149,7 @@ struct ExplorerApp::ShutdownPinTransaction {
     UINT64 generation=0;
     unsigned navigation=0;
     IExplorerBrowser* originalBrowser=nullptr;
+    IUIFramework* originalFramework=nullptr; // borrowed from the retained original close scope
     IShellView* originalSite=nullptr;
     IFolderView2* originalFolder=nullptr;
     ComPtr<IExplorerBrowser> browser;
@@ -1155,6 +1158,11 @@ struct ExplorerApp::ShutdownPinTransaction {
     std::vector<BYTE> location;
     std::vector<Row> rows;
     std::vector<FrequentPlace> places;
+    struct BufferedPin {UINT index=UI_COLLECTION_INVALIDINDEX;bool pinned=false;};
+    std::array<BufferedPin,64> bufferedPins{};
+    UINT bufferedPinCount=0;
+    HRESULT bufferedPinAdmission=S_OK;
+    bool bufferedPinDrainStarted=false;
     bool capturing=true,dispatching=false,originalReset=false;
     mutable bool revoked=false;
     std::function<HRESULT(UINT,IShellItem*,IShellView*,bool,const ContextMenuEntry&)> resolved;
@@ -1166,7 +1174,7 @@ bool ExplorerApp::shutdownPinSourceCurrent(const ShutdownPinTransaction& transac
     DWORD process=0;
     if(shutdownPinTransaction_!=&transaction||!closing_||destroying_||navigating_||commandRefreshActive_||
        GetCurrentThreadId()!=transaction.thread||shutdownPinCloseEntry_!=transaction.closeEntry||
-       ribbon_.callbackEntryEpoch()!=transaction.ribbonEpoch||window_!=transaction.window||
+       ribbon_.callbackEntryEpoch()!=transaction.ribbonEpoch||ribbon_.closeViewLifetimeRejected()||window_!=transaction.window||
        !IsWindow(transaction.window)||GetWindowThreadProcessId(transaction.window,&process)!=transaction.thread||
        process!=GetCurrentProcessId()||browser_.Get()!=transaction.originalBrowser||
        view_.Get()!=transaction.originalSite||folderView_.Get()!=transaction.originalFolder||
@@ -1199,6 +1207,7 @@ bool ExplorerApp::captureShutdownPins(ShutdownPinTransaction& transaction) {
     transaction.closeEntry=shutdownPinCloseEntry_;transaction.ribbonEpoch=ribbon_.callbackEntryEpoch();
     transaction.displayRevision=displayedFrequentPlacesRevision_;transaction.generation=namespaceGeneration_;
     transaction.navigation=navigationCount_;transaction.originalBrowser=browser_.Get();
+    transaction.originalFramework=ribbon_.nativeFramework();
     transaction.originalSite=view_.Get();transaction.originalFolder=folderView_.Get();
     transaction.hookGeneration=ownedCloseFrame_?ownedCloseFrame_->generation:0;transaction.lower=ownedCloseNext_;
     // Plain immutable descriptors precede all provider AddRefs. The original
@@ -1243,6 +1252,55 @@ bool ExplorerApp::consumeOwnedCloseContinuation() noexcept {
     if(!ownedCloseContinuation()||ownedCloseFrame_->forwarded)return false;
     ownedCloseFrame_->forwarded=true;return true;
 }
+bool ExplorerApp::deferOwnedCloseContinuation() noexcept {
+    // Only the original class close under its actual saved native call is
+    // postponed. Direct destruction and foreign/later close chains are intact.
+    if(!ownedCloseContinuation()||ownedCloseFrame_->forwarded||
+       !ownedCloseFrame_->nativeDispatchActive||!shutdownPinTransaction_||
+       shutdownPinTransaction_->capturing||!ownedCloseAttached_||ownedCloseRetired_||
+       ownedCloseWindow_!=window_||GetCurrentThreadId()!=ownedCloseThread_||
+       ownedCloseFrame_->nativeReceiver!=ownedCloseNext_)return false;
+    ownedCloseFrame_->classCloseDeferred=true;return true;
+}
+HRESULT ExplorerApp::drainShutdownPins(ShutdownPinTransaction& transaction,OwnedCloseFrame& frame) noexcept {
+    // Copy values and consume the once queue before the first external call.
+    // No native callback argument, property-set, SAFEARRAY or new source is kept.
+    const auto pending=transaction.bufferedPins;
+    const auto count=transaction.bufferedPinCount;
+    transaction.bufferedPinCount=0;
+    if(transaction.bufferedPinDrainStarted)return E_ABORT;
+    transaction.bufferedPinDrainStarted=true;
+    if(FAILED(transaction.bufferedPinAdmission))return transaction.bufferedPinAdmission;
+    if(!count)return S_FALSE;
+    const auto bindingCurrent=[&]() noexcept {
+        DWORD process=0;
+        return shutdownPinTransaction_==&transaction&&ownedCloseFrame_==&frame&&frame.original&&
+            !frame.nativeDispatchActive&&frame.window==transaction.window&&window_==transaction.window&&
+            frame.generation==ownedCloseGeneration_&&GetCurrentThreadId()==transaction.thread&&
+            ribbon_.callbackEntryEpoch()==transaction.ribbonEpoch&&transaction.originalFramework&&
+            ribbon_.nativeFramework()==transaction.originalFramework&&!ribbon_.closeViewLifetimeRejected()&&
+            IsWindow(transaction.window)&&GetWindowThreadProcessId(transaction.window,&process)==transaction.thread&&
+            process==GetCurrentProcessId();
+    };
+    // Opaque native destruction before return grants no queued action authority.
+    if(!bindingCurrent()||!shutdownPinSourceCurrent(transaction))return E_ABORT;
+    struct Drain {
+        OwnedCloseFrame& frame;
+        explicit Drain(OwnedCloseFrame& value):frame(value){frame.hostPinDrainActive=true;}
+        ~Drain(){frame.hostPinDrainActive=false;}
+    } drain{frame};
+    HRESULT result=S_OK;
+    for(UINT index=0;index<count;++index) {
+        if(!bindingCurrent())break;
+        // The unchanged host gate admits only original live Shell identities.
+        // App-only revocation still returns its original E_ABORT receipt; a
+        // retired Ribbon epoch/binding stops the remaining queue altogether.
+        const auto hr=commitShutdownPin(transaction,pending[index].index,pending[index].pinned);
+        if(FAILED(hr)&&SUCCEEDED(result))result=hr;
+        if(!bindingCurrent())break;
+    }
+    return result;
+}
 void ExplorerApp::observeShutdownWindowMessage(UINT message,bool originalCloseMessage) noexcept {
     if(message!=WM_CLOSE&&message!=WM_DESTROY&&message!=WM_NCDESTROY)return;
     auto* transaction=shutdownPinTransaction_;
@@ -1255,6 +1313,27 @@ void ExplorerApp::observeShutdownWindowMessage(UINT message,bool originalCloseMe
         else transaction->revoked=true;
     }
     if(message==WM_DESTROY&&ownedCloseContinuation())ownedCloseFrame_->destroyForwarded=true;
+}
+void ExplorerApp::observeShutdownPhase(RibbonShutdownPhase phase) const noexcept {
+    if(!headless_||!headlessShutdownPhaseDiagnostics_)return;
+    RibbonShutdownPhaseContext facts;
+    facts.app=reinterpret_cast<std::uintptr_t>(this);facts.window=reinterpret_cast<std::uintptr_t>(window_);
+    facts.ownedWindow=reinterpret_cast<std::uintptr_t>(ownedCloseWindow_);
+    facts.browser=reinterpret_cast<std::uintptr_t>(browser_.Get());facts.view=reinterpret_cast<std::uintptr_t>(view_.Get());
+    facts.folder=reinterpret_cast<std::uintptr_t>(folderView_.Get());
+    facts.hookGeneration=ownedCloseGeneration_;facts.closeEntry=shutdownPinCloseEntry_;
+    facts.displayRevision=displayedFrequentPlacesRevision_;facts.generation=namespaceGeneration_;facts.navigation=navigationCount_;
+    facts.cleanupStarted=windowDestructionCleanupStarted_;
+    if(ownedCloseFrame_) {
+        facts.originalWindow=reinterpret_cast<std::uintptr_t>(ownedCloseFrame_->window);
+        facts.originalFrame=ownedCloseFrame_->original;facts.nativeCallActive=ownedCloseFrame_->nativeDispatchActive;
+        facts.forwarded=ownedCloseFrame_->forwarded;facts.destroyForwarded=ownedCloseFrame_->destroyForwarded;
+    }
+    if(shutdownPinTransaction_) {
+        facts.transaction=true;facts.capturing=shutdownPinTransaction_->capturing;
+        facts.pinDispatching=shutdownPinTransaction_->dispatching;facts.sourceRevoked=shutdownPinTransaction_->revoked;
+    }
+    ribbon_.observeShutdownPhase(phase,facts);
 }
 LRESULT ExplorerApp::dispatchOwnedClose(HWND window,WPARAM wparam,LPARAM lparam,WNDPROC next) noexcept {
     const bool fresh=!ownedCloseFrame_&&(!closing_||previewClosePending_||searchClosePending_);
@@ -1297,11 +1376,13 @@ LRESULT ExplorerApp::dispatchOwnedClose(HWND window,WPARAM wparam,LPARAM lparam,
         // The stack, creator, HWND generation and actual saved receiver all
         // match; a different owner or later close gets no such admission.
         auto* const original=frame.previous;
-        if(!frame.original&&original&&original->original&&original->nativeDispatchActive&&
-           original->window==window&&original->generation==frame.generation&&
-           ownedCloseFrame_==&frame&&ownedCloseWindow_==window&&
-           ownedCloseAttached_&&!ownedCloseRetired_&&ownedCloseNext_==next&&
-           original->nativeReceiver==next&&GetCurrentThreadId()==ownedCloseThread_) {
+        if(!frame.original&&original&&original->original&&
+            ((original->nativeDispatchActive&&original->nativeReceiver==next)||
+             (original->hostPinDrainActive&&original->pinDrainReceiver==next))&&
+            original->window==window&&original->generation==frame.generation&&
+            ownedCloseFrame_==&frame&&ownedCloseWindow_==window&&
+            ownedCloseAttached_&&!ownedCloseRetired_&&ownedCloseNext_==next&&
+            GetCurrentThreadId()==ownedCloseThread_) {
             original->deferredCloseRequested=true;
             if(headless_)++headlessShutdownDeferredCloseCalls_;
             return LRESULT{0};
@@ -1328,10 +1409,17 @@ LRESULT ExplorerApp::dispatchOwnedClose(HWND window,WPARAM wparam,LPARAM lparam,
                 OwnedCloseFrame& frame;bool armed;
                 ~NativeDispatch(){if(armed){frame.nativeDispatchActive=false;frame.nativeReceiver=nullptr;}}
             } nativeDispatch{frame,frame.original&&capturedCurrent};
-            if(nativeDispatch.armed){frame.nativeReceiver=next;frame.nativeDispatchActive=true;}
+            if(nativeDispatch.armed){frame.nativeReceiver=next;frame.pinDrainReceiver=next;frame.nativeDispatchActive=true;}
+            observeShutdownPhase(RibbonShutdownPhase::NativeLowerBegin);
             dispatched=true;result=CallWindowProcW(receiver?receiver:windowProc,window,WM_CLOSE,wparam,lparam);
         }
         if(headless_&&frame.original&&capturedCurrent)headlessShutdownNativeCloseReturned_=true;
+        observeShutdownPhase(RibbonShutdownPhase::NativeLowerReturned);
+        // The complete native continuation is gone. Resolve only its captured
+        // decoded actions while the original owner/site still exist, then let
+        // the existing once class-close gate complete ordinary destruction.
+        if(frame.original&&capturedCurrent&&shutdownPinTransaction_&&ownedCloseFrame_==&frame)
+            shutdownPinDrainStatus_=drainShutdownPins(*shutdownPinTransaction_,frame);
         // Coalescing the genuine request cannot renew this close's pins.
         // The existing once class/dead-window continuations below remain
         // responsible for the original owner, including its nested request.
@@ -1414,10 +1502,34 @@ LRESULT ExplorerApp::dispatchOwnedClose(HWND window,WPARAM wparam,LPARAM lparam,
         return result;
     }
 }
-HRESULT ExplorerApp::commitShutdownPin(ShutdownPinTransaction& transaction,UINT index,bool pinned) {
+HRESULT ExplorerApp::commitShutdownPin(ShutdownPinTransaction& transaction,UINT index,bool pinned) noexcept {
+    if(ownedCloseFrame_&&ownedCloseFrame_->original&&ownedCloseFrame_->nativeDispatchActive&&
+       shutdownPinTransaction_==&transaction) {
+        const auto reject=[&](HRESULT error) noexcept {
+            transaction.bufferedPinAdmission=error;transaction.bufferedPinCount=0;
+            transaction.revoked=true;return error;
+        };
+        if(FAILED(transaction.bufferedPinAdmission))return transaction.bufferedPinAdmission;
+        if(transaction.bufferedPinDrainStarted||transaction.capturing||transaction.dispatching||
+           !shutdownPinSourceCurrent(transaction)||!transaction.originalFramework||
+           ribbon_.nativeFramework()!=transaction.originalFramework)return reject(E_ABORT);
+        if(index>=transaction.places.size()||transaction.bufferedPinCount>=transaction.bufferedPins.size())
+            return reject(E_INVALIDARG);
+        for(UINT row=0;row<transaction.bufferedPinCount;++row)
+            if(transaction.bufferedPins[row].index==index)return reject(E_INVALIDARG);
+        transaction.bufferedPins[transaction.bufferedPinCount++]={index,pinned};
+        ++shutdownPinNativeAdmissions_;
+        // This is actual native admission, not a completed Shell/profile action.
+        // Its S_OK remains in the real native receipt; host results follow later.
+        return S_OK;
+    }
     HeadlessShutdownPinResult diagnostic;diagnostic.index=index;diagnostic.pinned=pinned;
+    diagnostic.queuedNativeAction=ownedCloseFrame_&&ownedCloseFrame_->hostPinDrainActive;
     if(headless_)diagnostic.entry=headlessShutdownPinFacts();
-    const auto hr=pinShutdownFrequentPlace(transaction,index,pinned);
+    HRESULT hr=E_FAIL;
+    try{hr=pinShutdownFrequentPlace(transaction,index,pinned);}
+    catch(const std::bad_alloc&){transaction.revoked=true;hr=E_OUTOFMEMORY;}
+    catch(...){transaction.revoked=true;hr=E_FAIL;}
     if(headless_) {
         diagnostic.result=hr;diagnostic.returned=headlessShutdownPinFacts();
         if(headlessShutdownPinResultCount_<headlessShutdownPinResults_.size())
@@ -1449,6 +1561,9 @@ ExplorerApp::HeadlessShutdownPinFacts ExplorerApp::headlessShutdownPinFacts() co
     facts.sourceRevoked=shutdownPinTransaction_&&shutdownPinTransaction_->revoked;
     facts.capturing=shutdownPinTransaction_&&shutdownPinTransaction_->capturing;
     facts.nativeCloseScope=ribbon_.closeDispatchActive();
+    facts.nativeCallActive=ownedCloseFrame_&&ownedCloseFrame_->nativeDispatchActive;
+    facts.hostPinDrainActive=ownedCloseFrame_&&ownedCloseFrame_->hostPinDrainActive;
+    facts.classCloseDeferred=ownedCloseFrame_&&ownedCloseFrame_->classCloseDeferred;
     facts.displayRevision=displayedFrequentPlacesRevision_;facts.generation=namespaceGeneration_;
     facts.navigation=navigationCount_;facts.displayedCount=static_cast<UINT>(displayedFrequentPlaces_.size());
     facts.closing=closing_;facts.destroying=destroying_;facts.navigating=navigating_;facts.commandRefresh=commandRefreshActive_;

@@ -3,6 +3,7 @@
 #include "explorer/headless_visual.hpp"
 #include "explorer/worker_sta.hpp"
 #include "../src/parent_attribute_snapshot.hpp"
+#include "actual_native_view_enumeration.hpp"
 
 #include <shlobj.h>
 #include <objbase.h>
@@ -419,10 +420,14 @@ void exactTargetRegistrationReuseAndReentry() {
 class BackgroundNavigationEvents final : public Microsoft::WRL::RuntimeClass<
     Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::ClassicCom>,IExplorerBrowserEvents> {
 public:
-    bool complete=false;
+    bool complete=false,observeEnumeration=false;
     HRESULT status=E_PENDING;
+    native_view_fixture::ActualEnumeration enumeration;
     HRESULT STDMETHODCALLTYPE OnNavigationPending(PCIDLIST_ABSOLUTE) override{return S_OK;}
-    HRESULT STDMETHODCALLTYPE OnViewCreated(IShellView*) override{return S_OK;}
+    HRESULT STDMETHODCALLTYPE OnViewCreated(IShellView* originalView) override {
+        if(observeEnumeration)enumeration.attach(originalView);
+        return S_OK; // Preserve navigation; actual attachment failure rejects readiness.
+    }
     HRESULT STDMETHODCALLTYPE OnNavigationComplete(PCIDLIST_ABSOLUTE) override{complete=true;status=S_OK;return S_OK;}
     HRESULT STDMETHODCALLTYPE OnNavigationFailed(PCIDLIST_ABSOLUTE) override{complete=true;status=E_FAIL;return S_OK;}
 };
@@ -609,6 +614,7 @@ struct NativeBackgroundView {
         RECT bounds{0,0,800,600};FOLDERSETTINGS settings{FVM_DETAILS,0};
         succeeded(browser->Initialize(owner,&bounds,&settings),"Initialize native background browser without displaying it");
         events=Microsoft::WRL::Make<BackgroundNavigationEvents>();require(events!=nullptr,"Create native background navigation observer");
+        events->observeEnumeration=!ownedPaths.empty();
         succeeded(browser->Advise(events.Get(),&cookie),"Observe native background navigation completion");
         if(!ownedPaths.empty()) {
             require(target!=nullptr&&ownedPaths.size()<=64,"Owned native membership readiness requires a bounded exact target");expectedFolder=folder;
@@ -635,6 +641,8 @@ struct NativeBackgroundView {
         succeeded(browser->GetCurrentView(IID_PPV_ARGS(&view)),"Read actual native background view site");
         require(!IsWindowVisible(owner),"Native background browser displayed its owner");
         if(!expectedMembers.empty()) {
+            events->enumeration.emit("NativeBackground","navigation-complete");
+            require(events->enumeration.attachmentStatus()==S_OK,"Original native background EnumDone attachment failed");
             ComPtr<IFolderView2> folderView;succeeded(view.As(&folderView),"Read original native membership readiness view");
             unsigned observations=0;int lastCount=-2;HRESULT lastStatus=E_PENDING;
             std::array<bool,10> rejectionLogged{};
@@ -687,6 +695,8 @@ struct NativeBackgroundView {
                 } catch(...) {std::cout<<"NativeBackground readinessReject diagnosticException=1\n"<<std::flush;}
             };
             const auto ready=[&] {
+                if(!events->enumeration.completed(view.Get()))return false;
+                const auto enumeration=events->enumeration.completedCount();
                 if(GetTickCount64()>=deadline){reject(0,"deadline",-1,E_PENDING,false);return false;}
                 require(sourceCurrent(folderView.Get()),"Owned native membership lost its private source/view");
                 int count=-1;const auto status=folderView->ItemCount(SVGIO_ALLVIEW,&count);++observations;
@@ -812,12 +822,15 @@ struct NativeBackgroundView {
                     }
                     matched[memberIndex]=true;targetAvailable=targetAvailable||ILIsEqual(child.get(),ILFindLastID(targetId.get()));
                 }
-                const bool result=targetAvailable&&sourceCurrent(folderView.Get())&&GetTickCount64()<deadline;
+                const bool result=targetAvailable&&sourceCurrent(folderView.Get())&&
+                    events->enumeration.completed(view.Get())&&enumeration==events->enumeration.completedCount()&&
+                    GetTickCount64()<deadline;
                 if(!result)reject(targetAvailable?9:8,targetAvailable?"final-source-or-deadline":"target-child-byte-identity",-1,E_PENDING,targetAvailable);
                 return result;
             };
             const auto now=GetTickCount64();const auto remaining=now<deadline?static_cast<DWORD>(deadline-now):0;
             const bool membershipReady=remaining&&pumpPrivateNamespaceUntil(ready,remaining);
+            events->enumeration.emit("NativeBackground","before-original-selection");
             if(!membershipReady)selectionDiagnostic("initialization-not-ready");
             require(membershipReady,"Original native owned membership/target did not become ready within initialization budget");
             std::cout<<"NativeBackground readiness completeOwnedFileIDs="<<expectedMembers.size()<<" targetChildAvailable=1 observations="<<observations<<'\n'<<std::flush;
@@ -829,6 +842,7 @@ struct NativeBackgroundView {
         // Keep the native view/HWND alive through exact canceled-worker exit;
         // failed draining must stop this private process before teardown.
         drainNamespaceWorkers("native browser/view drain before teardown");
+        if(events){events->observeEnumeration=false;events->enumeration.detachOrTerminate();}
         view.Reset();
         if(browser){if(cookie)browser->Unadvise(cookie);browser->Destroy();browser.Reset();}
         events.Reset();if(owner)DestroyWindow(owner);
@@ -2425,6 +2439,7 @@ void asyncNativeKindAndOriginalView() {
     const auto kindBoundary=[&](const char* phase,explorer::NamespaceCommandStateTask* observedTask=nullptr,bool useCapturedSelection=false,
             HRESULT capturedSelectionStatus=E_PENDING,IShellItemArray* capturedSelection=nullptr) {
         if(!kindBoundaryEnabled)return;
+        host.events->enumeration.emit("NativeKind",phase);
         const auto diagnosticStarted=GetTickCount64(),diagnosticDeadline=diagnosticStarted+1000;
         const bool boundarySourceBefore=host.sourceCurrent(view.Get());
         const auto mayRead=[&]{return boundarySourceBefore&&GetTickCount64()<diagnosticDeadline;};

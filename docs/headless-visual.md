@@ -1,6 +1,59 @@
 # Native headless visual verification
 
-The latest complete installed-layout run is v134 on October 6, 2026, at
+The latest focused modern-layout run is v165 at
+`artifacts/visual/run-20261006-213441-6cef092df24743bd84209b007dfbd7c6`.
+All three genuine installed-layout private-desktop captures pass at actual 96 DPI
+on Windows 10 build 19045.6466 with Light requested. All three strict chrome
+comparisons fail the unchanged 0.98 pixel-agreement threshold:
+
+| Scene | Pixel agreement | Mean RGB error | Edge F1 | Chrome result |
+| --- | --- | --- | --- | --- |
+| Modern Home | 0.9757761012067777 | 0.9994404886006915 | 0.982903006396381 | Fail |
+| Modern Share | 0.9746406842430121 | 1.0180642506539694 | 0.9830312119437131 | Fail |
+| Modern View | 0.9746089961737168 | 1.0137769705946313 | 0.9830396830446826 | Fail |
+
+Each separate address-dropdown and Refresh region has pixel agreement 1.0.
+The tested experiment uses the native collapse control and one accepted public
+Light-highlight property request; captures are actual painting, without an image
+overlay. The original theme targets pass on that experiment in v165 in
+2.45 seconds. Public property
+acceptance and those scoped theme controls do not establish Explorer-host palette
+parity or a complete screenshot-suite pass. Private namespace source captures
+remain unpublishable. The v165b build records 151 unchanged source files and
+executable SHA-256
+`92be03bfbfdd1ccf0ec4ab7147a45ca73bfc1555c0175515ba07726e51854d01`;
+reference manifest is
+`1feb046c0671b0cc3955414366dc46554425edec763390cfc474847afaeda7b4`,
+and the unchanged comparator is
+`51a9a5840ce7dc563f80527e1fd7a8571f2a18752911ed5e035dc49a1e20876b`.
+The RGB/edge limits, channel tolerance and masks remain unchanged. Twelve comparator
+unit tests pass; they do not turn failed native comparisons into acceptance.
+
+The latest complete installed-layout run is experimental v165 at
+`artifacts/visual/run-20261006-213632-3f56bd0da33e441ba437ac45b3d2e698`.
+All nineteen native captures pass. Four strict comparisons pass (Picture,
+Application, Music, Video), twelve fail (Home, Share, View, Computer, Network,
+Drive, Compressed, Search, Recycle and all three modern scenes), and DiskImage,
+Library and Shortcut retain their source restrictions. No crash dump is
+produced with crash diagnostics enabled. This full run has the same experimental
+EXE, reference manifest, comparator and modern-scene metrics listed above.
+The ineffective Light-highlight production experiment was later reverted:
+native public acceptance changes zero File-interior pixels. The full/focused
+v165 images and theme passes are evidence of the tested experiment, not a pass
+for the later restored theme source. No thresholds or masks were relaxed.
+
+A fresh focused Search comparison after Theme rollback passes in v167 at
+`artifacts/visual/run-20261006-214221-54f1ea813c8d4968b58796594f926ec9`.
+Native capture passes at actual 96 DPI. Pixel agreement is
+0.9824210375875375, mean RGB error 0.9870261858256714 and edge F1
+0.9888858613893967 against the unchanged limits. Actual executable SHA-256 is
+`fd7ccf423efe02f10fe83af1ff89f7706ff278a0b737685893b4928152dadda1`;
+reference manifest and comparator match the v165 run. This restored-source
+scoped pass does not erase the experimental full-v165 Search failure or imply
+a complete suite pass. A later one-row caret change is now adopted but remains
+without native verification; this earlier capture cannot validate it.
+
+The previous complete installed-layout run is v134 on October 6, 2026, at
 `artifacts/visual/run-20261006-091029-e05919ac9d8a4d03bc6de9668456ddb8`.
 Eighteen native captures pass at actual 96 DPI. Six strict comparisons pass
 (Home, View, Picture, Application, Music and Video), nine fail, and DiskImage,
@@ -24,18 +77,24 @@ The v140 native image probe records 184 exact comparable first-current images
 and zero differences. Its added association/restoration scenario fails and
 then crashes during COM teardown. Four visibly mismatching commands have
 genuine null first images and use fallback resources, so those differences are
-outside the 184-image result. Whole-application visual parity remains unproved.
+outside the 184-image result. The later default v155 image target passes all 184
+comparisons and production apartment teardown. The v160 Auto/Light read-only oracle
+matches three actual CommandStore fallback specifications at both sizes using raw
+top-down four-byte bitmap storage, including separate/combined native extraction.
+That is exact fallback provenance, not proof of stock Explorer-host artwork for
+the four genuinely missing first images. Whole-application parity remains unproved.
 
 The current reference audit finds no embedded ICC profile in the pinned Tech
 JPEGs or PC Assist/Microsoft Press PNGs. Untagged web images use sRGB; inventing
 an AdobeRGB transform is unsupported. [W3C color contract](https://www.w3.org/TR/css-color-4/#untagged).
 Computer and Compressed references have the same blue File interior as the
 native framework. Tech's teal File interior has unrecorded build/accent
-provenance. The current full-frame crop includes one row of desktop wallpaper
-below the visible frame: all 856 pixels differ. The source-only v134 audit
-records the exact boundary and remaining color/status residuals. That is a
-comparison-protocol defect requiring a reviewed bounds correction; the current
-results remain failures. Its Share screenshot has one selected
+provenance. The historical v134 full-frame crop included one row of desktop
+wallpaper below the visible frame: all 856 pixels differed. The subsequent
+reviewed crop uses the actual 512-row window bound; v143 and v165 still fail the
+strict modern chrome comparison. The old negative result and source audit remain
+retained; the corrected bound does not alter comparison thresholds or masks.
+Its Share screenshot has one selected
 item/62 bytes, whereas the existing Quick Access control has no selection;
 that state mismatch cannot prove a command-eligibility defect. The command band
 and dynamic count are already masked, so it does not explain the remaining

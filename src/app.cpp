@@ -671,11 +671,14 @@ void ExplorerApp::finishWindowDestruction() {
     // Reserve once before providers/workers can pump nested cleanup.
     if(windowDestructionCleanupStarted_)return;
     windowDestructionCleanupStarted_=true;
+    observeShutdownPhase(RibbonShutdownPhase::CleanupBegin);
     cancelLiveSearch();
     if(window_)RemoveClipboardFormatListener(window_);cancelCommandStates();
     closing_=true;if(window_)KillTimer(window_,1);cancelFrequentPlaces();
     if(breadcrumbTask_) {breadcrumbTask_->cancel();breadcrumbTask_.reset();}
+    observeShutdownPhase(RibbonShutdownPhase::PreviewBegin);
     shutdownStatus_=shutdownPreview();
+    observeShutdownPhase(RibbonShutdownPhase::PreviewReturned);
     if(SUCCEEDED(shutdownStatus_)) {
         DWORD remaining=5000;
         if(searchBackings_) {
@@ -687,7 +690,11 @@ void ExplorerApp::finishWindowDestruction() {
     if(SUCCEEDED(shutdownStatus_)) {
         // The native frequent-place pin callback can arrive on Destroy.
         // Keep its original Shell view site alive until that callback ends.
-        forgetRibbonTheme(ribbon_.framework());resetRibbonForClose();destroyBrowser();
+        forgetRibbonTheme(ribbon_.framework());
+        observeShutdownPhase(RibbonShutdownPhase::RibbonResetBegin);resetRibbonForClose();
+        observeShutdownPhase(RibbonShutdownPhase::RibbonResetReturned);
+        observeShutdownPhase(RibbonShutdownPhase::BrowserCleanupBegin);destroyBrowser();
+        observeShutdownPhase(RibbonShutdownPhase::BrowserCleanupReturned);
         if(searchBackings_&&SUCCEEDED(shutdownStatus_))shutdownStatus_=closeSearchBackings();
     }
 #if defined(EXPLORER_HOSTED_PIN_PERSISTENCE_FIXTURE)
@@ -704,6 +711,7 @@ void ExplorerApp::finishWindowDestruction() {
 #else
     if (!headless_) PostQuitMessage(0);
 #endif
+    observeShutdownPhase(RibbonShutdownPhase::CleanupReturned);
 }
 
 void ExplorerApp::reconcileMissingWindowDestruction() {
@@ -750,17 +758,23 @@ void ExplorerApp::destroyBrowser() {
     newItemTypes_.reset();ribbonCommandChildren_.clear();ribbonCommandPaths_.clear();cancelFrequentPlaces();
     if(window_)KillTimer(window_,3);navigationExpansion_.clear();navigationTree_.Reset();
     if (breadcrumbDrop_) { breadcrumbDrop_->revokeWindow(); breadcrumbDrop_.Reset(); }
-    if(view_) {ComPtr<IObjectWithSite> site;if(SUCCEEDED(view_.As(&site)))site->SetSite(nullptr);}
     sortPropertyValid_ = groupPropertyValid_ = false; orderStateView_ = nullptr;
+    observeShutdownPhase(RibbonShutdownPhase::ShellViewReleaseBegin);
     folderView_.Reset(); view_.Reset();
+    observeShutdownPhase(RibbonShutdownPhase::ShellViewReleaseReturned);
     if (browser_) {
         ComPtr<IFolderFilterSite> filterSite;
         if (SUCCEEDED(browser_.As(&filterSite))) filterSite->SetFilter(nullptr);
         if (adviseCookie_) { browser_->Unadvise(adviseCookie_); adviseCookie_ = 0; }
         ComPtr<IObjectWithSite> site;
         if (SUCCEEDED(browser_.As(&site))) site->SetSite(nullptr);
-        if (browserInitialized_) { browser_->Destroy(); browserInitialized_ = false; }
-        browser_.Reset();
+        if (browserInitialized_) {
+            observeShutdownPhase(RibbonShutdownPhase::BrowserDestroyBegin);
+            browser_->Destroy(); browserInitialized_ = false;
+            observeShutdownPhase(RibbonShutdownPhase::BrowserDestroyReturned);
+        }
+        observeShutdownPhase(RibbonShutdownPhase::BrowserReleaseBegin);browser_.Reset();
+        observeShutdownPhase(RibbonShutdownPhase::BrowserReleaseReturned);
     }
 }
 HRESULT ExplorerApp::recreateBrowser(UINT toggleCommand) {
@@ -3637,6 +3651,11 @@ LRESULT CALLBACK ExplorerApp::editProc(HWND window, UINT message, WPARAM wparam,
     return DefSubclassProc(window, message, wparam, lparam);
 }
 LRESULT ExplorerApp::onMessage(UINT message, WPARAM wparam, LPARAM lparam) {
+    if(message==WM_DESTROY)observeShutdownPhase(RibbonShutdownPhase::AppDestroyMessage);
+    if(message==WM_NCDESTROY)observeShutdownPhase(RibbonShutdownPhase::AppNcDestroyMessage);
+    // Finish the exact saved native message before a host pin action or the
+    // class close can destroy its owner. Do not consume/renew that close here.
+    if(message==WM_CLOSE&&deferOwnedCloseContinuation())return 0;
     const bool originalCloseMessage=message==WM_CLOSE&&consumeOwnedCloseContinuation();
     observeShutdownWindowMessage(message,originalCloseMessage);
     // Message handlers may retain a native search view across provider calls.

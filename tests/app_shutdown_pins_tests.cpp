@@ -134,7 +134,61 @@ struct ShutdownPinsNativeFixture {
             <<",view="<<facts.view<<",folder="<<facts.folder<<",location="<<facts.location<<",transaction="<<facts.transaction
             <<",hookGeneration="<<facts.hookGeneration<<",ownedCloseEntryTick="<<facts.ownedCloseEntryTick
             <<",hookAttached="<<facts.hookAttached<<",hookTop="<<facts.hookTop<<",closeFrame="<<facts.closeFrame
-            <<",originalClose="<<facts.originalClose<<",originalReset="<<facts.originalReset<<",sourceRevoked="<<facts.sourceRevoked<<"}";
+            <<",originalClose="<<facts.originalClose<<",originalReset="<<facts.originalReset<<",sourceRevoked="<<facts.sourceRevoked
+            <<",nativeCloseScope="<<facts.nativeCloseScope<<",nativeCallActive="<<facts.nativeCallActive
+            <<",hostPinDrainActive="<<facts.hostPinDrainActive<<",classCloseDeferred="<<facts.classCloseDeferred<<"}";
+    }
+    // Fixed receipts only: no source/provider getter is inserted into this
+    // boundary. A native S_OK admits decoded values; actual host results follow.
+    static void verifyQueuedNativeBoundary(ExplorerApp& app,HWND window,DWORD thread,IUIFramework* framework,
+        IShellView* view,IFolderView2* folder,UINT64 generation,unsigned navigation) {
+        const auto facts=app.headlessShutdownPinFacts();
+        require(GetCurrentThreadId()==thread&&app.headlessShutdownNativeCloseEntered_&&
+            app.headlessShutdownNativeCloseReturned_&&!facts.nativeCallActive&&facts.hostPinDrainActive&&
+            facts.nativeCloseScope&&facts.originalClose,
+            "Queued host resolution entered before the complete original native lower returned");
+        RibbonRecentItemsDiagnostics native;app.ribbon_.recentItemsDiagnostics(native);
+        require(!native.overflow&&native.creatorThread==thread&&native.count<=native.receipts.size(),
+            "Queued original native ordering receipts are incomplete");
+        const auto originalApp=reinterpret_cast<std::uintptr_t>(&app);
+        const auto originalWindow=reinterpret_cast<std::uintptr_t>(window);
+        const auto originalFramework=reinterpret_cast<std::uintptr_t>(framework);
+        UINT begin=UI_COLLECTION_INVALIDINDEX,returned=UI_COLLECTION_INVALIDINDEX;
+        for(UINT index=0;index<native.count;++index) {
+            const auto& receipt=native.receipts[index];
+            if(receipt.kind!=RibbonRecentItemsReceiptKind::ShutdownPhase||
+                receipt.app.app!=originalApp||receipt.app.originalWindow!=originalWindow)continue;
+            if(receipt.phase==RibbonShutdownPhase::NativeLowerBegin) {
+                require(begin==UI_COLLECTION_INVALIDINDEX&&receipt.app.nativeCallActive,
+                    "Queued source did not retain one actual original native lower entry");
+                begin=index;
+            } else if(receipt.phase==RibbonShutdownPhase::NativeLowerReturned) {
+                require(begin!=UI_COLLECTION_INVALIDINDEX&&begin<index&&returned==UI_COLLECTION_INVALIDINDEX&&
+                    !receipt.app.nativeCallActive&&receipt.app.originalFrame&&receipt.app.window==originalWindow&&
+                    receipt.nativeWindow==originalWindow&&receipt.nativeFramework==originalFramework&&
+                    receipt.app.view==reinterpret_cast<std::uintptr_t>(view)&&
+                    receipt.app.folder==reinterpret_cast<std::uintptr_t>(folder)&&
+                    receipt.app.generation==generation&&receipt.app.navigation==navigation&&!receipt.app.cleanupStarted,
+                    "Queued source lost its completed native lower, original view or generation");
+                returned=index;
+            }
+        }
+        require(begin!=UI_COLLECTION_INVALIDINDEX&&returned!=UI_COLLECTION_INVALIDINDEX&&begin<returned,
+            "Queued host resolution has no earlier ordinal NativeLowerReturned receipt");
+        for(UINT index=0;index<returned;++index) {
+            const auto& receipt=native.receipts[index];
+            if(receipt.kind!=RibbonRecentItemsReceiptKind::ShutdownPhase)continue;
+            if(receipt.app.app==originalApp)
+                require(!receipt.app.cleanupStarted&&receipt.phase!=RibbonShutdownPhase::AppDestroyMessage&&
+                    receipt.phase!=RibbonShutdownPhase::AppNcDestroyMessage&&
+                    receipt.phase!=RibbonShutdownPhase::FixtureOwnerDestroyBegin,
+                    "Original owner cleanup began before queued native lower return");
+            if(receipt.nativeFramework==originalFramework)
+                // Native view-destroy notifications alone do not establish
+                // actual owner death or an explicit Framework::Destroy call.
+                require(receipt.phase!=RibbonShutdownPhase::FrameworkDestroyBegin,
+                    "Original native framework retired before queued native lower return");
+        }
     }
     struct PinStageSnapshot {
         const char* label=nullptr;
@@ -201,9 +255,15 @@ struct ShutdownPinsNativeFixture {
             <<" cleanupCompleted="<<app.headlessShutdownMissingWindowCleanupCompleted_<<"\n";
         std::cout<<"DIAGNOSTIC app callbacks="<<app.headlessShutdownPinResultCount_
             <<" overflow="<<app.headlessShutdownPinResultOverflow_<<"\n";
+        std::cout<<"DIAGNOSTIC native action admissions="<<app.shutdownPinNativeAdmissions_
+            <<" hostResults="<<app.headlessShutdownPinResultCount_
+            <<" hostDrainHR=0x"<<std::hex<<static_cast<unsigned long>(app.shutdownPinDrainStatus_)<<std::dec
+            <<" origin="<<(app.shutdownPinNativeAdmissions_?"native-WM_CLOSE-queued":"nonqueued-or-Framework-Destroy")
+            <<"\n";
         for(UINT index=0;index<std::min<UINT>(app.headlessShutdownPinResultCount_,static_cast<UINT>(app.headlessShutdownPinResults_.size()));++index) {
             const auto& result=app.headlessShutdownPinResults_[index];
-            std::cout<<"DIAGNOSTIC app row="<<result.index<<" pinned="<<result.pinned<<" hr=0x"<<std::hex
+            std::cout<<"DIAGNOSTIC app row="<<result.index<<" pinned="<<result.pinned
+                <<" queuedNativeAction="<<result.queuedNativeAction<<" hr=0x"<<std::hex
                 <<static_cast<unsigned long>(result.result)<<std::dec<<" ";
             printFacts("entry",result.entry);std::cout<<" ";printFacts("postReleaseReturn",result.returned);std::cout<<"\n";
         }
@@ -211,6 +271,24 @@ struct ShutdownPinsNativeFixture {
         std::cout<<"DIAGNOSTIC native receipts="<<native.count<<" overflow="<<native.overflow<<"\n";
         for(UINT index=0;index<std::min<UINT>(native.count,static_cast<UINT>(native.receipts.size()));++index) {
             const auto& receipt=native.receipts[index];
+            if(receipt.kind==RibbonRecentItemsReceiptKind::ShutdownPhase) {
+                std::cout<<"DIAGNOSTIC native shutdownPhase #"<<index<<" phase="<<static_cast<UINT>(receipt.phase)
+                    <<" tick="<<receipt.entryTick<<" epoch="<<receipt.entryEpoch<<" revision="<<receipt.entryRevision
+                    <<" nativeOwner="<<receipt.nativeOwner<<" nativeWindow="<<receipt.nativeWindow
+                    <<" framework="<<receipt.nativeFramework<<" nativeView="<<receipt.nativeView<<" object="<<receipt.phaseObject
+                    <<" active="<<receipt.messageActive<<" batch="<<receipt.batchDispatching<<" retired="<<receipt.retired
+                    <<" destroyed="<<receipt.windowDestroyed<<" destroyStarted="<<receipt.destroyStarted<<" deferred="<<receipt.retirementDeferred
+                    <<" viewLifetimeRejected="<<receipt.viewLifetimeRejected
+                    <<" app="<<receipt.app.app<<" window="<<receipt.app.window<<" originalWindow="<<receipt.app.originalWindow
+                    <<" ownedWindow="<<receipt.app.ownedWindow<<" hookGeneration="<<receipt.app.hookGeneration
+                    <<" closeEntry="<<receipt.app.closeEntry<<" originalFrame="<<receipt.app.originalFrame
+                    <<" nativeCallActive="<<receipt.app.nativeCallActive<<" forwarded="<<receipt.app.forwarded
+                    <<" destroyForwarded="<<receipt.app.destroyForwarded<<" browser="<<receipt.app.browser
+                    <<" view="<<receipt.app.view<<" folder="<<receipt.app.folder<<" cleanupStarted="<<receipt.app.cleanupStarted
+                    <<" transaction="<<receipt.app.transaction<<" capturing="<<receipt.app.capturing
+                    <<" pinDispatching="<<receipt.app.pinDispatching<<" sourceRevoked="<<receipt.app.sourceRevoked<<"\n";
+                continue;
+            }
             const auto kind=receipt.kind==RibbonRecentItemsReceiptKind::Source?"source":
                 receipt.kind==RibbonRecentItemsReceiptKind::NormalCommit?"normalCommit":
                 receipt.kind==RibbonRecentItemsReceiptKind::NormalPinned?"normalPinned":
@@ -250,6 +328,7 @@ struct ShutdownPinsNativeFixture {
         if(layout==RibbonLayout::InstalledWindows10)
             require(app->ribbon_.installedLayoutStatus()==S_OK,"Requested installed native Ribbon failed");
         succeeded(app->ribbon_.enableRecentItemsDiagnostics(),"Enable fixed actual native RecentItems receipts");
+        app->headlessShutdownPhaseDiagnostics_=true;
         app->cancelFrequentPlaces();
         app->frequentPlaces_={{folders.items[0],L"Owned Recent One",folders.paths[0].native(),false},
                               {folders.items[1],L"Owned Recent Two",folders.paths[1].native(),false}};
@@ -270,12 +349,17 @@ struct ShutdownPinsNativeFixture {
             require(replacement.handle!=nullptr,"Create separate owned replacement framework host");
         }
         std::vector<UINT> resolvedIndices;
-        unsigned reentries=0;
+        unsigned reentries=0,queuedBoundaryProofs=0;
         std::exception_ptr sinkFailure;
         if(optIn)app->headlessShutdownPinResolved_=[&](UINT index,IShellItem* item,IShellView* site,
             bool pinned,const ContextMenuEntry& entry)->HRESULT {
             try {
             require(app->closing_&&app->shutdownPinTransaction_,"Resolution bypassed actual App shutdown gate");
+            if(app->shutdownPinNativeAdmissions_) {
+                verifyQueuedNativeBoundary(*app.Get(),originalWindow,originalThread,originalFramework,
+                    originalView.Get(),originalFolder.Get(),generation,navigation);
+                ++queuedBoundaryProofs;
+            }
             require(GetCurrentThreadId()==originalThread&&app->window_==originalWindow&&IsWindow(originalWindow),
                 "Original creator STA/HWND did not survive native Destroy resolution");
             require(app->view_.Get()==originalView.Get()&&app->folderView_.Get()==originalFolder.Get()&&
@@ -313,8 +397,10 @@ struct ShutdownPinsNativeFixture {
                 }
                 case Reentry::Close: SendMessageW(originalWindow,WM_CLOSE,0,0);break;
                 case Reentry::DestroyOwner:
+                    app->observeShutdownPhase(RibbonShutdownPhase::FixtureOwnerDestroyBegin);
                     require(DestroyWindow(originalWindow)!=FALSE,"Actual nested owner DestroyWindow was refused");
-                    require(!IsWindow(originalWindow)&&!app->window_,"Actual nested owner destruction did not reach native NCDESTROY");break;
+                    require(!IsWindow(originalWindow)&&!app->window_,"Actual nested owner destruction did not reach native NCDESTROY");
+                    app->observeShutdownPhase(RibbonShutdownPhase::FixtureOwnerDestroyReturned);break;
                 case Reentry::ReplaceDisplayedIdentity:
                     // Deliberately replace only the old native index with a real
                     // third Shell item. The actual old pin array must not follow.
@@ -359,6 +445,8 @@ struct ShutdownPinsNativeFixture {
         // Real window destruction causes the framework's actual final batch.
         const auto preClose=app->headlessShutdownPinFacts();
         stages[3]=snapshot("before-real-WM_CLOSE",*app.Get());app->headlessNormalPinPhase_=5;
+        std::cerr<<"BEGIN actual App pin close enum="<<static_cast<UINT>(reentry)<<" case="<<label<<"\n"<<std::flush;
+        app->observeShutdownPhase(RibbonShutdownPhase::FixtureCloseBegin);
         SendMessageW(originalWindow,WM_CLOSE,0,0);
         checkOwnedPinDeadline();
         printTiming(stages,*app.Get());
@@ -384,6 +472,53 @@ struct ShutdownPinsNativeFixture {
                 app->headlessShutdownPinResults_[index].result==expectedResult,
                 "Actual final production callback did not accept/deny/revoke after native binding release");
             if(app->headlessShutdownPinResults_[index].result==S_OK)++productionAccepted;
+        }
+        if(app->shutdownPinNativeAdmissions_) {
+            // This is the measured original WM_CLOSE queue route. Direct native
+            // Framework::Destroy callbacks remain separately labeled evidence.
+            const auto nativeChanges=bothRows?2u:1u;
+            require((presses&1u)!=0&&app->shutdownPinNativeAdmissions_==nativeChanges&&
+                app->headlessShutdownOriginalLowerCalls_==1&&app->headlessShutdownNativeCloseEntered_&&
+                app->headlessShutdownNativeCloseReturned_&&queuedBoundaryProofs==resolvedIndices.size(),
+                "Queued route changed actual native admissions, source proofs or once lower dispatch");
+            HRESULT hostAggregate=S_OK;
+            for(UINT index=0;index<callbacks;++index) {
+                const auto& host=app->headlessShutdownPinResults_[index];
+                require(host.queuedNativeAction&&!host.entry.nativeCallActive&&host.entry.hostPinDrainActive&&
+                    host.entry.nativeCloseScope&&host.entry.originalClose&&!host.returned.nativeCallActive&&
+                    host.returned.hostPinDrainActive,
+                    "Queued host result was falsely attributed to active native dispatch");
+                if(FAILED(host.result)&&SUCCEEDED(hostAggregate))hostAggregate=host.result;
+            }
+            require(app->shutdownPinDrainStatus_==hostAggregate,
+                "Queued host drain status differs from actual original callback results");
+            RibbonRecentItemsDiagnostics admitted;app->ribbon_.recentItemsDiagnostics(admitted);
+            require(!admitted.overflow&&admitted.creatorThread==originalThread&&admitted.count<=admitted.receipts.size(),
+                "Actual native queue admission receipts overflowed");
+            UINT nativeAdmissions=0,admissionBatches=0;
+            for(UINT index=0;index<admitted.count;++index) {
+                const auto& receipt=admitted.receipts[index];
+                if((receipt.kind!=RibbonRecentItemsReceiptKind::NormalCommit&&
+                    receipt.kind!=RibbonRecentItemsReceiptKind::RetiredCommit)||
+                    !receipt.shutdownActive||!receipt.callbackCount)continue;
+                ++admissionBatches;nativeAdmissions+=receipt.callbackCount;
+                require(receipt.result==S_OK&&receipt.entryEpoch==originalEpoch&&receipt.exitEpoch==originalEpoch&&
+                    !receipt.retired&&!receipt.exitRetired&&!receipt.windowDestroyed&&!receipt.exitWindowDestroyed&&
+                    receipt.initialCount==2&&receipt.decodedCount==2&&receipt.decoded[0]&&receipt.decoded[1]&&
+                    !receipt.initialPins[0]&&!receipt.initialPins[1]&&receipt.decodedPins[0]&&
+                    receipt.decodedPins[1]==bothRows,
+                    "Native admission was replaced by a later host result or a different source array");
+                for(UINT row=0;row<receipt.initialCount;++row) {
+                    const bool rowChanged=receipt.initialPins[row]!=receipt.decodedPins[row];
+                    require(receipt.dispatched[row]==rowChanged&&
+                        (!rowChanged||receipt.callbackResults[row]==S_OK),
+                        "Actual native queue callbacks did not admit precisely the changed original rows");
+                }
+            }
+            require(admissionBatches==1&&nativeAdmissions==app->shutdownPinNativeAdmissions_,
+                "Actual native admission count differs from copied queued actions");
+            std::cout<<"DIAGNOSTIC queued boundary proofs="<<queuedBoundaryProofs
+                <<" actualNativeAdmissions="<<nativeAdmissions<<" actualHostResults="<<callbacks<<"\n";
         }
         require(reentry==Reentry::None||reentries==1,"Reentered final pin scope continued after revocation");
         app->ribbon_.reset();require(resolvedIndices==expected&&!app->ribbon_.valid()&&app->headlessShutdownPinResultCount_==callbacks,
@@ -414,6 +549,7 @@ struct ShutdownPinsNativeFixture {
         if(layout==RibbonLayout::InstalledWindows10)
             require(app->ribbon_.installedLayoutStatus()==S_OK,"Requested installed native Ribbon failed");
         succeeded(app->ribbon_.enableRecentItemsDiagnostics(),"Enable fixed actual native RecentItems receipts");
+        app->headlessShutdownPhaseDiagnostics_=true;
         app->cancelFrequentPlaces();
         app->frequentPlaces_={{folders.items[0],L"Owned Recent One",folders.paths[0].native(),false},
                               {folders.items[1],L"Owned Recent Two",folders.paths[1].native(),false}};

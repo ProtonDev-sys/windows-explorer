@@ -263,9 +263,11 @@ private:
     LRESULT dispatchOwnedClose(HWND,WPARAM,LPARAM,WNDPROC) noexcept;
     bool ownedCloseContinuation() const noexcept;
     bool consumeOwnedCloseContinuation() noexcept;
+    bool deferOwnedCloseContinuation() noexcept;
+    HRESULT drainShutdownPins(ShutdownPinTransaction&,OwnedCloseFrame&) noexcept;
     void observeShutdownWindowMessage(UINT,bool originalCloseMessage) noexcept;
     bool captureShutdownPins(ShutdownPinTransaction&);
-    HRESULT commitShutdownPin(ShutdownPinTransaction&,UINT,bool);
+    HRESULT commitShutdownPin(ShutdownPinTransaction&,UINT,bool) noexcept;
     void resetRibbonForClose() noexcept;
     bool shutdownPinSourceCurrent(const ShutdownPinTransaction& transaction) const noexcept;
     HRESULT pinShutdownFrequentPlace(ShutdownPinTransaction& transaction,UINT item,bool pinned);
@@ -519,7 +521,7 @@ private:
         std::uint64_t epoch=0,closeEntry=0,displayRevision=0,hookGeneration=0;
         ULONGLONG ownedCloseEntryTick=0;
         bool hookAttached=false,hookTop=false,closeFrame=false,originalClose=false,originalReset=false,sourceRevoked=false;
-        bool capturing=false,nativeCloseScope=false;
+        bool capturing=false,nativeCloseScope=false,nativeCallActive=false,hostPinDrainActive=false,classCloseDeferred=false;
         UINT64 generation=0;
         unsigned navigation=0;
         UINT displayedCount=0;
@@ -527,6 +529,8 @@ private:
         bool window=false,browser=false,view=false,folder=false,location=false,transaction=false;
     };
     HeadlessShutdownPinFacts headlessShutdownPinFacts() const noexcept;
+    bool headlessShutdownPhaseDiagnostics_=false;
+    void observeShutdownPhase(RibbonShutdownPhase) const noexcept;
     ULONGLONG headlessOwnedCloseEntryTick_=0;
     // Fixture-only controlled reentry after plain source capture, before its
     // first provider AddRef. Empty in ordinary App operation. No fake provider.
@@ -557,10 +561,14 @@ private:
     HeadlessShutdownPinFacts headlessShutdownPinAdmissionFacts_{};
     struct HeadlessShutdownPinResult {
         UINT index=UI_COLLECTION_INVALIDINDEX;HRESULT result=E_PENDING;
-        bool pinned=false;HeadlessShutdownPinFacts entry{},returned{};
+        bool pinned=false,queuedNativeAction=false;HeadlessShutdownPinFacts entry{},returned{};
     };
     std::array<HeadlessShutdownPinResult,64> headlessShutdownPinResults_{};
     UINT headlessShutdownPinResultCount_=0;
+    // Native admission results stay in real Ribbon receipts; these values
+    // observe the later original-source host drain, never rewrite native S_OK.
+    UINT shutdownPinNativeAdmissions_=0;
+    HRESULT shutdownPinDrainStatus_=E_PENDING;
     bool headlessShutdownPinResultOverflow_=false;
     // Explicit fixture-only timing observation of the ordinary guarded path.
     // Never authorizes a headless action or bypasses the shutdown-only sink.

@@ -186,6 +186,7 @@ NativeState readNative(explorer::NativeRibbon& ribbon, HWND owner, ULONGLONG dea
     require(nativeDock == UI_CONTROLDOCK_TOP || nativeDock == UI_CONTROLDOCK_BOTTOM, "Unsupported native dock value");
     state.dock = nativeDock;
     UINT count = 0; exact(state.collection->GetCount(&count), "Read complete actual native QAT count");
+    std::cout << "QAT actual native count phase=" << phase << " count=" << count << std::endl;
     require(count <= 20, "Native QAT count exceeds documented capacity");
     state.rows.reserve(count);
     for (UINT index = 0; index < count; ++index) {

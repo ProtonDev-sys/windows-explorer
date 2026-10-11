@@ -1,13 +1,15 @@
 # Native navigation and selection measurements
 
 The application was measured headlessly on Windows 10 22H2, build 19045, on
-2026-10-04 and 2026-10-05. These measurements compare revisions of this application. They
+2026-10-04 through 2026-10-06. These measurements compare revisions of this application. They
 do not compare it with Explorer.exe or establish performance on other machines.
 
 The first implementation eagerly constructed registered Shell command menus for
-every navigation and selection change. The current implementation reads native
-command state once per change and constructs full provider menus when requested.
-Native Ribbon property callbacks use cached results.
+every navigation and selection change. The current implementation caches native
+capabilities per namespace/selection generation and completes pending state queries
+on worker STAs. Compatible selection-menu states share one snapshot; pending
+registered commands can repeat their fast query before worker admission. Native
+Ribbon property callbacks consume cached results.
 
 ## Latest continuation snapshot
 
@@ -154,7 +156,7 @@ The reviewed six-file r3 patch has SHA-256
 It is integrated into the main working tree; validation of the combined current
 application remains separate from these isolated correctness and timing results.
 
-## Latest isolated main-checkout run
+## Earlier v48 main-checkout run
 
 The 2026-10-05 17:12 UTC installed-layout v48 run used executable
 `9cea818574f6301b47becd3edcbfd419fe94bb525e35506a180d1433b3dc4573`.

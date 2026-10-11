@@ -32,12 +32,12 @@ jobs:
       - uses: actions/checkout@v7
       - name: Build native C++ application
         shell: pwsh
-        run: ./scripts/build.ps1 -Configuration Release -AppSearchResidentStress
+        run: ./scripts/build.ps1 -Configuration Release -AppSearchResidentStress -AppShutdownPinResolution
       - name: Run headless core, Shell operation, and application checks
         shell: pwsh
         env:
           EXPLORER_NATIVE_KIND_BOUNDARY_DIAGNOSTICS: '1'
-        run: ./scripts/test.ps1 -Configuration Release -SkipBuild -RequireAppSearchResidentStress
+        run: ./scripts/test.ps1 -Configuration Release -SkipBuild -RequireAppSearchResidentStress -RequireAppShutdownPinResolution
       - uses: actions/setup-python@v7
         with:
           python-version: '3.13'

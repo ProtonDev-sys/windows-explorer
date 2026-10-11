@@ -31,6 +31,7 @@ int runNamespaceActionTests();
 int runNamespaceCastStateTests();
 int runBreadcrumbTests();
 int runAppCommandTests();
+int runMultiFolderPinStateOracle();
 int runSearchHistoryTests();
 int runAddressHistoryTests();
 int runTypedAddressTests();
@@ -289,6 +290,15 @@ int main(int argc, char** argv) {
         drainCreatorBeforeShutdown();
         nativeApartment.finishOrTerminate();
         return failures ? 1 : 0;
+    }
+    if(argc==2&&mode=="--pin-state-only") {
+        explorer::NativeApartmentOwner nativeApartment;
+        const auto initialized=nativeApartment.initializeSta();
+        if(FAILED(initialized))return 1;
+        const auto result=runMultiFolderPinStateOracle();
+        drainCreatorBeforeShutdown();
+        nativeApartment.finishOrTerminate();
+        return result;
     }
     if (argc == 2 && (std::string_view(argv[1]) == "--search-only" || std::string_view(argv[1]) == "--namespace-only" ||
                      std::string_view(argv[1]) == "--cast-state-only" ||

@@ -1,6 +1,8 @@
 # Headless verification
 
-The target machine is Windows 10 Home 22H2, build 19045. Builds use Visual Studio
+The Windows 10 reference machine is Home 22H2, build 19045. Remote v180 and v185
+checks run on the other PC's Windows 11 build 26200; they do not replace Windows
+10 UI or fresh Windows 2022 hosted evidence. Builds use Visual Studio
 2022 Build Tools, MSVC 19.44, Windows SDK 10.0.26100.0, C++20 and the static x64
 runtime. Verification runs without displaying anything on the input desktop.
 
@@ -20,10 +22,64 @@ run is not evidence for later source changes.
 
 ## Current evidence
 
+The other PC's v180 authored focused run passes all four targets in 45.58 seconds:
+`native_app_shutdown_pin_resolution` (23.47 seconds), App search backing lifetime,
+Ribbon and RecentItems. The App target passes all eleven original close cases
+and both first-retain controls. Its real native callbacks admit original decoded
+values; actual host/Shell resolution runs only after the once-original native
+lower returns. Receipt ordering establishes native-call inactive and host-drain
+active at each queued host entry. Native S_OK records admission, not the later
+host result or profile persistence. Reset, initialize and immediate owner
+DestroyWindow retain actual ERROR_RETRY and epoch-tail rejection; App-only
+source revocation retains the second actual E_ABORT result. DestroyOwner still
+proves actual HWND/WM_NCDESTROY death inside that host callback. Six authored
+RecentItems controls pass; their model-only FrameworkDestroy reentry does not
+certify the separate direct FrameworkDestroy-origin App/Shell callback path.
+Installed App close on Windows 11 and fresh Windows 2022 acceptance are unmeasured.
+
+The v185 dedicated `native_multi_folder_pin_state` target passes in 1.45 seconds
+(1.49-second recorded batch): five actual cases, five available native references,
+zero host mismatches and zero provider failures. App's nonempty selection binding
+now agrees independently with both ordinary `pintohome` and direct public
+`Windows.PinToHome` state for one folder, two folders, folder-plus-file,
+file-selected-first and one file. The first four are enabled; one-file is disabled.
+Both mixed gestures deliver the same actual folder,file array order. Exact original
+EnumDone, complete three-member readiness, FileIDs/attributes, selection, CIDA and
+view site remain strict. The known-faulting full registered-menu route is not
+queried; its explicit blocked diagnostic is not provider success. Native Invokes
+remain zero. This establishes Windows 11 state parity for these cases, not actual
+Pin persistence, Windows 10 parity or arbitrary provider/array-order coverage.
+
+Both runs record 152 unchanged sources and unchanged executable sets. Their exact
+receipts are `remote-v180-close-serialization-and-controls.{meta.json,LastTest.log}`
+and `remote-v185-pin-native-applicability.{meta.json,LastTest.log}`. The v185 build
+records `src/app_commands.cpp` SHA256
+`22962e018055cdf06838dcd77a8ad29945b24e45aa82d9a3a19a09d206718b3e`.
+These focused passes do not close the older visual/performance or hosted negatives.
+The v177 rejected initialization trial faults all eight original factory-route
+targets; it was reverted before v179. Retained matching dump evidence does not
+establish the cause or acceptance of the restored routes.
+
+The v186 Windows 11 authored strict visual run requests all nineteen scenes,
+records unchanged sources/executables and fails eighteen in 106.34 seconds.
+Five primary captures succeed. Only Home, Computer, Network and Drive reach
+reference comparison; all four fail. Library retains its genuine reference
+restriction. Thirteen capture processes exit with access violations and Search
+exits 7. Individual Home tabs and navigation/address/search glyph regions pass,
+without a whole-scene pass. The private captures and inventories are retained
+locally for diagnosis and are not public-commit inputs. The v187 core target
+passes; its authored genuine QAT gestures complete Add/Remove/order and 19/20
+transitions, but the actual twenty-first Add yields count 21 and the existing
+strict capacity assertion fails. The 23.04-second batch is not a suite pass.
+Neither observation erases the older Windows 10 visuals or final performance
+comparison gap.
+
 Evidence belongs to the tested source and executable, rather than the latest
-working tree. The v155 Release build is warning-free and records executable
-hashes and 151 unchanged source files. Earlier signedness and SDK-macro build
-failures were corrected before the affected native checks ran.
+working tree. The v165b Release application/theme build is warning-free and
+records executable hashes and 151 unchanged source files. The v166 QAT and v167 enumeration-control runs each record unchanged source
+and their own immutable executable. The v167 build is warning-free across
+152 unchanged source files. Earlier
+signedness and SDK-macro build failures were corrected before native checks ran.
 
 The v136 authored and installed General hosts pass in 65.86 and 73.04 seconds.
 The focused Search screenshot passes the unchanged reference protocol at
@@ -34,7 +90,9 @@ The v143 eight-target run passes six targets: both original App search lifetime
 targets, both 130-query resident-cache targets and both original RecentItems
 layouts. The retained native cursor is consumed for the first time after close,
 before separately rebinding the retained item and PIDL. Neither a fresh cursor
-nor an unsupported Reset substitutes for that original cursor.
+nor an unsupported Reset substitutes for that original cursor. The v160 subset
+also passes authored App lifetime, authored 130-query resident cache and installed
+App lifetime in 67.89 seconds; installed resident cache is not part of that rerun.
 
 The v157 same-executable App debugger run reaches the original immediate-owner-
 destruction case after the first nine cases complete their assertions, including
@@ -45,8 +103,21 @@ The nested close now records one deferred request and one original native lower
 call. The next immediate DestroyWindow case still crashes in native UIRibbon's
 ToolWindowMgr while the original close remains active. Dump disassembly identifies
 that enum-5 case precisely; buffered console output is not used to infer it.
-This is not a passing App close target. The later pre-first-retain controls
-remain unreached. Microsoft requires asynchronous Close/Exit from native Ribbon
+The v162 same-executable debugger control also retains the exact original
+native Ribbon view COM object and still faults in that enum-5 destruction case.
+Its debugger exit zero is not a test pass. Physical App cleanup while the original
+native close is active was unresolved on that snapshot. Its later pre-first-retain
+controls remain unreached there; v180 subsequently passes the original authored
+matrix by moving actual host callbacks after the native lower return. The later v168 physical-App-retirement experiment instead
+faults in the first original enum-0 ordinary close, before the later cases.
+Its CDB run observes DUI70 DirectUI::Element::RemoveListener reading FEEE-poisoned
+state in 2.73 seconds; the raw authored App target exits 0xc000041d in
+5.80 seconds. Source (152 files) and App executable 158c08…b0a9d remain
+unchanged during these runs. The complete production experiment was reversed;
+source review did not establish runtime safety. The retained source's v162
+enum-5 UIRibbon fault remains retained historical evidence. The v180 queue pass
+covers original native WM_CLOSE batches; direct FrameworkDestroy-origin App/Shell
+callbacks remain unmeasured. Microsoft requires asynchronous Close/Exit from native Ribbon
 callbacks; retaining native COM objects alone does not establish safe immediate
 child-window destruction. No profile pins are changed by these tests.
 [Microsoft Ribbon migration contract](https://learn.microsoft.com/en-us/windows/win32/windowsribbon/ribbon-migration).
@@ -57,14 +128,33 @@ context-action gate. Their actual Cut buttons supply empty UIA runtime-ID arrays
 Two fresh rooted walks establish the same unique path and actual native Legacy
 receiver, role, name, bounds and state despite distinct COM wrapper identities.
 That native bridge passes without promoting empty runtime IDs or wrapper
-pointers into identity. The actual context action remains unverified.
+pointers into identity. The v158 actual right-clicks then open genuine Add menus
+but reject popup ownership before Invoke. The v163 scoped original-popup authority
+permits genuine Add Cut/Paste, Remove, remove/readd order, 19-to-20 Add and
+20-to-19 Remove in both layouts. Both targets still fail the final assumption
+that the twenty-first Add row must be disabled; the actual row is enabled and
+no Invoke occurs in that case.
+
+The v166 capacity observation accepts the actual enabled row and invokes it once
+through the same native/UIA/Legacy/source fences. Both raw native Invoke results
+are S_OK, before the unchanged gesture deadline, with completed worker retirement.
+The independent actual native collection then reports more than twenty items and
+both strict targets fail (authored 8.60 seconds; installed 7.78 seconds). No count
+is truncated, row removed or HRESULT normalized to obtain acceptance. Earlier
+ordinary Add/Remove/order checks remain successful, but neither full gesture
+target passes its capacity check. Microsoft documents up to twenty QAT commands;
+it does not promise a disabled twenty-first context-menu row.
+[QAT contract](https://learn.microsoft.com/en-us/windows/win32/windowsribbon/windowsribbon-controls-quickaccesstoolbar).
 
 The v152 seven-target control run passes namespace actions, both original QAT
 controls, both original Ribbon layouts and both original RecentItems layouts
 in 56.96 seconds. Source and the monitored application executable remain
-unchanged throughout that run. The separate opt-in Hosted persistence fixture
-compiles without warnings in v153; it has not been executed locally or on a
-disposable runner at this snapshot. Its default test registration is disabled.
+unchanged throughout that run. The opt-in Hosted persistence fixture now has
+genuine disposable-runner negative evidence at commit 566ce07 below. The v164
+revision using an actual native setup pin followed by a fresh App's unpin callback
+compiles without warnings; it has no new Hosted runtime evidence. That revision
+explicitly leaves App pin persistence unmeasured. Default registration is disabled.
+Both original RecentItems layouts pass again in v164 in 20.43 seconds.
 
 The default v155 image target passes in 28.74 seconds with the production
 NativeApartmentOwner and without the temporary module-retention switch. It
@@ -93,9 +183,36 @@ first-property callbacks, CommandStore/provider HRESULTs, MUI inventory and
 independent Framework versus App color properties. The four missing first-image
 resources and equivalent native label inputs remain unavailable. Its exit zero
 establishes completed diagnosis, not Explorer-host artwork or palette parity.
+The v160 Auto and Light oracle controls complete in 10.24 seconds. Corrected
+top-down raw four-byte raster comparisons match three actual CommandStore
+fallback specifications at both sizes, including combined versus separate native
+extraction. Missing first images remain genuine native unavailability; these
+fallback comparisons do not identify stock Explorer's host artwork. The v164
+single public Light-highlight request is accepted independently by the actual
+framework, while its diagnostic explicitly claims no Explorer palette parity.
+Both original theme targets pass on the v165 experimental snapshot in 2.45 seconds.
+Its actual File-interior diagnostic changes zero pixels. The ineffective public
+highlight production experiment was subsequently reverted; these receipts
+belong to experimental executable 92be03…, not the later restored source.
 
 | Snapshot / scope | Actual result | Remaining implication |
 | --- | --- | --- |
+| Remote Windows 11 v187 core / authored QAT | Core passed; authored QAT failed; 23.04-second batch | Genuine Add/Remove/order and 19/20 transitions complete; actual twenty-first Add yields native count 21, failing the unchanged capacity assertion. |
+| Remote Windows 11 v186 strict visuals | Nineteen scenes requested; eighteen failed; 106.34 seconds | Five primary captures; four comparisons, all failed; Library restricted. Thirteen access-violation capture exits and Search exit 7. Individual region passes do not establish whole-scene parity. Private source captures stay out of public commits. |
+| Remote Windows 11 v185 Pin state | Five cases/native references passed; zero mismatches/provider failures; 1.45-second target | Both independent native states match App on full original selections. Mixed gestures both deliver folder,file order; one-file is disabled. No provider Invoke/persistence; full registered-menu route remains blocked. |
+| Remote Windows 11 v180 authored close / controls | Four targets passed; 45.58 seconds; eleven original App close cases plus two first-retain controls | Actual queued host entry follows once-original native lower return. Six authored RecentItems controls pass. Direct FrameworkDestroy-origin App/Shell path, installed Windows 11 App close and fresh Windows 2022 are unmeasured. |
+| Remote Windows 11 v177 rejected initialization trial | All eight original factory-route targets faulted; 44.21 seconds | Namespace actions, App commands, four menu partitions, native selection and hidden Shell host remain retained negatives. Trial reverted before v179; dump does not prove cause or restored-route acceptance. |
+| Local v168 physical App retirement trial | First enum-0 close faults; CDB 2.73 seconds; raw authored target 0xc000041d / 5.80 seconds | Production trial completely reversed; later original cases are unmeasured in this trial. The retained v162 fault belongs to its original snapshot; v180 later passes the authored WM_CLOSE queue matrix. |
+| Local v167 original enumeration controls | Four passed; 59.58 seconds | Namespace: 22 groups / 2,669 assertions; App commands: 18 groups / 3,664 assertions; both registered-menu partitions pass with genuine original creator EnumDone receipts. Fresh Hosted rerun is still required. |
+| Local v166 genuine QAT capacity | Both targets failed; authored 8.60 seconds, installed 7.78 seconds | Actual enabled twenty-first Add invokes once and returns raw S_OK before deadline; actual collection exceeds twenty. Previous genuine Add/Remove/order checks complete, but strict capacity acceptance fails. |
+| Local v165 experimental theme / complete visuals | Both theme targets passed, 2.45 seconds; all nineteen captures passed; four comparisons passed, twelve failed, three references restricted | Modern chrome remains below the unchanged 98% threshold. Accepted public highlight changes zero File-interior pixels; production experiment subsequently reverted. |
+| Local v164 RecentItems | Both layouts passed; 20.43 seconds | Four original cases and genuine shutdown revocation controls; Hosted profile persistence is a separate unverified revision. |
+| Local v163 genuine QAT gestures | Both failed; 20.26 seconds | Ordinary Add/Remove/order and 19/20 transitions work; actual enabled capacity row violates the fixture's disabled-row assumption, before any capacity Invoke. |
+| Local v162 exact native-view close lease | Debugger observed the enum-5 native access violation | Holding the exact native Ribbon COM view does not resolve immediate owner-window destruction; debugger exit zero is not acceptance. |
+| Local v161 search / theme controls | Five passed, one appropriately skipped; 13.41 seconds | Search lifetime, presentation, native result policy and both theme controls pass. Native search-options profile mutation is correctly skipped locally. |
+| Local v160 App search / oracle subsets | Three App targets passed, 67.89 seconds; two diagnostic controls passed, 10.24 seconds | Scoped App lifetime/resident checks and Auto/Light oracle cleanup, not full App close or visual parity. |
+| Hosted commit 566ce07 ordinary jobs | Each main job: 31 passed, three failed, three skipped out of 37 | Namespace selection preservation and both registered-menu partitions fail. Separate push transfer/drop pass; PR transfer fails and drop passes. |
+| Hosted commit 566ce07 owned-profile jobs | Both failed; normal 2.50 seconds, final-only 1.95 seconds | Actual GUID folder is absent from native App Home; zero Invokes/callback returns. Complete original four-pin inventory is restored. |
 | Local v158 image / gesture targets | Image passed; both gestures failed; 30.84 seconds | Actual native right-clicks open the genuine enabled Add menu. Popup path ownership is rejected before Invoke, so no Add/Remove coverage is claimed. Temporary fixture module-retention control is removed. |
 | Local v156 complete core targets | Sixteen passed; 323.92 seconds | File/Shell operations, saved-search metadata, Library, namespace/App commands, all menu partitions, 10,000-item selection, keyboard focus, search handoff, capabilities and Cast pass on the recorded source. |
 | Local v155 eight scoped targets | Six passed, two skipped; 64.58 seconds | Image provenance, resource-diagnostic cleanup, both RecentItems layouts and both apartment targets passed. Both genuine QAT gestures supplied no action coverage. Later v157 dump mapping identifies the App fault at immediate owner destruction. |
@@ -117,13 +234,52 @@ its combined validated application. The local QAT tests continue to exercise
 both real layouts; the Server 2022 admission correction runs their unchanged
 strict authored layout rather than assuming installed Windows 10 resources.
 
-The latest complete strict screenshot run is v134: eighteen native captures,
-six comparisons passed, nine failed, three restricted references and one Search
-capture failure. The subsequent focused Search run passes. Fresh v143 modern
+The newer commit 566ce07 [push](https://github.com/ProtonDev-sys/windows-explorer/actions/runs/37465670548)
+and [PR](https://github.com/ProtonDev-sys/windows-explorer/actions/runs/37465676548)
+main jobs each record 37 cases: 31 passed, three failed and three skipped. The
+mandatory App 130-query resident-cache target and strict QAT preservation/settings
+controls pass in both. Namespace selection disappears after the first actual
+Kind worker completes; both registered-menu partitions retain three real
+selection-command state differences. These observations establish failure
+boundaries, not causes. The v167 local enumeration revision then passes the
+four original namespace/App-command/registered-menu targets in 59.58 seconds
+with actual EnumDone/creator callback receipts and unchanged source/executable.
+This local pass does not resolve the hosted negatives until a fresh Hosted run.
+Separate push transfer/drop pass; PR transfer enters
+invokeCommandStore without returning before its original twenty-second deadline,
+while PR drop passes. No timeout extension or selection restoration is acceptance.
+
+The 566ce07 [normal](https://github.com/ProtonDev-sys/windows-explorer/actions/runs/37465713960)
+and [final-only](https://github.com/ProtonDev-sys/windows-explorer/actions/runs/37465718199)
+owned-profile jobs pass fresh admission, warning-free build and immutable source/
+executable checks, then fail actual native Home admission. SHAddToRecentDocs does
+not produce the owned GUID row. Both record zero native Invokes and zero normal/
+final callback returns, then prove the complete original four-pin inventory
+restored after App/OLE teardown and exact owned-folder cleanup. Successful
+restoration does not establish App pin persistence.
+
+The latest complete strict screenshot run is experimental v165: all nineteen
+native captures pass, four comparisons pass, twelve fail and three references
+remain restricted. Picture, Application, Music and Video pass. Home, Share, View,
+Computer, Network, Drive, Compressed, Search, Recycle and all three modern scenes
+fail. DiskImage, Library and Shortcut remain restricted. No crash dump is
+produced. Experimental executable 92be03… includes the later-reverted Light
+highlight request; these results are not acceptance of the restored source.
+The previous v134 run retains eighteen captures, six comparisons passed, nine
+failed, three restricted references and one Search capture failure. The later
+focused Search pass does not erase v165's new Search comparison failure. A
+fresh v167 focused Search run after Theme rollback passes again at
+0.9824210375875375 agreement, mean RGB error 0.9870261858256714 and edge F1
+0.9888858613893967 on restored-source executable fd7cc…2dadda1. This is a
+scoped comparison, not a new complete screenshot-suite pass. The later one-row
+caret change has been adopted but has no native verification yet. Fresh v143 modern
 captures use the corrected 512-row window bound; all three still fail chrome
 at 97.50%, 97.38% and 97.39% pixel agreement against the unchanged 98% threshold.
-Their separate dropdown and Refresh regions pass. Its exact scene
-results are in [headless-visual.md](headless-visual.md).
+Their separate dropdown and Refresh regions pass. The later v165 experimental
+Light-highlight run again passes all three native captures but fails all three
+chrome comparisons: 97.577610%, 97.464068% and 97.460900% agreement. Dropdown and
+Refresh agreement remains 100%; the original 98% chrome threshold is unchanged.
+Exact scene results are in [headless-visual.md](headless-visual.md).
 A successful native-current image check cannot replace a new complete screenshot
 comparison. The final 24-process interleaved performance comparison has not run;
 the earlier slow 1,000-item navigation episode remains unresolved.
@@ -131,8 +287,9 @@ the earlier slow 1,000-item navigation episode remains unresolved.
 Search backing now bounds cache-owned records at 128 without a lifetime query
 quota. Cache eviction and App close preserve published descriptor paths; they
 do not claim a last-consumer census or transparently reclaim those files. The
-v143 stress and delayed-native-use checks pass at their recorded snapshot. Native QAT context gestures,
-actual App pin persistence, noncurrent-DPI production image callbacks, arbitrary
+v143 stress and delayed-native-use checks pass at their recorded snapshot. Full
+native QAT gesture capacity, actual App pin persistence, noncurrent-DPI
+production image callbacks, arbitrary
 installed handlers and whole-application parity require their own evidence.
 
 ## Test boundaries

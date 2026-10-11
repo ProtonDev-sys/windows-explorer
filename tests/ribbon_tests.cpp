@@ -253,7 +253,7 @@ struct OwnedRefineLabels {
     std::vector<OwnedRefineControl> controls;
     std::vector<std::wstring> groupLabels;
 };
-HRESULT ownedAutomation(HWND window,std::function<HRESULT(IUIAutomation*)> action) {
+HRESULT ownedAutomation(HWND window,std::function<HRESULT(IUIAutomation*)> action,ULONGLONG admissionDeadline=0) {
     DWORD process=0;
     if(!window||GetWindowThreadProcessId(window,&process)!=GetCurrentThreadId()||process!=GetCurrentProcessId())return E_INVALIDARG;
     const auto desktop=GetThreadDesktop(GetCurrentThreadId());
@@ -310,7 +310,7 @@ HRESULT ownedAutomation(HWND window,std::function<HRESULT(IUIAutomation*)> actio
         }
     };
     if(!threadId)fatal(HRESULT_FROM_WIN32(threadIdentityError),"thread identity unavailable");
-    const auto deadline=GetTickCount64()+6000;
+    const auto deadline=admissionDeadline?admissionDeadline:GetTickCount64()+6000;
     const bool completed=waitUntil(deadline);
     if(!completed) {
         // Cancellation requests do not establish native completion. Observe
@@ -1566,6 +1566,7 @@ int main(int argc,char** argv){
         };
         verifyDestinationEnabled(false);
         verifyDestinationEnabled(true);
+        {
         const auto beforeDestinationExecution=itemExecutions;
         const auto beforeDestinationCommand=lastItemCommand,beforeDestinationIndex=lastItem;
         struct DestinationActivationReadback {
@@ -1574,7 +1575,30 @@ int main(int argc,char** argv){
             bool invokePresent=false,selectionPresent=false,legacyPresent=false;
             UINT count=0;
         } destinationReadback;
-        const auto destinationActivation=ownedAutomation(window.handle,[handle=window.handle,&destinationReadback](IUIAutomation* automation) {
+        // Retain original native source/row identities before the one Invoke.
+        const auto destinationOwner=window.handle;
+        const auto destinationCreator=GetCurrentThreadId(),destinationProcess=GetCurrentProcessId();
+        Microsoft::WRL::ComPtr<IUIFramework> destinationFramework(ribbon.nativeFramework());
+        require(destinationFramework!=nullptr,"No original Extract-to native framework");
+        const auto destinationNativeCommand=ribbon.nativeCommandId(explorer::RibbonExtractToGallery);
+        Microsoft::WRL::ComPtr<IUnknown> destinationCollectionIdentity,destinationFirstRow,destinationFirstIdentity;
+        succeeded(destinationItems.As(&destinationCollectionIdentity),"Original Extract-to collection identity");
+        succeeded(destinationItems->GetItem(0,&destinationFirstRow),"Original first visible Extract-to row");
+        succeeded(destinationFirstRow.As(&destinationFirstIdentity),"Original Extract-to row canonical identity");
+        const auto destinationOwnerCurrent=[&] {
+            DWORD process=0;
+            return window.handle==destinationOwner&&ribbon.nativeFramework()==destinationFramework.Get()&&
+                GetCurrentThreadId()==destinationCreator&&IsWindow(destinationOwner)&&
+                GetWindowThreadProcessId(destinationOwner,&process)==destinationCreator&&process==destinationProcess;
+        };
+        require(destinationOwnerCurrent(),"Extract-to original owner changed before Invoke");
+        explorer::RibbonCollectionReadback destinationSourceBefore;
+        succeeded(ribbon.collectionReadback(explorer::RibbonExtractToGallery,destinationSourceBefore),
+            "Original Extract-to source generation before Invoke");
+        require(destinationSourceBefore.publishedItems==54,"Original Extract-to source is incomplete");
+        // This one budget covers worker Invoke and subsequent creator dispatch.
+        const auto destinationDeadline=GetTickCount64()+6000;
+        const auto destinationActivation=ownedAutomation(window.handle,[handle=window.handle,&destinationReadback,destinationDeadline](IUIAutomation* automation) {
             Microsoft::WRL::ComPtr<IUIAutomationElement> row;
             auto status=namedElement(automation,handle,L"Folder 0",&row);
             if(FAILED(status))return status;
@@ -1593,11 +1617,68 @@ int main(int argc,char** argv){
             destinationReadback.selectionPresent=selection!=nullptr;
             destinationReadback.legacyPresent=legacy!=nullptr;
             status=destinationReadback.invokePattern;
-            if(SUCCEEDED(status))status=invoke?invoke->Invoke():E_NOINTERFACE;
+            if(SUCCEEDED(status)) {
+                if(GetTickCount64()>=destinationDeadline)status=HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+                else status=invoke?invoke->Invoke():E_NOINTERFACE;
+            }
             destinationReadback.activation=status;
             return status;
-        });
-        destinationReadback.countAfter=destinationItems->GetCount(&destinationReadback.count);
+        },destinationDeadline);
+        if(SUCCEEDED(destinationActivation)) {
+            // Invoke is asynchronous. Only the original creator may observe
+            // its real callback, without another Invoke or a new deadline.
+            while(itemExecutions==beforeDestinationExecution&&GetTickCount64()<destinationDeadline) {
+                require(destinationOwnerCurrent(),"Extract-to original owner changed during dispatch");
+                MSG message{};
+                for(unsigned dispatchedCount=0;dispatchedCount<64&&GetTickCount64()<destinationDeadline&&
+                    PeekMessageW(&message,nullptr,0,0,PM_REMOVE);++dispatchedCount) {
+                    TranslateMessage(&message);DispatchMessageW(&message);
+                }
+                if(itemExecutions!=beforeDestinationExecution)break;
+                const auto now=GetTickCount64();if(now>=destinationDeadline)break;
+                const auto waited=MsgWaitForMultipleObjectsEx(0,nullptr,
+                    static_cast<DWORD>(std::min<ULONGLONG>(destinationDeadline-now,10)),
+                    QS_ALLINPUT,MWMO_INPUTAVAILABLE);
+                if(waited!=WAIT_OBJECT_0&&waited!=WAIT_TIMEOUT) {
+                    const auto waitStatus=waited==WAIT_FAILED?HRESULT_FROM_WIN32(GetLastError()):E_UNEXPECTED;
+                    succeeded(FAILED(waitStatus)?waitStatus:E_UNEXPECTED,"Extract-to creator dispatch wait");
+                }
+            }
+            require(GetTickCount64()<destinationDeadline,"Extract-to callback did not complete within its original total budget");
+            require(destinationOwnerCurrent(),"Extract-to original owner changed after dispatch");
+            Variant currentSource;
+            succeeded(destinationFramework->GetUICommandProperty(destinationNativeCommand,UI_PKEY_ItemsSource,
+                &currentSource.value),"Original Extract-to ItemsSource after dispatch");
+            require(destinationOwnerCurrent()&&GetTickCount64()<destinationDeadline&&currentSource.value.vt==VT_UNKNOWN&&currentSource.value.punkVal,
+                "Extract-to native source changed during dispatch");
+            Microsoft::WRL::ComPtr<IUICollection> currentCollection;
+            succeeded(currentSource.value.punkVal->QueryInterface(IID_PPV_ARGS(&currentCollection)),
+                "Current Extract-to native collection");
+            require(destinationOwnerCurrent()&&GetTickCount64()<destinationDeadline,"Extract-to owner changed during source read");
+            Microsoft::WRL::ComPtr<IUnknown> currentCollectionIdentity,currentFirstRow,currentFirstIdentity;
+            succeeded(currentCollection.As(&currentCollectionIdentity),"Current Extract-to collection identity");
+            require(destinationOwnerCurrent()&&GetTickCount64()<destinationDeadline&&currentCollectionIdentity.Get()==destinationCollectionIdentity.Get(),
+                "Extract-to invocation replaced its original native collection");
+            succeeded(currentCollection->GetItem(0,&currentFirstRow),"Current first visible Extract-to row");
+            require(destinationOwnerCurrent()&&GetTickCount64()<destinationDeadline,"Extract-to owner changed during row read");
+            succeeded(currentFirstRow.As(&currentFirstIdentity),"Current Extract-to row canonical identity");
+            require(destinationOwnerCurrent()&&GetTickCount64()<destinationDeadline&&currentFirstIdentity.Get()==destinationFirstIdentity.Get(),
+                "Extract-to invocation replaced its original native row");
+        }
+        if(SUCCEEDED(destinationActivation)) {
+            require(destinationOwnerCurrent()&&GetTickCount64()<destinationDeadline,
+                "Extract-to dispatch budget expired before final native count read");
+            destinationReadback.countAfter=destinationItems->GetCount(&destinationReadback.count);
+            require(destinationOwnerCurrent(),"Extract-to source guard failed after final count read");
+            require(destinationReadback.countAfter==S_OK&&destinationReadback.count==54,
+                "Extract-to invocation changed its complete original destination count");
+            explorer::RibbonCollectionReadback destinationSourceAfter;
+            succeeded(ribbon.collectionReadback(explorer::RibbonExtractToGallery,destinationSourceAfter),
+                "Original Extract-to source generation after final native read");
+            require(destinationOwnerCurrent()&&destinationSourceAfter.sourceRequests==destinationSourceBefore.sourceRequests&&
+                destinationSourceAfter.publishedItems==54,"Extract-to invocation refreshed its original native source");
+            require(GetTickCount64()<destinationDeadline,"Extract-to callback did not complete within its original total budget");
+        }
         std::cout<<"Extract-to activation diagnostic stock="<<stock<<" worker/action="<<static_cast<ULONG>(destinationActivation)<<'/'<<static_cast<ULONG>(destinationReadback.activation)
             <<" executions before/after="<<beforeDestinationExecution<<'/'<<itemExecutions
             <<" command before/after="<<beforeDestinationCommand<<'/'<<lastItemCommand<<" index before/after="<<beforeDestinationIndex<<'/'<<lastItem
@@ -1607,6 +1688,7 @@ int main(int argc,char** argv){
         succeeded(destinationActivation,"Actual owned Extract-to row activation");
         require(itemExecutions==beforeDestinationExecution+1&&lastItemCommand==explorer::RibbonExtractToGallery&&lastItem==2,
             "The first visible Extract-to row did not invoke its original native provider index");
+        }
         succeeded(ribbon.setContexts(explorer::RibbonContext::None),"Scene context cleanup");succeeded(ribbon.setQuickAccessBelow(false),"Scene QAT cleanup");MoveWindow(window.handle,0,0,1000,700,TRUE);pump();
         std::vector<UINT> qat;succeeded(ribbon.quickAccessCommands(qat),"Native QAT readback");require(qat==std::vector<UINT>{explorer::Properties,explorer::NewFolder},"Windows 10 default QAT differs");
         const std::array<UINT,3> custom{explorer::Copy,explorer::Properties,explorer::NewFolder};succeeded(ribbon.setQuickAccessCommands(custom),"Custom native QAT");

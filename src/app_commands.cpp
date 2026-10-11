@@ -40,7 +40,7 @@ constexpr std::array catalog{
     native(NewFolder,L"Windows.newfolder"),host(NewText,{},directory),host(NewShortcut,{},directory),
     native(NewItems,L"Windows.newitem"),host(Properties,L"Windows.properties"),
     host(Open,L"Windows.open",selected),host(Edit,L"Windows.edit",selected),host(Print,L"Windows.print",selected),
-    host(Pin,L"Windows.PinToHome",RequireFolderView | RequireSingleSelection),
+    host(Pin,L"Windows.PinToHome",selected),
     native(Sharing,L"Windows.ModernShare",selected,Scope::Selection),host(SharingProperties,{},RequireFolderView),
     action(Security,Action::AdvancedSecurity),action(FileHistory,Action::FileHistory),
     host(SelectAll,L"Windows.selectall"),host(SelectNone,L"Windows.selectnone",selected),host(Invert,L"Windows.invertselection"),

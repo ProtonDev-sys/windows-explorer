@@ -43,6 +43,9 @@ struct GestureReadTrace {
     bool unavailableDiscoveryTruncated=false;
     std::array<GestureUnavailableRuntimeEvidence,32> unavailableDiscovery{};
     UINT pathProofs=0,pathCollisions=0,legacyReads=0,legacyNativePairs=0,legacyAbsentPairs=0;
+    UINT pathRootRole=0,pathOwnershipGate=0,popupOwnershipGate=0;
+    HWND pathNativeRoot=nullptr,pathReportedRoot=nullptr,pathReportedNode=nullptr;
+    HWND popupReadWindow=nullptr;
     HRESULT legacyPattern=E_PENDING,legacyAccessible=E_PENDING,legacyChild=E_PENDING,legacyUnknown=E_PENDING;
     int legacyChildId=0;
     bool legacyNull=false;
@@ -76,7 +79,7 @@ struct GestureElement {
     bool emptyToolbarRuntime=false; // Retained toolbar proof remains independent.
 };
 struct GestureConfig {
-    std::wstring toolbar = L"Quick Access Toolbar";
+    std::wstring toolbar = L"Quick Access";
     std::wstring add = L"Add to Quick Access Toolbar";
     std::wstring remove = L"Remove from Quick Access Toolbar";
 };
@@ -94,6 +97,14 @@ std::wstring gestureEnvironment(const wchar_t* name, const wchar_t* fallback) {
 bool gestureUnavailableStatus(HRESULT result) noexcept {
     return result == E_NOINTERFACE || result == E_NOTIMPL || result == UIA_E_NOTSUPPORTED ||
         result == HRESULT_FROM_WIN32(ERROR_NOT_FOUND) || result == HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+}
+// A returned UIA call can still report a transaction timeout or cancellation
+// before the creator deadline. Those are not completed capacity observations.
+// Admit only exact native success or these explicit returned rejection statuses;
+// every pending/timeout/cancel/source/guard/unavailable/unknown result remains a
+// failure with its unchanged raw HRESULT. Whole20 equality is still required.
+bool gestureCapacityActionStatus(HRESULT status) noexcept {
+    return status==S_OK || status==E_FAIL || status==HRESULT_FROM_WIN32(ERROR_TOO_MANY_CMDS);
 }
 HRESULT gestureElementRead(IUIAutomationElement* element, GestureElement& result,
                            bool allowUnavailableRuntime=false) {
@@ -382,9 +393,158 @@ bool gestureOwnedPopup(HWND window, HWND owner, DWORD creator) noexcept {
     }
     return false;
 }
+// Explicit scope issued only for a newly visible, owned native popup from
+// this original gesture's pre-opening HWND inventory. Null means the original
+// command-target protocol, whose child-only HWND admission is unchanged.
+bool gestureEqualReceiver(const qat_gesture_protocol::WindowIdentity&,
+                          const qat_gesture_protocol::WindowIdentity&) noexcept;
+enum class GestureRootRole { CommandTarget, NativePopup };
+struct GesturePopupAuthority {
+    GestureRootRole role=GestureRootRole::CommandTarget;
+    const GestureWindows* before=nullptr; // Immutable original bounded inventory, MTA-local lifetime.
+    HWND owner=nullptr;
+    DWORD creator=0;
+    HDESK desktop=nullptr;
+    ULONGLONG deadline=0;
+    qat_gesture_protocol::WindowIdentity ownerIdentity;
+    qat_gesture_protocol::WindowIdentity root;
+    std::array<HWND,16> owners{};
+    UINT ownerCount=0;
+};
+bool gestureNewPopup(const GestureWindows&,HWND,HWND,DWORD) noexcept;
+HRESULT gesturePopupWindowRead(const GesturePopupAuthority& authority,HWND window,
+                              qat_gesture_protocol::WindowIdentity& output) noexcept {
+    gestureReadTrace.popupReadWindow=window;gestureReadTrace.popupOwnershipGate=1;
+    if(authority.role!=GestureRootRole::NativePopup||!authority.before||!authority.owner||
+       !authority.creator||!authority.desktop||!authority.root.window||
+       authority.before->creator!=authority.creator||authority.before->overflow||authority.before->expired||
+       authority.before->count>authority.before->handles.size())
+        return E_ACCESSDENIED;
+    gestureReadTrace.popupOwnershipGate=2;
+    if(authority.root.root!=authority.root.window||authority.ownerIdentity.window!=authority.owner)
+        return E_ACCESSDENIED;
+    gestureReadTrace.popupOwnershipGate=3;
+    if(GetTickCount64()>=authority.deadline)return HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+    // Both threads remain associated with the exact creator-supplied private
+    // HDESK attached before any worker COM/UIA call. No desktop-root discovery.
+    gestureReadTrace.popupOwnershipGate=4;
+    if(GetThreadDesktop(GetCurrentThreadId())!=authority.desktop||
+       GetThreadDesktop(authority.creator)!=authority.desktop)return E_ACCESSDENIED;
+    gestureReadTrace.popupOwnershipGate=5;
+    const auto ownerBefore=qat_gesture_protocol::sameOwnedWindow(authority.ownerIdentity,authority.owner,authority.creator);
+    if(ownerBefore!=S_OK)return ownerBefore;
+    gestureReadTrace.popupOwnershipGate=6;
+    if(!gestureNewPopup(*authority.before,authority.root.window,authority.owner,authority.creator))return E_ACCESSDENIED;
+    gestureReadTrace.popupOwnershipGate=7;
+    if(!window||!IsWindow(window))return E_ACCESSDENIED;
+    gestureReadTrace.popupOwnershipGate=8;
+    if(!IsWindowVisible(window))return E_ACCESSDENIED;
+    gestureReadTrace.popupOwnershipGate=9;
+    if(window!=authority.root.window&&!IsChild(authority.root.window,window))return E_ACCESSDENIED;
+    gestureReadTrace.popupOwnershipGate=10;
+    if(!authority.ownerCount||authority.ownerCount>authority.owners.size())return E_ACCESSDENIED;
+    HWND ownerNode=authority.root.window;
+    for(UINT index=0;index<authority.ownerCount;++index) {
+        gestureReadTrace.popupOwnershipGate=11;
+        ownerNode=GetWindow(ownerNode,GW_OWNER);DWORD process=0;
+        if(ownerNode!=authority.owners[index]||!IsWindow(ownerNode)||
+           GetWindowThreadProcessId(ownerNode,&process)!=authority.creator||process!=GetCurrentProcessId())return E_ABORT;
+    }
+    gestureReadTrace.popupOwnershipGate=12;
+    if(ownerNode!=authority.owner&&!IsChild(authority.owner,ownerNode))return E_ACCESSDENIED;
+    const auto read=[&](HWND native,qat_gesture_protocol::WindowIdentity& value)->HRESULT {
+        value.window=native;value.root=GetAncestor(native,GA_ROOT);value.parent=GetAncestor(native,GA_PARENT);
+        value.thread=GetWindowThreadProcessId(native,&value.process);
+        gestureReadTrace.popupOwnershipGate=13;
+        if(value.thread!=authority.creator||value.process!=GetCurrentProcessId())return E_ACCESSDENIED;
+        gestureReadTrace.popupOwnershipGate=14;
+        SetLastError(ERROR_SUCCESS);
+        if(!GetWindowRect(native,&value.bounds))return qat_gesture_protocol::nativeError();
+        gestureReadTrace.popupOwnershipGate=15;
+        if(value.bounds.left>=value.bounds.right||value.bounds.top>=value.bounds.bottom)return E_UNEXPECTED;
+        gestureReadTrace.popupOwnershipGate=16;
+        SetLastError(ERROR_SUCCESS);
+        const auto length=GetClassNameW(native,value.windowClass.data(),static_cast<int>(value.windowClass.size()));
+        if(!length)return qat_gesture_protocol::nativeError();
+        gestureReadTrace.popupOwnershipGate=17;
+        return length==static_cast<int>(value.windowClass.size())-1?
+            HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER):S_OK;
+    };
+    qat_gesture_protocol::WindowIdentity currentRoot,current;
+    auto hr=read(authority.root.window,currentRoot);if(hr!=S_OK)return hr;
+    gestureReadTrace.popupOwnershipGate=18;
+    if(!gestureEqualReceiver(currentRoot,authority.root))return E_ABORT;
+    hr=read(window,current);if(hr!=S_OK)return hr;
+    // A popup child has no GW_OWNER of its own. Its exact GA_ROOT and real
+    // parent relation prove membership in this qualified popup, not any owned
+    // top-level window with the same caption or another visibility epoch.
+    gestureReadTrace.popupOwnershipGate=19;
+    if(current.root!=authority.root.root||
+       (window!=authority.root.window&&!IsChild(authority.root.window,window))||
+       !gestureNewPopup(*authority.before,authority.root.window,authority.owner,authority.creator))return E_ABORT;
+    gestureReadTrace.popupOwnershipGate=22;
+    if(window==authority.root.window&&!gestureEqualReceiver(current,authority.root))return E_ABORT;
+    // The actual receiver read is a separate snapshot. Never promote its root
+    // tuple to the original authority, and recheck the original root and owner
+    // chain after all child/root property reads before publishing this tuple.
+    qat_gesture_protocol::WindowIdentity finalRoot;
+    hr=read(authority.root.window,finalRoot);if(hr!=S_OK)return hr;
+    gestureReadTrace.popupOwnershipGate=23;
+    if(!gestureEqualReceiver(finalRoot,authority.root))return E_ABORT;
+    ownerNode=authority.root.window;
+    for(UINT index=0;index<authority.ownerCount;++index) {
+        gestureReadTrace.popupOwnershipGate=24;
+        ownerNode=GetWindow(ownerNode,GW_OWNER);DWORD process=0;
+        if(ownerNode!=authority.owners[index]||!IsWindow(ownerNode)||
+           GetWindowThreadProcessId(ownerNode,&process)!=authority.creator||process!=GetCurrentProcessId())return E_ABORT;
+    }
+    gestureReadTrace.popupOwnershipGate=25;
+    if(ownerNode!=authority.owner&&!IsChild(authority.owner,ownerNode))return E_ABORT;
+    gestureReadTrace.popupOwnershipGate=26;
+    if(!IsWindowVisible(window)||(window!=authority.root.window&&!IsChild(authority.root.window,window))||
+       !gestureNewPopup(*authority.before,authority.root.window,authority.owner,authority.creator))return E_ABORT;
+    gestureReadTrace.popupOwnershipGate=20;
+    const auto ownerAfter=qat_gesture_protocol::sameOwnedWindow(authority.ownerIdentity,authority.owner,authority.creator);
+    if(ownerAfter!=S_OK)return ownerAfter;
+    gestureReadTrace.popupOwnershipGate=21;
+    if(GetTickCount64()>=authority.deadline)return HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+    gestureReadTrace.popupOwnershipGate=0;output=current;return S_OK;
+}
+HRESULT gestureCapturePopupAuthority(const GestureWindows& before,HWND root,HWND owner,
+                                    DWORD creator,HDESK desktop,ULONGLONG deadline,
+                                    const qat_gesture_protocol::WindowIdentity& ownerIdentity,
+                                    GesturePopupAuthority& output) noexcept {
+    gestureReadTrace.popupReadWindow=root;gestureReadTrace.popupOwnershipGate=30;
+    if(!gestureNewPopup(before,root,owner,creator))return E_ACCESSDENIED;
+    GesturePopupAuthority next;next.role=GestureRootRole::NativePopup;
+    next.before=&before;next.owner=owner;next.creator=creator;next.desktop=desktop;next.deadline=deadline;
+    next.ownerIdentity=ownerIdentity;
+    next.root.window=root;next.root.root=GetAncestor(root,GA_ROOT);next.root.parent=GetAncestor(root,GA_PARENT);
+    next.root.thread=GetWindowThreadProcessId(root,&next.root.process);
+    HWND ownerNode=root;
+    for(UINT depth=0;depth<next.owners.size();++depth) {
+        gestureReadTrace.popupOwnershipGate=31;
+        ownerNode=GetWindow(ownerNode,GW_OWNER);if(!ownerNode)return E_ACCESSDENIED;
+        next.owners[next.ownerCount++]=ownerNode;
+        if(ownerNode==owner||IsChild(owner,ownerNode))break;
+    }
+    gestureReadTrace.popupOwnershipGate=32;
+    SetLastError(ERROR_SUCCESS);
+    if(!GetWindowRect(root,&next.root.bounds))return qat_gesture_protocol::nativeError();
+    gestureReadTrace.popupOwnershipGate=33;
+    SetLastError(ERROR_SUCCESS);
+    const auto length=GetClassNameW(root,next.root.windowClass.data(),static_cast<int>(next.root.windowClass.size()));
+    if(!length)return qat_gesture_protocol::nativeError();
+    gestureReadTrace.popupOwnershipGate=34;
+    if(length==static_cast<int>(next.root.windowClass.size())-1)return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+    qat_gesture_protocol::WindowIdentity verified;
+    const auto hr=gesturePopupWindowRead(next,root,verified);if(hr!=S_OK)return hr;
+    output=next;return S_OK;
+}
 HRESULT gestureMenuReceiver(IUIAutomation* automation, IUIAutomationElement* row,
                             HWND owner, DWORD creator, const RECT& rowBounds, HWND& result,
-                            qat_gesture_protocol::WindowIdentity* identity = nullptr) {
+                            qat_gesture_protocol::WindowIdentity* identity = nullptr,
+                            const GesturePopupAuthority* popup = nullptr) {
     ComPtr<IUIAutomationTreeWalker> walker;
     auto hr = automation->get_RawViewWalker(&walker);
     if (hr != S_OK || !walker) return hr == S_OK ? E_NOINTERFACE : hr;
@@ -394,7 +554,15 @@ HRESULT gestureMenuReceiver(IUIAutomation* automation, IUIAutomationElement* row
         if (hr != S_OK) return hr;
         if (native) {
             const auto window = reinterpret_cast<HWND>(native);
-            if (!gestureOwnedPopup(window, owner, creator)) return E_ACCESSDENIED;
+            qat_gesture_protocol::WindowIdentity scoped;
+            if(popup) {
+                if(popup->owner!=owner||popup->creator!=creator)return E_ACCESSDENIED;
+                const auto qualified=gesturePopupWindowRead(*popup,window,scoped);if(qualified!=S_OK)return qualified;
+            } else {
+                if(!IsWindowVisible(window))return E_ACCESSDENIED;
+                const auto qualified=qat_gesture_protocol::readOwnedWindow(window,owner,creator,scoped);
+                if(qualified!=S_OK)return qualified;
+            }
             RECT bounds{};
             SetLastError(ERROR_SUCCESS);
             if (!GetWindowRect(window, &bounds)) return qat_gesture_protocol::nativeError();
@@ -408,8 +576,12 @@ HRESULT gestureMenuReceiver(IUIAutomation* automation, IUIAutomationElement* row
             const auto length = GetClassNameW(window, actual.windowClass.data(), static_cast<int>(actual.windowClass.size()));
             if (!length) return qat_gesture_protocol::nativeError();
             if (length == static_cast<int>(actual.windowClass.size()) - 1) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
-            if (actual.thread != creator || actual.process != GetCurrentProcessId() || !gestureOwnedPopup(window, owner, creator))
-                return E_ACCESSDENIED;
+            if (actual.thread != creator || actual.process != GetCurrentProcessId())return E_ACCESSDENIED;
+            qat_gesture_protocol::WindowIdentity scopedAfter;
+            const auto currentWindowRead=popup?gesturePopupWindowRead(*popup,window,scopedAfter):
+                qat_gesture_protocol::readOwnedWindow(window,owner,creator,scopedAfter);
+            if(currentWindowRead!=S_OK)return currentWindowRead;
+            if(!gestureEqualReceiver(actual,scopedAfter)||!gestureEqualReceiver(scoped,scopedAfter))return E_ABORT;
             if (identity) *identity = actual;
             result = window; return S_OK;
         }
@@ -433,11 +605,13 @@ struct GestureShared {
     RECT rowBounds{};
     std::vector<int> rowRuntime;
     unsigned matchingRows = 0;
-    bool invoked = false;
+    bool invoked = false,invokeReturned=false,workerBodyCompleted=false;
+    HRESULT cancellationRetirementResult=E_PENDING;
+    ULONGLONG invokeReturnedAt=0,workerBodyCompletedAt=0;
 };
 void gestureUiWorker(const std::shared_ptr<GestureShared>& shared, HDESK desktop,
                      GestureConfig config, std::wstring controlName, bool qatControl,
-                     bool disabledObservation, std::shared_ptr<std::promise<HRESULT>> promise) noexcept {
+                     bool capacityObservation, std::shared_ptr<std::promise<HRESULT>> promise) noexcept {
     HRESULT result = E_FAIL;
     gestureReadTrace={};gestureReadTrace.phase=1;gestureReadTrace.stage=1;gestureReadTrace.root=shared->ticket.owner;
     const bool attached = SetThreadDesktop(desktop) != FALSE;
@@ -474,6 +648,10 @@ void gestureUiWorker(const std::shared_ptr<GestureShared>& shared, HDESK desktop
                 }
             }
             gestureReadTrace.toolbarCount=toolbarCount;
+            if(result==S_OK)std::wcout<<L"QAT exact toolbar discovery configured=\"" <<config.toolbar
+                <<L"\" walkedRows="<<before.size()<<L" visibleMatches="<<toolbarCount
+                <<L" unavailableRuntime="<<toolbarEvidence.runtimeUnavailable
+                <<L" rootedNativeIdentityProofRequired=1"<<std::endl;
             if (result == S_OK && toolbarCount != 1) {gestureReadTrace.phase=11;result = HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);}
             if(result==S_OK&&toolbarEvidence.emptyToolbarRuntime) {
                 // Prove the independently unique retained container itself even
@@ -584,8 +762,16 @@ void gestureUiWorker(const std::shared_ptr<GestureShared>& shared, HDESK desktop
                 unsigned matches = 0; HWND selectedRoot = nullptr;
                 std::vector<GestureActionPath> matchedActions;
                 std::vector<GestureElement> selectedRows;size_t selectedIndex=512;
+                GesturePopupAuthority selectedAuthority;
                 for (const auto window : roots) {
                     if (!gestureOwnedPopup(window, shared->ticket.owner, shared->ticket.creator)) continue;
+                    if(GetAncestor(window,GA_ROOT)!=window)continue; // NativePopup is an owned top-level root.
+                    gestureReadTrace.phase=40;gestureReadTrace.stage=102;gestureReadTrace.root=window;
+                    GesturePopupAuthority popupAuthority;
+                    result=gestureCapturePopupAuthority(initialWindows,window,shared->ticket.owner,
+                        shared->ticket.creator,desktop,shared->ticket.deadline,shared->ticket.ownerIdentity,popupAuthority);
+                    gestureReadTrace.nativeResult=result;
+                    if(result!=S_OK)break;
                     ComPtr<IUIAutomationElement> popupRoot; result = automation->ElementFromHandle(window, &popupRoot);
                     if (result != S_OK || !popupRoot) { if (result == S_OK) result = E_NOINTERFACE; break; }
                     gestureReadTrace.phase=40;gestureReadTrace.root=window;
@@ -615,13 +801,13 @@ void gestureUiWorker(const std::shared_ptr<GestureShared>& shared, HDESK desktop
                             const auto& expected=qatControl?config.remove:config.add;
                             if(row.name!=expected)continue;
                             GestureActionPath actionPath;result=gestureCapturePath(rows,rowIndex,shared->ticket.owner,
-                                shared->ticket.creator,shared->ticket.deadline,actionPath);
+                                shared->ticket.creator,shared->ticket.deadline,actionPath,&popupAuthority);
                             if(result!=S_OK)break;
                             const auto duplicate=std::any_of(matchedActions.begin(),matchedActions.end(),[&](const auto& prior){
                                 return gestureEqualPath(prior,actionPath);
                             });
                             if(!duplicate){matchedActions.push_back(std::move(actionPath));++matches;
-                                selectedRoot=window;selectedRows=rows;selectedIndex=rowIndex;}
+                                selectedRoot=window;selectedRows=rows;selectedIndex=rowIndex;selectedAuthority=popupAuthority;}
                         }
                         if(result!=S_OK)break;
                     }
@@ -633,7 +819,7 @@ void gestureUiWorker(const std::shared_ptr<GestureShared>& shared, HDESK desktop
                 if (matches == 1) {
                     std::vector<GestureElement> freshRows;size_t freshIndex=512;
                     result=gestureReacquire(automation.Get(),selectedRows,selectedIndex,shared->ticket.owner,
-                        shared->ticket.creator,shared->ticket.deadline,freshRows,freshIndex);
+                        shared->ticket.creator,shared->ticket.deadline,freshRows,freshIndex,&selectedAuthority);
                     if(result!=S_OK)break;
                     const auto& fresh=freshRows[freshIndex];
                     if(fresh.offscreen||!gestureNewPopup(initialWindows,selectedRoot,shared->ticket.owner,shared->ticket.creator)) {
@@ -642,11 +828,12 @@ void gestureUiWorker(const std::shared_ptr<GestureShared>& shared, HDESK desktop
                     HWND actualMenuWindow=nullptr;
                     qat_gesture_protocol::WindowIdentity menuIdentity;
                     result=gestureMenuReceiver(automation.Get(),fresh.element.Get(),shared->ticket.owner,
-                        shared->ticket.creator,fresh.bounds,actualMenuWindow,&menuIdentity);
+                        shared->ticket.creator,fresh.bounds,actualMenuWindow,&menuIdentity,&selectedAuthority);
                     if(result!=S_OK)break;
-                    if(!gestureNewPopup(initialWindows,actualMenuWindow,shared->ticket.owner,shared->ticket.creator)) {
-                        result=E_ABORT;break;
-                    }
+                    qat_gesture_protocol::WindowIdentity currentMenuIdentity;
+                    result=gesturePopupWindowRead(selectedAuthority,actualMenuWindow,currentMenuIdentity);
+                    if(result!=S_OK)break;
+                    if(!gestureEqualReceiver(currentMenuIdentity,menuIdentity)) {result=E_ABORT;break;}
                     shared->popup = actualMenuWindow; shared->rowRuntime = fresh.runtime; shared->rowBounds = fresh.bounds;
                     shared->rowEnabled = fresh.enabled; shared->rowOffscreen = fresh.offscreen;
                     std::wcout << L"QAT native menu HWND=" << menuIdentity.window << L" parent=" << menuIdentity.parent
@@ -654,28 +841,37 @@ void gestureUiWorker(const std::shared_ptr<GestureShared>& shared, HDESK desktop
                         << L"\" process=" << menuIdentity.process << L" thread=" << menuIdentity.thread << std::endl;
                     shared->invokeQuery = fresh.element->GetCurrentPatternAs(UIA_InvokePatternId, IID_PPV_ARGS(&invoke));
                     shared->invokePresent = invoke != nullptr;
-                    if (disabledObservation) {
-                        result = fresh.enabled ? E_FAIL : S_OK; found = true;
+                    // The public capacity contract does not promise a disabled
+                    // 21st context-menu row. Preserve its actual native state:
+                    // disabled is observation-only; enabled takes the same one
+                    // genuine Invoke and complete final native identity fences.
+                    if (capacityObservation && !fresh.enabled) {
+                        result = S_OK; found = true;
                     } else if (!fresh.enabled) { result = E_FAIL; break; }
                     else if (shared->invokeQuery != S_OK || !invoke) {
                         result = shared->invokeQuery == S_OK ? E_NOINTERFACE : shared->invokeQuery; break;
                     } else {
                         std::vector<GestureElement> finalRows;size_t finalIndex=512;
                         result=gestureReacquire(automation.Get(),freshRows,freshIndex,shared->ticket.owner,
-                            shared->ticket.creator,shared->ticket.deadline,finalRows,finalIndex);
+                            shared->ticket.creator,shared->ticket.deadline,finalRows,finalIndex,&selectedAuthority);
                         if(result!=S_OK)break;
                         const auto& finalRow=finalRows[finalIndex];
                         HWND finalWindow=nullptr;qat_gesture_protocol::WindowIdentity finalIdentity;
                         result=gestureMenuReceiver(automation.Get(),finalRow.element.Get(),shared->ticket.owner,
-                            shared->ticket.creator,finalRow.bounds,finalWindow,&finalIdentity);
+                            shared->ticket.creator,finalRow.bounds,finalWindow,&finalIdentity,&selectedAuthority);
+                        if(result!=S_OK)break;
+                        qat_gesture_protocol::WindowIdentity currentFinalIdentity;
+                        result=gesturePopupWindowRead(selectedAuthority,finalWindow,currentFinalIdentity);
                         if(result!=S_OK)break;
                         if(finalWindow!=actualMenuWindow||!finalRow.enabled||finalRow.offscreen||
                            !gestureEqualReceiver(finalIdentity,menuIdentity)||
-                           !gestureNewPopup(initialWindows,finalWindow,shared->ticket.owner,shared->ticket.creator)) {
+                           !gestureEqualReceiver(currentFinalIdentity,finalIdentity)) {
                             result=E_ABORT;break;
                         }
                         if (GetTickCount64() >= shared->ticket.deadline) { result = HRESULT_FROM_WIN32(ERROR_TIMEOUT); break; }
-                        shared->invoked = true; shared->actionResult = invoke->Invoke(); result = shared->actionResult; found = true;
+                        shared->invoked = true; shared->actionResult = invoke->Invoke();
+                        shared->invokeReturnedAt=GetTickCount64();shared->invokeReturned=true;
+                        result = shared->actionResult; found = true; // Raw native HRESULT is never normalized.
                     }
                 } else Sleep(1);
             }
@@ -692,18 +888,26 @@ void gestureUiWorker(const std::shared_ptr<GestureShared>& shared, HDESK desktop
                 gestureReadTrace.phase=39;gestureReadTrace.stage=93;
                 result = HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
             }
-            // Native disabled menu inspection has no Invoke. Failure also only
-            // cancels this exact owned opening; it cannot rescue its result.
-            if (shared->context.entered.load() && (disabledObservation || result != S_OK))
+            // Disabled capacity inspection has no Invoke. A completed failed
+            // native Invoke also cancels only this exact owned opening, without
+            // changing its raw HRESULT. An enabled successful Invoke is never
+            // cancelled here: its real native mutation/dismissal must finish.
+            if (shared->context.entered.load() && ((capacityObservation && !shared->invoked) || result != S_OK))
                 PostMessageW(shared->ticket.owner, qat_gesture_protocol::cancelMessage, shared->ticket.sequence, 0);
             invoke.Reset(); target.element.Reset(); toolbar.Reset(); root.Reset();
         }
+        // Every local UIA/native owner in the try body has retired. This receipt
+        // cannot be set by an exception after Invoke or a partial cleanup path.
+        shared->workerBodyCompletedAt=GetTickCount64();shared->workerBodyCompleted=true;
     } catch (const std::bad_alloc&) { result = E_OUTOFMEMORY; }
     catch (...) { result = E_FAIL; }
     if (!shared->prepared.load()) { shared->preparedResult = result; shared->prepared.store(true, std::memory_order_release); }
     if (shared->context.entered.load() && result != S_OK)
         PostMessageW(shared->ticket.owner, qat_gesture_protocol::cancelMessage, shared->ticket.sequence, 0);
-    if (cancellation == S_OK) { const auto disabled = CoDisableCallCancellation(nullptr); if (result == S_OK && FAILED(disabled)) result = disabled; }
+    if (cancellation == S_OK) {
+        const auto disabled = CoDisableCallCancellation(nullptr);shared->cancellationRetirementResult=disabled;
+        if (result == S_OK && FAILED(disabled)) result = disabled;
+    }
     shared->failureReadback=gestureReadTrace;shared->failureReadback.returned=result;
     CoUninitialize(); promise->set_value(result);
 }
@@ -749,9 +953,11 @@ std::wstring gestureCommandLabel(explorer::NativeRibbon& ribbon, UINT command) {
 }
 NativeState gesture(explorer::NativeRibbon& ribbon, HWND owner, unsigned& executions,
                     const GestureConfig& config, UINT command, bool qatControl,
-                    bool disabledObservation, ULONGLONG fixtureDeadline, const char* phase) {
+                    bool capacityObservation, ULONGLONG fixtureDeadline, const char* phase) {
     isolation(owner, fixtureDeadline);
     const auto original = readNative(ribbon, owner, fixtureDeadline, phase);
+    require(!capacityObservation || (!qatControl && original.rows.size()==20),
+        "Capacity observation requires the actual complete20 QAT and a command absent from it");
     ComPtr<IUIFramework> framework = ribbon.nativeFramework();
     const auto physicalCommand=ribbon.nativeCommandId(command);
     require(physicalCommand!=0,"Gesture command has no current native physical identity");
@@ -776,11 +982,11 @@ NativeState gesture(explorer::NativeRibbon& ribbon, HWND owner, unsigned& execut
     require(gestureSourceCurrent(&source, shared->ticket), "Label metadata/native diagnostic reentry changed original gesture source");
     std::wcout << L"QAT gesture target phase=" << phase << L" applicationId=" << command
         << L" nativeId=" << ribbon.nativeCommandId(command) << L" label=\"" << controlName
-        << L"\" qatInstance=" << qatControl << L" disabledObservation=" << disabledObservation << std::endl;
+        << L"\" qatInstance=" << qatControl << L" capacityObservation=" << capacityObservation << std::endl;
     const auto desktop = GetThreadDesktop(GetCurrentThreadId());
     require(desktop != nullptr, "Retain actual creator private desktop");
     auto promise = std::make_shared<std::promise<HRESULT>>(); auto future = promise->get_future();
-    std::thread worker(gestureUiWorker, shared, desktop, config, controlName, qatControl, disabledObservation, promise);
+    std::thread worker(gestureUiWorker, shared, desktop, config, controlName, qatControl, capacityObservation, promise);
     HANDLE kernel = worker.native_handle(); const DWORD threadId = GetThreadId(kernel);
     const auto fatal = [](const char* reason) {
         std::cerr << "FATAL owned QAT gesture " << reason << "; no owner/COM/desktop unwind while worker or native callback lives" << std::endl;
@@ -857,7 +1063,11 @@ NativeState gesture(explorer::NativeRibbon& ribbon, HWND owner, unsigned& execut
         << " menuMatches=" << shared->matchingRows << " menuEnabled=" << shared->rowEnabled
         << " menuOffscreen=" << shared->rowOffscreen << " invokeQuery=" << static_cast<ULONG>(shared->invokeQuery)
         << " invokePresent=" << shared->invokePresent << " invoked=" << shared->invoked
-        << " nativeInvoke=" << static_cast<ULONG>(shared->actionResult) << " popup=" << shared->popup
+        << " nativeInvoke=" << static_cast<ULONG>(shared->actionResult) << " invokeReturned=" << shared->invokeReturned
+        << " workerBodyCompleted=" << shared->workerBodyCompleted
+        << " invokeReturnedAt=" << shared->invokeReturnedAt << " workerBodyCompletedAt=" << shared->workerBodyCompletedAt
+        << " originalGestureDeadline=" << shared->ticket.deadline
+        << " cancellationRetirement=" << static_cast<ULONG>(shared->cancellationRetirementResult) << " popup=" << shared->popup
         << " kernelJoined=1 callbacks=" << executions
         << " emptyToolbarReads=" << shared->failureReadback.emptyToolbarReads
         << " emptyToolbarProofs=" << shared->failureReadback.emptyToolbarProofs
@@ -878,6 +1088,11 @@ NativeState gesture(explorer::NativeRibbon& ribbon, HWND owner, unsigned& execut
     }
 
     const auto& identityReceipt=shared->failureReadback;
+    std::cout<<"QAT actual rooted HWND authority role="<<identityReceipt.pathRootRole
+        <<" ownershipGate="<<identityReceipt.pathOwnershipGate<<" nativeRoot="<<identityReceipt.pathNativeRoot
+        <<" actualReportedRoot="<<identityReceipt.pathReportedRoot<<" actualReportedNode="<<identityReceipt.pathReportedNode
+        <<" popupOwnershipGate="<<identityReceipt.popupOwnershipGate<<" popupReadWindow="<<identityReceipt.popupReadWindow
+        <<" kernelJoined=1"<<std::endl;
     std::cout<<"QAT rooted native identity proofs="<<identityReceipt.pathProofs<<" collisions="<<identityReceipt.pathCollisions
         <<" legacyReads="<<identityReceipt.legacyReads<<" legacyNativePairs="<<identityReceipt.legacyNativePairs
         <<" legacyAbsentPairs="<<identityReceipt.legacyAbsentPairs
@@ -930,7 +1145,15 @@ NativeState gesture(explorer::NativeRibbon& ribbon, HWND owner, unsigned& execut
     isolation(owner, fixtureDeadline);
     require(gestureSourceCurrent(&source, shared->ticket), "Native gesture changed original source/framework generation");
     if (creatorResult != S_OK) exact(creatorResult, "Creator gesture admission failed");
-    if (action != S_OK) {
+    // Only a fully returned genuine capacity Invoke may carry a negative raw
+    // action HRESULT into the independent complete20-state proof below. Native
+    // discovery/source/deadline/retirement failures retain their original path.
+    const bool capacityInvokeCompleted=capacityObservation && shared->rowEnabled &&
+        shared->invokeQuery==S_OK && shared->invokePresent && shared->invoked && shared->invokeReturned &&
+        shared->workerBodyCompleted && shared->cancellationRetirementResult==S_OK && action==shared->actionResult &&
+        shared->invokeReturnedAt<shared->ticket.deadline && shared->workerBodyCompletedAt<shared->ticket.deadline &&
+        gestureCapacityActionStatus(shared->actionResult);
+    if (action != S_OK && !capacityInvokeCompleted) {
         exactState(original, readNative(ribbon, owner, fixtureDeadline, "unavailable-native-gesture-preserved"));
         if (gestureUnavailableStatus(action)) throw GestureUnavailable("Actual owned native gesture route/pattern unavailable (raw receipts retained)");
         exact(action, "Actual native gesture action failed");
@@ -942,11 +1165,25 @@ NativeState gesture(explorer::NativeRibbon& ribbon, HWND owner, unsigned& execut
         shared->context.downEntered.load() && shared->context.downReturned.load() &&
         shared->context.upEntered.load() && shared->context.upReturned.load(),
         "Native right-click lacked one admitted complete down/up pair");
-    require(disabledObservation ? !shared->rowEnabled && !shared->invoked :
+    require(capacityObservation ?
+        (shared->rowEnabled ? capacityInvokeCompleted :
+            !shared->invoked && !shared->invokeReturned && action==S_OK && shared->workerBodyCompleted &&
+            shared->workerBodyCompletedAt<shared->ticket.deadline &&
+            shared->cancellationRetirementResult==S_OK) :
         shared->rowEnabled && shared->invokeQuery == S_OK && shared->invokePresent && shared->invoked && shared->actionResult == S_OK,
         "Native gesture/pattern evidence is incomplete");
     materialize(ribbon, owner, fixtureDeadline);
-    return readNative(ribbon, owner, fixtureDeadline, "after-native-context-gesture");
+    auto after=readNative(ribbon, owner, fixtureDeadline, "after-native-context-gesture");
+    if(capacityObservation) {
+        require(original.rows.size()==20 && after.rows.size()==20,"Actual native21st Add changed the complete20 capacity");
+        exactState(original,after); // Collection, dock and every genuine whole row remain exact.
+        std::cout<<"QAT actual capacity receipt menuEnabled="<<shared->rowEnabled<<" invoked="<<shared->invoked
+            <<" invokeReturned="<<shared->invokeReturned<<" rawNativeInvokeHRESULT="<<static_cast<ULONG>(shared->actionResult)
+            <<" rawWorkerActionHRESULT="<<static_cast<ULONG>(action)<<" originalFullNativeCount="<<original.rows.size()
+            <<" actualFullNativeCount="<<after.rows.size()<<" exactWholeRowsPreserved=1 nativeCapacity20Observed=1"
+            <<" disabledAppearanceRequired=0 negativeInvokeNormalized=0"<<std::endl;
+    }
+    return after;
 }
 void gestureAdded(const NativeState& before, const NativeState& after, explorer::NativeRibbon& ribbon, UINT command) {
     require(after.collectionIdentity.Get() == before.collectionIdentity.Get() && after.dock == before.dock &&
@@ -963,7 +1200,8 @@ void gestureAdded(const NativeState& before, const NativeState& after, explorer:
 void runGestureLayout(explorer::RibbonLayout layout, ULONGLONG deadline) {
     using namespace explorer;
     GestureConfig config;
-    config.toolbar = gestureEnvironment(L"WINDOWSEXPLORER_QAT_TOOLBAR_LABEL", L"Quick Access Toolbar");
+    config.toolbar = gestureEnvironment(L"WINDOWSEXPLORER_QAT_TOOLBAR_LABEL",
+        layout == RibbonLayout::Authored ? L"Quick Access" : L"Quick Access Toolbar");
     config.add = gestureEnvironment(L"WINDOWSEXPLORER_QAT_ADD_LABEL", L"Add to Quick Access Toolbar");
     config.remove = gestureEnvironment(L"WINDOWSEXPLORER_QAT_REMOVE_LABEL", L"Remove from Quick Access Toolbar");
     Window window{CreateWindowExW(0, L"WindowsExplorerNativeQATRegression", L"Owned real QAT context gestures",
@@ -1011,11 +1249,11 @@ void runGestureLayout(explorer::RibbonLayout layout, ULONGLONG deadline) {
     exact(ribbon.setQuickAccessCommands(capacity), "Setup actual20 distinct commands excluding calibrated History");
     materialize(ribbon, window.handle, deadline);
     auto twenty = readNative(ribbon, window.handle, deadline, "gesture-capacity20"); ids(twenty, ribbon, capacity);
-    auto rejected = gesture(ribbon, window.handle, executions, config, FileHistory, false, true, deadline, "real-disabled21st-add");
+    auto rejected = gesture(ribbon, window.handle, executions, config, FileHistory, false, true, deadline, "real-capacity21st-add");
     exactState(twenty, rejected);
     require(executions == 0, "Native QAT gesture invoked an application/Shell command");
     isolation(window.handle, deadline);
     std::cout << "PASS genuine native QAT gestures layout=" << (layout == RibbonLayout::Authored ? "authored" : "installed")
-        << " actualAddRemove=1 untouchedWholeRows=1 removeReaddOrder=1 native19to20=1 disabled21stAdd=1"
+        << " actualAddRemove=1 untouchedWholeRows=1 removeReaddOrder=1 native19to20=1 actualNative21stCapacity20=1"
         << " nativeMoveGesture=NOT_COVERED opaqueSeparator=NOT_COVERED(no actual native QAT separator)" << std::endl;
 }
