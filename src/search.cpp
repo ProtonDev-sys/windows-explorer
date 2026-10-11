@@ -959,6 +959,17 @@ HRESULT writeConfirmedFile(const std::filesystem::path& path, const std::string&
     if (FAILED(hr)) return hr;
     FILE_BASIC_INFO retained{};
     retained.CreationTime = basic.CreationTime;
+    // Implicit file write times can share the same coarse system clock tick.
+    // A same-size replacement must not keep the previous saved query's write
+    // time: the native saved-search loader can then reuse its old condition.
+    FILETIME writeTime{};
+    GetSystemTimePreciseAsFileTime(&writeTime);
+    retained.LastWriteTime.LowPart = writeTime.dwLowDateTime;
+    retained.LastWriteTime.HighPart = static_cast<LONG>(writeTime.dwHighDateTime);
+    if (retained.LastWriteTime.QuadPart == basic.LastWriteTime.QuadPart) {
+        retained.LastWriteTime.QuadPart += retained.LastWriteTime.QuadPart ==
+            (std::numeric_limits<LONGLONG>::max)() ? -1 : 1;
+    }
     retained.FileAttributes = basic.FileAttributes &
         (FILE_ATTRIBUTE_ARCHIVE | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED);
     if (!retained.FileAttributes) retained.FileAttributes = FILE_ATTRIBUTE_NORMAL;

@@ -1499,6 +1499,13 @@ void protectiveScopeGuardsAndNewMatches() {
 }
 
 void confirmedSearchReplacement() {
+    const auto requireNewWriteTime = [](const FILE_BASIC_INFO& before, const FILE_BASIC_INFO& after, unsigned stage) {
+        std::cout << "INFO: confirmed save publication stage=" << stage
+                  << " previousWrite=" << before.LastWriteTime.QuadPart
+                  << " replacementWrite=" << after.LastWriteTime.QuadPart << '\n';
+        require(after.LastWriteTime.QuadPart != before.LastWriteTime.QuadPart,
+                "confirmed replacement retained the previous query's native write timestamp");
+    };
     Fixture fixture;
     const auto scopePath = fixture.root / L"scope";
     require(fs::create_directory(scopePath), "create owned replacement search scope");
@@ -1535,6 +1542,7 @@ void confirmedSearchReplacement() {
     require(fixtureMembers(fixture.root) == members, "confirmed replacement leaked a temporary/backup file");
     loadXml(output);
     requireReopenedResults(output, {second.native()}, "replaced native saved query has stale membership");
+    requireNewWriteTime(basic, replaced, 1);
     explorer::SavedSearchMetadata imported;
     succeeded(explorer::readSavedSearch(output, &imported), "read replaced saved-query metadata");
     require(imported.query.find(L"second.bin") != std::wstring::npos, "replaced query retained stale metadata");
@@ -1590,11 +1598,13 @@ void confirmedSearchReplacement() {
     // an absent path after a successful Save dialog selected a fresh name.
     ComPtr<IShellItemArray> scopes;
     succeeded(SHCreateShellItemArrayFromShellItem(scope.Get(), IID_PPV_ARGS(&scopes)), "create owned union scope");
+    const auto beforeUnionBasic = fileBasic(output);
     succeeded(explorer::saveSearchForScopes(L"System.FileName:=\"first.txt\"", scopes.Get(), true, output,
         explorer::SearchSaveMode::UserConfirmed), "replace confirmed union-scope query");
     require(read(output).find("first.txt") != std::string::npos && read(output).find("second.bin") == std::string::npos,
             "union replacement did not publish the requested XML");
     requireReopenedResults(output, {first.native()}, "union replacement kept stale query membership");
+    requireNewWriteTime(beforeUnionBasic, fileBasic(output), 2);
     const std::vector<explorer::SearchScopeRule> rules{{scope, false, false}};
     const auto beforeRuleBytes = read(output);
     const auto beforeRuleId = fileIdentity(output.native());
@@ -1668,6 +1678,7 @@ void confirmedSearchReplacement() {
             liveEvidence(7, L"System.FileName:=\"second.bin\"", rules);
             if (SUCCEEDED(importedStatus)) liveEvidence(8, metadata.query, metadata.scopeRules);
         });
+    requireNewWriteTime(beforeRuleBasic, fileBasic(output), 3);
     const auto fresh = fixture.root / L"new-confirmed.search-ms";
     succeeded(explorer::saveSearchForScopeRules(L"System.Size:>0", rules, fresh,
         explorer::SearchSaveMode::UserConfirmed), "confirmed dialog fresh path creates a new query");
@@ -1692,6 +1703,7 @@ void confirmedSearchReplacement() {
     require((fileBasic(output).FileAttributes & FILE_ATTRIBUTE_COMPRESSED) != 0 && fileDacl(output) == dacl,
             "confirmed save lost native compression or permissions");
     requireReopenedResults(output, {first.native()}, "compressed replacement has incorrect native results");
+    requireNewWriteTime(compressed, fileBasic(output), 4);
     require(fileIdentity(first.native()) == firstId && fileIdentity(second.native()) == secondId &&
             read(first) == "original source must survive" && read(second) == "second source must survive",
             "saved-query replacement changed source file identity or content");
