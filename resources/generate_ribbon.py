@@ -142,14 +142,14 @@ def split(name, primary, children):
     return (f'<SplitButton CommandName="{name}"><SplitButton.ButtonItem>{button(primary)}</SplitButton.ButtonItem>'
             '<SplitButton.MenuGroups><MenuGroup>' + ''.join(children) + '</MenuGroup></SplitButton.MenuGroups></SplitButton>')
 
-def gallery(name, in_ribbon=False):
+def gallery(name, in_ribbon=False, menu_rows=3):
     command(name)
     tag = 'InRibbonGallery' if in_ribbon else 'DropDownGallery'
     attributes = ' HasLargeItems="false" MaxRows="3" MaxColumns="2" MinColumnsLarge="2" TextPosition="Right"' if in_ribbon else ''
     gallery_type = 'Commands' if in_ribbon else 'Items'
     footer = button('RibbonClearSearchHistory') if name == 'RecentSearches' else ''
     return (f'<{tag} CommandName="{name}" Type="{gallery_type}"{attributes}>'
-            f'<{tag}.MenuLayout><VerticalMenuLayout Rows="3"/></{tag}.MenuLayout>'
+            f'<{tag}.MenuLayout><VerticalMenuLayout Rows="{menu_rows}"/></{tag}.MenuLayout>'
             f'<{tag}.MenuGroups><MenuGroup/>'+ (f'<MenuGroup>{footer}</MenuGroup>' if footer else '') + f'</{tag}.MenuGroups></{tag}>')
 
 def share_gallery():
@@ -258,7 +258,7 @@ contextual('RibbonCompressedContext','RibbonCompressedTab',[
 command('GroupExtractTo','Extract to')
 contextual('RibbonSearchContext','RibbonSearchTab',[
     group('GroupSearchLocation','Location',[button('RibbonSearchThisPC'),button('SearchCurrent','ToggleButton'),button('SearchSubfolders','ToggleButton'),dropdown('RibbonSearchAgainMenu',[button('RibbonSearchThisPC'),button('RibbonChangeIndexedLocations')])],[[0],[1,2,3]]),
-    group('GroupSearchRefine','Refine',[gallery('SearchDateMenu'),gallery('SearchKindMenu'),gallery('SearchSizeMenu'),gallery('RibbonSearchOtherProperties')],[[0],[1,2,3]]),
+    group('GroupSearchRefine','Refine',[gallery('SearchDateMenu',menu_rows=8),gallery('SearchKindMenu'),gallery('SearchSizeMenu'),gallery('RibbonSearchOtherProperties')],[[0],[1,2,3]]),
     group('GroupSearchOptions','Options',[gallery('RecentSearches'),dropdown('RibbonSearchAdvancedMenu',[button('RibbonChangeIndexedLocations'),button('RibbonSearchContents','CheckBox'),button('RibbonSearchSystemFiles','CheckBox'),button('RibbonSearchZipFiles','CheckBox')]),button('SaveSearch'),button('OpenFileLocation')],[[0,1,2],[3]]),
     group('GroupSearchClose','Close',[button('CloseSearch')]),
 ])
