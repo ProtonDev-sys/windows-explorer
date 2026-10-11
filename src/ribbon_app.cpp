@@ -2161,6 +2161,15 @@ HRESULT ExplorerApp::executeRibbon(UINT command) {
 
 int ExplorerApp::headlessVisual(const PrivateDesktop& desktop, const std::filesystem::path& screenshot,
                               const std::filesystem::path& report, const VisualScene& scene) {
+    struct SelectionReadback {
+        bool requested=false,filesystemAttributesRequested=false,ownerVisible=false,viewVisible=false;
+        HRESULT folderRead=E_PENDING,viewWindowRead=E_PENDING,filesystemAttributesRead=E_PENDING;
+        HRESULT itemsRead=E_PENDING,countRead=E_PENDING,lastItemRead=E_PENDING,lastCompareRead=E_PENDING,firstCompareFailure=E_PENDING;
+        DWORD filesystemAttributes=INVALID_FILE_ATTRIBUTES,count=0,maximumCount=0;
+        ULONGLONG polls=0,itemReads=0,compareReads=0,compareFailures=0,matches=0;
+        std::uintptr_t originalView=0,lastView=0;
+        UINT expectedPidlBytes=0;int lastComparison=1;
+    } selectionRead;
     VisualCaptureOptions::CommandReadinessReadback readiness;
     VisualCaptureOptions options;
     const auto captureDeadline=GetTickCount64()+25000;
@@ -2182,6 +2191,24 @@ int ExplorerApp::headlessVisual(const PrivateDesktop& desktop, const std::filesy
         const auto workerRead=staWorkerDiagnostics(&workers);
         std::ofstream diagnostic(report);
         diagnostic << "{\"headless\":true,\"failedStage\":\"" << stage << "\",\"hresult\":" << static_cast<long>(result)
+            << ",\"selectionAvailability\":{\"requested\":" << (selectionRead.requested?"true":"false")
+            << ",\"folderReadHresult\":" << static_cast<long>(selectionRead.folderRead)
+            << ",\"viewWindowReadHresult\":" << static_cast<long>(selectionRead.viewWindowRead)
+            << ",\"ownerVisible\":" << (selectionRead.ownerVisible?"true":"false")
+            << ",\"viewVisible\":" << (selectionRead.viewVisible?"true":"false")
+            << ",\"originalView\":" << selectionRead.originalView << ",\"lastView\":" << selectionRead.lastView
+            << ",\"expectedPidlBytes\":" << selectionRead.expectedPidlBytes
+            << ",\"filesystemAttributesRequested\":" << (selectionRead.filesystemAttributesRequested?"true":"false")
+            << ",\"filesystemAttributesReadHresult\":" << static_cast<long>(selectionRead.filesystemAttributesRead)
+            << ",\"filesystemAttributes\":" << selectionRead.filesystemAttributes
+            << ",\"polls\":" << selectionRead.polls << ",\"itemsReadHresult\":" << static_cast<long>(selectionRead.itemsRead)
+            << ",\"countReadHresult\":" << static_cast<long>(selectionRead.countRead)
+            << ",\"count\":" << selectionRead.count << ",\"maximumCount\":" << selectionRead.maximumCount
+            << ",\"itemReads\":" << selectionRead.itemReads << ",\"lastItemReadHresult\":" << static_cast<long>(selectionRead.lastItemRead)
+            << ",\"compareReads\":" << selectionRead.compareReads << ",\"compareFailures\":" << selectionRead.compareFailures
+            << ",\"lastCompareReadHresult\":" << static_cast<long>(selectionRead.lastCompareRead)
+            << ",\"firstCompareFailureHresult\":" << static_cast<long>(selectionRead.firstCompareFailure)
+            << ",\"lastComparison\":" << selectionRead.lastComparison << ",\"matches\":" << selectionRead.matches << '}'
             << ",\"commandReadiness\":{\"requested\":" << (readiness.requested?"true":"false")
             << ",\"ready\":" << (readiness.ready?"true":"false") << ",\"readHresult\":" << static_cast<long>(readiness.read)
             << ",\"waitMs\":" << readiness.waitMs
@@ -2237,7 +2264,12 @@ int ExplorerApp::headlessVisual(const PrivateDesktop& desktop, const std::filesy
     const auto viewResult = scene.nativeView?S_OK:setView(scene.view);
     if (FAILED(viewResult)) return failed(7,"view",viewResult);
     if (!scene.select.empty()) {
-        ComPtr<IShellItem> folder; currentFolder(folder);
+        selectionRead.requested=true;
+        selectionRead.originalView=reinterpret_cast<std::uintptr_t>(view_.Get());
+        selectionRead.ownerVisible=IsWindowVisible(window_)!=FALSE;
+        HWND selectionViewWindow=nullptr;selectionRead.viewWindowRead=view_->GetWindow(&selectionViewWindow);
+        selectionRead.viewVisible=SUCCEEDED(selectionRead.viewWindowRead)&&IsWindowVisible(selectionViewWindow)!=FALSE;
+        ComPtr<IShellItem> folder; selectionRead.folderRead=currentFolder(folder);
         const auto folderPath=nameOf(folder.Get(),SIGDN_FILESYSPATH);
         const auto parsing=scene.select.starts_with(L"shell:") || scene.select.starts_with(L"::{") ||
             std::filesystem::path(scene.select).is_absolute() ? scene.select :
@@ -2248,14 +2280,31 @@ int ExplorerApp::headlessVisual(const PrivateDesktop& desktop, const std::filesy
         if (FAILED(hr) || !selected) return failed(7,"selection-parse",hr);
         ComPtr<IShellItem> expected;
         hr=SHCreateItemFromIDList(selected.get(),IID_PPV_ARGS(&expected));if(FAILED(hr))return failed(7,"selection-identity",hr);
+        selectionRead.expectedPidlBytes=ILGetSize(selected.get());
+        if(std::filesystem::path(parsing).is_absolute()) {
+            selectionRead.filesystemAttributesRequested=true;
+            selectionRead.filesystemAttributes=GetFileAttributesW(parsing.c_str());
+            selectionRead.filesystemAttributesRead=selectionRead.filesystemAttributes!=INVALID_FILE_ATTRIBUTES?
+                S_OK:HRESULT_FROM_WIN32(GetLastError());
+        }
         const auto available=pumpScene([&] {
+            ++selectionRead.polls;selectionRead.lastView=reinterpret_cast<std::uintptr_t>(view_.Get());
             ComPtr<IShellItemArray> items;DWORD count=0;
-            hr=folderView_->Items(SVGIO_ALLVIEW,IID_PPV_ARGS(&items));if(FAILED(hr)||!items)return false;
-            hr=items->GetCount(&count);if(FAILED(hr))return false;
+            hr=folderView_->Items(SVGIO_ALLVIEW,IID_PPV_ARGS(&items));selectionRead.itemsRead=hr;
+            if(FAILED(hr)||!items)return false;
+            hr=items->GetCount(&count);selectionRead.countRead=hr;selectionRead.count=count;if(FAILED(hr))return false;
+            selectionRead.maximumCount=std::max(selectionRead.maximumCount,count);
             for(DWORD index=0;index<count;++index) {
                 ComPtr<IShellItem> item;int same=1;
-                if(SUCCEEDED(items->GetItemAt(index,&item))&&item&&
-                    SUCCEEDED(expected->Compare(item.Get(),SICHINT_CANONICAL,&same))&&same==0)return true;
+                ++selectionRead.itemReads;selectionRead.lastItemRead=items->GetItemAt(index,&item);
+                if(SUCCEEDED(selectionRead.lastItemRead)&&item) {
+                    ++selectionRead.compareReads;
+                    selectionRead.lastCompareRead=expected->Compare(item.Get(),SICHINT_CANONICAL,&same);
+                    selectionRead.lastComparison=same;
+                    if(FAILED(selectionRead.lastCompareRead)&&selectionRead.compareFailures++==0)
+                        selectionRead.firstCompareFailure=selectionRead.lastCompareRead;
+                    if(SUCCEEDED(selectionRead.lastCompareRead)&&same==0){++selectionRead.matches;return true;}
+                }
             }
             return false;
         },5000);

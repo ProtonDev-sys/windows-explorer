@@ -287,7 +287,32 @@ std::string nativePopupExpansionJson(const NativePopupCapture& popup) {
         << ",\"ribbonWindow\":" << popup.ribbonWindow << ",\"ribbonBounds\":";
     rectJson(out,popup.ribbonBounds);
     out << ",\"nativeCommand\":" << popup.nativeCommand << ",\"commandType\":" << popup.commandType
-        << ",\"executionAttempts\":" << popup.executionAttempts << ",\"parents\":[";
+        << ",\"executionAttempts\":" << popup.executionAttempts;
+    const auto& expansion=popup.expansion;
+    out << ",\"postExpand\":{\"expandReadHresult\":" << static_cast<long>(expansion.expandRead)
+        << ",\"stateReadHresult\":" << static_cast<long>(expansion.stateRead) << ",\"finalState\":" << expansion.finalState
+        << ",\"observations\":" << expansion.observations << ",\"elapsedMs\":" << expansion.elapsedMs
+        << ",\"enumerationSucceeded\":" << (expansion.enumerationSucceeded?"true":"false")
+        << ",\"enumerationError\":" << expansion.enumerationError << ",\"enumeratedWindows\":" << expansion.enumeratedWindows
+        << ",\"ownedPopups\":" << expansion.ownedPopups << ",\"maximumOwnedPopups\":" << expansion.maximumOwnedPopups
+        << ",\"matchedRows\":" << expansion.matchedRows << ",\"maximumMatchedRows\":" << expansion.maximumMatchedRows
+        << ",\"popupOverflow\":" << (expansion.popupOverflow?"true":"false") << ",\"popups\":[";
+    for(UINT index=0;index<expansion.popupReadbacks&&index<expansion.popups.size();++index) {
+        const auto& observed=expansion.popups[index];
+        out << (index?",":"") << "{\"window\":" << observed.window << ",\"bounds\":";rectJson(out,observed.bounds);
+        out << ",\"boundsReadHresult\":" << static_cast<long>(observed.boundsRead)
+            << ",\"rootReadHresult\":" << static_cast<long>(observed.rootRead)
+            << ",\"descendantsReadHresult\":" << static_cast<long>(observed.descendantsRead)
+            << ",\"countReadHresult\":" << static_cast<long>(observed.countRead)
+            << ",\"firstRowFailure\":" << static_cast<long>(observed.firstRowFailure) << ",\"rowCount\":" << observed.rowCount
+            << ",\"acceptedType\":" << observed.acceptedType << ",\"visible\":" << observed.visible
+            << ",\"insideBounds\":" << observed.insideBounds << ",\"named\":" << observed.named << ",\"matched\":" << observed.matched
+            << ",\"unexpectedTypes\":[";
+        for(UINT type=0;type<observed.unexpectedTypeCount&&type<observed.unexpectedTypes.size();++type)
+            out << (type?",":"") << observed.unexpectedTypes[type];
+        out << "]}";
+    }
+    out << "]},\"parents\":[";
     bool first=true;
     for(const auto& parent:popup.parents) {
         out << (first?"":",") << "{\"type\":" << parent.type

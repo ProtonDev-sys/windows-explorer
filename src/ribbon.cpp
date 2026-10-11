@@ -162,12 +162,13 @@ HRESULT expandNativeSearchDateMenu(IUIAutomation* automation, TabSelection& requ
     if(!expand)return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
     if(request.cancelled)return E_ABORT;
     request.popup.stage=5;
-    hr=expand->Expand();if(FAILED(hr))return hr;
+    const auto expansionStarted=GetTickCount64();
+    hr=expand->Expand();request.popup.expansion.expandRead=hr;if(FAILED(hr))return hr;
     ComPtr<IUIAutomationCondition> everything;
     hr=automation->CreateTrueCondition(&everything);if(FAILED(hr))return hr;
-    struct Popups {HWND host;std::vector<HWND> windows;} popups{request.window,{}};
+    struct Popups {HWND host;std::vector<HWND> windows;UINT enumerated=0;} popups{request.window,{}};
     const auto collect=[](HWND popup,LPARAM value)->BOOL {
-        auto& found=*reinterpret_cast<Popups*>(value);DWORD process=0;GetWindowThreadProcessId(popup,&process);
+        auto& found=*reinterpret_cast<Popups*>(value);++found.enumerated;DWORD process=0;GetWindowThreadProcessId(popup,&process);
         if(process==GetCurrentProcessId()&&popup!=found.host&&IsWindowVisible(popup)&&
             GetAncestor(popup,GA_ROOTOWNER)==found.host)found.windows.push_back(popup);
         return TRUE;
@@ -177,38 +178,65 @@ HRESULT expandNativeSearchDateMenu(IUIAutomation* automation, TabSelection& requ
     do {
         if(request.cancelled)return E_ABORT;
         ExpandCollapseState state=ExpandCollapseState_LeafNode;
-        hr=expand->get_CurrentExpandCollapseState(&state);if(FAILED(hr))return hr;
-        popups.windows.clear();
-        EnumThreadWindows(GetWindowThreadProcessId(request.window,nullptr),collect,reinterpret_cast<LPARAM>(&popups));
+        hr=expand->get_CurrentExpandCollapseState(&state);
+        auto& evidence=request.popup.expansion;++evidence.observations;
+        evidence.stateRead=hr;evidence.finalState=static_cast<int>(state);evidence.elapsedMs=GetTickCount64()-expansionStarted;
+        if(FAILED(hr))return hr;
+        popups.windows.clear();popups.enumerated=0;
+        SetLastError(ERROR_SUCCESS);
+        const auto enumerated=EnumThreadWindows(GetWindowThreadProcessId(request.window,nullptr),collect,reinterpret_cast<LPARAM>(&popups));
+        evidence.enumerationSucceeded=enumerated!=FALSE;evidence.enumerationError=enumerated?ERROR_SUCCESS:GetLastError();
+        evidence.enumeratedWindows=popups.enumerated;evidence.ownedPopups=static_cast<UINT>(popups.windows.size());
+        evidence.maximumOwnedPopups=std::max(evidence.maximumOwnedPopups,evidence.ownedPopups);
+        evidence.popupReadbacks=0;evidence.popups={};
+        evidence.popupOverflow=popups.windows.size()>evidence.popups.size();
         request.matchedRows=0;
         NativePopupCapture completePopup;
         for(const auto popup:popups.windows) {
+            NativePopupCapture::PopupReadback discarded;
+            auto& popupEvidence=evidence.popupReadbacks<evidence.popups.size()?evidence.popups[evidence.popupReadbacks++]:discarded;
+            popupEvidence.window=reinterpret_cast<UINT_PTR>(popup);
             RECT popupBounds{};
-            if(!GetWindowRect(popup,&popupBounds))continue;
+            if(!GetWindowRect(popup,&popupBounds)){const auto error=GetLastError();popupEvidence.boundsRead=HRESULT_FROM_WIN32(error?error:ERROR_GEN_FAILURE);continue;}
+            popupEvidence.boundsRead=S_OK;popupEvidence.bounds=popupBounds;
             std::vector<bool> matched(request.expectedRows.size(),false);
             std::vector<RECT> matchedBounds(request.expectedRows.size());
             ComPtr<IUIAutomationElement> popupRoot;
-            if(FAILED(automation->ElementFromHandle(popup,&popupRoot))||!popupRoot)continue;
+            popupEvidence.rootRead=automation->ElementFromHandle(popup,&popupRoot);
+            if(FAILED(popupEvidence.rootRead)||!popupRoot)continue;
             ComPtr<IUIAutomationElementArray> rows;
-            if(FAILED(popupRoot->FindAll(TreeScope_Descendants,everything.Get(),&rows))||!rows)continue;
-            int rowCount=0;hr=rows->get_Length(&rowCount);if(FAILED(hr))return hr;
+            popupEvidence.descendantsRead=popupRoot->FindAll(TreeScope_Descendants,everything.Get(),&rows);
+            if(FAILED(popupEvidence.descendantsRead)||!rows)continue;
+            int rowCount=0;hr=rows->get_Length(&rowCount);popupEvidence.countRead=hr;popupEvidence.rowCount=rowCount;if(FAILED(hr))return hr;
+            const auto observeRow=[&](HRESULT status){if(FAILED(status)&&SUCCEEDED(popupEvidence.firstRowFailure))popupEvidence.firstRowFailure=status;return status;};
             for(int index=0;index<rowCount;++index) {
                 if(request.cancelled)return E_ABORT;
                 ComPtr<IUIAutomationElement> row;BOOL offscreen=TRUE;RECT bounds{};CONTROLTYPEID type=0;
-                if(FAILED(rows->GetElement(index,&row))||!row||FAILED(row->get_CurrentControlType(&type))||
-                    (type!=UIA_MenuItemControlTypeId&&type!=UIA_ListItemControlTypeId&&type!=UIA_ButtonControlTypeId)||
-                    FAILED(row->get_CurrentIsOffscreen(&offscreen))||offscreen||
-                    FAILED(row->get_CurrentBoundingRectangle(&bounds))||bounds.right<=bounds.left||bounds.bottom<=bounds.top||
+                if(FAILED(observeRow(rows->GetElement(index,&row)))||!row||FAILED(observeRow(row->get_CurrentControlType(&type))))continue;
+                if(type!=UIA_MenuItemControlTypeId&&type!=UIA_ListItemControlTypeId&&type!=UIA_ButtonControlTypeId) {
+                    const auto used=popupEvidence.unexpectedTypes.begin()+popupEvidence.unexpectedTypeCount;
+                    if(std::find(popupEvidence.unexpectedTypes.begin(),used,type)==used&&used!=popupEvidence.unexpectedTypes.end())
+                        popupEvidence.unexpectedTypes[popupEvidence.unexpectedTypeCount++]=type;
+                    continue;
+                }
+                ++popupEvidence.acceptedType;
+                if(FAILED(observeRow(row->get_CurrentIsOffscreen(&offscreen)))||offscreen)continue;
+                ++popupEvidence.visible;
+                if(FAILED(observeRow(row->get_CurrentBoundingRectangle(&bounds)))||bounds.right<=bounds.left||bounds.bottom<=bounds.top||
                     bounds.left<popupBounds.left||bounds.top<popupBounds.top||
                     bounds.right>popupBounds.right||bounds.bottom>popupBounds.bottom)continue;
+                ++popupEvidence.insideBounds;
                 BSTR name=nullptr;
-                if(SUCCEEDED(row->get_CurrentName(&name))&&name)
+                const auto namedRow=observeRow(row->get_CurrentName(&name));
+                if(SUCCEEDED(namedRow)&&name)++popupEvidence.named;
+                if(SUCCEEDED(namedRow)&&name)
                     for(size_t wanted=0;wanted<matched.size();++wanted)if(request.expectedRows[wanted]==name) {
                         matched[wanted]=true;matchedBounds[wanted]=bounds;
                     }
                 SysFreeString(name);
             }
             const auto matchedCount=static_cast<UINT>(std::count(matched.begin(),matched.end(),true));
+            popupEvidence.matched=matchedCount;
             request.matchedRows=std::max(request.matchedRows,matchedCount);
             if(matchedCount==request.expectedRows.size()) {
                 if(completePopup.window)return E_UNEXPECTED;
@@ -216,7 +244,10 @@ HRESULT expandNativeSearchDateMenu(IUIAutomation* automation, TabSelection& requ
                 completePopup.rowBounds=std::move(matchedBounds);
             }
         }
+        evidence.matchedRows=request.matchedRows;evidence.maximumMatchedRows=std::max(evidence.maximumMatchedRows,request.matchedRows);
+        evidence.elapsedMs=GetTickCount64()-expansionStarted;
         if(state==ExpandCollapseState_Expanded&&completePopup.window) {
+            completePopup.expansion=evidence;
             completePopup.stage=7;completePopup.candidateCount=request.popup.candidateCount;
             completePopup.parents=std::move(request.popup.parents);
             completePopup.ribbonWindow=request.popup.ribbonWindow;completePopup.ribbonBounds=request.popup.ribbonBounds;
@@ -225,6 +256,7 @@ HRESULT expandNativeSearchDateMenu(IUIAutomation* automation, TabSelection& requ
         }
         Sleep(10); // The creator STA continues dispatching while rows materialize.
     }while(GetTickCount64()<deadline);
+    request.popup.expansion.elapsedMs=GetTickCount64()-expansionStarted;
     return HRESULT_FROM_WIN32(ERROR_TIMEOUT);
 }
 

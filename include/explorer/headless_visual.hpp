@@ -4,6 +4,7 @@
 #include "explorer/ribbon_features.hpp"
 #include "explorer/chrome.hpp"
 #include <filesystem>
+#include <array>
 #include <cstdint>
 #include <optional>
 #include <memory>
@@ -174,6 +175,25 @@ struct VisualWidget {
 // Exact native popup observed by UI Automation; all bounds are screen pixels.
 // Capture accepts only the same owned private HWND and unchanged geometry.
 struct NativePopupCapture {
+    struct PopupReadback {
+        UINT_PTR window=0;
+        RECT bounds{};
+        HRESULT boundsRead=E_PENDING,rootRead=E_PENDING,descendantsRead=E_PENDING,countRead=E_PENDING;
+        HRESULT firstRowFailure=S_OK;
+        int rowCount=-1;
+        UINT acceptedType=0,visible=0,insideBounds=0,named=0,matched=0,unexpectedTypeCount=0;
+        std::array<int,16> unexpectedTypes{};
+    };
+    struct ExpansionReadback {
+        HRESULT expandRead=E_PENDING,stateRead=E_PENDING;
+        int finalState=3;
+        UINT observations=0,enumeratedWindows=0,ownedPopups=0,maximumOwnedPopups=0;
+        UINT matchedRows=0,maximumMatchedRows=0,popupReadbacks=0;
+        bool enumerationSucceeded=false,popupOverflow=false;
+        DWORD enumerationError=0;
+        ULONGLONG elapsedMs=0;
+        std::array<PopupReadback,16> popups{};
+    } expansion;
     struct ParentReadback {
         int type = 0;
         bool enabled = false;
