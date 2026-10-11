@@ -453,3 +453,11 @@ into a pass. The former chronological document is preserved byte for byte as
 The source inventory is [feature-matrix.md](feature-matrix.md). Visible desktop
 operation, real recipients/devices/accounts, mixed-monitor transitions and
 third-party extension compatibility are not inferred from native delegation.
+
+## Native QAT collections beyond twenty items
+
+The Windows 11 authored framework accepted a real twenty-first Add gesture in v187. The application now snapshots complete native collections with a defensive 512-row resource bound, while its own command chooser retains its twenty-item Add policy. Existing schema 1 settings remain strict; schema 2 preserves 21–512 unique native IDs, exact order and the unchanged opaque native payload.
+
+Root v195 passed the original QAT preservation and envelope tests, authored Ribbon and App shutdown controls (4/4, 32.63 seconds). Root v196 passed the required actual extended gesture fixture in 12.41 seconds: 21-row snapshot, exact retained-row move/removal, 1,523 native settings bytes compared independently, separate native Save/Load, exact restored order/metadata, complete rollback, malformed-envelope rejection and retired-generation refusal. Both runs retained unchanged source and executable hashes.
+
+These passes supersede the count-21 failure as an unresolved persistence defect. They do not establish native separator or genuinely unmapped installed-command coverage on authored Windows 11. The app customization submenu still needs to expose valid unmapped native rows. The 512-row bound is an allocation guard, not a claim of native UI capacity.

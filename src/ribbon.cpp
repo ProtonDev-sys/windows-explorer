@@ -573,7 +573,10 @@ private:
 constexpr DWORD maximumSettingsBytes = 64 * 1024;
 constexpr std::array<BYTE,8> settingsMagic{'W','E','Q','A','T','\r','\n',0x1a};
 constexpr std::size_t settingsHeaderBytes=56;
-constexpr std::size_t maximumSettingsFileBytes=maximumSettingsBytes+settingsHeaderBytes+20*4;
+// A defensive readback/resource bound, not a claim about native QAT capacity.
+// Native context customization on build26200 accepts a genuine 21st command.
+constexpr UINT maximumNativeQuickAccessRows=512;
+constexpr std::size_t maximumSettingsFileBytes=maximumSettingsBytes+settingsHeaderBytes+maximumNativeQuickAccessRows*4;
 constexpr HRESULT changedBinding=HRESULT_FROM_WIN32(ERROR_RETRY);
 constexpr HRESULT invalidSettings=HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
 UINT settingsUInt(std::span<const BYTE> bytes,std::size_t offset) noexcept {
@@ -618,7 +621,12 @@ HRESULT decodeSettings(std::span<const BYTE> bytes,RibbonLayout layout,SettingsF
     }
     if(bytes.size()<settingsHeaderBytes||!std::equal(settingsMagic.begin(),settingsMagic.end(),bytes.begin()))return invalidSettings;
     const auto version=settingsUInt(bytes,8),savedLayout=settingsUInt(bytes,12),count=settingsUInt(bytes,16),length=settingsUInt(bytes,20);
-    if(version!=1||savedLayout>1||savedLayout!=static_cast<UINT>(layout)||count>20||!length||length>maximumSettingsBytes)
+    // Schema1 remains byte-compatible and rejects counts above20. Schema2 is
+    // canonical only for complete extended native states; changing an ordinary
+    // schema1 envelope's version cannot turn it into a valid schema2 envelope.
+    const bool supportedCount=(version==1&&count<=20)||
+        (version==2&&count>20&&count<=maximumNativeQuickAccessRows);
+    if(!supportedCount||savedLayout>1||savedLayout!=static_cast<UINT>(layout)||!length||length>maximumSettingsBytes)
         return invalidSettings;
     const std::size_t payload=settingsHeaderBytes+static_cast<std::size_t>(count)*4;
     if(bytes.size()!=payload+length)return invalidSettings; // Exact size rejects overflow, truncation and trailing bytes.
@@ -633,10 +641,10 @@ HRESULT decodeSettings(std::span<const BYTE> bytes,RibbonLayout layout,SettingsF
     output.native=bytes.subspan(payload,length);output.order=std::move(order);output.envelope=true;return S_OK;
 }
 HRESULT encodeSettings(RibbonLayout layout,std::span<const UINT> order,std::span<const BYTE> native,std::vector<BYTE>& output) {
-    if(order.size()>20||native.empty()||native.size()>maximumSettingsBytes)return invalidSettings;
+    if(order.size()>maximumNativeQuickAccessRows||native.empty()||native.size()>maximumSettingsBytes)return invalidSettings;
     std::vector<BYTE> bytes(settingsHeaderBytes+order.size()*4+native.size());
     std::copy(settingsMagic.begin(),settingsMagic.end(),bytes.begin());
-    putSettingsUInt(bytes,8,1);putSettingsUInt(bytes,12,static_cast<UINT>(layout));
+    putSettingsUInt(bytes,8,order.size()>20?2:1);putSettingsUInt(bytes,12,static_cast<UINT>(layout));
     putSettingsUInt(bytes,16,static_cast<UINT>(order.size()));putSettingsUInt(bytes,20,static_cast<UINT>(native.size()));
     for(std::size_t index=0;index<order.size();++index) {
         if(!order[index]||std::find(order.begin(),order.begin()+static_cast<std::ptrdiff_t>(index),order[index])!=order.begin()+static_cast<std::ptrdiff_t>(index))return invalidSettings;
@@ -2350,9 +2358,9 @@ HRESULT NativeRibbon::quickAccessSnapshot(RibbonQuickAccessSnapshot& output) con
         UINT count=0;hr=snapshot.collection->GetCount(&count);
         if(!current())return HRESULT_FROM_WIN32(ERROR_RETRY);
         if(hr!=S_OK)return FAILED(hr)?hr:E_UNEXPECTED;
-        // The public native QAT supports at most20 commands. Do not truncate.
-        // https://learn.microsoft.com/windows/win32/windowsribbon/windowsribbon-controls-quickaccesstoolbar
-        if(count>20)return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+        // Observe the complete native list, including native gesture additions
+        // beyond the app-owned Add limit. Never truncate to the token model.
+        if(count>maximumNativeQuickAccessRows)return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
         snapshot.rows.reserve(count);snapshot.identities.reserve(count);snapshot.items.reserve(count);snapshot.properties.reserve(count);
         for(UINT index=0;index<count;++index) {
             if(!current())return HRESULT_FROM_WIN32(ERROR_RETRY);
@@ -2419,6 +2427,8 @@ HRESULT NativeRibbon::editQuickAccess(const RibbonQuickAccessSnapshot& captured,
                (type!=original->commandTypes.end()&&(type->second==UI_COMMANDTYPE_GROUP||type->second==UI_COMMANDTYPE_CONTEXT)))return E_INVALIDARG;
             if(std::any_of(snapshot.items.begin(),snapshot.items.end(),[&](const auto& item){
                 return item.commandRead==S_OK&&item.nativeCommand==command;}))return S_FALSE;
+            // The app-owned chooser retains its20-item Add policy; native
+            // customization may already contain more, which all other paths preserve.
             if(count>=20)return HRESULT_FROM_WIN32(ERROR_TOO_MANY_CMDS);
             ComPtr<IUISimplePropertySet> properties;properties.Attach(new Item({command,{},false}));
             ComPtr<IUnknown> row;hr=properties.As(&row);if(hr!=S_OK)return FAILED(hr)?hr:E_UNEXPECTED;
@@ -2430,8 +2440,10 @@ HRESULT NativeRibbon::editQuickAccess(const RibbonQuickAccessSnapshot& captured,
             if(hr!=S_OK)return FAILED(hr)?hr:E_UNEXPECTED;
             return snapshot.matches(expected,current,command);
         }
+        // The exact retained native row is sufficient authority for a targeted
+        // edit. A readable native ID need not have an application mapping.
         if(edit.command||edit.index>=count||snapshot.items[edit.index].commandRead!=S_OK||
-           !snapshot.items[edit.index].command)return E_INVALIDARG;
+           !snapshot.items[edit.index].nativeCommand)return E_INVALIDARG;
         if(edit.kind==RibbonQuickAccessEditKind::Remove) {
             if(edit.destination)return E_INVALIDARG;
             expected.erase(expected.begin()+edit.index);
@@ -2469,13 +2481,18 @@ HRESULT NativeRibbon::editQuickAccess(const RibbonQuickAccessSnapshot& captured,
     } catch(const std::bad_alloc&) {return E_OUTOFMEMORY;}
 }
 HRESULT NativeRibbon::quickAccessCommands(std::vector<UINT>& output)const{
-    if(!valid())return E_UNEXPECTED;auto hr=impl_->sameThread();if(FAILED(hr))return hr;ComPtr<IUICollection>collection;hr=impl_->quickCollection(collection);if(FAILED(hr))return hr;
-    UINT count=0;hr=collection->GetCount(&count);if(FAILED(hr))return hr;if(count>20)return E_UNEXPECTED;
-    std::vector<UINT>commands;
-    for(UINT i=0;i<count;++i){ComPtr<IUnknown>item;hr=collection->GetItem(i,&item);if(FAILED(hr))return hr;ComPtr<IUISimplePropertySet>properties;hr=item.As(&properties);if(FAILED(hr))return hr;Variant value;hr=properties->GetValue(UI_PKEY_CommandId,&value.value);ULONG id=0;if(SUCCEEDED(hr))hr=PropVariantToUInt32(value.value,&id);if(FAILED(hr))return hr;
-        if(impl_->layout==RibbonLayout::InstalledWindows10) {id=impl_->applicationId(id);if(!id)return E_UNEXPECTED;}
-        commands.push_back(id);}
-    output=std::move(commands);return S_OK;
+    try {
+        RibbonQuickAccessSnapshot captured;const auto hr=quickAccessSnapshot(captured);if(hr!=S_OK)return hr;
+        std::vector<UINT> commands;commands.reserve(captured.items().size());
+        for(const auto& item:captured.items()) {
+            // This legacy projection is all-or-nothing. Native persistence and
+            // targeted edits use the full snapshot and never this mapped list.
+            if(item.commandRead!=S_OK)return FAILED(item.commandRead)?item.commandRead:E_UNEXPECTED;
+            if(!item.command)return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+            commands.push_back(item.command);
+        }
+        output=std::move(commands);return S_OK;
+    }catch(const std::bad_alloc&){return E_OUTOFMEMORY;}
 }
 HRESULT NativeRibbon::setQuickAccessCommands(std::span<const UINT> commands){
     if(!valid())return E_UNEXPECTED;auto hr=impl_->sameThread();if(FAILED(hr))return hr;if(commands.size()>20)return E_INVALIDARG;
@@ -2592,7 +2609,7 @@ HRESULT NativeRibbon::loadSettings(const std::filesystem::path& path){
         if(hr!=S_OK)return FAILED(hr)?hr:E_UNEXPECTED;
         hr=before.matches(before.identities,current);if(hr!=S_OK)return hr;
         // Reserve the bounded identity manifest before native mutation.
-        std::vector<ComPtr<IUnknown>> expected;expected.reserve(20);
+        std::vector<ComPtr<IUnknown>> expected;expected.reserve(maximumNativeQuickAccessRows);
         RibbonMutation mutation(revisionState);revision=revisionState->value;
         nativeMutated=true;const auto nativeLoad=nativeView->LoadSettingsFromStream(input.Get());
         if(!current())return changedBinding; // Preserve a newer host/UI edit or retired binding.

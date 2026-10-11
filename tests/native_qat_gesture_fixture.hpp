@@ -102,7 +102,7 @@ bool gestureUnavailableStatus(HRESULT result) noexcept {
 // before the creator deadline. Those are not completed capacity observations.
 // Admit only exact native success or these explicit returned rejection statuses;
 // every pending/timeout/cancel/source/guard/unavailable/unknown result remains a
-// failure with its unchanged raw HRESULT. Whole20 equality is still required.
+// failure with its unchanged raw HRESULT. Complete native row proof is required.
 bool gestureCapacityActionStatus(HRESULT status) noexcept {
     return status==S_OK || status==E_FAIL || status==HRESULT_FROM_WIN32(ERROR_TOO_MANY_CMDS);
 }
@@ -1146,7 +1146,7 @@ NativeState gesture(explorer::NativeRibbon& ribbon, HWND owner, unsigned& execut
     require(gestureSourceCurrent(&source, shared->ticket), "Native gesture changed original source/framework generation");
     if (creatorResult != S_OK) exact(creatorResult, "Creator gesture admission failed");
     // Only a fully returned genuine capacity Invoke may carry a negative raw
-    // action HRESULT into the independent complete20-state proof below. Native
+    // action HRESULT into the independent complete native-state proof below. Native
     // discovery/source/deadline/retirement failures retain their original path.
     const bool capacityInvokeCompleted=capacityObservation && shared->rowEnabled &&
         shared->invokeQuery==S_OK && shared->invokePresent && shared->invoked && shared->invokeReturned &&
@@ -1175,12 +1175,24 @@ NativeState gesture(explorer::NativeRibbon& ribbon, HWND owner, unsigned& execut
     materialize(ribbon, owner, fixtureDeadline);
     auto after=readNative(ribbon, owner, fixtureDeadline, "after-native-context-gesture");
     if(capacityObservation) {
-        require(original.rows.size()==20 && after.rows.size()==20,"Actual native21st Add changed the complete20 capacity");
-        exactState(original,after); // Collection, dock and every genuine whole row remain exact.
+        require(original.rows.size()==20 && (after.rows.size()==20 || after.rows.size()==21),
+            "Actual native21st Add returned an unexpected complete count");
+        if(after.rows.size()==20) exactState(original,after);
+        else {
+            require(shared->rowEnabled && shared->invoked && shared->actionResult==S_OK &&
+                after.collectionIdentity.Get()==original.collectionIdentity.Get() && after.dock==original.dock,
+                "An extended native list requires one successful source-owned native Add");
+            for(size_t index=0;index<original.rows.size();++index)
+                require(sameRow(original.rows[index],after.rows[index]),"Native21st Add changed an untouched whole row");
+            const auto& added=after.rows.back();
+            require(added.commandRead==S_OK && added.commandConvert==S_OK &&
+                added.command==shared->ticket.physicalCommand,"Native21st Add did not append the exact original command");
+        }
         std::cout<<"QAT actual capacity receipt menuEnabled="<<shared->rowEnabled<<" invoked="<<shared->invoked
             <<" invokeReturned="<<shared->invokeReturned<<" rawNativeInvokeHRESULT="<<static_cast<ULONG>(shared->actionResult)
             <<" rawWorkerActionHRESULT="<<static_cast<ULONG>(action)<<" originalFullNativeCount="<<original.rows.size()
-            <<" actualFullNativeCount="<<after.rows.size()<<" exactWholeRowsPreserved=1 nativeCapacity20Observed=1"
+            <<" actualFullNativeCount="<<after.rows.size()<<" untouchedWholeRowsPreserved=1 nativeCapacity20Observed="<<(after.rows.size()==20)
+            <<" native21stAccepted="<<(after.rows.size()==21)
             <<" disabledAppearanceRequired=0 negativeInvokeNormalized=0"<<std::endl;
     }
     return after;
@@ -1197,7 +1209,7 @@ void gestureAdded(const NativeState& before, const NativeState& after, explorer:
         return row.commandRead == S_OK && row.commandConvert == S_OK && row.command == added.command;
     }) == 1, "Native context Add created duplicate IDs");
 }
-void runGestureLayout(explorer::RibbonLayout layout, ULONGLONG deadline) {
+void runGestureLayout(explorer::RibbonLayout layout, ULONGLONG deadline, bool requireExtended) {
     using namespace explorer;
     GestureConfig config;
     config.toolbar = gestureEnvironment(L"WINDOWSEXPLORER_QAT_TOOLBAR_LABEL",
@@ -1249,11 +1261,17 @@ void runGestureLayout(explorer::RibbonLayout layout, ULONGLONG deadline) {
     exact(ribbon.setQuickAccessCommands(capacity), "Setup actual20 distinct commands excluding calibrated History");
     materialize(ribbon, window.handle, deadline);
     auto twenty = readNative(ribbon, window.handle, deadline, "gesture-capacity20"); ids(twenty, ribbon, capacity);
-    auto rejected = gesture(ribbon, window.handle, executions, config, FileHistory, false, true, deadline, "real-capacity21st-add");
-    exactState(twenty, rejected);
+    auto capacityResult = gesture(ribbon, window.handle, executions, config, FileHistory, false, true, deadline, "real-capacity21st-add");
+    require(!requireExtended || capacityResult.rows.size()==21,
+        "This regression requires actual successful native21st Add evidence");
+    if(capacityResult.rows.size()==21) {
+        gestureAdded(twenty,capacityResult,ribbon,FileHistory);
+        verifyExtendedNativeQuickAccess(ribbon,window.handle,layout,executions,deadline);
+    } else exactState(twenty,capacityResult);
     require(executions == 0, "Native QAT gesture invoked an application/Shell command");
     isolation(window.handle, deadline);
     std::cout << "PASS genuine native QAT gestures layout=" << (layout == RibbonLayout::Authored ? "authored" : "installed")
-        << " actualAddRemove=1 untouchedWholeRows=1 removeReaddOrder=1 native19to20=1 actualNative21stCapacity20=1"
+        << " actualAddRemove=1 untouchedWholeRows=1 removeReaddOrder=1 native19to20=1 actualNative21stCapacity20="<<(capacityResult.rows.size()==20)
+        << " nativeExtendedPreservation="<<(capacityResult.rows.size()==21)
         << " nativeMoveGesture=NOT_COVERED opaqueSeparator=NOT_COVERED(no actual native QAT separator)" << std::endl;
 }

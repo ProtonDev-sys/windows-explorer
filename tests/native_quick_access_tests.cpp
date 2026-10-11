@@ -1,6 +1,7 @@
 #include "explorer/native_apartment.hpp"
 #include "explorer/ribbon.hpp"
 #include "explorer/commands.hpp"
+#include "explorer/quick_access.hpp"
 #include "explorer/headless_visual.hpp"
 #include <UIRibbonPropertyHelpers.h>
 #include <propvarutil.h>
@@ -187,7 +188,9 @@ NativeState readNative(explorer::NativeRibbon& ribbon, HWND owner, ULONGLONG dea
     state.dock = nativeDock;
     UINT count = 0; exact(state.collection->GetCount(&count), "Read complete actual native QAT count");
     std::cout << "QAT actual native count phase=" << phase << " count=" << count << std::endl;
-    require(count <= 20, "Native QAT count exceeds documented capacity");
+    // Read every actual row after native customization, including the observed
+    // 21st row. This is a bounded oracle, not a native-capacity assumption.
+    require(count <= 512, "Native QAT count exceeds bounded complete-readback budget");
     state.rows.reserve(count);
     for (UINT index = 0; index < count; ++index) {
         Row row; exact(state.collection->GetItem(index, &row.object), "Read native QAT row object");
@@ -293,6 +296,8 @@ void edit(explorer::NativeRibbon& ribbon, const explorer::RibbonQuickAccessSnaps
     exact(ribbon.editQuickAccess(captured, {kind, command, index, destination}), "One targeted actual native QAT edit");
 }
 
+void verifyExtendedNativeQuickAccess(explorer::NativeRibbon&, HWND, explorer::RibbonLayout, unsigned&, ULONGLONG);
+
 #include "native_qat_gesture_fixture.hpp"
 
 void runLayout(explorer::RibbonLayout layout, const Directory& files, ULONGLONG deadline) {
@@ -350,7 +355,7 @@ void runLayout(explorer::RibbonLayout layout, const Directory& files, ULONGLONG 
     auto twenty = readNative(ribbon, window.handle, deadline, "actual-twenty"); ids(twenty, ribbon, capacity);
     auto twentySnapshot = snapshot(ribbon, twenty);
     require(twentySnapshot.items().size() == 20, "Native20 command snapshot was truncated");
-    require(ribbon.editQuickAccess(twentySnapshot, {RibbonQuickAccessEditKind::Add, FileHistory, 0, 0}) == HRESULT_FROM_WIN32(ERROR_TOO_MANY_CMDS), "Native20 capacity did not reject the21st command");
+    require(ribbon.editQuickAccess(twentySnapshot, {RibbonQuickAccessEditKind::Add, FileHistory, 0, 0}) == HRESULT_FROM_WIN32(ERROR_TOO_MANY_CMDS), "App-owned Add policy did not reject a21st programmatic command");
     exactState(twenty, readNative(ribbon, window.handle, deadline, "capacity-rejection-preserved"));
     edit(ribbon, twentySnapshot, RibbonQuickAccessEditKind::Move, 0, 19, 0);
     auto rotated = twenty; std::rotate(rotated.rows.begin(), rotated.rows.end() - 1, rotated.rows.end());
@@ -452,12 +457,12 @@ std::vector<BYTE> readOwnedBytes(const Directory& files, const fs::path& path) {
     require(file != INVALID_HANDLE_VALUE, "Open owned fixture bytes");
     LARGE_INTEGER length{}; std::vector<BYTE> bytes;
     const bool sized = GetFileSizeEx(file, &length) != FALSE;
-    if (sized && length.QuadPart > 0 && length.QuadPart <= 65700) bytes.resize(static_cast<size_t>(length.QuadPart));
+    if (sized && length.QuadPart > 0 && length.QuadPart <= 67640) bytes.resize(static_cast<size_t>(length.QuadPart));
     DWORD read = 0; const bool complete = !bytes.empty() && ReadFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &read, nullptr) != FALSE && read == bytes.size();
     const bool closed = CloseHandle(file) != FALSE; require(sized && complete && closed, "Read complete bounded owned fixture"); return bytes;
 }
 void writeOwnedBytes(const Directory& files, const fs::path& path, const std::vector<BYTE>& bytes) {
-    require(files.current() && path.parent_path() == files.path && !bytes.empty() && bytes.size() <= 65700, "Write only bounded current owned fixture");
+    require(files.current() && path.parent_path() == files.path && !bytes.empty() && bytes.size() <= 67640, "Write only bounded current owned fixture");
     const auto name = path.filename().wstring(); require(name == L"authored-invalid.bin" || name == L"installed-invalid.bin" ||
         name == L"authored-legacy.bin" || name == L"installed-legacy.bin", "Refuse an unowned negative-fixture filename");
     const DWORD attributes = GetFileAttributesW(path.c_str());
@@ -684,6 +689,8 @@ void runSettingsEnvelopeLayout(explorer::RibbonLayout layout, ULONGLONG deadline
     std::cout << "PASS QAT settings envelope layout=" << static_cast<UINT>(layout) << " ordered20=1 opaqueLegacy=1 corruptBeforeMutation=10"
         << " exactSetCountRollback=1 atomicFailure=1 metadataFence=1 sourceReentry=1 newerLoadEdit=1 retiredGeneration=1" << std::endl;
 }
+#include "native_qat_extended_fixture.hpp"
+
 int runSettingsEnvelopeControls(ULONGLONG deadline, bool authoredOnly) {
     UINT actualLayouts = 0;
     runSettingsEnvelopeLayout(explorer::RibbonLayout::Authored, deadline); ++actualLayouts;
@@ -693,16 +700,17 @@ int runSettingsEnvelopeControls(ULONGLONG deadline, bool authoredOnly) {
 } // namespace
 
 int main(int argc, char** argv) {
-    bool settingsControl = false, authoredOnly = false, nativeGesture = false, installedOnly = false;
+    bool settingsControl = false, authoredOnly = false, nativeGesture = false, installedOnly = false, requireExtended = false;
     for (int index = 1; index < argc; ++index) {
         const std::string_view argument(argv[index]);
         if (argument == "--native-context-gesture" && !nativeGesture) nativeGesture = true;
         else if (argument == "--installed-only" && !installedOnly) installedOnly = true;
+        else if (argument == "--require-native-extended" && !requireExtended) requireExtended = true;
         else if (argument == "--settings-envelope-control" && !settingsControl) settingsControl = true;
         else if (argument == "--authored-only" && !authoredOnly) authoredOnly = true;
-        else { std::cerr << "Usage: native_quick_access_tests [--settings-envelope-control | --native-context-gesture] [--authored-only | --installed-only]" << std::endl; return 2; }
+        else { std::cerr << "Usage: native_quick_access_tests [--settings-envelope-control | --native-context-gesture] [--authored-only | --installed-only] [--require-native-extended]" << std::endl; return 2; }
     }
-    if ((nativeGesture && settingsControl) || (authoredOnly && installedOnly) || (installedOnly && !nativeGesture) ||
+    if ((requireExtended && !nativeGesture) || (nativeGesture && settingsControl) || (authoredOnly && installedOnly) || (installedOnly && !nativeGesture) ||
         (nativeGesture && !authoredOnly && !installedOnly)) return 2;
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX);
     explorer::PrivateDesktop desktop;
@@ -733,7 +741,7 @@ int main(int argc, char** argv) {
             std::array<BYTE, 256> originalKeys{};
             require(GetKeyboardState(originalKeys.data()) != FALSE, "Read original creator key state");
             const HWND originalActive = GetActiveWindow(), originalFocus = GetFocus();
-            runGestureLayout(installedOnly ? explorer::RibbonLayout::InstalledWindows10 : explorer::RibbonLayout::Authored, deadline);
+            runGestureLayout(installedOnly ? explorer::RibbonLayout::InstalledWindows10 : explorer::RibbonLayout::Authored, deadline, requireExtended);
             std::array<BYTE, 256> finalKeys{};
             require(GetKeyboardState(finalKeys.data()) != FALSE && finalKeys == originalKeys, "Native gestures changed creator256 key state");
             require(!GetActiveWindow() && !GetFocus() && !originalActive && !originalFocus, "Gesture host teardown retained focus/active HWND");
