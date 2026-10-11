@@ -334,7 +334,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     DWORD clipboardProcess = 0;
     if (auto owner = GetClipboardOwner()) GetWindowThreadProcessId(owner, &clipboardProcess);
     if (clipboardProcess == GetCurrentProcessId()) OleFlushClipboard();
-    app->Release();
+    const auto remainingAppReferences=app->Release();
+    if(visual) {
+        std::fprintf(stderr,"Headless visual App retirement PID/TID=%lu/%lu remainingReferences=%lu captureExit=%d.\n",
+            GetCurrentProcessId(),GetCurrentThreadId(),remainingAppReferences,result);
+        std::fflush(stderr);
+    }
     nativeApartment.finishOrTerminate();
     if (headless && FAILED(privateDesktop.verifyIsolation())) result = 5;
     if (FAILED(finishPreviewLowDesktop())) result = 5;

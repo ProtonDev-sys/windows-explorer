@@ -7,6 +7,7 @@
 #include "explorer/ui_strings.hpp"
 #include "explorer/preview_diagnostics.hpp"
 #include "explorer/headless_window_isolation.hpp"
+#include "../tests/actual_native_view_enumeration.hpp"
 #include <propkey.h>
 #include <shlwapi.h>
 #include <shlguid.h>
@@ -4903,10 +4904,27 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report, bool library
                     }
                     app->Release();
                 };
+                native_view_fixture::ActualEnumeration kindEnumeration;
                 std::unique_ptr<ExplorerApp,decltype(releaseMedia)> child(new ExplorerApp(instance_,true,requestedRibbonLayout_),releaseMedia);
+                struct KindEnumerationScope {
+                    ExplorerApp& app;native_view_fixture::ActualEnumeration& observation;
+                    ~KindEnumerationScope(){app.headlessCreatedViewObserver_={};observation.detachOrTerminate();}
+                } kindEnumerationScope{*child,kindEnumeration};
+                child->headlessCreatedViewObserver_=[&](IShellView* createdNativeView){kindEnumeration.attach(createdNativeView);};
                 const auto created=sourcesReady&&musicIds.size()==257&&allIds.size()==258?child->create(mediaRoot.wstring()):E_UNEXPECTED;
-                const bool childReady=created==S_OK&&pumpUntil([&]{int count=-1;return !child->navigating_&&child->folderView_&&
-                    child->folderView_->ItemCount(SVGIO_ALLVIEW,&count)==S_OK&&count==258;},5000);
+                int kindEnumeratedCount=-1;HRESULT kindEnumerationCountRead=E_PENDING;
+                // Navigation and count can precede the native view's final
+                // initialization/selection restoration. Admit the original one
+                // selection only after its actual EnumDone event, within the
+                // existing five-second readiness budget.
+                const bool childReady=created==S_OK&&pumpUntil([&]{
+                    if(child->navigating_||!child->folderView_||!kindEnumeration.completed(child->view_.Get()))return false;
+                    kindEnumerationCountRead=child->folderView_->ItemCount(SVGIO_ALLVIEW,&kindEnumeratedCount);
+                    return kindEnumerationCountRead==S_OK&&kindEnumeratedCount==258&&kindEnumeration.completed(child->view_.Get());
+                },5000);
+                kindEnumeration.emit("AppKind","before-original-selection");
+                std::fprintf(stderr,"headless-kind-enumeration ready=%u count_hresult=0x%08lX count=%d\n",
+                    static_cast<unsigned>(childReady),static_cast<unsigned long>(kindEnumerationCountRead),kindEnumeratedCount);
                 const auto nativeView=child->view_;const auto nativeFolder=child->folderView_;
                 Pidl nativeLocation(child->currentPidl_?ILCloneFull(child->currentPidl_.get()):nullptr);
                 const auto nativeKindNavigation=child->navigationCount_;const auto historySize=child->history_.size();const auto historyIndex=child->historyIndex_;
@@ -4925,9 +4943,17 @@ int ExplorerApp::headlessSmoke(const std::filesystem::path& report, bool library
                 // Clear once before applying SELECT to the full native array;
                 // DESELECTOTHERS describes a single selected item and must not
                 // collapse this 257-item fixture as each item is selected.
+                int kindBeforeClearCount=-1,kindAfterClearCount=-1,kindAfterSeedCount=-1;
+                const auto kindBeforeClearRead=nativeFolder?nativeFolder->ItemCount(SVGIO_SELECTION,&kindBeforeClearCount):E_UNEXPECTED;
                 if(seed==S_OK&&musicChildren.size()==257)seed=nativeView?nativeView->SelectItem(nullptr,SVSI_DESELECTOTHERS):E_NOINTERFACE;
+                const auto kindClearStatus=seed;
+                const auto kindAfterClearRead=nativeFolder?nativeFolder->ItemCount(SVGIO_SELECTION,&kindAfterClearCount):E_UNEXPECTED;
                 if(seed==S_OK&&musicChildren.size()==257)seed=nativeFolder->SelectAndPositionItems(static_cast<UINT>(musicChildren.size()),
                     musicChildren.data(),nullptr,SVSI_SELECT|SVSI_NOTAKEFOCUS);
+                const auto kindAfterSeedRead=nativeFolder?nativeFolder->ItemCount(SVGIO_SELECTION,&kindAfterSeedCount):E_UNEXPECTED;
+                std::fprintf(stderr,"headless-kind-seed clear/seed=0x%08lX/0x%08lX native_counts_before/cleared/selected=%d/%d/%d read_hresult=0x%08lX/0x%08lX/0x%08lX\n",
+                    static_cast<unsigned long>(kindClearStatus),static_cast<unsigned long>(seed),kindBeforeClearCount,kindAfterClearCount,kindAfterSeedCount,
+                    static_cast<unsigned long>(kindBeforeClearRead),static_cast<unsigned long>(kindAfterClearRead),static_cast<unsigned long>(kindAfterSeedRead));
                 const auto selectedIds=[&](const std::set<NativeFileIdentity>& expected) {
                     ComPtr<IShellItemArray> selected;std::set<NativeFileIdentity> actual;DWORD count=0;
                     return child->folderView_&&child->folderView_->GetSelection(FALSE,&selected)==S_OK&&selected&&selected->GetCount(&count)==S_OK&&

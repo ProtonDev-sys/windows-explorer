@@ -1072,6 +1072,12 @@ HRESULT ExplorerApp::OnViewCreated(IShellView* view) {
     folderView_.Reset();
     if (view) view->QueryInterface(IID_PPV_ARGS(&folderView_));
     PostMessageW(window_, DeferredView, 0, 0);
+    // Observe after ordinary setup; native observation can pump, so do not
+    // overwrite any newer view after the callback returns.
+    if(headless_&&headlessCreatedViewObserver_) {
+        auto observer=std::move(headlessCreatedViewObserver_);headlessCreatedViewObserver_={};
+        observer(view);
+    }
     return S_OK;
 }
 HRESULT ExplorerApp::OnNavigationComplete(PCIDLIST_ABSOLUTE pidl) {

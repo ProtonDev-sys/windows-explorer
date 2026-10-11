@@ -413,6 +413,9 @@ private:
     std::array<unsigned long long,6> headlessCurrentViewStateEvents_{},headlessStaleViewStateEvents_{};
     unsigned long long headlessEquivalentSelectionRefreshes_=0,headlessUncertainSelectionRefreshes_=0;
     std::function<void()> headlessCommandReentryProbe_;
+    // One-shot owned headless observation, before the initial view can finish
+    // enumeration. It observes the actual view; it never alters navigation.
+    std::function<void(IShellView*)> headlessCreatedViewObserver_;
     // Owned headless regression only: consume one finished native state query
     // as a provider that honestly returns E_PENDING even with slow work allowed.
     std::optional<UINT> headlessCompletedPendingCommand_;

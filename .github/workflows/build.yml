@@ -72,6 +72,9 @@ jobs:
             artifacts/visual/**/summary.json
             artifacts/visual/**/reference-manifest.json
             artifacts/visual/**/native.json
+            artifacts/visual/**/pilot.json
+            artifacts/visual/**/*-process.json
+            artifacts/visual/**/*-stderr.log
             artifacts/visual/**/native.png
             artifacts/visual/**/Native fixture report.json
             !artifacts/visual/**/comparison/**

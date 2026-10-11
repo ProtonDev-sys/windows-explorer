@@ -121,6 +121,12 @@ HRESULT NativeApartmentOwner::finish() noexcept {
     if(remaining!=CO_E_NOTINITIALIZED&&!implicitMta) {
         // An unowned outstanding initialization invalidates the final-boundary
         // contract. Do not force-balance counts or drop the retained module.
+        std::fprintf(stderr,"Native apartment final-boundary PID/TID/creator=%lu/%lu/%lu kind=%s initialization=0x%08lX "
+            "remaining=0x%08lX type/qualifier=%d/%d depth/clients=%u/%u codeHeld/verified=%u/%u acquisitions/releases=%u/%u.\n",
+            GetCurrentProcessId(),GetCurrentThreadId(),creator_,kind_==Kind::Ole?"Ole":"STA",static_cast<ULONG>(nativeResult_),
+            static_cast<ULONG>(remaining),postApartmentType_,postApartmentQualifier_,depth_,clients_,
+            static_cast<unsigned>(code_!=nullptr),static_cast<unsigned>(verifiedCode_),codeAcquisitions_,codeReleases_);
+        std::fflush(stderr);
         unsafeCleanup(FAILED(remaining)?remaining:HRESULT_FROM_WIN32(ERROR_BUSY));
     }
     if(code_) {
