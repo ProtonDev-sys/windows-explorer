@@ -15,6 +15,7 @@
 #include <map>
 #include <optional>
 #include <fstream>
+#include <sstream>
 #include <mutex>
 #include <thread>
 
@@ -2169,6 +2170,8 @@ int ExplorerApp::headlessVisual(const PrivateDesktop& desktop, const std::filesy
         ULONGLONG polls=0,itemReads=0,compareReads=0,compareFailures=0,matches=0;
         std::uintptr_t originalView=0,lastView=0;
         UINT expectedPidlBytes=0;int lastComparison=1;
+        HRESULT identityDiagnosticRead=E_PENDING;
+        std::string identityDiagnostic="{}";
     } selectionRead;
     VisualCaptureOptions::CommandReadinessReadback readiness;
     VisualCaptureOptions options;
@@ -2208,6 +2211,8 @@ int ExplorerApp::headlessVisual(const PrivateDesktop& desktop, const std::filesy
             << ",\"compareReads\":" << selectionRead.compareReads << ",\"compareFailures\":" << selectionRead.compareFailures
             << ",\"lastCompareReadHresult\":" << static_cast<long>(selectionRead.lastCompareRead)
             << ",\"firstCompareFailureHresult\":" << static_cast<long>(selectionRead.firstCompareFailure)
+            << ",\"identityDiagnosticReadHresult\":" << static_cast<long>(selectionRead.identityDiagnosticRead)
+            << ",\"identityDiagnostic\":" << selectionRead.identityDiagnostic
             << ",\"lastComparison\":" << selectionRead.lastComparison << ",\"matches\":" << selectionRead.matches << '}'
             << ",\"commandReadiness\":{\"requested\":" << (readiness.requested?"true":"false")
             << ",\"ready\":" << (readiness.ready?"true":"false") << ",\"readHresult\":" << static_cast<long>(readiness.read)
@@ -2308,7 +2313,126 @@ int ExplorerApp::headlessVisual(const PrivateDesktop& desktop, const std::filesy
             }
             return false;
         },5000);
-        if(!available)return failed(7,"selection-child-ready",FAILED(hr)?hr:HRESULT_FROM_WIN32(ERROR_TIMEOUT));
+        if(!available) {
+            // The original bounded canonical predicate has already failed.
+            // Metadata is diagnostic only: no FileID/path fallback, reselection,
+            // successful retry, or change to the captured original failure.
+            const auto originalFailure=FAILED(hr)?hr:HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+            try {
+                const auto originalView=view_;const auto originalFolderView=folderView_;
+                const auto originalNavigation=navigationCount_;const auto originalGeneration=namespaceGeneration_;
+                Pidl originalLocation(currentPidl_?ILCloneFull(currentPidl_.get()):nullptr);
+                const auto diagnosticDeadline=std::min<ULONGLONG>(captureDeadline,GetTickCount64()+1000);
+                const auto sourceCurrent=[&] {
+                    return originalView&&originalFolderView&&!closing_&&!navigating_&&view_.Get()==originalView.Get()&&folderView_.Get()==originalFolderView.Get()&&
+                        reinterpret_cast<std::uintptr_t>(view_.Get())==selectionRead.originalView&&navigationCount_==originalNavigation&&
+                        namespaceGeneration_==originalGeneration&&originalLocation&&currentPidl_&&ILIsEqual(originalLocation.get(),currentPidl_.get());
+                };
+                const auto admitted=[&]{return sourceCurrent()&&GetTickCount64()<diagnosticDeadline;};
+                const auto displayPath=[&](IShellItem* item,std::wstring& text)->HRESULT {
+                    if(!admitted())return E_ABORT;if(!item)return E_POINTER;
+                    PWSTR rawPath=nullptr;const auto status=item->GetDisplayName(SIGDN_FILESYSPATH,&rawPath);
+                    std::unique_ptr<wchar_t,decltype(&CoTaskMemFree)> owned(rawPath,CoTaskMemFree);
+                    if(status!=S_OK)return status;if(!rawPath)return E_UNEXPECTED;
+                    const auto length=wcsnlen_s(rawPath,32769);if(length>32768)return HRESULT_FROM_WIN32(ERROR_BUFFER_OVERFLOW);
+                    text.assign(rawPath,length);return S_OK;
+                };
+                struct FileFact {HRESULT open=E_PENDING,idRead=E_PENDING,basicRead=E_PENDING;FILE_ID_INFO id{};FILE_BASIC_INFO basic{};};
+                const auto fileFact=[&](const std::wstring& path) {
+                    FileFact fact;if(!admitted()){fact.open=E_ABORT;return fact;}
+                    if(path.empty()||!std::filesystem::path(path).is_absolute()){fact.open=E_INVALIDARG;return fact;}
+                    const auto file=CreateFileW(path.c_str(),FILE_READ_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
+                        nullptr,OPEN_EXISTING,FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT,nullptr);
+                    if(file==INVALID_HANDLE_VALUE){const auto error=GetLastError();fact.open=HRESULT_FROM_WIN32(error?error:ERROR_GEN_FAILURE);return fact;}
+                    struct Close {HANDLE value;~Close(){CloseHandle(value);}} close{file};fact.open=S_OK;
+                    if(GetFileInformationByHandleEx(file,FileIdInfo,&fact.id,sizeof(fact.id)))fact.idRead=S_OK;
+                    else {const auto error=GetLastError();fact.idRead=HRESULT_FROM_WIN32(error?error:ERROR_GEN_FAILURE);}
+                    if(GetFileInformationByHandleEx(file,FileBasicInfo,&fact.basic,sizeof(fact.basic)))fact.basicRead=S_OK;
+                    else {const auto error=GetLastError();fact.basicRead=HRESULT_FROM_WIN32(error?error:ERROR_GEN_FAILURE);}
+                    return fact;
+                };
+                const auto sameFile=[](const FileFact& a,const FileFact& b) {
+                    return a.idRead==S_OK&&b.idRead==S_OK&&a.id.VolumeSerialNumber==b.id.VolumeSerialNumber&&
+                        std::memcmp(a.id.FileId.Identifier,b.id.FileId.Identifier,sizeof(a.id.FileId.Identifier))==0;
+                };
+                const auto pathEqual=[](const std::wstring& a,const std::wstring& b,bool ignoreCase) {
+                    return !a.empty()&&!b.empty()&&CompareStringOrdinal(a.c_str(),static_cast<int>(a.size()),b.c_str(),static_cast<int>(b.size()),ignoreCase?TRUE:FALSE)==CSTR_EQUAL;
+                };
+                const auto sameBytes=[](PCIDLIST_ABSOLUTE a,PCIDLIST_ABSOLUTE b) {
+                    return a&&b&&ILGetSize(a)==ILGetSize(b)&&std::memcmp(a,b,ILGetSize(a))==0;
+                };
+                std::wstring expectedPath;const auto expectedPathRead=displayPath(expected.Get(),expectedPath);
+                const auto inputFile=fileFact(parsing),expectedFile=fileFact(expectedPath),folderFile=fileFact(folderPath);
+                ComPtr<IShellFolder> actualFolder;ComPtr<IShellItem> actualFolderItem,expectedParent;
+                const auto folderObjectRead=admitted()?originalFolderView->GetFolder(IID_PPV_ARGS(&actualFolder)):E_ABORT;
+                PIDLIST_ABSOLUTE actualFolderRaw=nullptr;
+                const auto folderPidlRead=folderObjectRead==S_OK&&actualFolder&&admitted()?SHGetIDListFromObject(actualFolder.Get(),&actualFolderRaw):E_ABORT;
+                Pidl actualFolderPidl(actualFolderRaw);
+                const auto folderItemRead=folderPidlRead==S_OK&&actualFolderPidl&&admitted()?SHCreateItemFromIDList(actualFolderPidl.get(),IID_PPV_ARGS(&actualFolderItem)):E_ABORT;
+                int folderOrder=99;const auto folderCompare=folderItemRead==S_OK&&actualFolderItem&&folder&&admitted()?actualFolderItem->Compare(folder.Get(),SICHINT_CANONICAL,&folderOrder):E_ABORT;
+                std::wstring actualFolderPath;const auto actualFolderPathRead=displayPath(actualFolderItem.Get(),actualFolderPath);
+                const auto actualFolderFile=fileFact(actualFolderPath);
+                const auto expectedParentRead=admitted()?expected->GetParent(&expectedParent):E_ABORT;
+                int expectedParentOrder=99;const auto expectedParentCompare=expectedParentRead==S_OK&&expectedParent&&folder&&admitted()?
+                    expectedParent->Compare(folder.Get(),SICHINT_CANONICAL,&expectedParentOrder):E_ABORT;
+                Pidl expectedParentPidl(ILCloneFull(selected.get()));
+                const bool expectedParentPidlReady=expectedParentPidl&&ILRemoveLastID(expectedParentPidl.get());
+                ComPtr<IShellItemArray> actualItems;DWORD actualCount=0;
+                const auto itemsRead=admitted()?originalFolderView->Items(SVGIO_ALLVIEW,IID_PPV_ARGS(&actualItems)):E_ABORT;
+                const auto countRead=itemsRead==S_OK&&actualItems&&admitted()?actualItems->GetCount(&actualCount):E_ABORT;
+                std::ostringstream evidence;
+                const auto emitFile=[&](const char* label,const FileFact& fact) {
+                    evidence<<",\""<<label<<"\":{\"openHresult\":"<<static_cast<long>(fact.open)<<",\"idReadHresult\":"<<static_cast<long>(fact.idRead)
+                        <<",\"basicReadHresult\":"<<static_cast<long>(fact.basicRead)<<",\"attributes\":"<<fact.basic.FileAttributes<<'}';
+                };
+                evidence<<"{\"navigation\":"<<originalNavigation<<",\"namespaceGeneration\":"<<originalGeneration
+                    <<",\"inputAbsolute\":"<<std::filesystem::path(parsing).is_absolute()<<",\"inputLength\":"<<parsing.size()
+                    <<",\"expectedPathReadHresult\":"<<static_cast<long>(expectedPathRead)<<",\"expectedPathLength\":"<<expectedPath.size()
+                    <<",\"expectedPathEqualsInputOrdinal\":"<<pathEqual(expectedPath,parsing,false)<<",\"expectedPathEqualsInputIgnoreCase\":"<<pathEqual(expectedPath,parsing,true)
+                    <<",\"expectedFileSameInput\":"<<sameFile(inputFile,expectedFile)
+                    <<",\"actualFolderReadHresult\":"<<static_cast<long>(folderObjectRead)<<",\"actualFolderPidlReadHresult\":"<<static_cast<long>(folderPidlRead)
+                    <<",\"actualFolderItemReadHresult\":"<<static_cast<long>(folderItemRead)<<",\"actualFolderCompareHresult\":"<<static_cast<long>(folderCompare)<<",\"actualFolderOrder\":"<<folderOrder
+                    <<",\"actualFolderPathReadHresult\":"<<static_cast<long>(actualFolderPathRead)<<",\"actualFolderPathLength\":"<<actualFolderPath.size()
+                    <<",\"actualFolderPathSameRequested\":"<<pathEqual(actualFolderPath,folderPath,true)<<",\"actualFolderSameFile\":"<<sameFile(actualFolderFile,folderFile)
+                    <<",\"actualFolderPidlEqualsCurrent\":"<<(actualFolderPidl&&originalLocation&&ILIsEqual(actualFolderPidl.get(),originalLocation.get()))
+                    <<",\"expectedParentReadHresult\":"<<static_cast<long>(expectedParentRead)<<",\"expectedParentCompareHresult\":"<<static_cast<long>(expectedParentCompare)
+                    <<",\"expectedParentOrder\":"<<expectedParentOrder<<",\"expectedParentPidlEqualsActualFolder\":"<<(expectedParentPidlReady&&actualFolderPidl&&ILIsEqual(expectedParentPidl.get(),actualFolderPidl.get()))
+                    <<",\"itemsReadHresult\":"<<static_cast<long>(itemsRead)<<",\"countReadHresult\":"<<static_cast<long>(countRead)<<",\"count\":"<<actualCount;
+                emitFile("inputFile",inputFile);emitFile("expectedFile",expectedFile);emitFile("requestedFolderFile",folderFile);emitFile("actualFolderFile",actualFolderFile);
+                evidence<<",\"rows\":[";DWORD observed=0;
+                for(DWORD index=0;countRead==S_OK&&index<actualCount&&index<32&&admitted();++index) {
+                    ComPtr<IShellItem> actual,parent;const auto itemRead=actualItems->GetItemAt(index,&actual);
+                    int forward=99,reverse=99,parentOrder=99;
+                    const auto forwardRead=itemRead==S_OK&&actual&&admitted()?expected->Compare(actual.Get(),SICHINT_CANONICAL,&forward):E_ABORT;
+                    const auto reverseRead=itemRead==S_OK&&actual&&admitted()?actual->Compare(expected.Get(),SICHINT_CANONICAL,&reverse):E_ABORT;
+                    PIDLIST_ABSOLUTE rawItem=nullptr;
+                    const auto pidlRead=itemRead==S_OK&&actual&&admitted()?SHGetIDListFromObject(actual.Get(),&rawItem):E_ABORT;
+                    Pidl actualPidl(rawItem);
+                    const auto parentRead=itemRead==S_OK&&actual&&admitted()?actual->GetParent(&parent):E_ABORT;
+                    const auto parentCompare=parentRead==S_OK&&parent&&folder&&admitted()?parent->Compare(folder.Get(),SICHINT_CANONICAL,&parentOrder):E_ABORT;
+                    std::wstring actualPath;const auto pathRead=displayPath(actual.Get(),actualPath);const auto actualFile=fileFact(actualPath);
+                    evidence<<(observed?",":"")<<"{\"index\":"<<index<<",\"itemReadHresult\":"<<static_cast<long>(itemRead)
+                        <<",\"forwardCompareHresult\":"<<static_cast<long>(forwardRead)<<",\"forwardOrder\":"<<forward
+                        <<",\"reverseCompareHresult\":"<<static_cast<long>(reverseRead)<<",\"reverseOrder\":"<<reverse
+                        <<",\"pidlReadHresult\":"<<static_cast<long>(pidlRead)<<",\"pidlBytes\":"<<(actualPidl?ILGetSize(actualPidl.get()):0)
+                        <<",\"pidlEqualExpected\":"<<(actualPidl&&ILIsEqual(selected.get(),actualPidl.get()))<<",\"pidlBytesEqualExpected\":"<<sameBytes(selected.get(),actualPidl.get())
+                        <<",\"childPidlEqualExpected\":"<<(actualPidl&&ILIsEqual(ILFindLastID(selected.get()),ILFindLastID(actualPidl.get())))
+                        <<",\"parentReadHresult\":"<<static_cast<long>(parentRead)<<",\"parentCompareHresult\":"<<static_cast<long>(parentCompare)<<",\"parentOrder\":"<<parentOrder
+                        <<",\"pathReadHresult\":"<<static_cast<long>(pathRead)<<",\"pathLength\":"<<actualPath.size()
+                        <<",\"pathSameInputOrdinal\":"<<pathEqual(actualPath,parsing,false)<<",\"pathSameInputIgnoreCase\":"<<pathEqual(actualPath,parsing,true)
+                        <<",\"pathSameExpectedOrdinal\":"<<pathEqual(actualPath,expectedPath,false)<<",\"pathSameExpectedIgnoreCase\":"<<pathEqual(actualPath,expectedPath,true)
+                        <<",\"sameFileIdInput\":"<<sameFile(actualFile,inputFile)<<",\"sameFileIdExpected\":"<<sameFile(actualFile,expectedFile)
+                        <<",\"attributesEqualExpected\":"<<(actualFile.basicRead==S_OK&&expectedFile.basicRead==S_OK&&actualFile.basic.FileAttributes==expectedFile.basic.FileAttributes)
+                        <<",\"lastWriteEqualExpected\":"<<(actualFile.basicRead==S_OK&&expectedFile.basicRead==S_OK&&actualFile.basic.LastWriteTime.QuadPart==expectedFile.basic.LastWriteTime.QuadPart);
+                    emitFile("actualFile",actualFile);evidence<<'}';++observed;
+                }
+                evidence<<"],\"observed\":"<<observed<<",\"complete\":"<<(countRead==S_OK&&observed==actualCount)
+                    <<",\"sourceCurrentAtEnd\":"<<sourceCurrent()<<",\"diagnosticDeadlineReached\":"<<(GetTickCount64()>=diagnosticDeadline)<<'}';
+                selectionRead.identityDiagnostic=evidence.str();selectionRead.identityDiagnosticRead=S_OK;
+            }catch(const std::bad_alloc&){selectionRead.identityDiagnosticRead=E_OUTOFMEMORY;}
+             catch(...){selectionRead.identityDiagnosticRead=E_FAIL;}
+            return failed(7,"selection-child-ready",originalFailure);
+        }
         hr=view_->SelectItem(ILFindLastID(selected.get()),SVSI_SELECT|SVSI_DESELECTOTHERS);
         if(FAILED(hr))return failed(7,"selection-apply",hr);
         const auto chosen=pumpScene([&] {
