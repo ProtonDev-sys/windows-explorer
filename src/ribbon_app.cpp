@@ -15,6 +15,7 @@
 #include <map>
 #include <optional>
 #include <fstream>
+#include <sstream>
 #include <mutex>
 #include <thread>
 
@@ -77,7 +78,8 @@ const std::vector<SearchChoice>& dateChoices() {
     return choices;
 }
 const std::vector<SearchChoice>& sizeChoices() {
-    static const std::vector<SearchChoice> choices{
+    static thread_local const std::vector<SearchChoice> choices = [] {
+        std::vector<SearchChoice> result{
         {L"Empty (0 KB)",L"System.Size:System.Size#Empty"},
         {L"Tiny (0–16 KB)",L"System.Size:System.Size#Tiny"},
         {L"Small (16 KB–1 MB)",L"System.Size:System.Size#Small"},
@@ -85,6 +87,17 @@ const std::vector<SearchChoice>& sizeChoices() {
         {L"Large (128 MB–1 GB)",L"System.Size:System.Size#Large"},
         {L"Huge (1–4 GB)",L"System.Size:System.Size#Huge"},
         {L"Gigantic (over 4 GB)",L"System.Size:System.Size#Gigantic"}};
+        // The same installed seven-leaf contract supplies localized captions;
+        // the canonical range expressions remain independent of UI language.
+        std::vector<NamespaceSubcommandMetadata> native;
+        if (SUCCEEDED(namespaceCommandChildren(L"Windows.SearchFilterSize", nullptr, nullptr, &native)) &&
+            native.size() == result.size() && std::all_of(native.begin(), native.end(), [](const auto& entry) {
+                return !entry.label.empty() && entry.flags == ECF_DEFAULT && entry.children.empty();
+            })) {
+            for (size_t index = 0; index < result.size(); ++index) result[index].label = native[index].label;
+        }
+        return result;
+    }();
     return choices;
 }
 const std::array<SearchChoice,4>& otherPropertyChoices() {
@@ -256,6 +269,10 @@ void ExplorerApp::cancelCommandStates() {
 }
 void ExplorerApp::cancelCommandStatesImpl() {
     if(window_)KillTimer(window_,4);
+    if(selectionKindsRequest_.task)selectionKindsRequest_.task->cancel();
+    selectionKindsRequest_={};
+    headlessBeforeKindsPublication_={};
+    if(closing_)headlessAfterKindsSourceCapture_={};
     headlessCompletedPendingCommand_.reset();
     headlessCompletedPendingOriginalStatus_=E_PENDING;
     if(selectionStateBatch_)selectionStateBatch_->cancel();
@@ -268,8 +285,165 @@ void ExplorerApp::cancelCommandStatesImpl() {
     commandStateStartAt_=GetTickCount64()+100;
 }
 
+bool ExplorerApp::selectionKindsSourceCurrent() const noexcept {
+    const auto& request=selectionKindsRequest_;
+    return !closing_&&!navigating_&&!namespaceDirty_&&!selectionStateDirty_&&!commandStatesCancelPending_&&
+        request.generation==namespaceGeneration_&&request.sourceRevision==commandSourceRevision_&&
+        request.navigation==navigationCount_&&request.view.Get()==view_.Get()&&
+        request.folderView.Get()==folderView_.Get()&&request.selection&&
+        request.location&&currentPidl_&&ILGetSize(request.location.get())==ILGetSize(currentPidl_.get())&&
+        std::memcmp(request.location.get(),currentPidl_.get(),ILGetSize(request.location.get()))==0;
+}
+
+void ExplorerApp::startPendingSelectionKinds() {
+    auto& request=selectionKindsRequest_;
+    if(!request.pending||request.task||closing_)return;
+    if(!selectionKindsSourceCurrent()) {
+        if(!namespaceDirty_&&!selectionStateDirty_&&!navigating_) {
+            request.pending=false;request.status=HRESULT_FROM_WIN32(ERROR_RETRY);
+            namespaceDirty_=true;deferCommandRefresh();
+        }
+        return;
+    }
+    const auto generation=request.generation,revision=request.sourceRevision;
+    const auto navigation=request.navigation;
+    const auto selectedIdentity=request.selection.Get();const auto viewIdentity=request.view.Get();
+    const auto folderIdentity=request.folderView.Get();const auto useFacade=request.useFacade;
+    const auto count=request.count;const auto countKnown=request.countKnown;const auto requestedAt=request.requestedAt;
+    Pidl location(request.location?ILCloneFull(request.location.get()):nullptr);
+    if(request.location&&!location) {namespaceDirty_=true;deferCommandRefresh();return;}
+    const auto sameRequest=[&] {
+        return request.pending&&!request.task&&request.generation==generation&&request.sourceRevision==revision&&
+            request.navigation==navigation&&request.selection.Get()==selectedIdentity&&request.view.Get()==viewIdentity&&
+            request.folderView.Get()==folderIdentity&&request.useFacade==useFacade&&request.count==count&&
+            request.countKnown==countKnown&&request.requestedAt==requestedAt&&
+            (location?request.location&&ILGetSize(location.get())==ILGetSize(request.location.get())&&
+                std::memcmp(location.get(),request.location.get(),ILGetSize(location.get()))==0:!request.location);
+    };
+    const auto selected=request.selection;
+    const auto sourceView=request.view;
+    if(!sameRequest()||!selectionKindsSourceCurrent())return;
+    const auto started=commandTimingNow();
+    std::unique_ptr<NamespaceCommandStateTask> task;
+    auto status=useFacade?namespaceActions_.startSelectionKindsTask(&task):
+        NamespaceCommandStateTask::startSelectionKinds(selected.Get(),sourceView.Get(),&task);
+    if(headless_)commandTimings_.selectionKindsSchedulingMs+=commandTimingNow()-started;
+    if(!sameRequest()||!selectionKindsSourceCurrent()) {
+        if(task){task->cancel();task.reset();}
+        if(sameRequest()) {
+            request.pending=false;request.status=HRESULT_FROM_WIN32(ERROR_RETRY);
+            namespaceDirty_=true;deferCommandRefresh();
+        }
+        return;
+    }
+    if(SUCCEEDED(status)&&!task)status=E_UNEXPECTED;
+    if(SUCCEEDED(status))request.task=std::move(task);
+    else if(status!=HRESULT_FROM_WIN32(ERROR_BUSY)) {request.pending=false;request.status=status;}
+    if(headless_)commandTimings_.selectionKindsStatus=request.status;
+}
+
+void ExplorerApp::recordHeadlessKindsPublicationBoundary(HeadlessKindsPublicationBoundary boundary,
+    UINT64 generation,UINT64 revision,unsigned navigation) noexcept {
+    if(!headless_||!headlessKindsPublicationDiagnostics_)return;
+    auto& diagnostics=*headlessKindsPublicationDiagnostics_;
+    if(diagnostics.count==diagnostics.rows.size()){++diagnostics.dropped;return;}
+    auto& row=diagnostics.rows[diagnostics.count++];
+    const auto& request=selectionKindsRequest_;
+    row.boundary=boundary;row.capturedGeneration=generation;row.capturedRevision=revision;
+    row.capturedNavigation=navigation;row.requestGeneration=request.generation;row.requestRevision=request.sourceRevision;
+    row.requestNavigation=request.navigation;row.namespaceGeneration=namespaceGeneration_;row.sourceRevision=commandSourceRevision_;
+    row.currentNavigation=navigationCount_;row.rejections=headlessRejectedKindsCompletions_;
+    row.lastRejectedGeneration=headlessRejectedKindsGeneration_;row.lastRejectedRevision=headlessRejectedKindsRevision_;
+    row.pending=request.pending;row.task=request.task!=nullptr;row.current=selectionKindsSourceCurrent();
+    row.refresh=commandRefreshActive_;row.cancel=commandStatesCancelPending_;row.navigating=navigating_;
+    row.namespaceDirty=namespaceDirty_;row.selectionDirty=selectionStateDirty_;row.callback=!!headlessBeforeKindsPublication_;
+}
+
+void ExplorerApp::pollSelectionKinds() {
+    auto& request=selectionKindsRequest_;
+    if(!request.pending||!request.task)return;
+    const auto originalTask=request.task.get();
+    const auto generation=request.generation,revision=request.sourceRevision;
+    const auto navigation=request.navigation;
+    const auto count=request.count;const auto countKnown=request.countKnown;
+    const auto requestedAt=request.requestedAt;
+    const auto selected=request.selection.Get();
+    const auto sourceView=request.view.Get();
+    const auto sourceFolder=request.folderView.Get();
+    Pidl location(request.location?ILCloneFull(request.location.get()):nullptr);
+    if(request.location&&!location) {namespaceDirty_=true;deferCommandRefresh();return;}
+    const auto sameRequest=[&](const NamespaceCommandStateTask* task) {
+        return request.pending&&request.task.get()==task&&request.generation==generation&&request.sourceRevision==revision&&
+            request.navigation==navigation&&request.count==count&&request.countKnown==countKnown&&request.requestedAt==requestedAt&&
+            request.selection.Get()==selected&&request.view.Get()==sourceView&&
+            request.folderView.Get()==sourceFolder&&
+            (location?request.location&&ILGetSize(location.get())==ILGetSize(request.location.get())&&
+                std::memcmp(location.get(),request.location.get(),ILGetSize(location.get()))==0:!request.location);
+    };
+    if(!selectionKindsSourceCurrent()) {
+        auto retired=std::move(request.task);retired->cancel();retired.reset();
+        if(sameRequest(nullptr)) {
+            request.pending=false;request.status=HRESULT_FROM_WIN32(ERROR_RETRY);
+            namespaceDirty_=true;deferCommandRefresh();
+        }
+        return;
+    }
+    const auto started=commandTimingNow();
+    const bool finished=originalTask->completed();
+    NamespaceSelectionKinds kinds;
+    auto status=originalTask->pollSelectionKinds(&kinds);
+    if(status==E_PENDING&&!finished)return;
+    if(SUCCEEDED(status)&&request.countKnown&&kinds.count!=request.count)status=HRESULT_FROM_WIN32(ERROR_RETRY);
+    HeadlessStateWorkerTiming timing;
+    if(headless_) {
+        timing.selectionKinds=true;timing.status=status;
+        timing.timingStatus=originalTask->pollTimings(&timing.native);
+    }
+    auto retired=std::move(request.task);retired.reset();
+    recordHeadlessKindsPublicationBoundary(HeadlessKindsPublicationBoundary::BeforeCallback,generation,revision,navigation);
+    if(headless_&&headlessBeforeKindsPublication_) {
+        auto probe=std::move(headlessBeforeKindsPublication_);headlessBeforeKindsPublication_={};
+        probe(status,kinds,generation,revision);
+    }
+    recordHeadlessKindsPublicationBoundary(HeadlessKindsPublicationBoundary::AfterCallback,generation,revision,navigation);
+    // Final registration/proxy release can enter native COM. Revalidate the
+    // original request after that boundary, including whether a newer task
+    // now occupies it. A superseding request owns its own pending/result state.
+    if(!sameRequest(nullptr)) {
+        recordHeadlessKindsPublicationBoundary(HeadlessKindsPublicationBoundary::BeforeRejectRequest,generation,revision,navigation);
+        if(headless_) {
+            ++headlessRejectedKindsCompletions_;
+            headlessRejectedKindsGeneration_=generation;headlessRejectedKindsRevision_=revision;
+        }
+        recordHeadlessKindsPublicationBoundary(HeadlessKindsPublicationBoundary::AfterRejectRequest,generation,revision,navigation);
+        return;
+    }
+    if(!selectionKindsSourceCurrent()) {
+        recordHeadlessKindsPublicationBoundary(HeadlessKindsPublicationBoundary::BeforeRejectSource,generation,revision,navigation);
+        status=HRESULT_FROM_WIN32(ERROR_RETRY);
+        if(headless_) {
+            ++headlessRejectedKindsCompletions_;
+            headlessRejectedKindsGeneration_=generation;headlessRejectedKindsRevision_=revision;
+        }
+        recordHeadlessKindsPublicationBoundary(HeadlessKindsPublicationBoundary::AfterRejectSource,generation,revision,navigation);
+    }
+    recordHeadlessKindsPublicationBoundary(HeadlessKindsPublicationBoundary::BeforePublish,generation,revision,navigation);
+    request.pending=false;request.status=status;
+    if(headless_) {
+        commandTimings_.completedStateWorkers.push_back(timing);
+        commandTimings_.selectionKindsReadyDelayMs+=commandTimingNow()-requestedAt;
+        commandTimings_.selectionKindsStatus=status;
+    }
+    selectionKinds_=SUCCEEDED(status)?kinds:NamespaceSelectionKinds{};
+    if(status==HRESULT_FROM_WIN32(ERROR_RETRY)) {namespaceDirty_=true;deferCommandRefresh();}
+    else updateContextTabsImpl();
+    if(headless_)commandTimings_.selectionKindsPublicationMs+=commandTimingNow()-started;
+}
+
 void ExplorerApp::startPendingCommandStates() {
     if(closing_)return;
+    startPendingSelectionKinds();
+    if(closing_||navigating_||namespaceDirty_||selectionStateDirty_||commandStatesCancelPending_)return;
     const auto now=GetTickCount64();
     if(now<commandStateStartAt_) {
         SetTimer(window_,4,static_cast<UINT>(commandStateStartAt_-now),nullptr);
@@ -303,7 +477,7 @@ void ExplorerApp::startPendingCommandStates() {
             capability.status=hr;capability.enabled=false;capability.checked=false;capability.slowStateCompleted=true;
         }
     }
-    const bool pending=std::any_of(commandCapabilities_.begin(),commandCapabilities_.end(),
+    const bool pending=selectionKindsRequest_.pending||std::any_of(commandCapabilities_.begin(),commandCapabilities_.end(),
         [](const auto& entry){return entry.second.status==E_PENDING&&!entry.second.slowStateCompleted;});
     if(pending)SetTimer(window_,4,50,nullptr);else KillTimer(window_,4);
 }
@@ -332,6 +506,8 @@ void ExplorerApp::pollCommandStates() {
     // updateNamespaceImpl cancels that work when its actual target changes.
     if(selectionStateDirty_||namespaceDirty_) {updateCommands();return;}
     CommandRefreshScope scope(*this);
+    pollSelectionKinds();
+    if(namespaceDirty_||selectionStateDirty_||navigating_||closing_)return;
     if(selectionStateBatch_) {
         std::vector<NamespaceSelectionVerbState> states;
         // Snapshot completion BEFORE polling: a worker can finish between the
@@ -652,6 +828,7 @@ void ExplorerApp::initializeSearchRefinementChoices() {
     // Load/validate enum syntax before LoadUI can request a collection. Native
     // parser work belongs to the owner STA, outside Ribbon property callbacks.
     (void)kindChoices();
+    (void)sizeChoices();
 }
 
 void ExplorerApp::refreshSearchRefinements() {
@@ -738,6 +915,7 @@ RibbonCommandState ExplorerApp::ribbonState(UINT command) {
     if (binding && !appCommandApplicable(*binding, commandContext())) { state.enabled = false; return state; }
     if (binding && binding->route != AppCommandRoute::Host) { state.enabled = false; return state; }
     const bool selected = selectionCount_ != 0;
+    const bool currentOrder = orderStateView_ == folderView_.Get() && orderStateNavigation_ == navigationCount_ && !navigating_;
     switch (command) {
     case Copy: case CopyPath:
         state.enabled = selected && (selectionAttributes_ & SFGAO_CANCOPY); break;
@@ -768,8 +946,17 @@ RibbonCommandState ExplorerApp::ribbonState(UINT command) {
     case HiddenItems: state.checked = preferences_.showHidden; break;
     case Collapse: state.checked = preferences_.ribbonCollapsed; break;
     case Fullscreen: state.checked = fullscreen_; break;
-    case SortAscending: state.checked = ascending_; break;
-    case SortDescending: state.checked = !ascending_; break;
+    case SortName: state.checked = currentOrder && sortPropertyValid_ && IsEqualPropertyKey(sortProperty_, PKEY_ItemNameDisplay); break;
+    case SortDate: state.checked = currentOrder && sortPropertyValid_ && IsEqualPropertyKey(sortProperty_, PKEY_DateModified); break;
+    case SortType: state.checked = currentOrder && sortPropertyValid_ && IsEqualPropertyKey(sortProperty_, PKEY_ItemTypeText); break;
+    case SortSize: state.checked = currentOrder && sortPropertyValid_ && IsEqualPropertyKey(sortProperty_, PKEY_Size); break;
+    case SortAscending: state.checked = currentOrder && sortPropertyValid_ && ascending_; break;
+    case SortDescending: state.checked = currentOrder && sortPropertyValid_ && !ascending_; break;
+    case GroupNone: state.checked = currentOrder && groupPropertyValid_ && IsEqualPropertyKey(groupProperty_, PKEY_Null); break;
+    case GroupName: state.checked = currentOrder && groupPropertyValid_ && IsEqualPropertyKey(groupProperty_, PKEY_ItemNameDisplay); break;
+    case GroupDate: state.checked = currentOrder && groupPropertyValid_ && IsEqualPropertyKey(groupProperty_, PKEY_DateModified); break;
+    case GroupType: state.checked = currentOrder && groupPropertyValid_ && IsEqualPropertyKey(groupProperty_, PKEY_ItemTypeText); break;
+    case GroupSize: state.checked = currentOrder && groupPropertyValid_ && IsEqualPropertyKey(groupProperty_, PKEY_Size); break;
     case SearchCurrent: state.checked = searchActive_ && !searchRecursive_; state.enabled = searchActive_; break;
     case SearchSubfolders: state.checked = searchActive_ && searchRecursive_; state.enabled = searchActive_; break;
     case RecentSearches: case RibbonClearSearchHistory: state.enabled = !recentSearches_.empty(); break;
@@ -878,22 +1065,735 @@ void ExplorerApp::pollFrequentPlaces() {
     }
 }
 
-HRESULT ExplorerApp::pinFrequentPlace(UINT index,bool pinned) {
-    if(index>=displayedFrequentPlaces_.size())return E_INVALIDARG;
-    const auto& place=displayedFrequentPlaces_[index];
+// Installed only after complete real Ribbon/browser creation. This raw top
+// procedure captures the actual lower chain, including a native raw Ribbon
+// hook outside the earlier common-controls subclass manager.
+HRESULT ExplorerApp::installOwnedCloseHook() noexcept {
+    DWORD process=0;
+    if(ownedCloseAttached_||!window_||!IsWindow(window_)||
+       GetWindowThreadProcessId(window_,&process)!=GetCurrentThreadId()||process!=GetCurrentProcessId())return E_UNEXPECTED;
+    const auto original=reinterpret_cast<WNDPROC>(GetWindowLongPtrW(window_,GWLP_WNDPROC));
+    if(!original||original==ownedCloseProc)return E_UNEXPECTED;
+    const auto hookStatus=ribbon_.setOwnerWindowRetirementHook(window_,[this]{return retireOwnedCloseHook();});
+    if(FAILED(hookStatus))return hookStatus;
+    ownedCloseWindow_=window_;ownedCloseThread_=GetCurrentThreadId();ownedCloseNext_=original;
+    ++ownedCloseGeneration_;ownedCloseAttached_=true;ownedCloseRetired_=false;
+    SetLastError(0);
+    const auto previous=reinterpret_cast<WNDPROC>(SetWindowLongPtrW(window_,GWLP_WNDPROC,reinterpret_cast<LONG_PTR>(ownedCloseProc)));
+    const auto error=GetLastError();
+    if(!previous&&error){ownedCloseAttached_=false;ownedCloseWindow_=nullptr;ownedCloseNext_=nullptr;return HRESULT_FROM_WIN32(error);}
+    if(previous)ownedCloseNext_=previous;
+    if(!previous||reinterpret_cast<WNDPROC>(GetWindowLongPtrW(window_,GWLP_WNDPROC))!=ownedCloseProc){retireOwnedCloseHook();return E_UNEXPECTED;}
+#if defined(EXPLORER_HOSTED_PIN_PERSISTENCE_FIXTURE)
+    if(hostedPinReceiptsEnabled_&&!headless_) {
+        hostedPinCreatedOwner_=window_;
+    }
+#endif
+    return S_OK;
+}
+void ExplorerApp::detachOwnedCloseHook() noexcept {
+    if(ownedCloseAttached_&&ownedCloseWindow_&&ownedCloseNext_&&GetCurrentThreadId()==ownedCloseThread_&&
+       IsWindow(ownedCloseWindow_)&&reinterpret_cast<WNDPROC>(GetWindowLongPtrW(ownedCloseWindow_,GWLP_WNDPROC))==ownedCloseProc)
+        SetWindowLongPtrW(ownedCloseWindow_,GWLP_WNDPROC,reinterpret_cast<LONG_PTR>(ownedCloseNext_));
+    // Never overwrite a later foreign/native top procedure. NC destruction
+    // and destructor retirement invalidate this ownership generation either way.
+    ownedCloseAttached_=false;ownedCloseRetired_=true;ownedCloseWindow_=nullptr;ownedCloseNext_=nullptr;++ownedCloseGeneration_;
+}
+bool ExplorerApp::retireOwnedCloseHook() noexcept {
+    // This durable binding callback precedes the original lower chain's
+    // retirement, even before a close scope/capture exists. Retain the plain
+    // original window generation and lawful class-proc cleanup continuation.
+    if(!ownedCloseWindow_||!IsWindow(ownedCloseWindow_))return true;
+    if(GetCurrentThreadId()!=ownedCloseThread_)return false;
+    if(!ownedCloseAttached_)return ownedCloseRetired_;
+    // A buried wrapper cannot be safely spliced out of an opaque later chain.
+    // Keep its actual former lower continuation alive; NativeRibbon retains
+    // that original Impl until complete original window/close retirement.
+    if(reinterpret_cast<WNDPROC>(GetWindowLongPtrW(ownedCloseWindow_,GWLP_WNDPROC))!=ownedCloseProc)return false;
+    if(ownedCloseNext_) {
+        SetLastError(0);
+        const auto previous=SetWindowLongPtrW(ownedCloseWindow_,GWLP_WNDPROC,reinterpret_cast<LONG_PTR>(ownedCloseNext_));
+        if(!previous&&GetLastError())return false;
+        if(reinterpret_cast<WNDPROC>(GetWindowLongPtrW(ownedCloseWindow_,GWLP_WNDPROC))!=ownedCloseNext_)return false;
+    }
+    // The owned current top was removed successfully. It is no longer in a
+    // live ordinary chain. Retain only the known original class-proc cleanup.
+    ownedCloseNext_=windowProc;ownedCloseAttached_=false;ownedCloseRetired_=true;
+    return true;
+}
+LRESULT CALLBACK ExplorerApp::ownedCloseProc(HWND window,UINT message,WPARAM wparam,LPARAM lparam) {
+    auto* app=reinterpret_cast<ExplorerApp*>(GetWindowLongPtrW(window,GWLP_USERDATA));
+    if(!app||app->ownedCloseWindow_!=window||!app->ownedCloseNext_)
+        return DefWindowProcW(window,message,wparam,lparam);
+    const auto next=app->ownedCloseNext_;
+    if(message==WM_CLOSE&&app->ownedCloseAttached_)return app->dispatchOwnedClose(window,wparam,lparam,next);
+    if(message==WM_NCDESTROY)app->detachOwnedCloseHook();
+    return CallWindowProcW(next,window,message,wparam,lparam);
+}
+struct ExplorerApp::OwnedCloseFrame {
+    OwnedCloseFrame* previous=nullptr;
+    HWND window=nullptr;
+    std::uint64_t generation=0;
+    bool original=false,forwarded=false,destroyForwarded=false;
+    // Exact original saved-native call only; never a pin/source authority.
+    WNDPROC nativeReceiver=nullptr;
+    bool nativeDispatchActive=false,deferredCloseRequested=false;
+    bool hostPinDrainActive=false,classCloseDeferred=false;
+    WNDPROC pinDrainReceiver=nullptr; // original once receiver, no native dispatch authority
+};
+struct ExplorerApp::ShutdownPinTransaction {
+    struct Row {IShellItem* item=nullptr;std::wstring label,description;bool pinned=false;};
+    HWND window=nullptr;
+    DWORD thread=0;
+    WNDPROC lower=nullptr;
+    std::uint64_t closeEntry=0,ribbonEpoch=0,displayRevision=0,hookGeneration=0;
+    UINT64 generation=0;
+    unsigned navigation=0;
+    IExplorerBrowser* originalBrowser=nullptr;
+    IUIFramework* originalFramework=nullptr; // borrowed from the retained original close scope
+    IShellView* originalSite=nullptr;
+    IFolderView2* originalFolder=nullptr;
+    ComPtr<IExplorerBrowser> browser;
+    ComPtr<IShellView> site;
+    ComPtr<IFolderView2> folder;
+    std::vector<BYTE> location;
+    std::vector<Row> rows;
+    std::vector<FrequentPlace> places;
+    struct BufferedPin {UINT index=UI_COLLECTION_INVALIDINDEX;bool pinned=false;};
+    std::array<BufferedPin,64> bufferedPins{};
+    UINT bufferedPinCount=0;
+    HRESULT bufferedPinAdmission=S_OK;
+    bool bufferedPinDrainStarted=false;
+    bool capturing=true,dispatching=false,originalReset=false;
+    mutable bool revoked=false;
+    std::function<HRESULT(UINT,IShellItem*,IShellView*,bool,const ContextMenuEntry&)> resolved;
+};
+
+bool ExplorerApp::shutdownPinSourceCurrent(const ShutdownPinTransaction& transaction) const noexcept {
+    const auto reject=[&]{transaction.revoked=true;return false;};
+    if(transaction.revoked)return false;
+    DWORD process=0;
+    if(shutdownPinTransaction_!=&transaction||!closing_||destroying_||navigating_||commandRefreshActive_||
+       GetCurrentThreadId()!=transaction.thread||shutdownPinCloseEntry_!=transaction.closeEntry||
+       ribbon_.callbackEntryEpoch()!=transaction.ribbonEpoch||ribbon_.closeViewLifetimeRejected()||window_!=transaction.window||
+       !IsWindow(transaction.window)||GetWindowThreadProcessId(transaction.window,&process)!=transaction.thread||
+       process!=GetCurrentProcessId()||browser_.Get()!=transaction.originalBrowser||
+       view_.Get()!=transaction.originalSite||folderView_.Get()!=transaction.originalFolder||
+       namespaceGeneration_!=transaction.generation||navigationCount_!=transaction.navigation||
+       displayedFrequentPlacesRevision_!=transaction.displayRevision||
+       displayedFrequentPlaces_.size()!=transaction.rows.size())return reject();
+    if(transaction.hookGeneration) {
+        if((!ownedCloseAttached_&&!transaction.originalReset)||ownedCloseGeneration_!=transaction.hookGeneration||ownedCloseWindow_!=transaction.window||
+           !ownedCloseFrame_||!ownedCloseFrame_->original||ownedCloseFrame_->window!=transaction.window)return reject();
+        const auto top=reinterpret_cast<WNDPROC>(GetWindowLongPtrW(transaction.window,GWLP_WNDPROC));
+        // Original synchronous native Destroy may restore its original chain.
+        // No unrecognized later wrapper is admitted, even during that reset.
+        if(top!=ownedCloseProc&&(!transaction.originalReset||(top!=transaction.lower&&top!=windowProc)))return reject();
+    }
+    if(transaction.location.empty()||!currentPidl_)return reject();
+    const auto bytes=ILGetSize(currentPidl_.get());
+    if(bytes!=transaction.location.size()||std::memcmp(transaction.location.data(),currentPidl_.get(),bytes)!=0)return reject();
+    for(size_t index=0;index<transaction.rows.size();++index) {
+        const auto& original=transaction.rows[index];const auto& current=displayedFrequentPlaces_[index];
+        if(current.item.Get()!=original.item||current.label!=original.label||
+           current.description!=original.description||current.pinned!=original.pinned)return reject();
+    }
+    if(!transaction.capturing&&(transaction.browser.Get()!=transaction.originalBrowser||
+       transaction.site.Get()!=transaction.originalSite||transaction.folder.Get()!=transaction.originalFolder||
+       transaction.places.size()!=transaction.rows.size()))return reject();
+    return true;
+}
+bool ExplorerApp::captureShutdownPins(ShutdownPinTransaction& transaction) {
+    transaction.window=window_;transaction.thread=GetWindowThreadProcessId(window_,nullptr);
+    transaction.closeEntry=shutdownPinCloseEntry_;transaction.ribbonEpoch=ribbon_.callbackEntryEpoch();
+    transaction.displayRevision=displayedFrequentPlacesRevision_;transaction.generation=namespaceGeneration_;
+    transaction.navigation=navigationCount_;transaction.originalBrowser=browser_.Get();
+    transaction.originalFramework=ribbon_.nativeFramework();
+    transaction.originalSite=view_.Get();transaction.originalFolder=folderView_.Get();
+    transaction.hookGeneration=ownedCloseFrame_?ownedCloseFrame_->generation:0;transaction.lower=ownedCloseNext_;
+    // Plain immutable descriptors precede all provider AddRefs. The original
+    // close entry and transaction have already been published by the caller.
+    const auto bytes=ILGetSize(currentPidl_.get());
+    if(!bytes)return false;
+    transaction.location.resize(bytes);std::memcpy(transaction.location.data(),currentPidl_.get(),bytes);
+    transaction.rows.reserve(displayedFrequentPlaces_.size());
+    for(const auto& row:displayedFrequentPlaces_)
+        transaction.rows.push_back({row.item.Get(),row.label,row.description,row.pinned});
+    if(!shutdownPinSourceCurrent(transaction))return false;
+    if(headless_&&headlessBeforeShutdownPinRetain_) {
+        ++headlessShutdownPinCaptureProbes_;
+        const auto probe=std::move(headlessBeforeShutdownPinRetain_);headlessBeforeShutdownPinRetain_={};probe();
+        if(!shutdownPinSourceCurrent(transaction))return false;
+    }
+    if(headless_)++headlessShutdownPinRetains_;
+    transaction.browser=transaction.originalBrowser;if(!shutdownPinSourceCurrent(transaction))return false;
+    if(headless_)++headlessShutdownPinRetains_;
+    transaction.site=transaction.originalSite;if(!shutdownPinSourceCurrent(transaction))return false;
+    if(headless_)++headlessShutdownPinRetains_;
+    transaction.folder=transaction.originalFolder;if(!shutdownPinSourceCurrent(transaction))return false;
+    transaction.places.reserve(transaction.rows.size());
+    for(const auto& row:transaction.rows) {
+        if(!shutdownPinSourceCurrent(transaction))return false;
+        if(headless_)++headlessShutdownPinRetains_;
+        ComPtr<IShellItem> item=row.item;
+        if(!shutdownPinSourceCurrent(transaction))return false;
+        transaction.places.push_back({std::move(item),row.label,row.description,row.pinned});
+    }
+    if(headless_)transaction.resolved=headlessShutdownPinResolved_;
+    transaction.capturing=false;
+    const bool current=shutdownPinSourceCurrent(transaction);
+    if(headless_)headlessShutdownCaptureReady_=current;
+    return current;
+}
+bool ExplorerApp::ownedCloseContinuation() const noexcept {
+    return ownedCloseFrame_&&ownedCloseFrame_->original&&ownedCloseFrame_->window==window_&&
+        ownedCloseFrame_->generation==ownedCloseGeneration_;
+}
+bool ExplorerApp::consumeOwnedCloseContinuation() noexcept {
+    if(!ownedCloseContinuation()||ownedCloseFrame_->forwarded)return false;
+    ownedCloseFrame_->forwarded=true;return true;
+}
+bool ExplorerApp::deferOwnedCloseContinuation() noexcept {
+    // Only the original class close under its actual saved native call is
+    // postponed. Direct destruction and foreign/later close chains are intact.
+    if(!ownedCloseContinuation()||ownedCloseFrame_->forwarded||
+       !ownedCloseFrame_->nativeDispatchActive||!shutdownPinTransaction_||
+       shutdownPinTransaction_->capturing||!ownedCloseAttached_||ownedCloseRetired_||
+       ownedCloseWindow_!=window_||GetCurrentThreadId()!=ownedCloseThread_||
+       ownedCloseFrame_->nativeReceiver!=ownedCloseNext_)return false;
+    ownedCloseFrame_->classCloseDeferred=true;return true;
+}
+HRESULT ExplorerApp::drainShutdownPins(ShutdownPinTransaction& transaction,OwnedCloseFrame& frame) noexcept {
+    // Copy values and consume the once queue before the first external call.
+    // No native callback argument, property-set, SAFEARRAY or new source is kept.
+    const auto pending=transaction.bufferedPins;
+    const auto count=transaction.bufferedPinCount;
+    transaction.bufferedPinCount=0;
+    if(transaction.bufferedPinDrainStarted)return E_ABORT;
+    transaction.bufferedPinDrainStarted=true;
+    if(FAILED(transaction.bufferedPinAdmission))return transaction.bufferedPinAdmission;
+    if(!count)return S_FALSE;
+    const auto bindingCurrent=[&]() noexcept {
+        DWORD process=0;
+        return shutdownPinTransaction_==&transaction&&ownedCloseFrame_==&frame&&frame.original&&
+            !frame.nativeDispatchActive&&frame.window==transaction.window&&window_==transaction.window&&
+            frame.generation==ownedCloseGeneration_&&GetCurrentThreadId()==transaction.thread&&
+            ribbon_.callbackEntryEpoch()==transaction.ribbonEpoch&&transaction.originalFramework&&
+            ribbon_.nativeFramework()==transaction.originalFramework&&!ribbon_.closeViewLifetimeRejected()&&
+            IsWindow(transaction.window)&&GetWindowThreadProcessId(transaction.window,&process)==transaction.thread&&
+            process==GetCurrentProcessId();
+    };
+    // Opaque native destruction before return grants no queued action authority.
+    if(!bindingCurrent()||!shutdownPinSourceCurrent(transaction))return E_ABORT;
+    struct Drain {
+        OwnedCloseFrame& frame;
+        explicit Drain(OwnedCloseFrame& value):frame(value){frame.hostPinDrainActive=true;}
+        ~Drain(){frame.hostPinDrainActive=false;}
+    } drain{frame};
+    HRESULT result=S_OK;
+    for(UINT index=0;index<count;++index) {
+        if(!bindingCurrent())break;
+        // The unchanged host gate admits only original live Shell identities.
+        // App-only revocation still returns its original E_ABORT receipt; a
+        // retired Ribbon epoch/binding stops the remaining queue altogether.
+        const auto hr=commitShutdownPin(transaction,pending[index].index,pending[index].pinned);
+        if(FAILED(hr)&&SUCCEEDED(result))result=hr;
+        if(!bindingCurrent())break;
+    }
+    return result;
+}
+void ExplorerApp::observeShutdownWindowMessage(UINT message,bool originalCloseMessage) noexcept {
+    if(message!=WM_CLOSE&&message!=WM_DESTROY&&message!=WM_NCDESTROY)return;
+    auto* transaction=shutdownPinTransaction_;
+    const bool original=transaction&&!transaction->dispatching&&!transaction->capturing&&ownedCloseContinuation()&&
+        ((message==WM_CLOSE&&originalCloseMessage)||(message==WM_DESTROY&&ownedCloseFrame_->forwarded&&
+            !ownedCloseFrame_->destroyForwarded))&&shutdownPinSourceCurrent(*transaction);
+    ++shutdownPinCloseEntry_;
+    if(transaction) {
+        if(original)transaction->closeEntry=shutdownPinCloseEntry_;
+        else transaction->revoked=true;
+    }
+    if(message==WM_DESTROY&&ownedCloseContinuation())ownedCloseFrame_->destroyForwarded=true;
+}
+void ExplorerApp::observeShutdownPhase(RibbonShutdownPhase phase) const noexcept {
+    if(!headless_||!headlessShutdownPhaseDiagnostics_)return;
+    RibbonShutdownPhaseContext facts;
+    facts.app=reinterpret_cast<std::uintptr_t>(this);facts.window=reinterpret_cast<std::uintptr_t>(window_);
+    facts.ownedWindow=reinterpret_cast<std::uintptr_t>(ownedCloseWindow_);
+    facts.browser=reinterpret_cast<std::uintptr_t>(browser_.Get());facts.view=reinterpret_cast<std::uintptr_t>(view_.Get());
+    facts.folder=reinterpret_cast<std::uintptr_t>(folderView_.Get());
+    facts.hookGeneration=ownedCloseGeneration_;facts.closeEntry=shutdownPinCloseEntry_;
+    facts.displayRevision=displayedFrequentPlacesRevision_;facts.generation=namespaceGeneration_;facts.navigation=navigationCount_;
+    facts.cleanupStarted=windowDestructionCleanupStarted_;
+    if(ownedCloseFrame_) {
+        facts.originalWindow=reinterpret_cast<std::uintptr_t>(ownedCloseFrame_->window);
+        facts.originalFrame=ownedCloseFrame_->original;facts.nativeCallActive=ownedCloseFrame_->nativeDispatchActive;
+        facts.forwarded=ownedCloseFrame_->forwarded;facts.destroyForwarded=ownedCloseFrame_->destroyForwarded;
+    }
+    if(shutdownPinTransaction_) {
+        facts.transaction=true;facts.capturing=shutdownPinTransaction_->capturing;
+        facts.pinDispatching=shutdownPinTransaction_->dispatching;facts.sourceRevoked=shutdownPinTransaction_->revoked;
+    }
+    ribbon_.observeShutdownPhase(phase,facts);
+}
+LRESULT ExplorerApp::dispatchOwnedClose(HWND window,WPARAM wparam,LPARAM lparam,WNDPROC next) noexcept {
+    const bool fresh=!ownedCloseFrame_&&(!closing_||previewClosePending_||searchClosePending_);
+    OwnedCloseFrame frame{ownedCloseFrame_,window,ownedCloseGeneration_,fresh,false,false};
+    if(shutdownPinTransaction_)shutdownPinTransaction_->revoked=true;
+    ++shutdownPinCloseEntry_; // Before any source capture/provider retain.
+    if(headless_)headlessOwnedCloseEntryTick_=GetTickCount64();
+    ownedCloseFrame_=&frame;
+    struct Frame {
+        ExplorerApp& app;OwnedCloseFrame& frame;
+        ~Frame(){if(app.ownedCloseFrame_==&frame)app.ownedCloseFrame_=frame.previous;}
+    } frameLifetime{*this,frame};
+    struct Finish {NativeRibbon& ribbon;~Finish(){ribbon.finishOwnerWindowRetirement();}} finish{ribbon_};
+    if(fresh)closing_=true;
+    bool dispatched=false;LRESULT result=0;
+    const auto recordCloseState=[&](HeadlessOwnedCloseState& state) noexcept {
+        state.original=frame.original;state.forwarded=frame.forwarded;state.destroyForwarded=frame.destroyForwarded;
+        state.hookAttached=ownedCloseAttached_;state.hookRetired=ownedCloseRetired_;
+        state.frameGeneration=frame.generation;state.hookGeneration=ownedCloseGeneration_;
+        state.originalWindow=reinterpret_cast<std::uintptr_t>(window);state.currentWindow=reinterpret_cast<std::uintptr_t>(window_);
+        state.ownedWindow=reinterpret_cast<std::uintptr_t>(ownedCloseWindow_);
+        state.originalFrame=reinterpret_cast<std::uintptr_t>(&frame);state.activeFrame=reinterpret_cast<std::uintptr_t>(ownedCloseFrame_);
+        state.creator=ownedCloseThread_;
+    };
+    const auto dispatch=[&]{
+        // A capture AddRef can pump reset/initialize/destroy. Re-admit the
+        // exact original live window before any first lower-chain dispatch.
+        DWORD process=0;
+        if(window_!=window||frame.generation!=ownedCloseGeneration_||!IsWindow(window)||
+           GetWindowThreadProcessId(window,&process)!=GetCurrentThreadId()||process!=GetCurrentProcessId()||
+           reinterpret_cast<ExplorerApp*>(GetWindowLongPtrW(window,GWLP_USERDATA))!=this) {
+            if(headless_){++headlessShutdownGoneCloseCalls_;headlessShutdownDispatchTick_=GetTickCount64();
+                headlessShutdownSavedLower_=reinterpret_cast<std::uintptr_t>(next);headlessShutdownActualReceiver_=0;}
+            return LRESULT{0};
+        }
+        // A genuine nested close belongs to the same already-dispatched
+        // original close. Revoke pins at entry as usual, then let that
+        // original native call and once App cleanup finish it. A second
+        // native/class dispatch could destroy the first call's physical UI.
+        // The stack, creator, HWND generation and actual saved receiver all
+        // match; a different owner or later close gets no such admission.
+        auto* const original=frame.previous;
+        if(!frame.original&&original&&original->original&&
+            ((original->nativeDispatchActive&&original->nativeReceiver==next)||
+             (original->hostPinDrainActive&&original->pinDrainReceiver==next))&&
+            original->window==window&&original->generation==frame.generation&&
+            ownedCloseFrame_==&frame&&ownedCloseWindow_==window&&
+            ownedCloseAttached_&&!ownedCloseRetired_&&ownedCloseNext_==next&&
+            GetCurrentThreadId()==ownedCloseThread_) {
+            original->deferredCloseRequested=true;
+            if(headless_)++headlessShutdownDeferredCloseCalls_;
+            return LRESULT{0};
+        }
+        const auto top=reinterpret_cast<WNDPROC>(GetWindowLongPtrW(window,GWLP_WNDPROC));
+        const bool capturedCurrent=ownedCloseAttached_&&!ownedCloseRetired_&&ownedCloseWindow_==window&&
+            ownedCloseNext_==next&&top==ownedCloseProc;
+        // Once retired, deliver only the genuine original App cleanup, without
+        // retrying a native batch or forwarding a stale saved native procedure.
+        const auto receiver=capturedCurrent?next:(ownedCloseRetired_?windowProc:nullptr);
+        if(!receiver) {
+            if(shutdownPinTransaction_)shutdownPinTransaction_->revoked=true;
+            // An unexpected later live wrapper grants no pin authority. The
+            // original class still owns its plain close cleanup continuation.
+        }
+        if(headless_) {
+            if(capturedCurrent)++headlessShutdownOriginalLowerCalls_;else ++headlessShutdownPlainCloseCalls_;
+            headlessShutdownDispatchTick_=GetTickCount64();headlessShutdownSavedLower_=reinterpret_cast<std::uintptr_t>(next);
+            headlessShutdownActualReceiver_=reinterpret_cast<std::uintptr_t>(receiver?receiver:windowProc);
+        }
+        if(headless_&&frame.original&&capturedCurrent)headlessShutdownNativeCloseEntered_=true;
+        {
+            struct NativeDispatch {
+                OwnedCloseFrame& frame;bool armed;
+                ~NativeDispatch(){if(armed){frame.nativeDispatchActive=false;frame.nativeReceiver=nullptr;}}
+            } nativeDispatch{frame,frame.original&&capturedCurrent};
+            if(nativeDispatch.armed){frame.nativeReceiver=next;frame.pinDrainReceiver=next;frame.nativeDispatchActive=true;}
+            observeShutdownPhase(RibbonShutdownPhase::NativeLowerBegin);
+            dispatched=true;result=CallWindowProcW(receiver?receiver:windowProc,window,WM_CLOSE,wparam,lparam);
+        }
+        if(headless_&&frame.original&&capturedCurrent)headlessShutdownNativeCloseReturned_=true;
+        observeShutdownPhase(RibbonShutdownPhase::NativeLowerReturned);
+        // The complete native continuation is gone. Resolve only its captured
+        // decoded actions while the original owner/site still exist, then let
+        // the existing once class-close gate complete ordinary destruction.
+        if(frame.original&&capturedCurrent&&shutdownPinTransaction_&&ownedCloseFrame_==&frame)
+            shutdownPinDrainStatus_=drainShutdownPins(*shutdownPinTransaction_,frame);
+        // Coalescing the genuine request cannot renew this close's pins.
+        // The existing once class/dead-window continuations below remain
+        // responsible for the original owner, including its nested request.
+        if(frame.deferredCloseRequested&&shutdownPinTransaction_)shutdownPinTransaction_->revoked=true;
+        // The admitted native lower may retire itself from its pin callback
+        // and consume this WM_CLOSE without reaching the App class. Complete
+        // only this original message's still-unconsumed class continuation.
+        // Never call the saved native receiver again or restore pin authority.
+        process=0;
+        if(headless_&&frame.original){headlessShutdownPostLowerGateReached_=true;recordCloseState(headlessShutdownPostLowerState_);}
+        bool originalWindowLivenessRead=false,originalWindowLive=false;
+        const auto closeGate=[&](UINT bit,bool admitted) noexcept {
+            if(bit==(1u<<8)){originalWindowLivenessRead=true;originalWindowLive=admitted;}
+            if(headless_&&frame.original) {
+                headlessShutdownPostLowerGateEvaluated_|=bit;
+                if(admitted)headlessShutdownPostLowerGatePassed_|=bit;
+            }
+            return admitted;
+        };
+        if(closeGate(1u<<0,capturedCurrent)&&closeGate(1u<<1,frame.original)&&closeGate(1u<<2,!frame.forwarded)&&
+           closeGate(1u<<3,ownedCloseFrame_==&frame)&&closeGate(1u<<4,window_==window)&&
+           closeGate(1u<<5,frame.generation==ownedCloseGeneration_)&&closeGate(1u<<6,ownedCloseWindow_==window)&&
+           closeGate(1u<<7,GetCurrentThreadId()==ownedCloseThread_)&&closeGate(1u<<8,IsWindow(window))&&
+           closeGate(1u<<9,GetWindowThreadProcessId(window,&process)==ownedCloseThread_)&&
+           closeGate(1u<<10,process==GetCurrentProcessId())&&
+           closeGate(1u<<11,reinterpret_cast<ExplorerApp*>(GetWindowLongPtrW(window,GWLP_USERDATA))==this)) {
+            if(headless_) {
+                ++headlessShutdownPlainCloseCalls_;headlessShutdownDispatchTick_=GetTickCount64();
+                headlessShutdownActualReceiver_=reinterpret_cast<std::uintptr_t>(windowProc);
+            }
+            result=CallWindowProcW(windowProc,window,WM_CLOSE,wparam,lparam);
+        }
+        if(headless_&&frame.original)headlessShutdownPostLowerState_.process=process;
+        // The exact original owner prefix was admitted before the liveness
+        // read. Native close can destroy its HWND without forwarding App's
+        // destroy stages after reentrant native reset. Reconcile owned state,
+        // never dispatch a saved/class procedure to an invalid or reused HWND.
+        if(originalWindowLivenessRead&&!originalWindowLive&&capturedCurrent&&frame.original&&
+           !frame.forwarded&&!frame.destroyForwarded&&ownedCloseFrame_==&frame&&window_==window&&
+           frame.generation==ownedCloseGeneration_&&ownedCloseWindow_==window&&
+           !windowDestructionCleanupStarted_) {
+            if(shutdownPinTransaction_)shutdownPinTransaction_->revoked=true;
+            if(headless_)++headlessShutdownMissingWindowDestructions_;
+            reconcileMissingWindowDestruction();
+            if(headless_)headlessShutdownMissingWindowCleanupCompleted_=!window_&&!browser_&&!view_&&!folderView_&&
+                SUCCEEDED(shutdownStatus_);
+        }
+        return result;
+    };
+    try {
+        DWORD process=0;
+        if(!fresh||destroying_||navigating_||commandRefreshActive_||liveSearchDispatchActive_||searchNativeCallsActive_||previewCallsActive_||
+           !browser_||!view_||!folderView_||!currentPidl_||ownedCloseThread_!=GetCurrentThreadId()||
+           window_!=window||GetWindowThreadProcessId(window,&process)!=ownedCloseThread_||process!=GetCurrentProcessId()||
+           reinterpret_cast<WNDPROC>(GetWindowLongPtrW(window,GWLP_WNDPROC))!=ownedCloseProc)return dispatch();
+        ShutdownPinTransaction transaction;
+        struct Published {
+            ExplorerApp& app;ShutdownPinTransaction& transaction;OwnedCloseFrame& frame;
+            ~Published(){if(app.shutdownPinTransaction_==&transaction)app.shutdownPinTransaction_=nullptr;
+                if(app.ownedCloseFrame_==&frame)app.ownedCloseFrame_=frame.previous;}
+        } published{*this,transaction,frame};
+        shutdownPinTransaction_=&transaction;
+        const std::function<HRESULT(UINT,bool)> commit=[this,&transaction](UINT index,bool pinned){return commitShutdownPin(transaction,index,pinned);};
+        // Arm the original native binding's once-scope before the first
+        // provider AddRef. A capturing transaction cannot accept a commit.
+        return ribbon_.dispatchCloseWithFinalPinCallback(commit,[&]{
+            if(!captureShutdownPins(transaction)) {
+                transaction.revoked=true;if(headless_)headlessShutdownCaptureDenied_=true;
+            }
+            return dispatch();
+        });
+    }catch(...) {
+        if(headless_&&frame.original) {
+            headlessShutdownCaughtAfterDispatch_=dispatched;recordCloseState(headlessShutdownCaughtState_);
+        }
+        // Capture/scope failure removed pin authority before releasing refs.
+        // Re-establish only the original plain cleanup continuation, so the
+        // early closing_ flag cannot suppress the original App close handler.
+        if(!dispatched){ownedCloseFrame_=&frame;return dispatch();}
+        return result;
+    }
+}
+HRESULT ExplorerApp::commitShutdownPin(ShutdownPinTransaction& transaction,UINT index,bool pinned) noexcept {
+    if(ownedCloseFrame_&&ownedCloseFrame_->original&&ownedCloseFrame_->nativeDispatchActive&&
+       shutdownPinTransaction_==&transaction) {
+        const auto reject=[&](HRESULT error) noexcept {
+            transaction.bufferedPinAdmission=error;transaction.bufferedPinCount=0;
+            transaction.revoked=true;return error;
+        };
+        if(FAILED(transaction.bufferedPinAdmission))return transaction.bufferedPinAdmission;
+        if(transaction.bufferedPinDrainStarted||transaction.capturing||transaction.dispatching||
+           !shutdownPinSourceCurrent(transaction)||!transaction.originalFramework||
+           ribbon_.nativeFramework()!=transaction.originalFramework)return reject(E_ABORT);
+        if(index>=transaction.places.size()||transaction.bufferedPinCount>=transaction.bufferedPins.size())
+            return reject(E_INVALIDARG);
+        for(UINT row=0;row<transaction.bufferedPinCount;++row)
+            if(transaction.bufferedPins[row].index==index)return reject(E_INVALIDARG);
+        transaction.bufferedPins[transaction.bufferedPinCount++]={index,pinned};
+        ++shutdownPinNativeAdmissions_;
+        // This is actual native admission, not a completed Shell/profile action.
+        // Its S_OK remains in the real native receipt; host results follow later.
+        return S_OK;
+    }
+    HeadlessShutdownPinResult diagnostic;diagnostic.index=index;diagnostic.pinned=pinned;
+    diagnostic.queuedNativeAction=ownedCloseFrame_&&ownedCloseFrame_->hostPinDrainActive;
+    if(headless_)diagnostic.entry=headlessShutdownPinFacts();
+    HRESULT hr=E_FAIL;
+    try{hr=pinShutdownFrequentPlace(transaction,index,pinned);}
+    catch(const std::bad_alloc&){transaction.revoked=true;hr=E_OUTOFMEMORY;}
+    catch(...){transaction.revoked=true;hr=E_FAIL;}
+    if(headless_) {
+        diagnostic.result=hr;diagnostic.returned=headlessShutdownPinFacts();
+        if(headlessShutdownPinResultCount_<headlessShutdownPinResults_.size())
+            headlessShutdownPinResults_[headlessShutdownPinResultCount_++]=diagnostic;
+        else headlessShutdownPinResultOverflow_=true;
+    }
+#if defined(EXPLORER_HOSTED_PIN_PERSISTENCE_FIXTURE)
+    if(hostedPinReceiptsEnabled_&&!headless_) {
+        if(hostedPinReturnCount_<hostedPinReturns_.size()) {
+            const auto* place=index<transaction.places.size()?&transaction.places[index]:nullptr;
+            hostedPinReturns_[hostedPinReturnCount_++]={index,place?place->pinned:false,pinned,
+                shutdownPinSourceCurrent(transaction),hr,transaction.window,place?place->item.Get():nullptr,
+                transaction.site.Get(),transaction.generation,transaction.navigation,
+                transaction.displayRevision,transaction.closeEntry};
+        } else hostedPinReceiptOverflow_=true;
+    }
+#endif
+    return hr;
+}
+
+ExplorerApp::HeadlessShutdownPinFacts ExplorerApp::headlessShutdownPinFacts() const noexcept {
+    HeadlessShutdownPinFacts facts;
+    facts.epoch=ribbon_.callbackEntryEpoch();facts.closeEntry=shutdownPinCloseEntry_;
+    facts.hookGeneration=ownedCloseGeneration_;facts.ownedCloseEntryTick=headlessOwnedCloseEntryTick_;
+    facts.hookAttached=ownedCloseAttached_;
+    facts.hookTop=window_&&IsWindow(window_)&&reinterpret_cast<WNDPROC>(GetWindowLongPtrW(window_,GWLP_WNDPROC))==ownedCloseProc;
+    facts.closeFrame=ownedCloseFrame_!=nullptr;facts.originalClose=ownedCloseContinuation();
+    facts.originalReset=shutdownPinTransaction_&&shutdownPinTransaction_->originalReset;
+    facts.sourceRevoked=shutdownPinTransaction_&&shutdownPinTransaction_->revoked;
+    facts.capturing=shutdownPinTransaction_&&shutdownPinTransaction_->capturing;
+    facts.nativeCloseScope=ribbon_.closeDispatchActive();
+    facts.nativeCallActive=ownedCloseFrame_&&ownedCloseFrame_->nativeDispatchActive;
+    facts.hostPinDrainActive=ownedCloseFrame_&&ownedCloseFrame_->hostPinDrainActive;
+    facts.classCloseDeferred=ownedCloseFrame_&&ownedCloseFrame_->classCloseDeferred;
+    facts.displayRevision=displayedFrequentPlacesRevision_;facts.generation=namespaceGeneration_;
+    facts.navigation=navigationCount_;facts.displayedCount=static_cast<UINT>(displayedFrequentPlaces_.size());
+    facts.closing=closing_;facts.destroying=destroying_;facts.navigating=navigating_;facts.commandRefresh=commandRefreshActive_;
+    facts.window=window_!=nullptr;facts.browser=browser_.Get()!=nullptr;facts.view=view_.Get()!=nullptr;facts.folder=folderView_.Get()!=nullptr;
+    facts.location=static_cast<bool>(currentPidl_);facts.transaction=shutdownPinTransaction_!=nullptr;
+    return facts;
+}
+
+void ExplorerApp::resetRibbonForClose() noexcept {
+    if(headless_){headlessShutdownPinAdmission_=1;headlessShutdownPinAdmissionFacts_=headlessShutdownPinFacts();}
+    if(shutdownPinTransaction_) {
+        auto& transaction=*shutdownPinTransaction_;
+        // Only the non-nested original App destroy continuation advances the
+        // already captured token. A revoked token is never recaptured/healed.
+        const bool original=ownedCloseContinuation()&&ownedCloseFrame_->forwarded&&ownedCloseFrame_->destroyForwarded&&
+            !transaction.originalReset&&!transaction.dispatching&&
+            !transaction.capturing&&shutdownPinSourceCurrent(transaction);
+        ++shutdownPinCloseEntry_;
+        if(!original){transaction.revoked=true;retireOwnedCloseHook();ribbon_.resetClosingFramework();return;}
+        transaction.closeEntry=shutdownPinCloseEntry_;
+        try {
+            const std::function<HRESULT(UINT,bool)> commit=[this,&transaction](UINT index,bool pinned){return commitShutdownPin(transaction,index,pinned);};
+            transaction.originalReset=true;++transaction.ribbonEpoch;
+            if(headless_)headlessShutdownPinAdmission_=5;
+            ribbon_.resetClosingFrameworkWithFinalPinCallback(commit);
+            if(headless_)headlessShutdownPinAdmission_=6;
+        }catch(...) {transaction.revoked=true;ribbon_.resetClosingFramework();if(headless_)headlessShutdownPinAdmission_=7;}
+        return;
+    }
+    ++shutdownPinCloseEntry_;
+    // Direct original DestroyWindow can still deliver its genuine final batch.
+    // No nested owned-close frame is allowed to create fresh pin authority.
+    if(ownedCloseFrame_||!closing_||destroying_||navigating_||commandRefreshActive_||
+       !window_||!IsWindow(window_)||!browser_||!view_||!folderView_||!currentPidl_) {retireOwnedCloseHook();ribbon_.resetClosingFramework();return;}
+    try {
+        ShutdownPinTransaction transaction;
+        struct Published {
+            ExplorerApp& app;ShutdownPinTransaction& transaction;
+            ~Published(){if(app.shutdownPinTransaction_==&transaction)app.shutdownPinTransaction_=nullptr;}
+        } published{*this,transaction};
+        shutdownPinTransaction_=&transaction;
+        if(!captureShutdownPins(transaction)){if(headless_)headlessShutdownPinAdmission_=4;retireOwnedCloseHook();ribbon_.resetClosingFramework();return;}
+        const std::function<HRESULT(UINT,bool)> commit=[this,&transaction](UINT index,bool pinned){return commitShutdownPin(transaction,index,pinned);};
+        ++transaction.ribbonEpoch;transaction.originalReset=true;
+        retireOwnedCloseHook();
+        if(headless_)headlessShutdownPinAdmission_=5;
+        ribbon_.resetClosingFrameworkWithFinalPinCallback(commit);
+        if(headless_)headlessShutdownPinAdmission_=6;
+    }catch(...) {if(headless_)headlessShutdownPinAdmission_=7;retireOwnedCloseHook();ribbon_.resetClosingFramework();}
+}
+
+HRESULT ExplorerApp::pinShutdownFrequentPlace(ShutdownPinTransaction& transaction,UINT index,bool pinned) {
+    if(transaction.capturing||!shutdownPinSourceCurrent(transaction)||transaction.dispatching)return E_ABORT;
+    if(index>=transaction.places.size())return E_INVALIDARG;
+    const auto& place=transaction.places[index];
     if(place.pinned==pinned)return S_FALSE;
-    if(headless_)return E_ACCESSDENIED;
-    ComPtr<IShellItemArray> items;auto hr=SHCreateShellItemArrayFromShellItem(place.item.Get(),IID_PPV_ARGS(&items));
+    if(!place.item)return E_UNEXPECTED;
+    if(headless_) {
+        const auto desktop=PrivateDesktop::current();
+        if(!transaction.resolved||!desktop||!desktop->ready()||FAILED(desktop->verifyIsolation()))return E_ACCESSDENIED;
+    }
+    struct Dispatch {
+        ShutdownPinTransaction& transaction;
+        explicit Dispatch(ShutdownPinTransaction& value):transaction(value){transaction.dispatching=true;}
+        ~Dispatch(){transaction.dispatching=false;}
+    } dispatch{transaction};
+    const auto current=[&]{return shutdownPinSourceCurrent(transaction);};
+    std::function<HRESULT(IShellItem*,const ContextMenuEntry&)> resolved;
+    if(headless_)resolved=[&](IShellItem* boundItem,const ContextMenuEntry& entry) {
+        return transaction.resolved(index,boundItem,transaction.site.Get(),pinned,entry);
+    };
+    // No CommandRefreshScope, source reload, invalidation or worker publication
+    // is admitted while closing. Original item/site interfaces remain owned.
+    const auto hr=resolveFrequentPlacePin(transaction.window,place.item.Get(),transaction.site.Get(),pinned,current,
+        headless_?&resolved:nullptr);
+    return current()?hr:HRESULT_FROM_WIN32(ERROR_RETRY);
+}
+
+HRESULT ExplorerApp::resolveFrequentPlacePin(HWND owner,IShellItem* item,IShellView* site,bool pinned,
+    const std::function<bool()>& current,const std::function<HRESULT(IShellItem*,const ContextMenuEntry&)>* resolved) {
+    if(headless_&&!resolved)return E_ACCESSDENIED;
+    if(!item||!site)return E_UNEXPECTED;
+    if(!current())return HRESULT_FROM_WIN32(ERROR_RETRY);
+    ComPtr<IShellItemArray> items;auto hr=SHCreateShellItemArrayFromShellItem(item,IID_PPV_ARGS(&items));
     NativeContextMenu menu;std::vector<ContextMenuEntry> entries;
-    if(SUCCEEDED(hr))hr=menu.createSelection(window_,items.Get(),view_.Get());
+    if(SUCCEEDED(hr)&&!current())return HRESULT_FROM_WIN32(ERROR_RETRY);
+    if(SUCCEEDED(hr))hr=menu.createSelection(owner,items.Get(),site);
+    if(SUCCEEDED(hr)&&!current())return HRESULT_FROM_WIN32(ERROR_RETRY);
     if(SUCCEEDED(hr))hr=menu.enumerate(entries,false);
     if(FAILED(hr))return hr;
+    if(!current())return HRESULT_FROM_WIN32(ERROR_RETRY);
     const auto verb=pinned?L"pintohome":L"unpinfromhome";
     const auto entry=std::find_if(entries.begin(),entries.end(),[verb](const auto& candidate){return candidate.canonicalVerb==verb&&candidate.enabled()&&!candidate.submenu;});
     if(entry==entries.end())return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
-    activeContextMenu_=&menu;hr=menu.invoke(entry->id);activeContextMenu_=nullptr;
-    if(SUCCEEDED(hr)){displayedFrequentPlaces_[index].pinned=pinned;frequentPlacesReadAt_=0;refreshFrequentPlaces();namespaceDirty_=true;updateCommands();}
-    return hr;
+    if(!current())return HRESULT_FROM_WIN32(ERROR_RETRY);
+    if(resolved) {
+        // Read-only test acceptance ends at the actual resolved native leaf.
+        // This branch cannot reach NativeContextMenu::invoke.
+        DWORD count=0;hr=items->GetCount(&count);
+        if(!current())return HRESULT_FROM_WIN32(ERROR_RETRY);
+        if(FAILED(hr))return hr;if(count!=1)return E_UNEXPECTED;
+        ComPtr<IShellItem> boundItem;hr=items->GetItemAt(0,&boundItem);
+        if(!current())return HRESULT_FROM_WIN32(ERROR_RETRY);
+        if(FAILED(hr))return hr;if(!boundItem)return E_UNEXPECTED;
+        hr=(*resolved)(boundItem.Get(),*entry);
+        // Provider/interface Release can itself pump close/reset/source work.
+        // Finish all temporary native binding releases before accepting the
+        // read-only fixture result against the complete original-source fence.
+        boundItem.Reset();menu.reset();items.Reset();
+        return current()?hr:HRESULT_FROM_WIN32(ERROR_RETRY);
+    }
+    struct ActiveMenu {
+        ExplorerApp& app;NativeContextMenu* previous;
+        ~ActiveMenu(){app.activeContextMenu_=previous;}
+    } active{*this,activeContextMenu_};
+    activeContextMenu_=&menu;
+#if defined(EXPLORER_HOSTED_PIN_PERSISTENCE_FIXTURE)
+    if(hostedPinReceiptsEnabled_&&!headless_) {
+        // The real normal callback may observe a refreshed row mapping after
+        // the UIA handshake. Verify its actual binding BEFORE any mutation.
+        if(!hostedPinOwnedTarget_||!current())return E_ACCESSDENIED;
+        DWORD count=0;ComPtr<IShellItem> bound;
+        hr=items->GetCount(&count);if(!current())return HRESULT_FROM_WIN32(ERROR_RETRY);
+        if(hr!=S_OK)return FAILED(hr)?hr:E_UNEXPECTED;if(count!=1)return E_ACCESSDENIED;
+        hr=items->GetItemAt(0,&bound);if(!current())return HRESULT_FROM_WIN32(ERROR_RETRY);
+        if(hr!=S_OK)return FAILED(hr)?hr:E_UNEXPECTED;if(!bound)return E_UNEXPECTED;
+        int order=1;hr=bound->Compare(hostedPinOwnedTarget_.Get(),SICHINT_CANONICAL,&order);
+        if(!current())return HRESULT_FROM_WIN32(ERROR_RETRY);
+        if(hr!=S_OK||order!=0)return FAILED(hr)?hr:E_ACCESSDENIED;
+        PWSTR rawPath=nullptr;hr=bound->GetDisplayName(SIGDN_FILESYSPATH,&rawPath);
+        struct Path {PWSTR value;~Path(){CoTaskMemFree(value);}} path{rawPath};
+        if(!current())return HRESULT_FROM_WIN32(ERROR_RETRY);
+        if(hr!=S_OK)return FAILED(hr)?hr:E_UNEXPECTED;if(!rawPath||!*rawPath)return E_UNEXPECTED;
+        // Only an already proved canonical owned GUID item grants path-read authority.
+        const auto file=CreateFileW(rawPath,FILE_READ_ATTRIBUTES,FILE_SHARE_READ,nullptr,OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT,nullptr);
+        if(file==INVALID_HANDLE_VALUE){const auto error=GetLastError();return HRESULT_FROM_WIN32(error?error:ERROR_GEN_FAILURE);}
+        struct File {HANDLE value;~File(){if(value!=INVALID_HANDLE_VALUE)CloseHandle(value);}} ownedFile{file};
+        FILE_ID_INFO actual{};FILE_ATTRIBUTE_TAG_INFO tag{};
+        if(!GetFileInformationByHandleEx(file,FileIdInfo,&actual,sizeof(actual))||
+           !GetFileInformationByHandleEx(file,FileAttributeTagInfo,&tag,sizeof(tag))) {
+            const auto error=GetLastError();return HRESULT_FROM_WIN32(error?error:ERROR_GEN_FAILURE);
+        }
+        if(!(tag.FileAttributes&FILE_ATTRIBUTE_DIRECTORY)||(tag.FileAttributes&FILE_ATTRIBUTE_REPARSE_POINT)||
+           actual.VolumeSerialNumber!=hostedPinOwnedFile_.VolumeSerialNumber||
+           std::memcmp(actual.FileId.Identifier,hostedPinOwnedFile_.FileId.Identifier,16)!=0)return E_ACCESSDENIED;
+        // Release every diagnostic native result before the final original-source fence.
+        bound.Reset();CoTaskMemFree(path.value);path.value=nullptr;
+        if(!CloseHandle(ownedFile.value)){const auto error=GetLastError();return HRESULT_FROM_WIN32(error?error:ERROR_GEN_FAILURE);}ownedFile.value=INVALID_HANDLE_VALUE;
+        if(!current())return HRESULT_FROM_WIN32(ERROR_RETRY);
+    }
+#endif
+#if defined(EXPLORER_HOSTED_PIN_PERSISTENCE_FIXTURE)
+    if(hostedPinReceiptsEnabled_&&!headless_) {
+        const auto result=menu.invoke(entry->id);
+        if(hostedPinInvokeCount_<hostedPinInvokes_.size()) {
+            auto& receipt=hostedPinInvokes_[hostedPinInvokeCount_++];
+            receipt.array=items.Get();receipt.item=item;receipt.site=site;receipt.owner=owner;
+            receipt.menuId=entry->id;receipt.requested=pinned;receipt.result=result;
+            const auto length=std::min(entry->canonicalVerb.size(),std::size(receipt.verb)-1);
+            std::copy_n(entry->canonicalVerb.data(),length,receipt.verb);receipt.verb[length]=0;
+            // Retain the exact array actually supplied to the actual provider.
+            // This opt-in AddRef may pump; the enclosing callback's complete
+            // original-source receipt is recorded after all local releases.
+            receipt.retainedArray=items;
+        } else hostedPinReceiptOverflow_=true;
+        return result;
+    }
+#endif
+    return menu.invoke(entry->id);
+}
+
+HRESULT ExplorerApp::pinFrequentPlace(UINT index,bool pinned) {
+    struct NormalPinDiagnostic {
+        ExplorerApp& app;HeadlessNormalPinResult receipt;
+        bool enabled=false;
+        NormalPinDiagnostic(ExplorerApp& value,UINT index,bool pinned):app(value) {
+            enabled=app.headless_&&app.headlessNormalPinDiagnostics_;
+            if(!enabled)return;
+            receipt.index=index;receipt.pinned=pinned;receipt.phase=app.headlessNormalPinPhase_;
+            receipt.entryTick=GetTickCount64();receipt.entry=app.headlessShutdownPinFacts();
+        }
+        ~NormalPinDiagnostic() {
+            if(!enabled)return;
+            // Existing local provider/interface releases precede this receipt.
+            receipt.returned=app.headlessShutdownPinFacts();receipt.returnTick=GetTickCount64();
+            if(app.headlessNormalPinResultCount_<app.headlessNormalPinResults_.size())
+                app.headlessNormalPinResults_[app.headlessNormalPinResultCount_++]=receipt;
+            else app.headlessNormalPinResultOverflow_=true;
+        }
+        HRESULT finish(HRESULT hr) noexcept {if(enabled)receipt.result=hr;return (hr);}
+    } diagnostic(*this,index,pinned);
+    if(closing_)return diagnostic.finish(E_ABORT);
+    if(commandRefreshActive_) {deferCommandRefresh();return diagnostic.finish(HRESULT_FROM_WIN32(ERROR_RETRY));}
+    if(index>=displayedFrequentPlaces_.size())return diagnostic.finish(E_INVALIDARG);
+    if(displayedFrequentPlaces_[index].pinned==pinned)return diagnostic.finish(S_FALSE);
+    if(headless_)return diagnostic.finish(E_ACCESSDENIED);
+    CommandRefreshScope nativeCommand(*this);
+    const auto generation=namespaceGeneration_;
+    const auto navigation=navigationCount_;
+    const auto owner=window_;
+    const auto originalSite=view_.Get();
+    const auto originalItem=displayedFrequentPlaces_[index].item.Get();
+    const auto label=displayedFrequentPlaces_[index].label;
+    const bool originalPin=displayedFrequentPlaces_[index].pinned;
+    ComPtr<IShellItem> item=originalItem;
+    const auto current=[&] {
+        return !closing_&&window_==owner&&IsWindow(owner)&&view_.Get()==originalSite&&
+            namespaceGeneration_==generation&&navigationCount_==navigation&&index<displayedFrequentPlaces_.size()&&
+            displayedFrequentPlaces_[index].item.Get()==item.Get()&&displayedFrequentPlaces_[index].label==label&&
+            displayedFrequentPlaces_[index].pinned==originalPin;
+    };
+    if(!item)return diagnostic.finish(E_UNEXPECTED);
+    if(!current())return diagnostic.finish(HRESULT_FROM_WIN32(ERROR_RETRY));
+    ComPtr<IShellView> site=view_;
+    if(!current())return diagnostic.finish(HRESULT_FROM_WIN32(ERROR_RETRY));
+    const auto hr=resolveFrequentPlacePin(owner,item.Get(),site.Get(),pinned,current);
+    if(SUCCEEDED(hr)&&!closing_) {
+        // The provider can pump navigation/source callbacks. Its success does
+        // not validate a displayed row or its new pin value; reload native truth.
+        cancelFrequentPlaces();frequentPlacesReadAt_=0;
+        try {refreshFrequentPlaces();}
+        catch(const std::bad_alloc&) {
+            // Keep the completed provider result; a later source request will
+            // retry this read-only reload while the old timestamp stays invalid.
+        }
+        namespaceDirty_=true;updateCommands();
+    }
+    return diagnostic.finish(hr);
 }
 
 HRESULT ExplorerApp::appendSearchRefinementMenu(UINT command, HMENU menu, std::vector<std::wstring>* expressions) const {
@@ -944,6 +1844,7 @@ std::vector<RibbonItem> ExplorerApp::ribbonItems(UINT command) {
         const auto oldFont=dc&&font_?SelectObject(dc,font_):nullptr;
         if(extractDestinations_) for(UINT index=0;index<extractDestinations_->entries().size();++index) {
             const auto& entry=extractDestinations_->entries()[index];
+            if((entry.flags&ECF_ISSEPARATOR)||(entry.state&ECS_HIDDEN))continue;
             auto label=entry.label;
             // Explorer's three destination columns keep a fixed compact label
             // width; the complete native title/path remains in the tooltip.
@@ -959,13 +1860,17 @@ std::vector<RibbonItem> ExplorerApp::ribbonItems(UINT command) {
                 if(low&&label[low-1]>=0xD800&&label[low-1]<=0xDBFF)--low;
                 label.resize(low);label+=L"\u2026";
             }
-            result.push_back({index,std::move(label),false,entry.icon,entry.description.empty()?entry.label:entry.description});
+            RibbonItem row{index,std::move(label),false,entry.icon,entry.description.empty()?entry.label:entry.description,
+                SUCCEEDED(entry.stateStatus)&&!(entry.state&(ECS_DISABLED|ECS_HIDDEN)),(entry.state&ECS_CHECKED)!=0};
+            row.invocationIndex=index;
+            row.checkable=(entry.flags&ECF_TOGGLEABLE)!=0;
+            result.push_back(std::move(row));
         }
         if(oldFont)SelectObject(dc,oldFont);
         if(dc)ReleaseDC(window_,dc);
     } else if (command == RibbonFrequentPlaces) {
         if(GetTickCount64()-frequentPlacesReadAt_>5000)refreshFrequentPlaces();
-        displayedFrequentPlaces_=frequentPlaces_;
+        displayedFrequentPlaces_=frequentPlaces_;++displayedFrequentPlacesRevision_;
         for(UINT index=0;index<displayedFrequentPlaces_.size();++index) {
             const auto& place=displayedFrequentPlaces_[index];
             result.push_back({index,place.label,place.pinned,{},place.description});
@@ -1001,29 +1906,25 @@ std::vector<RibbonItem> ExplorerApp::ribbonItems(UINT command) {
                 }
                 if(snapshot) {
                     auto& paths=ribbonCommandPaths_[command];paths.clear();
-                    const auto convert=[&](auto&& self,const std::vector<NamespaceSubcommandMetadata>& entries,
-                                           std::vector<size_t> parent)->std::vector<RibbonItem> {
-                        std::vector<RibbonItem> items;
-                        UINT category=0;
-                        for(size_t index=0;index<entries.size();++index) {
-                            const auto& entry=entries[index];
-                            if(entry.flags&ECF_ISSEPARATOR) {if(!items.empty())++category;continue;}
-                            if(entry.state&ECS_HIDDEN)continue;
-                            if((entry.flags&ECF_SEPARATORBEFORE)&&!items.empty())++category;
-                            auto path=parent;path.push_back(index);
-                            RibbonItem item{static_cast<UINT>(index),entry.label,false,entry.icon,entry.description,
-                                SUCCEEDED(entry.stateStatus)&&!(entry.state&ECS_DISABLED),(entry.state&ECS_CHECKED)!=0};
-                            item.invocationIndex=static_cast<UINT>(paths.size());paths.push_back(path);
-                            item.children=self(self,entry.children,path);
-                            item.checkable=(entry.flags&ECF_TOGGLEABLE)!=0;
-                            item.category=category;
-                            items.push_back(std::move(item));
-                            if(entry.flags&ECF_SEPARATORAFTER)++category;
-                        }
-                        if(!category)for(auto& item:items)item.category=UI_COLLECTION_INVALIDINDEX;
-                        return items;
-                    };
-                    result=convert(convert,snapshot->entries(),{});
+                    // Runtime action rows do not expose nested Ribbon sources.
+                    // Retain each original top-level path; executeRibbonItem
+                    // opens its provider-owned descendants as a native HMENU.
+                    UINT category=0;
+                    const auto& entries=snapshot->entries();
+                    for(size_t index=0;index<entries.size();++index) {
+                        const auto& entry=entries[index];
+                        if(entry.flags&ECF_ISSEPARATOR) {if(!result.empty())++category;continue;}
+                        if(entry.state&ECS_HIDDEN)continue;
+                        if((entry.flags&ECF_SEPARATORBEFORE)&&!result.empty())++category;
+                        RibbonItem item{static_cast<UINT>(index),entry.label,false,entry.icon,entry.description,
+                            SUCCEEDED(entry.stateStatus)&&!(entry.state&ECS_DISABLED),(entry.state&ECS_CHECKED)!=0};
+                        item.invocationIndex=static_cast<UINT>(paths.size());paths.push_back({index});
+                        item.checkable=(entry.flags&ECF_TOGGLEABLE)!=0;
+                        item.category=category;
+                        result.push_back(std::move(item));
+                        if(entry.flags&ECF_SEPARATORAFTER)++category;
+                    }
+                    if(!category)for(auto& item:result)item.category=UI_COLLECTION_INVALIDINDEX;
                 }
             }
             if(result.empty()&&(command==RibbonOptionsMenu||command==FolderOptions)) {
@@ -1261,6 +2162,17 @@ HRESULT ExplorerApp::executeRibbon(UINT command) {
 
 int ExplorerApp::headlessVisual(const PrivateDesktop& desktop, const std::filesystem::path& screenshot,
                               const std::filesystem::path& report, const VisualScene& scene) {
+    struct SelectionReadback {
+        bool requested=false,filesystemAttributesRequested=false,ownerVisible=false,viewVisible=false;
+        HRESULT folderRead=E_PENDING,viewWindowRead=E_PENDING,filesystemAttributesRead=E_PENDING;
+        HRESULT itemsRead=E_PENDING,countRead=E_PENDING,lastItemRead=E_PENDING,lastCompareRead=E_PENDING,firstCompareFailure=E_PENDING;
+        DWORD filesystemAttributes=INVALID_FILE_ATTRIBUTES,count=0,maximumCount=0;
+        ULONGLONG polls=0,itemReads=0,compareReads=0,compareFailures=0,matches=0;
+        std::uintptr_t originalView=0,lastView=0;
+        UINT expectedPidlBytes=0;int lastComparison=1;
+        HRESULT identityDiagnosticRead=E_PENDING;
+        std::string identityDiagnostic="{}";
+    } selectionRead;
     VisualCaptureOptions::CommandReadinessReadback readiness;
     VisualCaptureOptions options;
     const auto captureDeadline=GetTickCount64()+25000;
@@ -1282,6 +2194,26 @@ int ExplorerApp::headlessVisual(const PrivateDesktop& desktop, const std::filesy
         const auto workerRead=staWorkerDiagnostics(&workers);
         std::ofstream diagnostic(report);
         diagnostic << "{\"headless\":true,\"failedStage\":\"" << stage << "\",\"hresult\":" << static_cast<long>(result)
+            << ",\"selectionAvailability\":{\"requested\":" << (selectionRead.requested?"true":"false")
+            << ",\"folderReadHresult\":" << static_cast<long>(selectionRead.folderRead)
+            << ",\"viewWindowReadHresult\":" << static_cast<long>(selectionRead.viewWindowRead)
+            << ",\"ownerVisible\":" << (selectionRead.ownerVisible?"true":"false")
+            << ",\"viewVisible\":" << (selectionRead.viewVisible?"true":"false")
+            << ",\"originalView\":" << selectionRead.originalView << ",\"lastView\":" << selectionRead.lastView
+            << ",\"expectedPidlBytes\":" << selectionRead.expectedPidlBytes
+            << ",\"filesystemAttributesRequested\":" << (selectionRead.filesystemAttributesRequested?"true":"false")
+            << ",\"filesystemAttributesReadHresult\":" << static_cast<long>(selectionRead.filesystemAttributesRead)
+            << ",\"filesystemAttributes\":" << selectionRead.filesystemAttributes
+            << ",\"polls\":" << selectionRead.polls << ",\"itemsReadHresult\":" << static_cast<long>(selectionRead.itemsRead)
+            << ",\"countReadHresult\":" << static_cast<long>(selectionRead.countRead)
+            << ",\"count\":" << selectionRead.count << ",\"maximumCount\":" << selectionRead.maximumCount
+            << ",\"itemReads\":" << selectionRead.itemReads << ",\"lastItemReadHresult\":" << static_cast<long>(selectionRead.lastItemRead)
+            << ",\"compareReads\":" << selectionRead.compareReads << ",\"compareFailures\":" << selectionRead.compareFailures
+            << ",\"lastCompareReadHresult\":" << static_cast<long>(selectionRead.lastCompareRead)
+            << ",\"firstCompareFailureHresult\":" << static_cast<long>(selectionRead.firstCompareFailure)
+            << ",\"identityDiagnosticReadHresult\":" << static_cast<long>(selectionRead.identityDiagnosticRead)
+            << ",\"identityDiagnostic\":" << selectionRead.identityDiagnostic
+            << ",\"lastComparison\":" << selectionRead.lastComparison << ",\"matches\":" << selectionRead.matches << '}'
             << ",\"commandReadiness\":{\"requested\":" << (readiness.requested?"true":"false")
             << ",\"ready\":" << (readiness.ready?"true":"false") << ",\"readHresult\":" << static_cast<long>(readiness.read)
             << ",\"waitMs\":" << readiness.waitMs
@@ -1337,7 +2269,12 @@ int ExplorerApp::headlessVisual(const PrivateDesktop& desktop, const std::filesy
     const auto viewResult = scene.nativeView?S_OK:setView(scene.view);
     if (FAILED(viewResult)) return failed(7,"view",viewResult);
     if (!scene.select.empty()) {
-        ComPtr<IShellItem> folder; currentFolder(folder);
+        selectionRead.requested=true;
+        selectionRead.originalView=reinterpret_cast<std::uintptr_t>(view_.Get());
+        selectionRead.ownerVisible=IsWindowVisible(window_)!=FALSE;
+        HWND selectionViewWindow=nullptr;selectionRead.viewWindowRead=view_->GetWindow(&selectionViewWindow);
+        selectionRead.viewVisible=SUCCEEDED(selectionRead.viewWindowRead)&&IsWindowVisible(selectionViewWindow)!=FALSE;
+        ComPtr<IShellItem> folder; selectionRead.folderRead=currentFolder(folder);
         const auto folderPath=nameOf(folder.Get(),SIGDN_FILESYSPATH);
         const auto parsing=scene.select.starts_with(L"shell:") || scene.select.starts_with(L"::{") ||
             std::filesystem::path(scene.select).is_absolute() ? scene.select :
@@ -1348,18 +2285,154 @@ int ExplorerApp::headlessVisual(const PrivateDesktop& desktop, const std::filesy
         if (FAILED(hr) || !selected) return failed(7,"selection-parse",hr);
         ComPtr<IShellItem> expected;
         hr=SHCreateItemFromIDList(selected.get(),IID_PPV_ARGS(&expected));if(FAILED(hr))return failed(7,"selection-identity",hr);
+        selectionRead.expectedPidlBytes=ILGetSize(selected.get());
+        if(std::filesystem::path(parsing).is_absolute()) {
+            selectionRead.filesystemAttributesRequested=true;
+            selectionRead.filesystemAttributes=GetFileAttributesW(parsing.c_str());
+            selectionRead.filesystemAttributesRead=selectionRead.filesystemAttributes!=INVALID_FILE_ATTRIBUTES?
+                S_OK:HRESULT_FROM_WIN32(GetLastError());
+        }
         const auto available=pumpScene([&] {
+            ++selectionRead.polls;selectionRead.lastView=reinterpret_cast<std::uintptr_t>(view_.Get());
             ComPtr<IShellItemArray> items;DWORD count=0;
-            hr=folderView_->Items(SVGIO_ALLVIEW,IID_PPV_ARGS(&items));if(FAILED(hr)||!items)return false;
-            hr=items->GetCount(&count);if(FAILED(hr))return false;
+            hr=folderView_->Items(SVGIO_ALLVIEW,IID_PPV_ARGS(&items));selectionRead.itemsRead=hr;
+            if(FAILED(hr)||!items)return false;
+            hr=items->GetCount(&count);selectionRead.countRead=hr;selectionRead.count=count;if(FAILED(hr))return false;
+            selectionRead.maximumCount=std::max(selectionRead.maximumCount,count);
             for(DWORD index=0;index<count;++index) {
                 ComPtr<IShellItem> item;int same=1;
-                if(SUCCEEDED(items->GetItemAt(index,&item))&&item&&
-                    SUCCEEDED(expected->Compare(item.Get(),SICHINT_CANONICAL,&same))&&same==0)return true;
+                ++selectionRead.itemReads;selectionRead.lastItemRead=items->GetItemAt(index,&item);
+                if(SUCCEEDED(selectionRead.lastItemRead)&&item) {
+                    ++selectionRead.compareReads;
+                    selectionRead.lastCompareRead=expected->Compare(item.Get(),SICHINT_CANONICAL,&same);
+                    selectionRead.lastComparison=same;
+                    if(FAILED(selectionRead.lastCompareRead)&&selectionRead.compareFailures++==0)
+                        selectionRead.firstCompareFailure=selectionRead.lastCompareRead;
+                    if(SUCCEEDED(selectionRead.lastCompareRead)&&same==0){++selectionRead.matches;return true;}
+                }
             }
             return false;
         },5000);
-        if(!available)return failed(7,"selection-child-ready",FAILED(hr)?hr:HRESULT_FROM_WIN32(ERROR_TIMEOUT));
+        if(!available) {
+            // The original bounded canonical predicate has already failed.
+            // Metadata is diagnostic only: no FileID/path fallback, reselection,
+            // successful retry, or change to the captured original failure.
+            const auto originalFailure=FAILED(hr)?hr:HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+            try {
+                const auto originalView=view_;const auto originalFolderView=folderView_;
+                const auto originalNavigation=navigationCount_;const auto originalGeneration=namespaceGeneration_;
+                Pidl originalLocation(currentPidl_?ILCloneFull(currentPidl_.get()):nullptr);
+                const auto diagnosticDeadline=std::min<ULONGLONG>(captureDeadline,GetTickCount64()+1000);
+                const auto sourceCurrent=[&] {
+                    return originalView&&originalFolderView&&!closing_&&!navigating_&&view_.Get()==originalView.Get()&&folderView_.Get()==originalFolderView.Get()&&
+                        reinterpret_cast<std::uintptr_t>(view_.Get())==selectionRead.originalView&&navigationCount_==originalNavigation&&
+                        namespaceGeneration_==originalGeneration&&originalLocation&&currentPidl_&&ILIsEqual(originalLocation.get(),currentPidl_.get());
+                };
+                const auto admitted=[&]{return sourceCurrent()&&GetTickCount64()<diagnosticDeadline;};
+                const auto displayPath=[&](IShellItem* item,std::wstring& text)->HRESULT {
+                    if(!admitted())return E_ABORT;if(!item)return E_POINTER;
+                    PWSTR rawPath=nullptr;const auto status=item->GetDisplayName(SIGDN_FILESYSPATH,&rawPath);
+                    std::unique_ptr<wchar_t,decltype(&CoTaskMemFree)> owned(rawPath,CoTaskMemFree);
+                    if(status!=S_OK)return status;if(!rawPath)return E_UNEXPECTED;
+                    const auto length=wcsnlen_s(rawPath,32769);if(length>32768)return HRESULT_FROM_WIN32(ERROR_BUFFER_OVERFLOW);
+                    text.assign(rawPath,length);return S_OK;
+                };
+                struct FileFact {HRESULT open=E_PENDING,idRead=E_PENDING,basicRead=E_PENDING;FILE_ID_INFO id{};FILE_BASIC_INFO basic{};};
+                const auto fileFact=[&](const std::wstring& path) {
+                    FileFact fact;if(!admitted()){fact.open=E_ABORT;return fact;}
+                    if(path.empty()||!std::filesystem::path(path).is_absolute()){fact.open=E_INVALIDARG;return fact;}
+                    const auto file=CreateFileW(path.c_str(),FILE_READ_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
+                        nullptr,OPEN_EXISTING,FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT,nullptr);
+                    if(file==INVALID_HANDLE_VALUE){const auto error=GetLastError();fact.open=HRESULT_FROM_WIN32(error?error:ERROR_GEN_FAILURE);return fact;}
+                    struct Close {HANDLE value;~Close(){CloseHandle(value);}} close{file};fact.open=S_OK;
+                    if(GetFileInformationByHandleEx(file,FileIdInfo,&fact.id,sizeof(fact.id)))fact.idRead=S_OK;
+                    else {const auto error=GetLastError();fact.idRead=HRESULT_FROM_WIN32(error?error:ERROR_GEN_FAILURE);}
+                    if(GetFileInformationByHandleEx(file,FileBasicInfo,&fact.basic,sizeof(fact.basic)))fact.basicRead=S_OK;
+                    else {const auto error=GetLastError();fact.basicRead=HRESULT_FROM_WIN32(error?error:ERROR_GEN_FAILURE);}
+                    return fact;
+                };
+                const auto sameFile=[](const FileFact& a,const FileFact& b) {
+                    return a.idRead==S_OK&&b.idRead==S_OK&&a.id.VolumeSerialNumber==b.id.VolumeSerialNumber&&
+                        std::memcmp(a.id.FileId.Identifier,b.id.FileId.Identifier,sizeof(a.id.FileId.Identifier))==0;
+                };
+                const auto pathEqual=[](const std::wstring& a,const std::wstring& b,bool ignoreCase) {
+                    return !a.empty()&&!b.empty()&&CompareStringOrdinal(a.c_str(),static_cast<int>(a.size()),b.c_str(),static_cast<int>(b.size()),ignoreCase?TRUE:FALSE)==CSTR_EQUAL;
+                };
+                const auto sameBytes=[](PCIDLIST_ABSOLUTE a,PCIDLIST_ABSOLUTE b) {
+                    return a&&b&&ILGetSize(a)==ILGetSize(b)&&std::memcmp(a,b,ILGetSize(a))==0;
+                };
+                std::wstring expectedPath;const auto expectedPathRead=displayPath(expected.Get(),expectedPath);
+                const auto inputFile=fileFact(parsing),expectedFile=fileFact(expectedPath),folderFile=fileFact(folderPath);
+                ComPtr<IShellFolder> actualFolder;ComPtr<IShellItem> actualFolderItem,expectedParent;
+                const auto folderObjectRead=admitted()?originalFolderView->GetFolder(IID_PPV_ARGS(&actualFolder)):E_ABORT;
+                PIDLIST_ABSOLUTE actualFolderRaw=nullptr;
+                const auto folderPidlRead=folderObjectRead==S_OK&&actualFolder&&admitted()?SHGetIDListFromObject(actualFolder.Get(),&actualFolderRaw):E_ABORT;
+                Pidl actualFolderPidl(actualFolderRaw);
+                const auto folderItemRead=folderPidlRead==S_OK&&actualFolderPidl&&admitted()?SHCreateItemFromIDList(actualFolderPidl.get(),IID_PPV_ARGS(&actualFolderItem)):E_ABORT;
+                int folderOrder=99;const auto folderCompare=folderItemRead==S_OK&&actualFolderItem&&folder&&admitted()?actualFolderItem->Compare(folder.Get(),SICHINT_CANONICAL,&folderOrder):E_ABORT;
+                std::wstring actualFolderPath;const auto actualFolderPathRead=displayPath(actualFolderItem.Get(),actualFolderPath);
+                const auto actualFolderFile=fileFact(actualFolderPath);
+                const auto expectedParentRead=admitted()?expected->GetParent(&expectedParent):E_ABORT;
+                int expectedParentOrder=99;const auto expectedParentCompare=expectedParentRead==S_OK&&expectedParent&&folder&&admitted()?
+                    expectedParent->Compare(folder.Get(),SICHINT_CANONICAL,&expectedParentOrder):E_ABORT;
+                Pidl expectedParentPidl(ILCloneFull(selected.get()));
+                const bool expectedParentPidlReady=expectedParentPidl&&ILRemoveLastID(expectedParentPidl.get());
+                ComPtr<IShellItemArray> actualItems;DWORD actualCount=0;
+                const auto itemsRead=admitted()?originalFolderView->Items(SVGIO_ALLVIEW,IID_PPV_ARGS(&actualItems)):E_ABORT;
+                const auto countRead=itemsRead==S_OK&&actualItems&&admitted()?actualItems->GetCount(&actualCount):E_ABORT;
+                std::ostringstream evidence;
+                const auto emitFile=[&](const char* label,const FileFact& fact) {
+                    evidence<<",\""<<label<<"\":{\"openHresult\":"<<static_cast<long>(fact.open)<<",\"idReadHresult\":"<<static_cast<long>(fact.idRead)
+                        <<",\"basicReadHresult\":"<<static_cast<long>(fact.basicRead)<<",\"attributes\":"<<fact.basic.FileAttributes<<'}';
+                };
+                evidence<<"{\"navigation\":"<<originalNavigation<<",\"namespaceGeneration\":"<<originalGeneration
+                    <<",\"inputAbsolute\":"<<std::filesystem::path(parsing).is_absolute()<<",\"inputLength\":"<<parsing.size()
+                    <<",\"expectedPathReadHresult\":"<<static_cast<long>(expectedPathRead)<<",\"expectedPathLength\":"<<expectedPath.size()
+                    <<",\"expectedPathEqualsInputOrdinal\":"<<pathEqual(expectedPath,parsing,false)<<",\"expectedPathEqualsInputIgnoreCase\":"<<pathEqual(expectedPath,parsing,true)
+                    <<",\"expectedFileSameInput\":"<<sameFile(inputFile,expectedFile)
+                    <<",\"actualFolderReadHresult\":"<<static_cast<long>(folderObjectRead)<<",\"actualFolderPidlReadHresult\":"<<static_cast<long>(folderPidlRead)
+                    <<",\"actualFolderItemReadHresult\":"<<static_cast<long>(folderItemRead)<<",\"actualFolderCompareHresult\":"<<static_cast<long>(folderCompare)<<",\"actualFolderOrder\":"<<folderOrder
+                    <<",\"actualFolderPathReadHresult\":"<<static_cast<long>(actualFolderPathRead)<<",\"actualFolderPathLength\":"<<actualFolderPath.size()
+                    <<",\"actualFolderPathSameRequested\":"<<pathEqual(actualFolderPath,folderPath,true)<<",\"actualFolderSameFile\":"<<sameFile(actualFolderFile,folderFile)
+                    <<",\"actualFolderPidlEqualsCurrent\":"<<(actualFolderPidl&&originalLocation&&ILIsEqual(actualFolderPidl.get(),originalLocation.get()))
+                    <<",\"expectedParentReadHresult\":"<<static_cast<long>(expectedParentRead)<<",\"expectedParentCompareHresult\":"<<static_cast<long>(expectedParentCompare)
+                    <<",\"expectedParentOrder\":"<<expectedParentOrder<<",\"expectedParentPidlEqualsActualFolder\":"<<(expectedParentPidlReady&&actualFolderPidl&&ILIsEqual(expectedParentPidl.get(),actualFolderPidl.get()))
+                    <<",\"itemsReadHresult\":"<<static_cast<long>(itemsRead)<<",\"countReadHresult\":"<<static_cast<long>(countRead)<<",\"count\":"<<actualCount;
+                emitFile("inputFile",inputFile);emitFile("expectedFile",expectedFile);emitFile("requestedFolderFile",folderFile);emitFile("actualFolderFile",actualFolderFile);
+                evidence<<",\"rows\":[";DWORD observed=0;
+                for(DWORD index=0;countRead==S_OK&&index<actualCount&&index<32&&admitted();++index) {
+                    ComPtr<IShellItem> actual,parent;const auto itemRead=actualItems->GetItemAt(index,&actual);
+                    int forward=99,reverse=99,parentOrder=99;
+                    const auto forwardRead=itemRead==S_OK&&actual&&admitted()?expected->Compare(actual.Get(),SICHINT_CANONICAL,&forward):E_ABORT;
+                    const auto reverseRead=itemRead==S_OK&&actual&&admitted()?actual->Compare(expected.Get(),SICHINT_CANONICAL,&reverse):E_ABORT;
+                    PIDLIST_ABSOLUTE rawItem=nullptr;
+                    const auto pidlRead=itemRead==S_OK&&actual&&admitted()?SHGetIDListFromObject(actual.Get(),&rawItem):E_ABORT;
+                    Pidl actualPidl(rawItem);
+                    const auto parentRead=itemRead==S_OK&&actual&&admitted()?actual->GetParent(&parent):E_ABORT;
+                    const auto parentCompare=parentRead==S_OK&&parent&&folder&&admitted()?parent->Compare(folder.Get(),SICHINT_CANONICAL,&parentOrder):E_ABORT;
+                    std::wstring actualPath;const auto pathRead=displayPath(actual.Get(),actualPath);const auto actualFile=fileFact(actualPath);
+                    evidence<<(observed?",":"")<<"{\"index\":"<<index<<",\"itemReadHresult\":"<<static_cast<long>(itemRead)
+                        <<",\"forwardCompareHresult\":"<<static_cast<long>(forwardRead)<<",\"forwardOrder\":"<<forward
+                        <<",\"reverseCompareHresult\":"<<static_cast<long>(reverseRead)<<",\"reverseOrder\":"<<reverse
+                        <<",\"pidlReadHresult\":"<<static_cast<long>(pidlRead)<<",\"pidlBytes\":"<<(actualPidl?ILGetSize(actualPidl.get()):0)
+                        <<",\"pidlEqualExpected\":"<<(actualPidl&&ILIsEqual(selected.get(),actualPidl.get()))<<",\"pidlBytesEqualExpected\":"<<sameBytes(selected.get(),actualPidl.get())
+                        <<",\"childPidlEqualExpected\":"<<(actualPidl&&ILIsEqual(ILFindLastID(selected.get()),ILFindLastID(actualPidl.get())))
+                        <<",\"parentReadHresult\":"<<static_cast<long>(parentRead)<<",\"parentCompareHresult\":"<<static_cast<long>(parentCompare)<<",\"parentOrder\":"<<parentOrder
+                        <<",\"pathReadHresult\":"<<static_cast<long>(pathRead)<<",\"pathLength\":"<<actualPath.size()
+                        <<",\"pathSameInputOrdinal\":"<<pathEqual(actualPath,parsing,false)<<",\"pathSameInputIgnoreCase\":"<<pathEqual(actualPath,parsing,true)
+                        <<",\"pathSameExpectedOrdinal\":"<<pathEqual(actualPath,expectedPath,false)<<",\"pathSameExpectedIgnoreCase\":"<<pathEqual(actualPath,expectedPath,true)
+                        <<",\"sameFileIdInput\":"<<sameFile(actualFile,inputFile)<<",\"sameFileIdExpected\":"<<sameFile(actualFile,expectedFile)
+                        <<",\"attributesEqualExpected\":"<<(actualFile.basicRead==S_OK&&expectedFile.basicRead==S_OK&&actualFile.basic.FileAttributes==expectedFile.basic.FileAttributes)
+                        <<",\"lastWriteEqualExpected\":"<<(actualFile.basicRead==S_OK&&expectedFile.basicRead==S_OK&&actualFile.basic.LastWriteTime.QuadPart==expectedFile.basic.LastWriteTime.QuadPart);
+                    emitFile("actualFile",actualFile);evidence<<'}';++observed;
+                }
+                evidence<<"],\"observed\":"<<observed<<",\"complete\":"<<(countRead==S_OK&&observed==actualCount)
+                    <<",\"sourceCurrentAtEnd\":"<<sourceCurrent()<<",\"diagnosticDeadlineReached\":"<<(GetTickCount64()>=diagnosticDeadline)<<'}';
+                selectionRead.identityDiagnostic=evidence.str();selectionRead.identityDiagnosticRead=S_OK;
+            }catch(const std::bad_alloc&){selectionRead.identityDiagnosticRead=E_OUTOFMEMORY;}
+             catch(...){selectionRead.identityDiagnosticRead=E_FAIL;}
+            return failed(7,"selection-child-ready",originalFailure);
+        }
         hr=view_->SelectItem(ILFindLastID(selected.get()),SVSI_SELECT|SVSI_DESELECTOTHERS);
         if(FAILED(hr))return failed(7,"selection-apply",hr);
         const auto chosen=pumpScene([&] {
@@ -1553,7 +2626,7 @@ int ExplorerApp::headlessVisual(const PrivateDesktop& desktop, const std::filesy
             options.searchDateMenu.navigationDelta==1;
         options.searchDateMenu.retainedFactoriesAfter=static_cast<UINT>(searchLocations_.size());
         const auto inspectionRevision=searchInteractionRevision_;const auto inspectionNavigation=navigationCount_;
-        const auto currentRules=searchScopeRules_;const auto currentScopes=searchScopes_;const auto afterFolderView=folderView_;
+        auto currentRules=searchScopeRules_;const auto currentScopes=searchScopes_;const auto afterFolderView=folderView_;
         Pidl finalLocation(currentPidl_?ILCloneFull(currentPidl_.get()):nullptr);
         Pidl finalScope(searchScope_?ILCloneFull(searchScope_.get()):nullptr);
         Pidl finalHistory(historyIndex_>=0&&static_cast<size_t>(historyIndex_)<history_.size()?
@@ -1564,6 +2637,11 @@ int ExplorerApp::headlessVisual(const PrivateDesktop& desktop, const std::filesy
         DWORD currentScopeCount=0;ComPtr<IShellItem> currentScope;
         if(SUCCEEDED(scopeRead)&&currentScopes)scopeRead=currentScopes->GetCount(&currentScopeCount);
         if(SUCCEEDED(scopeRead)&&currentScopeCount==1)scopeRead=currentScopes->GetItemAt(0,&currentScope);
+        // A query typed in its physical folder retains implicit rule metadata.
+        // Compare its effective rule using the actual retained native scope;
+        // the app's metadata and the saved input remain unchanged.
+        if(SUCCEEDED(scopeRead)&&currentScopeCount==1&&currentScope&&currentRules.empty())
+            currentRules.push_back({currentScope,searchRecursive_,false});
         // Retain scope vectors/interfaces across public COM comparisons, then
         // reject any newer navigation or interaction after their readbacks.
         const bool sameRules=currentRules.size()==rules.size()&&std::equal(rules.begin(),rules.end(),currentRules.begin(),[](const auto& a,const auto& b) {
@@ -1714,9 +2792,95 @@ int ExplorerApp::headlessVisual(const PrivateDesktop& desktop, const std::filesy
         options.ribbonProviders.push_back(provider);
     }
     if(found->second==RibbonShareTab) {
-        constexpr std::pair<UINT,std::wstring_view> commands[]{
-            {RibbonEmail,L"Windows.email"},{RibbonSpecificPeople,L"Windows.ShareSpecificUsers"},{RibbonStopSharing,L"Windows.SharePrivate"}};
-        for(const auto& [command,key]:commands) {
+        // These are diagnostics over the original App target, not a replacement
+        // state provider. In particular E_NOTIMPL from direct GetState remains
+        // visible even when a registered menu can supply a native ordinal.
+        const auto originalView=view_;
+        const auto originalFolderView=folderView_;
+        const auto originalGeneration=namespaceGeneration_;
+        const auto originalNavigation=navigationCount_;
+        const auto originalSelected=selectionCount_;
+        const auto originalHistoryIndex=historyIndex_;
+        Pidl originalFolder(ILCloneFull(currentPidl_.get()));
+        std::vector<Pidl> originalHistory,originalSelection;
+        for(const auto& entry:history_)originalHistory.emplace_back(ILCloneFull(entry.get()));
+        if(commandSelectionIdentities_)
+            for(const auto& entry:*commandSelectionIdentities_)originalSelection.emplace_back(ILCloneFull(entry.get()));
+        const auto sameBytes=[](PCIDLIST_ABSOLUTE a,PCIDLIST_ABSOLUTE b) {
+            if(!a||!b)return a==b;
+            const auto length=ILGetSize(a);
+            return length==ILGetSize(b)&&std::memcmp(a,b,length)==0;
+        };
+        const auto unchangedTarget=[&] {
+            return !closing_&&!navigating_&&originalFolder&&originalView&&originalFolderView&&
+                originalGeneration==namespaceGeneration_&&originalNavigation==navigationCount_&&
+                originalView.Get()==view_.Get()&&originalFolderView.Get()==folderView_.Get()&&
+                originalSelected==selectionCount_&&commandSelectionView_==originalView.Get()&&
+                originalHistoryIndex==historyIndex_&&sameBytes(originalFolder.get(),currentPidl_.get())&&
+                originalHistory.size()==history_.size()&&
+                std::equal(originalHistory.begin(),originalHistory.end(),history_.begin(),
+                    [&](const Pidl& a,const Pidl& b){return a&&b&&sameBytes(a.get(),b.get());})&&
+                commandSelectionIdentities_&&originalSelection.size()==originalSelected&&
+                originalSelection.size()==commandSelectionIdentities_->size()&&
+                std::equal(originalSelection.begin(),originalSelection.end(),commandSelectionIdentities_->begin(),
+                    [&](const Pidl& a,const Pidl& b){return a&&b&&sameBytes(a.get(),b.get());});
+        };
+        struct SourceSnapshot {
+            std::filesystem::path path;
+            FILE_ID_INFO identity{};
+            FILE_BASIC_INFO basic{};
+            FILE_STANDARD_INFO standard{};
+            std::vector<BYTE> security;
+        };
+        const auto readSource=[](const std::filesystem::path& path,SourceSnapshot& output)->HRESULT {
+            SourceSnapshot staged;staged.path=path;
+            const auto file=CreateFileW(path.c_str(),FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,FILE_FLAG_BACKUP_SEMANTICS,nullptr);
+            if(file==INVALID_HANDLE_VALUE)return HRESULT_FROM_WIN32(GetLastError());
+            const BOOL read=GetFileInformationByHandleEx(file,FileIdInfo,&staged.identity,sizeof(staged.identity))&&
+                GetFileInformationByHandleEx(file,FileBasicInfo,&staged.basic,sizeof(staged.basic))&&
+                GetFileInformationByHandleEx(file,FileStandardInfo,&staged.standard,sizeof(staged.standard));
+            const auto error=read?ERROR_SUCCESS:GetLastError();CloseHandle(file);
+            if(!read)return HRESULT_FROM_WIN32(error);
+            constexpr SECURITY_INFORMATION wanted=OWNER_SECURITY_INFORMATION|GROUP_SECURITY_INFORMATION|DACL_SECURITY_INFORMATION;
+            DWORD length=0;SetLastError(ERROR_SUCCESS);
+            const BOOL sized=GetFileSecurityW(path.c_str(),wanted,nullptr,0,&length);
+            const auto securityError=GetLastError();
+            if(sized||securityError!=ERROR_INSUFFICIENT_BUFFER||!length||length>64*1024)
+                return HRESULT_FROM_WIN32(securityError?securityError:ERROR_INVALID_DATA);
+            staged.security.resize(length);
+            if(!GetFileSecurityW(path.c_str(),wanted,staged.security.data(),length,&length))return HRESULT_FROM_WIN32(GetLastError());
+            staged.security.resize(length);output=std::move(staged);return S_OK;
+        };
+        const auto readSelection=[&](std::vector<SourceSnapshot>& output)->HRESULT {
+            ComPtr<IShellItemArray> selected;
+            auto hr=originalFolderView->GetSelection(FALSE,&selected);
+            if(FAILED(hr)||!selected)return FAILED(hr)?hr:E_UNEXPECTED;
+            DWORD count=0;hr=selected->GetCount(&count);if(FAILED(hr))return hr;
+            if(count!=originalSelected)return HRESULT_FROM_WIN32(ERROR_RETRY);
+            std::vector<SourceSnapshot> staged;staged.reserve(count);
+            for(DWORD index=0;index<count;++index) {
+                ComPtr<IShellItem> item;hr=selected->GetItemAt(index,&item);if(FAILED(hr)||!item)return FAILED(hr)?hr:E_UNEXPECTED;
+                PWSTR path=nullptr;hr=item->GetDisplayName(SIGDN_FILESYSPATH,&path);
+                if(FAILED(hr)||!path){CoTaskMemFree(path);return FAILED(hr)?hr:E_UNEXPECTED;}
+                const std::filesystem::path sourcePath(path);CoTaskMemFree(path);
+                SourceSnapshot source;hr=readSource(sourcePath,source);if(FAILED(hr))return hr;
+                staged.push_back(std::move(source));
+            }
+            output=std::move(staged);return S_OK;
+        };
+        std::vector<SourceSnapshot> sources;
+        HRESULT snapshotRead=unchangedTarget()?readSelection(sources):HRESULT_FROM_WIN32(ERROR_RETRY);
+        if(SUCCEEDED(snapshotRead)&&!unchangedTarget())snapshotRead=HRESULT_FROM_WIN32(ERROR_RETRY);
+        constexpr DWORD settingsMask=SSF_SHOWALLOBJECTS|SSF_SHOWSUPERHIDDEN|SSF_SHOWEXTENSIONS|SSF_NOCONFIRMRECYCLE;
+        SHELLSTATE originalSettings{};SHGetSetSettings(&originalSettings,settingsMask,FALSE);
+        const auto originalClipboardSequence=GetClipboardSequenceNumber();
+        struct SharingDiagnosticCommand {UINT command;std::wstring_view key;NamespaceAction action;};
+        constexpr SharingDiagnosticCommand commands[]{
+            {RibbonEmail,L"Windows.email",NamespaceAction::Email},
+            {RibbonSpecificPeople,L"Windows.ShareSpecificUsers",NamespaceAction::ShareSpecificPeople},
+            {RibbonStopSharing,L"Windows.SharePrivate",NamespaceAction::RemoveAccess}};
+        for(const auto& [command,key,action]:commands) {
             auto provider=std::find_if(options.ribbonProviders.begin(),options.ribbonProviders.end(),
                 [&](const auto& entry){return entry.command==command;});
             if(provider==options.ribbonProviders.end()) {
@@ -1724,9 +2888,145 @@ int ExplorerApp::headlessVisual(const PrivateDesktop& desktop, const std::filesy
                 missing.cachedRead=HRESULT_FROM_WIN32(ERROR_NOT_FOUND);options.ribbonProviders.push_back(missing);
                 provider=std::prev(options.ribbonProviders.end());
             }
+            const auto providerIndex=static_cast<size_t>(provider-options.ribbonProviders.begin());
+            auto diagnostic=*provider;
             NamespaceCommandState actual;
-            provider->nativeRead=namespaceActions_.queryCommandState(key,&actual,NamespaceMenuScope::Selection);
-            if(SUCCEEDED(provider->nativeRead))provider->nativeState=actual.state;
+            diagnostic.nativeRead=unchangedTarget()&&GetTickCount64()<captureDeadline?
+                namespaceActions_.queryCommandState(key,&actual,NamespaceMenuScope::Selection):
+                HRESULT_FROM_WIN32(unchangedTarget()?ERROR_TIMEOUT:ERROR_RETRY);
+            if(SUCCEEDED(diagnostic.nativeRead))diagnostic.nativeState=actual.state;
+            diagnostic.registeredSynchronous=true;
+            diagnostic.registeredPreservationRead=snapshotRead;
+            if(SUCCEEDED(snapshotRead)&&unchangedTarget()&&GetTickCount64()<captureDeadline) {
+                diagnostic.registeredAttempted=true;
+                const auto started=GetTickCount64();
+                if(action==NamespaceAction::ShareSpecificPeople||action==NamespaceAction::RemoveAccess) {
+                    diagnostic.selectionMenuAttempted=true;
+                    const auto menuStarted=GetTickCount64();
+                    // Copy the facts before the native menu call can dispatch
+                    // messages; no borrowed App/menu rows cross that boundary.
+                    const auto facts=namespaceActions_.facts();
+                    std::vector<ContextMenuEntry> selectionRows;
+                    diagnostic.selectionMenuRead=namespaceActions_.selectionEntries(selectionRows);
+                    if(SUCCEEDED(diagnostic.selectionMenuRead)&&(!unchangedTarget()||GetTickCount64()>=captureDeadline))
+                        diagnostic.selectionMenuRead=HRESULT_FROM_WIN32(unchangedTarget()?ERROR_TIMEOUT:ERROR_RETRY);
+                    if(SUCCEEDED(diagnostic.selectionMenuRead)) {
+                        NamespaceInvocationPlan menuPlan;
+                        diagnostic.selectionMenuPlanRead=planNamespaceAction(action,facts,selectionRows,{},&menuPlan);
+                        if(SUCCEEDED(diagnostic.selectionMenuPlanRead)) {
+                            diagnostic.selectionMenuPlanStatus=menuPlan.status;
+                            diagnostic.selectionMenuPlanRoute=static_cast<int>(menuPlan.route);
+                            diagnostic.selectionMenuPlanEnabled=menuPlan.enabled;
+                        }
+                        const bool plannedRow=SUCCEEDED(diagnostic.selectionMenuPlanRead)&&
+                            menuPlan.route==NamespaceInvocationRoute::SelectionMenu;
+                        unsigned budget=4096,rawMatches=0;
+                        bool complete=true;
+                        const auto readRows=[&](auto&& self,const std::vector<ContextMenuEntry>& rows,
+                                                unsigned depth,bool ancestorsEnabled)->void {
+                            if(depth>16){complete=false;return;}
+                            for(const auto& row:rows) {
+                                if(!budget){complete=false;return;}
+                                --budget;
+                                const bool canonical=!row.separator()&&row.canonicalVerb.size()==key.size()&&
+                                    CompareStringOrdinal(row.canonicalVerb.data(),static_cast<int>(row.canonicalVerb.size()),
+                                        key.data(),static_cast<int>(key.size()),TRUE)==CSTR_EQUAL;
+                                if(canonical) {
+                                    ++diagnostic.selectionMenuMatches;
+                                    if(!plannedRow||row.id==menuPlan.commandId) {
+                                        ++rawMatches;
+                                        diagnostic.selectionMenuState=row.state;
+                                        diagnostic.selectionMenuCommandId=row.id;
+                                        diagnostic.selectionMenuSubmenu=row.submenu;
+                                        diagnostic.selectionMenuAncestorDisabled=!ancestorsEnabled;
+                                    }
+                                }
+                                if(!row.children.empty())self(self,row.children,depth+1,ancestorsEnabled&&row.enabled());
+                            }
+                        };
+                        readRows(readRows,selectionRows,0,true);
+                        diagnostic.selectionMenuRawRead=!complete||rawMatches>1?E_UNEXPECTED:
+                            !rawMatches?HRESULT_FROM_WIN32(ERROR_NOT_FOUND):
+                            !diagnostic.selectionMenuCommandId||diagnostic.selectionMenuCommandId>0x7fff?
+                                HRESULT_FROM_WIN32(ERROR_INVALID_DATA):S_OK;
+                    }
+                    diagnostic.selectionMenuReadMs=GetTickCount64()-menuStarted;
+                }
+                NamespaceInvocationPlan generic;
+                diagnostic.registeredGenericRead=unchangedTarget()&&GetTickCount64()<captureDeadline?
+                    namespaceActions_.planCommandStore(key,&generic,NamespaceMenuScope::Selection):
+                    HRESULT_FROM_WIN32(unchangedTarget()?ERROR_TIMEOUT:ERROR_RETRY);
+                NamespaceInvocationPlan plan;
+                diagnostic.registeredRead=unchangedTarget()&&GetTickCount64()<captureDeadline?
+                    namespaceActions_.planInvocation(action,&plan):
+                    HRESULT_FROM_WIN32(unchangedTarget()?ERROR_TIMEOUT:ERROR_RETRY);
+                if(SUCCEEDED(diagnostic.registeredRead)&&unchangedTarget()&&GetTickCount64()<captureDeadline) {
+                    diagnostic.registeredPlanStatus=plan.status;
+                    diagnostic.registeredRoute=static_cast<int>(plan.route);
+                    diagnostic.registeredCommandId=plan.commandId;
+                    diagnostic.registeredSubmenu=plan.submenu;
+                    diagnostic.registeredEnabled=plan.enabled;
+                    std::vector<ContextMenuEntry> entries;
+                    // Resolve flags only from the actual action-owned menu.
+                    // SendTo/component routes have no menu flags to invent.
+                    if(plan.route==NamespaceInvocationRoute::SelectionMenu)
+                        diagnostic.registeredRawStateRead=namespaceActions_.selectionEntries(entries);
+                    else if(plan.route==NamespaceInvocationRoute::CommandStoreMenu)
+                        diagnostic.registeredRawStateRead=namespaceActions_.commandStoreEntries(entries,NamespaceMenuScope::Selection);
+                    if(SUCCEEDED(diagnostic.registeredRawStateRead)&&(!unchangedTarget()||GetTickCount64()>=captureDeadline))
+                        diagnostic.registeredRawStateRead=HRESULT_FROM_WIN32(unchangedTarget()?ERROR_TIMEOUT:ERROR_RETRY);
+                    if(SUCCEEDED(diagnostic.registeredRawStateRead)&&unchangedTarget()&&GetTickCount64()<captureDeadline) {
+                        unsigned count=0,budget=4096;
+                        bool submenu=false;
+                        const auto findEntry=[&](auto&& self,const std::vector<ContextMenuEntry>& rows,unsigned depth)->void {
+                            if(depth>16){budget=0;return;}
+                            for(const auto& row:rows) {
+                                if(!budget)return;
+                                --budget;
+                                if(!row.separator()&&row.id==plan.commandId) {
+                                    ++count;diagnostic.registeredState=row.state;
+                                    submenu=row.submenu;
+                                }
+                                self(self,row.children,depth+1);
+                            }
+                        };
+                        findEntry(findEntry,entries,0);
+                        if(count!=1||!budget||submenu!=plan.submenu)diagnostic.registeredRawStateRead=E_UNEXPECTED;
+                    }
+                }
+                diagnostic.registeredReadMs=GetTickCount64()-started;
+            } else diagnostic.registeredRead=FAILED(snapshotRead)?snapshotRead:
+                HRESULT_FROM_WIN32(unchangedTarget()?ERROR_TIMEOUT:ERROR_RETRY);
+            // GetState/menu enumeration can dispatch native messages. Retain no
+            // live-map iterator across them; fence the exact target afterward.
+            diagnostic.registeredTargetPreserved=unchangedTarget();
+            if(!diagnostic.registeredTargetPreserved)diagnostic.registeredPreservationRead=HRESULT_FROM_WIN32(ERROR_RETRY);
+            else if(GetTickCount64()>=captureDeadline)diagnostic.registeredPreservationRead=HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+            options.ribbonProviders[providerIndex]=diagnostic;
+        }
+        std::vector<SourceSnapshot> afterSources;
+        auto preservationRead=SUCCEEDED(snapshotRead)&&unchangedTarget()?readSelection(afterSources):snapshotRead;
+        const bool sameIdentities=SUCCEEDED(preservationRead)&&afterSources.size()==sources.size()&&
+            std::equal(sources.begin(),sources.end(),afterSources.begin(),[&](const auto& a,const auto& b) {
+                return sameFileIdentity(a.identity,b.identity);
+            });
+        const bool sameSources=sameIdentities&&std::equal(sources.begin(),sources.end(),afterSources.begin(),[](const auto& a,const auto& b) {
+            return a.basic.CreationTime.QuadPart==b.basic.CreationTime.QuadPart&&
+                a.basic.LastWriteTime.QuadPart==b.basic.LastWriteTime.QuadPart&&
+                a.basic.ChangeTime.QuadPart==b.basic.ChangeTime.QuadPart&&a.basic.FileAttributes==b.basic.FileAttributes&&
+                a.standard.EndOfFile.QuadPart==b.standard.EndOfFile.QuadPart&&
+                a.standard.Directory==b.standard.Directory&&a.security==b.security;
+        });
+        SHELLSTATE afterSettings{};SHGetSetSettings(&afterSettings,settingsMask,FALSE);
+        const bool sameSettings=std::memcmp(&originalSettings,&afterSettings,sizeof(originalSettings))==0&&
+            originalClipboardSequence==GetClipboardSequenceNumber()&&SUCCEEDED(desktop.verifyIsolation());
+        if(SUCCEEDED(preservationRead)&&(!unchangedTarget()||!sameSources||!sameSettings))preservationRead=HRESULT_FROM_WIN32(ERROR_RETRY);
+        for(auto& provider:options.ribbonProviders) {
+            if(!provider.registeredSynchronous)continue;
+            provider.registeredTargetPreserved=provider.registeredTargetPreserved&&unchangedTarget()&&sameIdentities;
+            provider.registeredSourcesPreserved=sameSources;
+            provider.registeredSettingsPreserved=sameSettings;
+            if(FAILED(preservationRead)||FAILED(snapshotRead))provider.registeredPreservationRead=FAILED(snapshotRead)?snapshotRead:preservationRead;
         }
     }
     for(UINT bit=0;bit<11;++bit) {

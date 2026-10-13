@@ -104,6 +104,10 @@ public:
     HRESULT STDMETHODCALLTYPE Drop(IDataObject* data, DWORD keys, POINTL point, DWORD* effect) override;
 
 private:
+    friend class ExplorerApp;
+    // Only the creator App may retire this authority after its original parent
+    // HWND is proven gone. This does not release an external OLE registration.
+    HRESULT retireDestroyedWindow() noexcept;
     BreadcrumbDropTarget(HWND owner, BreadcrumbDropOptions options);
     ~BreadcrumbDropTarget();
     HRESULT checkThread() const noexcept;
@@ -117,6 +121,7 @@ private:
     HWND owner_ = nullptr;
     DWORD thread_ = 0;
     bool registered_ = false;
+    bool windowRetired_ = false;
     BreadcrumbDropOptions options_;
     Microsoft::WRL::ComPtr<IDataObject> data_;
     Microsoft::WRL::ComPtr<IShellItem> item_;

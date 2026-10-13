@@ -5,6 +5,7 @@
 #include <wrl/client.h>
 #include <vector>
 #include <optional>
+#include <string>
 
 namespace explorer {
 
@@ -63,6 +64,14 @@ HRESULT createSearchFolderForScopes(const std::wstring& query, IShellItemArray* 
 // locations; unsupported virtual combinations return ERROR_NOT_SUPPORTED.
 HRESULT createSearchFolderForScopeRules(const std::wstring& query,
                                        const std::vector<SearchScopeRule>& scopes, IShellItem** result);
+// Deliberate route preflight. True only for a scope shape rejected by the
+// physical-live normalizer but losslessly represented by the documented
+// known-folder descriptor rules. Native/validation errors remain errors.
+HRESULT searchScopeRulesRequireBacking(const std::vector<SearchScopeRule>& rules, bool* required,
+                                      std::vector<SearchScopeRule>* descriptorRules = nullptr);
+// Validate the same unresolved native parser/condition contract before the
+// backing store reserves a directory/file. No filesystem or Shell setting write.
+HRESULT validateSearchDescriptorQuery(const std::wstring& query);
 
 // Saves the native condition tree as a documented .search-ms file. Generic
 // leaves are normalized with their parser context; relative dates stay
@@ -73,9 +82,22 @@ HRESULT createSearchFolderForScopeRules(const std::wstring& query,
 // attributes and native compression. Read-only, reparse and EFS targets are
 // refused; existing handles that deny deletion retain their sharing error.
 // Filesystem folders, exact known-folder roots and native Library location
-// unions are supported. Unsupported scope/condition shapes return
+// unions are supported, including shallow known-folder includes and mixed
+// include depths carried by the native descriptor. The file-free live factory
+// above retains its physical-domain restriction. Virtual exclusions and
+// physical protective guards keep their existing limits. Unsupported shapes return
 // ERROR_NOT_SUPPORTED before creating the file.
 enum class SearchSaveMode { CreateNew, UserConfirmed };
+// Optional CreateNew-only ownership proof. Captured from the original writer's
+// exclusive CREATE_NEW handle after writing, before close or SHChangeNotify,
+// together with the exact serialized bytes written by that handle.
+// A later path/lease must match this full identity; a fresh path read cannot
+// establish ownership of a file created during native notification reentry.
+struct SearchCreatedFileProof {
+    FILE_ID_INFO identity{};
+    std::string bytes;
+    bool captured = false;
+};
 HRESULT saveSearch(const std::wstring& query, IShellItem* scope, bool recursive,
                    const std::filesystem::path& path, SearchSaveMode mode = SearchSaveMode::CreateNew,
                    const SearchViewPresentation* presentation = nullptr,
@@ -87,6 +109,7 @@ HRESULT saveSearchForScopes(const std::wstring& query, IShellItemArray* scopes, 
 HRESULT saveSearchForScopeRules(const std::wstring& query, const std::vector<SearchScopeRule>& scopes,
                                const std::filesystem::path& path, SearchSaveMode mode = SearchSaveMode::CreateNew,
                                const SearchViewPresentation* presentation = nullptr,
-                               const SearchFileProperties* fileProperties = nullptr);
+                               const SearchFileProperties* fileProperties = nullptr,
+                               SearchCreatedFileProof* createdFileProof = nullptr);
 
 } // namespace explorer

@@ -5,6 +5,9 @@
 #include <shobjidl.h>
 #include <wrl/client.h>
 #include <string>
+#include <string_view>
+#include <span>
+#include <cstdint>
 #include <vector>
 
 namespace explorer {
@@ -22,6 +25,38 @@ struct ContextMenuEntry {
     bool enabled() const noexcept { return (state & (MFS_DISABLED | MFS_GRAYED)) == 0; }
 };
 
+// Optional external diagnostics for the real create/createLeafState native calls.
+// The callback can pump or throw. A failed callback aborts creation; it cannot
+// turn an actual native failure or an invalidated generation into success.
+// operationResult is raw, and is E_PENDING/unattempted on a before boundary.
+// The observer and its state must remain alive for the entire synchronous call.
+// Do not reuse one observer for a reentrant or concurrent creation.
+struct NativeContextMenuCreateBoundary {
+    const char* operation = nullptr;
+    bool after = false;
+    bool attempted = false;
+    HRESULT operationResult = E_PENDING;
+    std::uint64_t generation = 0;
+    bool sourceCurrent = false;
+    unsigned sequence = 0;
+};
+
+struct NativeContextMenuCreateReceipt {
+    NativeContextMenuCreateBoundary last;
+    NativeContextMenuCreateBoundary lastNativeFailure;
+    NativeContextMenuCreateBoundary firstDiagnosticFailure;
+    HRESULT diagnosticResult = S_OK;
+    HRESULT creationResult = E_PENDING;
+    bool observerThrew = false;
+    bool sourceCurrent = false;
+};
+
+struct NativeContextMenuCreateObserver {
+    void* state = nullptr;
+    void (*record)(void*, const NativeContextMenuCreateBoundary&) = nullptr;
+    NativeContextMenuCreateReceipt receipt;
+};
+
 // Owns a native Shell menu for one STA interaction. Keep it alive while tracking
 // the popup and invoking its result. Returned HMENUs are borrowed; never destroy
 // or reparent a submenu. This class never displays a menu or invokes a default.
@@ -36,6 +71,13 @@ public:
                              UINT flags = CMF_NORMAL);
     HRESULT createSelection(HWND owner, IShellItemArray* selection, IUnknown* site = nullptr,
                             UINT flags = CMF_NORMAL);
+    // Normal native selection provider, without requesting synchronous
+    // population of EVERY cascade. Exact planning below can initialize the
+    // requested native branch; invocation still uses its original numeric ID.
+    HRESULT createSelectionForPlanning(HWND owner, IShellItemArray* selection,
+                                      IUnknown* site = nullptr, UINT flags = CMF_NORMAL);
+    HRESULT createForPlanning(HWND owner, IContextMenu* context, IUnknown* site = nullptr,
+                              UINT flags = CMF_NORMAL);
     // Uses the SDK's CLSID_NewMenu and registered ShellNew handlers. Its popup
     // contains Folder, Shortcut and the file types installed on this computer.
     // The optional site can supply SID_SNewMenuClient and Shell-view services.
@@ -56,6 +98,13 @@ public:
     // path, so a retained provider remains suitable for a later normal menu.
     HRESULT createLeafState(IContextMenu* context, IUnknown* site = nullptr,
                             UINT flags = CMF_NORMAL, bool omitResourceVerbs = false);
+    // Explicit opt-in overloads share the production implementation. Ordinary
+    // calls instantiate its compile-time unobserved path, with no callbacks,
+    // diagnostic receipt writes, diagnostic allocations or extra COM retention.
+    HRESULT create(HWND owner, IContextMenu* context, IUnknown* site, UINT flags,
+                   NativeContextMenuCreateObserver& observer);
+    HRESULT createLeafState(IContextMenu* context, IUnknown* site, UINT flags,
+                            bool omitResourceVerbs, NativeContextMenuCreateObserver& observer);
     void reset() noexcept;
 
     HMENU menu() const noexcept { return menu_; }
@@ -68,6 +117,18 @@ public:
     // Populate delayed submenus using WM_INITMENUPOPUP without showing them.
     // Labels and verbs are descriptive: invoke only the selected numeric ID.
     HRESULT enumerate(std::vector<ContextMenuEntry>& entries, bool populateSubmenus = true);
+    // Ordered canonical aliases. Inspect already supplied native metadata
+    // first; a known leaf never initializes an unrelated submenu. Only a
+    // uniquely matched enabled native cascade is populated (once per menu
+    // lifetime), with strict native errors and original hierarchy/ordinals.
+    // Unknown branch names are never inferred from labels or menu positions.
+    // enumerate(...,true) remains the explicit full-menu inspection API.
+    HRESULT enumerateForVerbs(std::span<const std::wstring_view> verbs,
+                              std::vector<ContextMenuEntry>& entries);
+    // An isolated registered provider can expose one native anonymous cascade.
+    // Its actual unique numeric ID is authority, never a synthesized verb or
+    // translated label. Disabled parents do not receive initialization.
+    HRESULT enumerateForCommand(UINT actualNativeId, std::vector<ContextMenuEntry>& entries);
     // Invoke an enabled leaf actually belonging to this menu, using its ordinal
     // offset. Zero/cancel, stale/foreign IDs, disabled items and group headers fail.
     // Native handlers may launch applications or dialogs; this is not a silent
@@ -79,10 +140,17 @@ public:
     bool handleMessage(UINT message, WPARAM wParam, LPARAM lParam, LRESULT& result);
 
 private:
+    template<bool Observed>
     HRESULT createImpl(HWND owner, IContextMenu* context, IUnknown* site, UINT flags,
-                       bool leafStateOnly, bool omitResourceVerbs = false);
+                       bool leafStateOnly, bool omitResourceVerbs = false,
+                       bool synchronousCascades = true,
+                       NativeContextMenuCreateObserver* observer = nullptr);
     HRESULT enumerateMenu(HMENU menu, UINT position, unsigned depth, unsigned& budget,
-                          std::vector<ContextMenuEntry>& entries, bool populate);
+                          std::vector<ContextMenuEntry>& entries, bool populate,
+                          bool strictMessages = false);
+    HRESULT initializeForPlanning(HMENU menu, UINT position);
+    HRESULT enumerateForTarget(std::span<const std::wstring_view> verbs, UINT actualNativeId,
+                               std::vector<ContextMenuEntry>& entries);
     std::wstring canonicalVerb(UINT id) const;
     bool ownsMenu(HMENU candidate) const noexcept;
     bool selectableCommand(UINT id) const noexcept;
@@ -96,6 +164,9 @@ private:
     UINT commandCount_ = 0;
     bool siteAttached_ = false;
     bool leafStateOnly_ = false;
+    std::uint64_t generation_ = 0;
+    struct PlannedPopup { HMENU menu; HRESULT status; };
+    std::vector<PlannedPopup> plannedPopups_;
     Microsoft::WRL::ComPtr<IContextMenu> context_;
     Microsoft::WRL::ComPtr<IContextMenu2> context2_;
     Microsoft::WRL::ComPtr<IContextMenu3> context3_;

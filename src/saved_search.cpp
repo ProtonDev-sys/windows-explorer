@@ -401,7 +401,7 @@ HRESULT scopeItemMetadata(IXMLDOMNode* node, SavedSearchMetadata& result) {
         GUID identifier{};
         if (FAILED(hr = IIDFromString(text.c_str(), &identifier))) return hr;
         if (FAILED(hr = SHGetKnownFolderItem(identifier, KF_FLAG_DEFAULT, nullptr, IID_PPV_ARGS(&result.scope)))) return hr;
-        if (!result.recursive || excluded) {
+        if (excluded) {
             PWSTR raw = nullptr;
             hr = result.scope->GetDisplayName(SIGDN_FILESYSPATH, &raw);
             TaskString nativePath(raw);
@@ -443,16 +443,8 @@ HRESULT scopeMetadata(IXMLDOMNode* node, SavedSearchMetadata& result, bool& need
         pidls.push_back(raw); owned.push_back(std::move(pidl));
     }
     if (!result.scope || pidls.empty()) return unsupported;
-    const bool shallow = std::any_of(result.scopeRules.begin(), result.scopeRules.end(), [](const SearchScopeRule& rule) {
-        return !rule.excluded && !rule.recursive;
-    });
-    for (const auto& rule : result.scopeRules) {
-        if (!rule.excluded && shallow) {
-            PWSTR raw = nullptr;
-            hr = rule.folder->GetDisplayName(SIGDN_FILESYSPATH, &raw); TaskString path(raw);
-            if (FAILED(hr) || !raw || !*raw) return unsupported;
-        }
-    }
+    // Every include already resolved either a physical path or an exact native
+    // known-folder GUID. The descriptor, unlike SetScope, preserves its depth.
     bool required = false;
     if (FAILED(hr = search_scope_internal::requiresProtectiveGuard(result.scopeRules, &required))) return hr;
     if (FAILED(hr = SHCreateShellItemArrayFromIDLists(static_cast<UINT>(pidls.size()), pidls.data(), &result.scopes))) return hr;

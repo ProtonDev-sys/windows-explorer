@@ -2,6 +2,7 @@
 
 #include "explorer/context_menu.hpp"
 
+#include <array>
 #include <memory>
 #include <span>
 #include <string_view>
@@ -100,6 +101,28 @@ struct NamespaceCommandMetadata {
     std::wstring icon;
 };
 
+// Opt-in bounded plain receipts over the existing native metadata route.
+// status is the actual native/registry HRESULT; returned is the existing
+// apartment-wrapper HRESULT. attempted distinguishes real E_PENDING output
+// from a native method that was never admitted. Text truncation is diagnostic.
+struct NamespaceMetadataTextReceipt {
+    HRESULT status=E_PENDING,returned=E_PENDING;
+    bool attempted=false,present=false,truncated=false;
+    std::array<wchar_t,1024> text{};
+};
+struct NamespaceCommandMetadataDiagnostics {
+    DWORD creatorThread=0;
+    HRESULT metadataRegistryOpen=E_PENDING,providerRegistryOpen=E_PENDING;
+    HRESULT handlerRead=E_PENDING,handlerParse=E_PENDING,providerCreate=E_PENDING,nativeProviderCreate=E_PENDING,objectQuery=E_PENDING;
+    HRESULT initializerQuery=E_PENDING,propertyBagOpen=E_PENDING,initialize=E_PENDING,nativeInitialize=E_PENDING;
+    HRESULT siteQuery=E_PENDING,siteAttach=E_PENDING,nativeSiteAttach=E_PENDING,siteDetach=E_PENDING,nativeSiteDetach=E_PENDING;
+    HRESULT providerLoad=E_PENDING,returned=E_PENDING;
+    CLSID handler=CLSID_NULL;
+    bool initialized=false,siteSupplied=false,siteAttached=false,diagnosticException=false;
+    NamespaceMetadataTextReceipt muiVerb,defaultVerb,description,icon,handlerText;
+    std::array<NamespaceMetadataTextReceipt,3> providerFields{}; // Title, Icon, ToolTip
+};
+
 struct NamespaceSubcommandMetadata {
     GUID canonicalName = GUID_NULL;
     std::wstring label;
@@ -137,6 +160,7 @@ struct NamespaceSelectionVerbState {
 };
 
 struct NamespaceCommandStateTimings {
+    ULONGLONG kindReadMicroseconds = 0;
     ULONGLONG dataObjectExportMicroseconds = 0;
     ULONGLONG identityConstructionMicroseconds = 0;
     ULONGLONG contextBindMicroseconds = 0;
@@ -188,6 +212,12 @@ public:
     ~NamespaceCommandStateTask();
     static HRESULT start(std::wstring_view command,IShellItemArray* selection,IUnknown* site,
                          bool background,std::unique_ptr<NamespaceCommandStateTask>* result);
+    // Reads the original full array's fast aggregate PKEY_Kind on its correctly
+    // marshaled interface. Independent of menu construction and its reservation;
+    // no CIDA reconstruction, item enumeration or extension classification.
+    static HRESULT startSelectionKinds(IShellItemArray* selection,IUnknown* site,
+                                       std::unique_ptr<NamespaceCommandStateTask>* result);
+    HRESULT pollSelectionKinds(NamespaceSelectionKinds* result);
     // Reads the complete original selection's native IContextMenu on the
     // worker STA. Exact unique canonical leaf only; never invokes anything.
     static HRESULT startSelectionVerb(std::wstring_view verb,IShellItemArray* selection,IUnknown* site,
@@ -222,10 +252,12 @@ public:
 private:
     friend class NativeNamespaceActions;
     struct Impl;
+    enum class Work { CommandState, SelectionKinds };
     static HRESULT startImpl(std::wstring_view name,IShellItemArray* selection,IUnknown* site,
                              bool background,std::vector<std::wstring> selectionVerbs,
                              std::unique_ptr<NamespaceCommandStateTask>* result,bool independentVerbs = false,
-                             std::shared_ptr<NamespaceStateRegistration> registration = {});
+                             std::shared_ptr<NamespaceStateRegistration> registration = {},
+                             Work work = Work::CommandState);
     explicit NamespaceCommandStateTask(std::unique_ptr<Impl> impl);
     std::unique_ptr<Impl> impl_;
 };
@@ -267,6 +299,11 @@ std::wstring_view namespaceActionLabel(NamespaceAction action) noexcept;
 HRESULT namespaceCommandMetadata(std::wstring_view command,
                                  NamespaceCommandMetadata* result,
                                  IShellItemArray* selection = nullptr,IUnknown* site = nullptr);
+// Same calls/order/precedence as namespaceCommandMetadata. The receipt is
+// borrowed synchronously through actual provider retirement on the creator STA.
+HRESULT namespaceCommandMetadataWithDiagnostics(std::wstring_view command,
+    NamespaceCommandMetadata* result,IShellItemArray* selection,IUnknown* site,
+    NamespaceCommandMetadataDiagnostics* diagnostics) noexcept;
 // Reads IExplorerCommand::EnumSubCommands/GetTitle/GetIcon/GetState(FALSE) only.
 // Windows.IconSize exposes the OS's eight localized View gallery items here.
 // Enumeration order is native; GUID_NULL is retained when a provider has no ID.
@@ -313,6 +350,10 @@ public:
                              NamespaceMenuScope scope = NamespaceMenuScope::Selection);
     HRESULT commandStoreEntries(std::vector<ContextMenuEntry>& result,
                                 NamespaceMenuScope scope = NamespaceMenuScope::Selection);
+    // Explicitly populates/copies the retained complete selection menu on its
+    // creator STA. Exact action planning keeps partial native snapshots until
+    // this full inspection is requested. No command invocation or replacement.
+    HRESULT selectionEntries(std::vector<ContextMenuEntry>& result);
     HRESULT commandMetadata(std::wstring_view command, NamespaceCommandMetadata* result,
                             NamespaceMenuScope scope = NamespaceMenuScope::Selection);
     HRESULT invokeCommandStore(std::wstring_view command, bool headless, POINT point = {},
@@ -332,6 +373,9 @@ public:
                               NamespaceMenuScope scope = NamespaceMenuScope::Selection);
     HRESULT startCommandStateTask(std::wstring_view command,std::unique_ptr<NamespaceCommandStateTask>* result,
                                   NamespaceMenuScope scope = NamespaceMenuScope::Selection);
+    // Requires an actual nonempty selection; the current-folder fallback used
+    // by command providers is never classified as selected media.
+    HRESULT startSelectionKindsTask(std::unique_ptr<NamespaceCommandStateTask>* result);
     HRESULT startStaticVerbStateTask(std::wstring_view verb,std::unique_ptr<NamespaceCommandStateTask>* result);
     HRESULT startStaticVerbStateBatch(std::span<const std::wstring_view> verbs,std::unique_ptr<NamespaceCommandStateTask>* result);
     HRESULT startActionStateTask(NamespaceAction action,std::unique_ptr<NamespaceCommandStateTask>* result);

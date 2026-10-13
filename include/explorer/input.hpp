@@ -11,7 +11,7 @@ namespace explorer {
 std::optional<Command> shortcutCommand(UINT key, bool control, bool shift,
                                        bool alt, bool editing) noexcept;
 
-enum class FocusRegion { FolderView, Sorting, Status, Toolbar, Navigation };
+enum class FocusRegion { FolderView, Sorting, Status, Toolbar, Navigation, Preview };
 
 struct FocusAvailability {
     bool folderView = true;
@@ -19,9 +19,13 @@ struct FocusAvailability {
     bool status = true;
     bool toolbar = true;
     bool navigation = true;
+    bool preview = false;
 };
 
 // Windows 10 cycles content -> sorting header -> status -> toolbar -> navigation.
+// The App-owned Preview pane is inserted after content when available. This is
+// the host's authored order; the public Windows contract does not specify its
+// position in the native Explorer cycle. Existing region values are unchanged.
 // Ribbon navigation uses Alt; address and search have direct shortcuts. The
 // cycle skips unavailable regions. An unknown current region starts at the first
 // available region in the chosen direction. No available region returns empty.

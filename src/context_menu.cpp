@@ -2,6 +2,8 @@
 
 #include <shlobj.h>
 #include <array>
+#include <algorithm>
+#include <climits>
 #include <memory>
 #include <new>
 
@@ -49,11 +51,61 @@ void findCommand(HMENU root, UINT id, unsigned depth, unsigned& budget,
         }
     }
 }
+
+bool sameVerb(std::wstring_view left, std::wstring_view right) noexcept {
+    return left.size() == right.size() && left.size() <= INT_MAX &&
+        CompareStringOrdinal(left.data(), static_cast<int>(left.size()), right.data(),
+                             static_cast<int>(right.size()), TRUE) == CSTR_EQUAL;
+}
+
+void findVerb(const std::vector<ContextMenuEntry>& entries, std::wstring_view verb,
+              std::vector<UINT>& path, std::vector<UINT>& found, unsigned& matches,
+              bool ancestorsEnabled, bool& enabled, size_t& matchedDepth) {
+    for (size_t index = 0; index < entries.size(); ++index) {
+        const auto& entry = entries[index];
+        path.push_back(static_cast<UINT>(index));
+        const bool usable = ancestorsEnabled && entry.enabled();
+        if (!entry.separator() && sameVerb(entry.canonicalVerb, verb)) {
+            if (path.size() < matchedDepth) {
+                matches = 1; found = path; enabled = usable; matchedDepth = path.size();
+            } else if (path.size() == matchedDepth) ++matches;
+        }
+        findVerb(entry.children, verb, path, found, matches, usable, enabled, matchedDepth);
+        path.pop_back();
+    }
+}
+
+unsigned commandOccurrences(const std::vector<ContextMenuEntry>& entries, UINT id) noexcept {
+    unsigned count = 0;
+    for (const auto& entry : entries) {
+        if (!entry.separator() && entry.id == id) ++count;
+        count += commandOccurrences(entry.children, id);
+    }
+    return count;
+}
+
+void findCommandPath(const std::vector<ContextMenuEntry>& entries, UINT id,
+                     std::vector<UINT>& path, std::vector<UINT>& found, unsigned& matches,
+                     bool ancestorsEnabled, bool& enabled) {
+    for (size_t index = 0; index < entries.size(); ++index) {
+        const auto& entry = entries[index];
+        path.push_back(static_cast<UINT>(index));
+        const bool usable = ancestorsEnabled && entry.enabled();
+        if (!entry.separator() && entry.id == id) {
+            ++matches;
+            if (matches == 1) { found = path; enabled = usable; }
+        }
+        findCommandPath(entry.children, id, path, found, matches, usable, enabled);
+        path.pop_back();
+    }
+}
 } // namespace
 
 NativeContextMenu::~NativeContextMenu() { reset(); }
 
 void NativeContextMenu::reset() noexcept {
+    ++generation_;
+    plannedPopups_.clear();
     // The handler owns owner-draw item data, so retain its interfaces until the
     // complete root menu (including borrowed submenus) has been destroyed.
     if (menu_) DestroyMenu(menu_);
@@ -72,38 +124,167 @@ void NativeContextMenu::reset() noexcept {
 
 HRESULT NativeContextMenu::create(HWND owner, IContextMenu* context, IUnknown* site,
                                   UINT flags) {
-    return createImpl(owner, context, site, flags, false);
+    return createImpl<false>(owner, context, site, flags, false);
 }
 
 HRESULT NativeContextMenu::createLeafState(IContextMenu* context, IUnknown* site, UINT flags,
                                          bool omitResourceVerbs) {
-    return createImpl(nullptr, context, site, flags, true, omitResourceVerbs);
+    return createImpl<false>(nullptr, context, site, flags, true, omitResourceVerbs);
 }
 
+HRESULT NativeContextMenu::createForPlanning(HWND owner, IContextMenu* context,
+                                            IUnknown* site, UINT flags) {
+    return createImpl<false>(owner, context, site, flags, false, false, false);
+}
+
+HRESULT NativeContextMenu::create(HWND owner, IContextMenu* context, IUnknown* site,
+                                  UINT flags, NativeContextMenuCreateObserver& observer) {
+    observer.receipt = {};
+    const HRESULT hr = createImpl<true>(owner, context, site, flags, false, false, true, &observer);
+    observer.receipt.creationResult = hr;
+    return hr;
+}
+
+HRESULT NativeContextMenu::createLeafState(IContextMenu* context, IUnknown* site, UINT flags,
+                                         bool omitResourceVerbs, NativeContextMenuCreateObserver& observer) {
+    observer.receipt = {};
+    const HRESULT hr = createImpl<true>(nullptr, context, site, flags, true, omitResourceVerbs, true, &observer);
+    observer.receipt.creationResult = hr;
+    return hr;
+}
+
+template<bool Observed>
 HRESULT NativeContextMenu::createImpl(HWND owner, IContextMenu* context, IUnknown* site,
-                                     UINT flags, bool leafStateOnly, bool omitResourceVerbs) {
+                                     UINT flags, bool leafStateOnly, bool omitResourceVerbs,
+                                     bool synchronousCascades, [[maybe_unused]] NativeContextMenuCreateObserver* observer) {
     // Retain inputs first: a caller may rebuild using this object's current menu.
     ComPtr<IContextMenu> retained = context;
     ComPtr<IUnknown> retainedSite = site;
     reset();
+    const auto generation = generation_;
     if (!retained) return E_INVALIDARG;
     owner_ = owner;
     thread_ = GetCurrentThreadId();
     leafStateOnly_ = leafStateOnly;
     context_ = retained;
-    context_.As(&context2_);
-    context_.As(&context3_);
-    context_.As(&objectWithSite_);
+    [[maybe_unused]] IContextMenu* const originalProvider = retained.Get();
+    [[maybe_unused]] const auto current = [&] { return generation == generation_ && context_.Get() == originalProvider; };
+    // The unobserved specialization has no diagnostic invocation or retention.
+    // Before/after diagnostics may pump. Freeze each native result before the
+    // callback, then check the original generation/provider again afterwards.
+    [[maybe_unused]] const auto boundary = [&]([[maybe_unused]] const char* operation, [[maybe_unused]] bool after,
+        [[maybe_unused]] HRESULT hr, [[maybe_unused]] bool attempted) {
+        if constexpr (!Observed) return S_OK;
+        else {
+            auto& receipt = observer->receipt;
+            receipt.last = {operation, after, attempted, hr, generation, current(), receipt.last.sequence + 1};
+            if (after && attempted && FAILED(hr)) receipt.lastNativeFailure = receipt.last;
+            HRESULT diagnostic = S_OK;
+            bool threw = false;
+            try {
+                if (observer->record) observer->record(observer->state, receipt.last);
+            } catch (const std::bad_alloc&) { diagnostic = E_OUTOFMEMORY; threw = true; }
+              catch (...) { diagnostic = E_FAIL; threw = true; }
+            receipt.sourceCurrent = current();
+            receipt.last.sourceCurrent = receipt.sourceCurrent;
+            if (SUCCEEDED(diagnostic) && !receipt.sourceCurrent) diagnostic = E_ABORT;
+            if (FAILED(diagnostic) && SUCCEEDED(receipt.diagnosticResult)) {
+                receipt.firstDiagnosticFailure = receipt.last;
+                receipt.diagnosticResult = diagnostic;
+            }
+            receipt.observerThrew = receipt.observerThrew || threw;
+            return diagnostic;
+        }
+    };
+    struct CallResult { HRESULT native; HRESULT diagnostic; bool attempted; };
+    const auto call = [&]([[maybe_unused]] const char* operation, const auto& nativeCall,
+        [[maybe_unused]] bool restore = false) {
+        if constexpr (!Observed) return CallResult{nativeCall(), S_OK, true};
+        else {
+            const HRESULT before = boundary(operation, false, E_PENDING, false);
+            // Restoring this same retained provider is required even if a
+            // diagnostic throws or invalidates the wrapper. Never skip cleanup.
+            if (FAILED(before) && !restore) return CallResult{E_PENDING, before, false};
+            const HRESULT hr = nativeCall();
+            const HRESULT after = boundary(operation, true, hr, true);
+            return CallResult{hr, FAILED(before) ? before : after, true};
+        }
+    };
+    const auto fail = [&](HRESULT hr) {
+        // A pumped callback may have rebuilt this instance. Never reset the new
+        // generation as cleanup for this abandoned creation.
+        if constexpr (Observed) {
+            if (current()) reset();
+            observer->receipt.sourceCurrent = current();
+        }
+        else reset();
+        return hr;
+    };
+    [[maybe_unused]] ComPtr<IContextMenu2> queried2;
+    [[maybe_unused]] const auto query2 = call("QI.IContextMenu2", [&] {
+        if constexpr (Observed) {
+            const HRESULT hr = retained.As(&queried2);
+            if (current()) context2_.Swap(queried2);
+            return hr;
+        } else return context_.As(&context2_);
+    });
+    if constexpr (Observed) { if (FAILED(query2.diagnostic)) return fail(query2.diagnostic); }
+    [[maybe_unused]] ComPtr<IContextMenu3> queried3;
+    [[maybe_unused]] const auto query3 = call("QI.IContextMenu3", [&] {
+        if constexpr (Observed) {
+            const HRESULT hr = retained.As(&queried3);
+            if (current()) context3_.Swap(queried3);
+            return hr;
+        } else return context_.As(&context3_);
+    });
+    if constexpr (Observed) { if (FAILED(query3.diagnostic)) return fail(query3.diagnostic); }
+    [[maybe_unused]] ComPtr<IObjectWithSite> queriedSite;
+    [[maybe_unused]] const auto querySite = call("QI.IObjectWithSite", [&] {
+        if constexpr (Observed) {
+            const HRESULT hr = retained.As(&queriedSite);
+            if (current()) objectWithSite_.Swap(queriedSite);
+            return hr;
+        } else return context_.As(&objectWithSite_);
+    });
+    if constexpr (Observed) { if (FAILED(querySite.diagnostic)) return fail(querySite.diagnostic); }
+    if (generation != generation_) return E_ABORT;
     if (retainedSite && objectWithSite_) {
-        const HRESULT hr = objectWithSite_->SetSite(retainedSite.Get());
-        if (FAILED(hr)) { reset(); return hr; }
+        [[maybe_unused]] ComPtr<IObjectWithSite> siteTarget;
+        if constexpr (Observed) siteTarget = objectWithSite_;
+        const auto attached = call("SetSite.attach", [&] {
+            if constexpr (Observed) {
+                const HRESULT hr = siteTarget->SetSite(retainedSite.Get());
+                // Publish successful attachment before an after observer can
+                // reset the wrapper, so reset detaches the original site.
+                if (SUCCEEDED(hr) && current()) siteAttached_ = true;
+                return hr;
+            } else return objectWithSite_->SetSite(retainedSite.Get());
+        });
+        const HRESULT hr = attached.native;
+        if (generation != generation_) return E_ABORT;
+        if (FAILED(hr) && attached.attempted) return fail(hr);
+        if constexpr (Observed) { if (FAILED(attached.diagnostic)) return fail(attached.diagnostic); }
         siteAttached_ = true;
     }
     ComPtr<IDefaultFolderMenuInitialize> configuration;
     DEFAULT_FOLDER_MENU_RESTRICTIONS previous = DFMR_DEFAULT;
     bool restrictedResources = false;
+    const auto restoreRestrictions = [&] {
+        return call("SetMenuRestrictions.restore", [&] { return configuration->SetMenuRestrictions(previous); }, true);
+    };
+    [[maybe_unused]] const auto failRestricted = [&](HRESULT hr) {
+        if (restrictedResources) restoreRestrictions();
+        return fail(hr);
+    };
     if (leafStateOnly && omitResourceVerbs) {
-        HRESULT restriction = context_.As(&configuration);
+        const auto queried = call("QI.IDefaultFolderMenuInitialize", [&] {
+            if constexpr (Observed) return retained.As(&configuration);
+            else return context_.As(&configuration);
+        });
+        if constexpr (Observed) {
+            if (FAILED(queried.diagnostic)) return fail(queried.attempted && FAILED(queried.native) && queried.native != E_NOINTERFACE ? queried.native : queried.diagnostic);
+        }
+        HRESULT restriction = queried.native;
         if (restriction != E_NOINTERFACE) {
             // Preserve every documented restriction. Only unrelated built-in
             // operation entries are omitted; association and dynamic native
@@ -113,37 +294,87 @@ HRESULT NativeContextMenu::createImpl(HWND owner, IContextMenu* context, IUnknow
                 DFMR_OPTIN_HANDLERS_ONLY | DFMR_RESOURCE_AND_FOLDER_VERBS_ONLY |
                 DFMR_USE_SPECIFIED_HANDLERS | DFMR_USE_SPECIFIED_VERBS | DFMR_NO_ASYNC_VERBS |
                 DFMR_NO_NATIVECPU_VERBS | DFMR_NO_NONWOW_VERBS);
-            if (SUCCEEDED(restriction)) restriction = configuration->GetMenuRestrictions(mask,&previous);
-            if (SUCCEEDED(restriction) && !(previous & DFMR_NO_RESOURCE_VERBS)) {
-                restriction = configuration->SetMenuRestrictions(
-                    static_cast<DEFAULT_FOLDER_MENU_RESTRICTIONS>(previous | DFMR_NO_RESOURCE_VERBS));
-                restrictedResources = SUCCEEDED(restriction);
+            if (SUCCEEDED(restriction)) {
+                const auto read = call("GetMenuRestrictions", [&] { return configuration->GetMenuRestrictions(mask,&previous); });
+                restriction = read.native;
+                if constexpr (Observed) {
+                    if (FAILED(read.diagnostic)) return fail(read.attempted && FAILED(restriction) ? restriction : read.diagnostic);
+                }
             }
-            if (FAILED(restriction)) { reset(); return restriction; }
+            if (SUCCEEDED(restriction) && !(previous & DFMR_NO_RESOURCE_VERBS)) {
+                const auto changed = call("SetMenuRestrictions.omitResource", [&] {
+                    return configuration->SetMenuRestrictions(
+                        static_cast<DEFAULT_FOLDER_MENU_RESTRICTIONS>(previous | DFMR_NO_RESOURCE_VERBS));
+                });
+                restriction = changed.native;
+                restrictedResources = changed.attempted && SUCCEEDED(restriction);
+                if constexpr (Observed) {
+                    if (FAILED(changed.diagnostic)) return failRestricted(changed.attempted && FAILED(restriction) ? restriction : changed.diagnostic);
+                }
+            }
+            if (FAILED(restriction)) return fail(restriction);
         }
     }
-    menu_ = CreatePopupMenu();
+    const auto popupCreation = call("CreatePopupMenu", [&] {
+        menu_ = CreatePopupMenu();
+        return menu_ ? S_OK : menuError();
+    });
+    if constexpr (Observed) {
+        if (FAILED(popupCreation.diagnostic)) return failRestricted(popupCreation.attempted && FAILED(popupCreation.native) ? popupCreation.native : popupCreation.diagnostic);
+    }
     if (!menu_) {
-        const HRESULT hr = menuError();
-        if (restrictedResources) configuration->SetMenuRestrictions(previous);
-        reset(); return hr;
+        const HRESULT hr = popupCreation.native;
+        if (restrictedResources) restoreRestrictions();
+        return fail(hr);
     }
     popup_ = menu_;
-    // Real popups need populated cascades. A read-only leaf-state worker never
-    // opens those cascades, so avoid requesting their synchronous enumeration.
-    const UINT nativeFlags = leafStateOnly ? flags & ~CMF_SYNCCASCADEMENU : flags | CMF_SYNCCASCADEMENU;
-    const HRESULT hr = context_->QueryContextMenu(menu_, 0, firstCommand_, lastCommand_,
-                                                 nativeFlags);
+    // Ordinary popups retain synchronous cascades. Exact planning and the
+    // read-only leaf worker inspect native metadata before any branch request.
+    const UINT nativeFlags = leafStateOnly || !synchronousCascades
+        ? flags & ~CMF_SYNCCASCADEMENU : flags | CMF_SYNCCASCADEMENU;
+    const HMENU originalMenu = menu_;
+    const auto queried = call("QueryContextMenu", [&] {
+        return retained->QueryContextMenu(originalMenu, 0, firstCommand_, lastCommand_,
+                                          nativeFlags);
+    });
+    const HRESULT hr = queried.native;
     // A custom namespace can retain this same provider for a later normal
     // popup. Restrict only this query; canonical readback below must still use
     // the native menu that was just created, with the provider's original flags.
-    const HRESULT restored = restrictedResources ? configuration->SetMenuRestrictions(previous) : S_OK;
-    if (FAILED(hr)) { reset(); return hr; }
-    if (FAILED(restored)) { reset(); return restored; }
-    commandCount_ = HRESULT_CODE(hr);
-    if (commandCount_ > lastCommand_ - firstCommand_ + 1) {
-        reset();
-        return E_UNEXPECTED;
+    const auto restoration = restrictedResources ? restoreRestrictions() : CallResult{S_OK, S_OK, false};
+    const HRESULT restored = restoration.native;
+    if (generation != generation_) return E_ABORT;
+    if (FAILED(hr) && queried.attempted) return fail(hr);
+    if (FAILED(restored)) return fail(restored);
+    if constexpr (Observed) {
+        if (FAILED(queried.diagnostic)) return fail(queried.diagnostic);
+        if (FAILED(restoration.diagnostic)) return fail(restoration.diagnostic);
+    }
+    if constexpr (Observed) {
+        const UINT commands = HRESULT_CODE(hr);
+        if (commands > lastCommand_ - firstCommand_ + 1) return fail(E_UNEXPECTED);
+        // Release the same original temporaries in their ordinary destruction
+        // order before accepting success. Release itself can pump. The raw
+        // original-provider address is only compared, never dereferenced here.
+        configuration.Reset();
+        queriedSite.Reset();
+        queried3.Reset();
+        queried2.Reset();
+        retainedSite.Reset();
+        retained.Reset();
+        observer->receipt.sourceCurrent = current();
+        if (!observer->receipt.sourceCurrent) {
+            if (SUCCEEDED(observer->receipt.diagnosticResult)) {
+                observer->receipt.diagnosticResult = E_ABORT;
+                observer->receipt.firstDiagnosticFailure = {
+                    "completionFence", false, false, E_PENDING, generation, false, observer->receipt.last.sequence + 1};
+            }
+            return E_ABORT;
+        }
+        commandCount_ = commands;
+    } else {
+        commandCount_ = HRESULT_CODE(hr);
+        if (commandCount_ > lastCommand_ - firstCommand_ + 1) return fail(E_UNEXPECTED);
     }
     return S_OK;
 }
@@ -171,6 +402,19 @@ HRESULT NativeContextMenu::createSelection(HWND owner, IShellItemArray* selectio
     ComPtr<IContextMenu> context;
     hr = selection->BindToHandler(nullptr, BHID_SFUIObject, IID_PPV_ARGS(&context));
     return FAILED(hr) ? hr : create(owner, context.Get(), site, flags | CMF_ITEMMENU);
+}
+
+HRESULT NativeContextMenu::createSelectionForPlanning(HWND owner, IShellItemArray* selection,
+                                                      IUnknown* site, UINT flags) {
+    reset();
+    if (!selection) return E_INVALIDARG;
+    DWORD count = 0;
+    HRESULT hr = selection->GetCount(&count);
+    if (FAILED(hr)) return hr;
+    if (!count) return E_INVALIDARG;
+    ComPtr<IContextMenu> context;
+    hr = selection->BindToHandler(nullptr, BHID_SFUIObject, IID_PPV_ARGS(&context));
+    return FAILED(hr) ? hr : createForPlanning(owner, context.Get(), site, flags | CMF_ITEMMENU);
 }
 
 HRESULT NativeContextMenu::createNewItems(HWND owner, IShellItem* folder, IUnknown* site,
@@ -238,14 +482,16 @@ bool NativeContextMenu::selectableCommand(UINT id) const noexcept {
 
 std::wstring NativeContextMenu::canonicalVerb(UINT id) const {
     if (id < firstCommand_ || id - firstCommand_ >= commandCount_) return {};
+    const auto retained = context_;
+    if (!retained) return {};
     std::array<wchar_t, 512> wide{};
-    HRESULT hr = context_->GetCommandString(id - firstCommand_, GCS_VERBW, nullptr,
+    HRESULT hr = retained->GetCommandString(id - firstCommand_, GCS_VERBW, nullptr,
                                             reinterpret_cast<LPSTR>(wide.data()),
                                             static_cast<UINT>(wide.size()));
     wide.back() = L'\0';
     if (SUCCEEDED(hr)) return wide.data();
     std::array<char, 512> ansi{};
-    hr = context_->GetCommandString(id - firstCommand_, GCS_VERBA, nullptr, ansi.data(),
+    hr = retained->GetCommandString(id - firstCommand_, GCS_VERBA, nullptr, ansi.data(),
                                     static_cast<UINT>(ansi.size()));
     ansi.back() = '\0';
     if (FAILED(hr)) return {};
@@ -257,13 +503,19 @@ std::wstring NativeContextMenu::canonicalVerb(UINT id) const {
 HRESULT NativeContextMenu::enumerateMenu(HMENU menu, UINT position, unsigned depth,
                                          unsigned& budget,
                                          std::vector<ContextMenuEntry>& entries,
-                                         bool populate) {
+                                         bool populate, bool strictMessages) {
     if (depth > maximumDepth || !budget) return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+    const auto generation = generation_;
     if (populate) {
-        LRESULT ignored = 0;
-        handleMessage(WM_INITMENUPOPUP, reinterpret_cast<WPARAM>(menu),
-                      MAKELPARAM(position, FALSE), ignored);
+        if (strictMessages) {
+            const HRESULT hr = initializeForPlanning(menu, position);
+            if (FAILED(hr)) return hr;
+        } else {
+            LRESULT ignored = 0;
+            handleMessage(WM_INITMENUPOPUP, reinterpret_cast<WPARAM>(menu),MAKELPARAM(position, FALSE), ignored);
+        }
     }
+    if (generation != generation_) return E_ABORT;
     const int count = GetMenuItemCount(menu);
     if (count < 0) return menuError();
     for (int i = 0; i < count; ++i) {
@@ -286,14 +538,135 @@ HRESULT NativeContextMenu::enumerateMenu(HMENU menu, UINT position, unsigned dep
             entry.label.resize(info.cch);
         }
         if (!entry.separator()) entry.canonicalVerb = canonicalVerb(entry.id);
+        if (generation != generation_) return E_ABORT;
         if (info.hSubMenu) {
             const HRESULT hr = enumerateMenu(info.hSubMenu, static_cast<UINT>(i), depth + 1,
-                                             budget, entry.children, populate);
+                                             budget, entry.children,
+                                             populate && (!strictMessages || entry.enabled()), strictMessages);
             if (FAILED(hr)) return hr;
         }
+        if (generation != generation_) return E_ABORT;
         entries.push_back(std::move(entry));
     }
     return S_OK;
+}
+
+HRESULT NativeContextMenu::initializeForPlanning(HMENU menu, UINT position) {
+    if (!context_ || !menu_ || !ownsMenu(menu)) return E_INVALIDARG;
+    if (thread_ != GetCurrentThreadId()) return RPC_E_WRONG_THREAD;
+    if (leafStateOnly_) return E_ACCESSDENIED;
+    const auto prior = std::find_if(plannedPopups_.begin(), plannedPopups_.end(),
+                                   [menu](const PlannedPopup& popup) { return popup.menu == menu; });
+    if (prior != plannedPopups_.end()) return prior->status;
+    // Publish the pending attempt before the native callback. Reentrant exact
+    // planning cannot initialize this same popup a second time.
+    plannedPopups_.push_back({menu, E_PENDING});
+    const auto generation = generation_;
+    const auto retained = context_;
+    const auto retained3 = context3_;
+    const auto retained2 = context2_;
+    HRESULT hr = S_OK; // A static IContextMenu has no delayed-message contract.
+    if (retained3) {
+        LRESULT ignored = 0;
+        hr = retained3->HandleMenuMsg2(WM_INITMENUPOPUP, reinterpret_cast<WPARAM>(menu),
+                                     MAKELPARAM(position, FALSE), &ignored);
+        if (generation != generation_) return E_ABORT;
+    } else if (retained2) {
+        hr = retained2->HandleMenuMsg(WM_INITMENUPOPUP, reinterpret_cast<WPARAM>(menu),
+                                     MAKELPARAM(position, FALSE));
+    }
+    if (generation != generation_ || context_.Get() != retained.Get() || !ownsMenu(menu)) return E_ABORT;
+    if (SUCCEEDED(hr) && hr != S_OK) hr = E_UNEXPECTED;
+    const auto completed = std::find_if(plannedPopups_.begin(), plannedPopups_.end(),
+                                       [menu](const PlannedPopup& popup) { return popup.menu == menu; });
+    if (completed == plannedPopups_.end()) return E_ABORT;
+    completed->status = hr;
+    return hr;
+}
+
+HRESULT NativeContextMenu::enumerateForVerbs(std::span<const std::wstring_view> verbs,
+                                            std::vector<ContextMenuEntry>& entries) {
+    return enumerateForTarget(verbs, 0, entries);
+}
+
+HRESULT NativeContextMenu::enumerateForCommand(UINT actualNativeId, std::vector<ContextMenuEntry>& entries) {
+    if (actualNativeId < firstCommand_ || actualNativeId > lastCommand_) { entries.clear(); return E_INVALIDARG; }
+    return enumerateForTarget({}, actualNativeId, entries);
+}
+
+HRESULT NativeContextMenu::enumerateForTarget(std::span<const std::wstring_view> verbs, UINT actualNativeId,
+                                             std::vector<ContextMenuEntry>& entries) {
+    entries.clear();
+    if (!context_ || !menu_) return E_UNEXPECTED;
+    if (thread_ != GetCurrentThreadId()) return RPC_E_WRONG_THREAD;
+    if (verbs.size() > maximumEntries) return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+    for (const auto verb : verbs)
+        if (verb.empty() || verb.size() >= 512 || verb.find(L'\0') != std::wstring_view::npos) return E_INVALIDARG;
+    try {
+        const auto generation = generation_;
+        const auto retained = context_;
+        std::vector<ContextMenuEntry> snapshot;
+        unsigned budget = maximumEntries;
+        HRESULT hr = enumerateMenu(popup_, 0, 0, budget, snapshot, false);
+        if (FAILED(hr)) return hr;
+        const size_t requests = actualNativeId ? 1 : verbs.size();
+        for (size_t request = 0; request < requests; ++request) {
+            std::vector<UINT> path, found;
+            unsigned matches = 0;
+            bool enabled = false;
+            if (actualNativeId) findCommandPath(snapshot, actualNativeId, path, found, matches, true, enabled);
+            else {
+                size_t matchedDepth = maximumDepth + 2;
+                findVerb(snapshot, verbs[request], path, found, matches, true, enabled, matchedDepth);
+            }
+            if (matches > 1) return E_UNEXPECTED;
+            if (!matches) {
+                if (actualNativeId) return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+                continue;
+            }
+            HMENU branch = popup_;
+            const std::vector<ContextMenuEntry>* level = &snapshot;
+            unsigned depth = 0;
+            UINT position = 0;
+            const ContextMenuEntry* matched = nullptr;
+            for (const auto index : found) {
+                if (index >= level->size()) return E_UNEXPECTED;
+                matched = &(*level)[index];
+                MENUITEMINFOW native{sizeof(native)};
+                native.fMask = MIIM_ID | MIIM_SUBMENU;
+                if (!GetMenuItemInfoW(branch, index, TRUE, &native)) return menuError();
+                if (native.wID != matched->id || (native.hSubMenu != nullptr) != matched->submenu) return E_ABORT;
+                position = index;
+                branch = native.hSubMenu;
+                level = &matched->children;
+                ++depth;
+            }
+            if (!matched || matched->id < firstCommand_ || matched->id - firstCommand_ >= commandCount_)
+                return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+            if (commandOccurrences(snapshot, matched->id) != 1) return E_UNEXPECTED;
+            if (matched && matched->submenu && enabled) {
+                if (leafStateOnly_) return E_ACCESSDENIED;
+                std::vector<ContextMenuEntry> populated;
+                // Account for entries outside this branch when applying the
+                // same complete-tree bound used by ordinary enumeration.
+                unsigned oldBranchCount = maximumEntries;
+                std::vector<ContextMenuEntry> oldBranch;
+                hr = enumerateMenu(branch, position, depth, oldBranchCount, oldBranch, false);
+                if (FAILED(hr)) return hr;
+                budget += maximumEntries - oldBranchCount;
+                hr = enumerateMenu(branch, position, depth, budget, populated, true, true);
+                if (FAILED(hr)) return hr;
+                snapshot.clear(); budget = maximumEntries;
+                hr = enumerateMenu(popup_, 0, 0, budget, snapshot, false);
+                if (FAILED(hr)) return hr;
+            }
+            break; // Original ordered-alias authority, including disabled rows.
+        }
+        if (generation != generation_ || context_.Get() != retained.Get()) return E_ABORT;
+        entries.swap(snapshot);
+        return S_OK;
+    } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
+      catch (...) { return E_FAIL; }
 }
 
 HRESULT NativeContextMenu::enumerate(std::vector<ContextMenuEntry>& entries, bool populate) {

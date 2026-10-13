@@ -13,6 +13,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
+$captureScriptSha256 = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash.ToLowerInvariant()
 . (Join-Path $PSScriptRoot 'windows-environment.ps1')
 if ([string]::IsNullOrWhiteSpace($BuildDirectory)) { $BuildDirectory = Join-Path $projectRoot 'build' }
 $BuildDirectory = [IO.Path]::GetFullPath($BuildDirectory)
@@ -85,6 +86,42 @@ try {
         } finally { $entryStream.Dispose() }
     } finally { $archive.Dispose() }
 } finally { $archiveStream.Dispose() }
+$compressedSourceFixture = $null
+$compressedSourceFolderNativePath = $null
+$compressedSourceArchive = $null
+$compressedSourceArchiveSha256 = $null
+if ($Scenes -contains 'Compressed') {
+    # The source's Downloads caption and disabled destination gallery show a
+    # ZIP selected outside its namespace. Keep the inside-ZIP fixture above
+    # for the independent native member/Extract-to capture.
+    $compressedSourceFixture = Join-Path $fixture 'Downloads'
+    New-Item -ItemType Directory -Path $compressedSourceFixture | Out-Null
+    $compressedSourceArchive = Join-Path $compressedSourceFixture 'Archive.zip'
+    [IO.File]::Copy((Join-Path $fixture 'Archive.zip'), $compressedSourceArchive, $false)
+    $compressedSourceArchiveSha256 = (Get-FileHash -LiteralPath $compressedSourceArchive -Algorithm SHA256).Hash.ToLowerInvariant()
+    # Shell filesystem display names can expand an 8.3 parent. Resolve the
+    # existing owned folder, rather than accepting a suffix or another folder.
+    if (-not ('ExplorerVisual.NativePaths' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System.Runtime.InteropServices;
+using System.Text;
+namespace ExplorerVisual {
+    public static class NativePaths {
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
+        public static extern uint GetLongPathNameW(string path, StringBuilder output, uint characters);
+    }
+}
+'@
+    }
+    $nativePath = [Text.StringBuilder]::new(32768)
+    $nativePathLength = [ExplorerVisual.NativePaths]::GetLongPathNameW(
+        [IO.Path]::GetFullPath($compressedSourceFixture), $nativePath, [uint32]$nativePath.Capacity)
+    $nativePathError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+    if ($nativePathLength -eq 0 -or $nativePathLength -ge $nativePath.Capacity) {
+        throw "Owned Compressed containing-folder long-path resolution failed: length $nativePathLength; native error $nativePathError"
+    }
+    $compressedSourceFolderNativePath = $nativePath.ToString()
+}
 # A tiny owned PNG; no external thumbnail, network storage, or user files.
 [IO.File]::WriteAllBytes((Join-Path $fixture 'Photo.png'), [Convert]::FromBase64String('iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAAAI0lEQVR4nGNkqLjOQApgIkk1w6gG4gATkergYFQDMYDkUAIAMscBb9kZy0QAAAAASUVORK5CYII='))
 foreach ($entry in Get-ChildItem -LiteralPath $fixture -File) {
@@ -92,6 +129,100 @@ foreach ($entry in Get-ChildItem -LiteralPath $fixture -File) {
 }
 $fixtureBuilderSha256 = $null
 $fixtureBuilderReport = $null
+$fixtureBuilderFirstReport = $null
+$fixtureBuilderStages = [Collections.Generic.List[object]]::new()
+$script:visualChildLaunchBlocked = $false
+$script:undrainedVisualChild = $null
+$script:undrainedVisualChildId = $null
+function Invoke-VisualChildProcess([string]$Filename, [string[]]$Arguments, [string]$Stdout,
+        [string]$Stderr, [string]$ReceiptPath, [string]$Context) {
+    $childProcess = $null
+    $failure = $null
+    $stage = 'launch-guard'
+    $receipt = [ordered]@{
+        context = $Context; processId = $null; startUtc = $null; endUtc = $null;
+        launchAttemptUtc = $null; observedUtc = $null; elapsedMilliseconds = $null;
+        elapsedMeaning = 'Measured parent stopwatch through launch, wait, bounded cleanup and native exit readback; not process execution time.';
+        waitMilliseconds = 30000; drainMilliseconds = 5000; timeout = $null; exited = $null; exitCode = $null;
+        launchAttempted = $false; handleCached = $false; killAttempted = $false; killSucceeded = $false;
+        drainAttempted = $false; drained = $null; failureStage = $null; operationError = $null;
+        killError = $null; drainError = $null; exitReadbackError = $null; releaseError = $null;
+        blockedByProcessId = $null
+    }
+    $elapsed = [Diagnostics.Stopwatch]::StartNew()
+    try {
+        if ($script:visualChildLaunchBlocked) {
+            $receipt.blockedByProcessId = $script:undrainedVisualChildId
+            throw 'A previous native child has no confirmed exit; no further native process will be launched.'
+        }
+        $stage = 'launch'
+        $receipt.launchAttempted = $true
+        $receipt.launchAttemptUtc = [DateTime]::UtcNow.ToString('o')
+        $childProcess = Start-Process -FilePath $Filename -ArgumentList $Arguments -WindowStyle Hidden -PassThru `
+            -RedirectStandardOutput $Stdout -RedirectStandardError $Stderr
+        $receipt.processId = $childProcess.Id
+        $stage = 'handle'
+        # Windows PowerShell 5.1 must retain this handle before waiting to
+        # expose the actual native ExitCode reliably after a fast child exits.
+        $null = $childProcess.Handle
+        $receipt.handleCached = $true
+        $stage = 'start-time'
+        $receipt.startUtc = $childProcess.StartTime.ToUniversalTime().ToString('o')
+        $stage = 'wait'
+        $receipt.exited = $childProcess.WaitForExit(30000)
+        $receipt.timeout = -not $receipt.exited
+        if ($receipt.timeout) {
+            $failure = 'Native child exceeded the original 30000 ms wait.'
+            $receipt.failureStage = 'wait-timeout'
+            $receipt.operationError = $failure
+        }
+    } catch {
+        $receipt.failureStage = $stage
+        $receipt.operationError = $_.Exception.Message
+        $failure = $_.Exception.Message
+    } finally {
+        if ($childProcess -and $receipt.exited -ne $true) {
+            # Kill this retained Process object only. Do not search by name or
+            # release its ownership while its kernel exit remains uncertain.
+            if ($receipt.handleCached) {
+                $receipt.killAttempted = $true
+                try { $childProcess.Kill(); $receipt.killSucceeded = $true }
+                catch { $receipt.killError = $_.Exception.Message }
+                $receipt.drainAttempted = $true
+                try {
+                    $receipt.drained = $childProcess.WaitForExit(5000)
+                    $receipt.exited = $receipt.drained
+                } catch { $receipt.drainError = $_.Exception.Message }
+            } else {
+                $receipt.killError = 'No owned kernel handle was retained; PID-only termination or exit observation is unsafe and was not attempted.'
+            }
+        }
+        if ($childProcess -and $receipt.exited -eq $true) {
+            try {
+                $childProcess.Refresh()
+                $actualExitCode = $childProcess.ExitCode
+                if ($null -eq $actualExitCode) { throw 'An exited native child returned no ExitCode.' }
+                $receipt.exitCode = $actualExitCode
+                $receipt.endUtc = $childProcess.ExitTime.ToUniversalTime().ToString('o')
+            } catch { $receipt.exitReadbackError = $_.Exception.Message }
+            try { $childProcess.Dispose() }
+            catch { $receipt.releaseError = $_.Exception.Message }
+        } elseif (-not $script:visualChildLaunchBlocked) {
+            $script:visualChildLaunchBlocked = $true
+            $script:undrainedVisualChild = $childProcess
+            $script:undrainedVisualChildId = $receipt.processId
+        }
+        $elapsed.Stop()
+        $receipt.elapsedMilliseconds = $elapsed.Elapsed.TotalMilliseconds
+        $receipt.observedUtc = [DateTime]::UtcNow.ToString('o')
+        [IO.File]::WriteAllText($ReceiptPath, ($receipt | ConvertTo-Json -Depth 4), [Text.UTF8Encoding]::new($false))
+    }
+    $errors = @(@($failure, $receipt.killError, $receipt.drainError, $receipt.exitReadbackError, $receipt.releaseError) |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($receipt.exited -ne $true) { $errors += 'The exact native child did not reach a confirmed kernel exit; subsequent native launches are blocked.' }
+    if ($errors.Count -gt 0) { throw "$Context failed: $($errors -join '; '); process receipt: $ReceiptPath" }
+    return [PSCustomObject]$receipt
+}
 if (@($Scenes | Where-Object { $_ -in @('Search', 'Library', 'Application', 'Shortcut', 'Music', 'Video', 'DiskImage') }).Count -gt 0) {
     $builtFixtureBuilder = Join-Path $BuildDirectory ($Configuration + '/visual_fixture_builder.exe')
     if (-not (Test-Path -LiteralPath $builtFixtureBuilder)) {
@@ -103,22 +234,76 @@ if (@($Scenes | Where-Object { $_ -in @('Search', 'Library', 'Application', 'Sho
     if ((Get-FileHash -LiteralPath $fixtureBuilder -Algorithm SHA256).Hash.ToLowerInvariant() -ne $fixtureBuilderSha256) {
         throw 'The native fixture builder changed while its immutable executable was being copied.'
     }
+    function Test-FixtureIdentity($Left, $Right) {
+        return $null -ne $Left -and $null -ne $Right -and
+            $Left.volume -is [string] -and $Right.volume -is [string] -and
+            $Left.volume -cmatch '^[0-9]{1,20}$' -and $Right.volume -cmatch '^[0-9]{1,20}$' -and
+            $Left.fileId -is [string] -and $Right.fileId -is [string] -and
+            $Left.fileId -cmatch '^[0-9a-f]{32}$' -and $Right.fileId -cmatch '^[0-9a-f]{32}$' -and
+            $Left.volume -ceq $Right.volume -and $Left.fileId -ceq $Right.fileId
+    }
+    function Test-FixtureDescriptor($Left, $Right) {
+        return $null -ne $Left -and $null -ne $Right -and
+            (Test-FixtureIdentity $Left.identity $Right.identity) -and
+            $Left.bytes -gt 0 -and $Left.bytes -le 1048576 -and $Left.bytes -eq $Right.bytes -and
+            $Left.sha256 -is [string] -and $Right.sha256 -is [string] -and
+            $Left.sha256 -cmatch '^[0-9a-f]{64}$' -and $Right.sha256 -cmatch '^[0-9a-f]{64}$' -and
+            $Left.sha256 -ceq $Right.sha256 -and $Left.attributes -eq $Right.attributes -and
+            $Left.creation -eq $Right.creation -and $Left.write -eq $Right.write -and $Left.change -eq $Right.change
+    }
+    $fixtureBuilderFirstReport = Join-Path $fixture 'Native fixture first-stage report.json'
     $fixtureBuilderReport = Join-Path $fixture 'Native fixture report.json'
-    $builderArguments = @('--path', ('"' + $fixture + '"'), '--executable', ('"' + $executable + '"'),
-        '--report', ('"' + $fixtureBuilderReport + '"'))
-    $builder = Start-Process -FilePath $fixtureBuilder -ArgumentList $builderArguments -WindowStyle Hidden -PassThru `
-        -RedirectStandardOutput (Join-Path $runDirectory 'fixture-stdout.log') `
-        -RedirectStandardError (Join-Path $runDirectory 'fixture-stderr.log')
-    if (-not $builder.WaitForExit(30000)) { $builder.Kill(); throw 'Native semantic fixture creation timed out.' }
-    $builder.Refresh()
+    $builderCommon = @('--path', ('"' + $fixture + '"'), '--executable', ('"' + $executable + '"'))
+    $firstArguments = $builderCommon + @('--stage', 'first', '--report', ('"' + $fixtureBuilderFirstReport + '"'))
+    $firstBuilder = Invoke-VisualChildProcess $fixtureBuilder $firstArguments `
+        (Join-Path $runDirectory 'fixture-first-stdout.log') (Join-Path $runDirectory 'fixture-first-stderr.log') `
+        (Join-Path $runDirectory 'fixture-first-process.json') 'First native semantic fixture stage'
+    $fixtureBuilderStages.Add($firstBuilder)
+    if ($firstBuilder.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $fixtureBuilderFirstReport)) {
+        throw "First native semantic fixture stage failed: exit $($firstBuilder.ExitCode); artifacts: $runDirectory"
+    }
+    $firstProof = Get-Content -LiteralPath $fixtureBuilderFirstReport -Raw | ConvertFrom-Json
+    $handoffPath = Join-Path $fixture '.native-library-stage.bin'
+    $ownedLibraryPath = Join-Path $fixture 'Owned library.library-ms'
+    if ($firstProof.stage -cne 'first' -or $firstProof.passed -ne $true -or $firstProof.completeFixture -ne $false -or
+        $firstProof.headless -ne $true -or $firstProof.privateDesktop -ne $true -or $firstProof.inputDesktopUnchanged -ne $true -or
+        $firstProof.visibleInputDesktopWindows -ne $false -or $firstProof.executedFixture -ne $false -or
+        $firstProof.created -ne 4 -or $firstProof.createdThisStage -ne 4 -or @($firstProof.fixtureFiles).Count -ne 4 -or $firstProof.libraryLocations -ne 1 -or
+        @($firstProof.sourceFolders).Count -ne 3 -or $firstProof.searchRelativeToday -ne $true -or
+        $firstProof.searchVerificationStage -cne 'first' -or $firstProof.searchSourceStatePreserved -ne $true -or
+        @($firstProof.searchSourceFolders).Count -ne 2 -or @($firstProof.searchSourceFiles).Count -ne 5 -or
+        $firstProof.searchScope -cne 'Search scope' -or $firstProof.searchRecursive -ne $true -or $firstProof.searchResultCount -ne 2 -or $firstProof.searchExactIdentities -ne $true -or
+        $firstProof.searchEarlierExcluded -ne $true -or $firstProof.searchOutsideScopeExcluded -ne $true -or
+        -not (Test-FixtureIdentity $firstProof.fixtureRoot $firstProof.fixtureRoot) -or
+        -not (Test-FixtureDescriptor $firstProof.libraryDescriptorAfter $firstProof.libraryDescriptorAfter) -or
+        -not (Test-FixtureDescriptor $firstProof.handoff $firstProof.handoff) -or
+        -not (Test-Path -LiteralPath $handoffPath) -or -not (Test-Path -LiteralPath $ownedLibraryPath)) {
+        throw 'The first native stage did not prove an incomplete owned fixture and one genuinely persisted library member.'
+    }
+    $fixtureGuid = [Guid](Get-Content -LiteralPath (Join-Path $fixture '.native-visual-fixture') -Raw)
+    if ([Guid]$firstProof.fixtureGuid -ne $fixtureGuid -or
+        (Get-FileHash -LiteralPath $handoffPath -Algorithm SHA256).Hash.ToLowerInvariant() -cne $firstProof.handoff.sha256 -or
+        (Get-Item -LiteralPath $handoffPath).Length -ne $firstProof.handoff.bytes -or
+        (Get-FileHash -LiteralPath $ownedLibraryPath -Algorithm SHA256).Hash.ToLowerInvariant() -cne $firstProof.libraryDescriptorAfter.sha256 -or
+        (Get-Item -LiteralPath $ownedLibraryPath).Length -ne $firstProof.libraryDescriptorAfter.bytes) {
+        throw 'The first-stage native library/handoff bytes or owned fixture GUID changed before completion.'
+    }
+    # Each genuinely native stage keeps the original 30s wait and 5s exact-child
+    # cleanup. A partial stage is never a complete fixture or capture admission.
+    $completeArguments = $builderCommon + @('--stage', 'complete', '--report', ('"' + $fixtureBuilderReport + '"'))
+    $builder = Invoke-VisualChildProcess $fixtureBuilder $completeArguments `
+        (Join-Path $runDirectory 'fixture-stdout.log') (Join-Path $runDirectory 'fixture-stderr.log') `
+        (Join-Path $runDirectory 'fixture-process.json') 'Complete native semantic fixture stage'
+    $fixtureBuilderStages.Add($builder)
     if ($builder.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $fixtureBuilderReport)) {
         throw "Native semantic fixture creation failed: exit $($builder.ExitCode); artifacts: $runDirectory"
     }
     $fixtureProof = Get-Content -LiteralPath $fixtureBuilderReport -Raw | ConvertFrom-Json
-    if ($fixtureProof.passed -ne $true -or $fixtureProof.headless -ne $true -or
+    if ($fixtureProof.stage -cne 'complete' -or $fixtureProof.completeFixture -ne $true -or
+        $fixtureProof.passed -ne $true -or $fixtureProof.headless -ne $true -or
         $fixtureProof.privateDesktop -ne $true -or $fixtureProof.inputDesktopUnchanged -ne $true -or
         $fixtureProof.visibleInputDesktopWindows -ne $false -or $fixtureProof.executedFixture -ne $false -or
-        $fixtureProof.created -ne 7 -or @($fixtureProof.fixtureFiles).Count -ne 7 -or
+        $fixtureProof.created -ne 7 -or $fixtureProof.createdThisStage -ne 3 -or @($fixtureProof.fixtureFiles).Count -ne 7 -or
         $fixtureProof.libraryLocations -ne 3 -or $fixtureProof.libraryDefault -ne 'Documents' -or
         $fixtureProof.libraryTemplate -ne 'Documents' -or $fixtureProof.isoBuilder -ne 'IMAPI2FS' -or
         $fixtureProof.isoBuilderStatus -ne 0 -or $fixtureProof.isoVolumeVerified -ne $true -or
@@ -127,6 +312,46 @@ if (@($Scenes | Where-Object { $_ -in @('Search', 'Library', 'Application', 'Sho
         $fixtureProof.searchExactIdentities -ne $true -or $fixtureProof.searchEarlierExcluded -ne $true -or
         $fixtureProof.searchOutsideScopeExcluded -ne $true) {
         throw 'The native helper did not prove valid owned semantic fixtures on its private desktop.'
+    }
+    if ($fixtureProof.searchVerificationStage -cne 'complete' -or $fixtureProof.searchSourceStatePreserved -ne $true -or
+        @($fixtureProof.searchSourceFolders).Count -ne 2 -or @($fixtureProof.searchSourceFiles).Count -ne 5) {
+        throw 'Completion did not freshly verify native Today results and preserve every original search source.'
+    }
+    if ([Guid]$fixtureProof.fixtureGuid -ne $fixtureGuid -or @($fixtureProof.sourceFolders).Count -ne 3 -or
+        -not (Test-FixtureIdentity $firstProof.fixtureRoot $fixtureProof.fixtureRoot) -or
+        -not (Test-FixtureDescriptor $firstProof.libraryDescriptorAfter $fixtureProof.libraryDescriptorBefore) -or
+        -not (Test-FixtureDescriptor $firstProof.handoff $fixtureProof.handoff) -or
+        -not (Test-FixtureDescriptor $fixtureProof.libraryDescriptorAfter $fixtureProof.libraryDescriptorAfter) -or
+        (Get-FileHash -LiteralPath $ownedLibraryPath -Algorithm SHA256).Hash.ToLowerInvariant() -cne $fixtureProof.libraryDescriptorAfter.sha256 -or
+        (Get-Item -LiteralPath $ownedLibraryPath).Length -ne $fixtureProof.libraryDescriptorAfter.bytes -or
+        (Get-FileHash -LiteralPath $handoffPath -Algorithm SHA256).Hash.ToLowerInvariant() -cne $firstProof.handoff.sha256) {
+        throw 'Native completion did not preserve the exact first-stage source/descriptor handoff and publish the full committed library.'
+    }
+    $expectedFolderNames = @('Documents', 'Pictures', 'Music')
+    for ($index = 0; $index -lt $expectedFolderNames.Count; ++$index) {
+        if ($firstProof.sourceFolders[$index].name -cne $expectedFolderNames[$index] -or
+            $fixtureProof.sourceFolders[$index].name -cne $expectedFolderNames[$index] -or
+            -not (Test-FixtureIdentity $firstProof.sourceFolders[$index].identity $fixtureProof.sourceFolders[$index].identity)) {
+            throw 'A complete native library source folder differs from the first-stage full FileID.'
+        }
+    }
+    $expectedSearchFolderNames = @('Search scope', 'Search scope/Child')
+    for ($index = 0; $index -lt $expectedSearchFolderNames.Count; ++$index) {
+        if ($firstProof.searchSourceFolders[$index].name -cne $expectedSearchFolderNames[$index] -or
+            $fixtureProof.searchSourceFolders[$index].name -cne $expectedSearchFolderNames[$index] -or
+            -not (Test-FixtureIdentity $firstProof.searchSourceFolders[$index].identity $fixtureProof.searchSourceFolders[$index].identity)) {
+            throw 'An owned Today search scope folder differs from its first-stage full FileID.'
+        }
+    }
+    $expectedSearchFileNames = @('Search scope/Today.txt', 'Search scope/Earlier.txt',
+        'Search scope/Child/Today child.txt', 'Search scope/Child/Earlier child.txt', 'Outside today.txt')
+    for ($index = 0; $index -lt $expectedSearchFileNames.Count; ++$index) {
+        if ($firstProof.searchSourceFiles[$index].name -cne $expectedSearchFileNames[$index] -or
+            $fixtureProof.searchSourceFiles[$index].name -cne $expectedSearchFileNames[$index] -or
+            $firstProof.searchSourceFiles[$index].snapshot.bytes -ne 6 -or
+            -not (Test-FixtureDescriptor $firstProof.searchSourceFiles[$index].snapshot $fixtureProof.searchSourceFiles[$index].snapshot)) {
+            throw 'An owned Today source differs from its first-stage full FileID, bytes or metadata.'
+        }
     }
 }
 
@@ -141,6 +366,7 @@ function Invoke-PrivateCapture([string]$Scene, [int]$Width, [int]$Height, [strin
         elseif ($Scene -eq 'Network') { 'shell:::{f02c1a0d-be21-4350-88b0-7367fc96ef3c}' }
         elseif ($Scene -eq 'Recycle') { 'shell:::{645ff040-5081-101b-9f08-00aa002f954e}' }
         elseif ($SourceMatched -and $Scene.StartsWith('Modern')) { 'shell:::{679f85cb-0220-4080-b29b-5540cc05aab6}' }
+        elseif ($SourceMatched -and $Scene -eq 'Compressed') { $compressedSourceFixture }
         elseif ($Scene -eq 'Compressed') { Join-Path $fixture 'Archive.zip' }
         elseif ($Scene -eq 'Search') { Join-Path $fixture 'Owned search.search-ms' }
         elseif ($Scene -eq 'Library') { Join-Path $fixture 'Owned library.library-ms' }
@@ -172,6 +398,8 @@ function Invoke-PrivateCapture([string]$Scene, [int]$Width, [int]$Height, [strin
         $argumentList += @('--select-shell', ('"' + $volume + '\\"'), '--view', 'Tiles')
     } elseif ($SourceMatched -and $Scene.StartsWith('Modern')) {
         $argumentList += @('--view', 'Default')
+    } elseif ($SourceMatched -and $Scene -eq 'Compressed') {
+        $argumentList += @('--select', 'Archive.zip', '--view', 'Details')
     } elseif ($Scene.StartsWith('Modern')) {
         # Match the reference's actual visible view state through native public
         # view/selection APIs; folder eligibility still comes from Windows.
@@ -185,14 +413,9 @@ function Invoke-PrivateCapture([string]$Scene, [int]$Width, [int]$Height, [strin
     elseif ($Scene -eq 'DiskImage') { $argumentList += @('--select', '"Owned disc image.iso"', '--view', 'Details') }
     elseif ($Scene -eq 'Music') { $argumentList += @('--select', '"Owned audio.wav"', '--view', 'Details') }
     elseif ($Scene -eq 'Video') { $argumentList += @('--select', '"Owned video.avi"', '--view', 'Details') }
-    $process = Start-Process -FilePath $executable -ArgumentList $argumentList -WindowStyle Hidden -PassThru `
-        -RedirectStandardOutput (Join-Path $sceneDirectory ($Suffix + '-stdout.log')) `
-        -RedirectStandardError (Join-Path $sceneDirectory ($Suffix + '-stderr.log'))
-    if (-not $process.WaitForExit(30000)) {
-        $process.Kill()
-        throw "Private-desktop native capture timed out: $Scene"
-    }
-    $process.Refresh()
+    $process = Invoke-VisualChildProcess $executable $argumentList `
+        (Join-Path $sceneDirectory ($Suffix + '-stdout.log')) (Join-Path $sceneDirectory ($Suffix + '-stderr.log')) `
+        (Join-Path $sceneDirectory ($Suffix + '-process.json')) "Private-desktop native capture $Scene/$Suffix"
     if ($SourceMatched -and $Scene -eq 'Library' -and $process.ExitCode -eq 9 -and
         (Test-Path -LiteralPath $capture) -and -not (Test-Path -LiteralPath $screenshot)) {
         $unavailable = Get-Content -LiteralPath $capture -Raw | ConvertFrom-Json
@@ -250,6 +473,20 @@ function Invoke-PrivateCapture([string]$Scene, [int]$Width, [int]$Height, [strin
             throw 'Recycle source fixture did not prove the actual read-only Recycle Bin namespace.'
         }
     }
+    if ($SourceMatched -and $Scene -eq 'Compressed') {
+        $addressEntries = @($inventory.widgets | Where-Object { $_.id -eq 104 -and $_.class -eq 'Edit' })
+        $extractAll = @($inventory.nativeRibbonCommands | Where-Object { $_.id -eq 172 })
+        $destinations = @($inventory.nativeRibbonCommands | Where-Object { $_.id -eq 1220 })
+        $archiveSelection = @($inventory.nativeRibbonProviders | Where-Object { $_.command -eq 172 })
+        if ($addressEntries.Count -ne 1 -or -not [StringComparer]::OrdinalIgnoreCase.Equals(
+                [string]$addressEntries[0].text, $compressedSourceFolderNativePath) -or
+            $archiveSelection.Count -ne 1 -or $archiveSelection[0].selectedCount -ne 1 -or
+            $extractAll.Count -ne 1 -or $extractAll[0].enabledReadHresult -ne 0 -or $extractAll[0].enabled -ne $true -or
+            $destinations.Count -ne 1 -or $destinations[0].enabledReadHresult -ne 0 -or $destinations[0].enabled -ne $false -or
+            (Get-FileHash -LiteralPath $compressedSourceArchive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $compressedSourceArchiveSha256) {
+            throw 'Compressed comparison did not prove its owned containing Downloads folder, one selected intact ZIP, native Extract all enabled and native Extract-to gallery disabled.'
+        }
+    }
     if ($searchMenuRequested -and ($inventory.searchDateMenu.requested -ne $true -or
             $inventory.searchDateMenu.readHresult -ne 0 -or $inventory.searchDateMenu.expanded -ne $true -or
             $inventory.searchDateMenu.expectedRows -ne 8 -or $inventory.searchDateMenu.matchedRows -ne 8 -or
@@ -288,6 +525,9 @@ function Invoke-PrivateCapture([string]$Scene, [int]$Width, [int]$Height, [strin
     }
     if ((Get-FileHash -LiteralPath $comparer -Algorithm SHA256).Hash.ToLowerInvariant() -ne $comparerSha256) {
         throw 'The visual comparison tool changed during the immutable capture run.'
+    }
+    if ((Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash.ToLowerInvariant() -ne $captureScriptSha256) {
+        throw 'The visual capture protocol script changed during the capture run.'
     }
     & $pythonPath -B $comparer --manifest $manifestPath --validate-capture --require-ribbon --actual $screenshot --capture $capture | Out-Host
     if ($LASTEXITCODE -ne 0) { throw "Actual native PNG or command band failed capture invariants: $Scene" }
@@ -339,7 +579,7 @@ foreach ($scene in $Scenes) {
                 $results.Add([PSCustomObject]$row)
                 continue
             }
-            if ($scene -in @('Home', 'Computer', 'Drive') -or $scene.StartsWith('Modern')) {
+            if ($scene -in @('Home', 'Computer', 'Drive', 'Compressed') -or $scene.StartsWith('Modern')) {
                 # This read-only native namespace fixture reproduces the source's
                 # actual SFGAO selection eligibility. Its Desktop body may have
                 # personal item names, so private-source files must not publish.
@@ -350,9 +590,11 @@ foreach ($scene in $Scenes) {
                 $row.sourceFixture = if ($scene -eq 'Home') { 'Native Desktop UsersFilesFolder; read-only, private body' }
                     elseif ($scene -eq 'Computer') { 'Native Computer namespace; read-only, private body' }
                     elseif ($scene -eq 'Drive') { 'Native Computer namespace and actual owned-fixture volume; read-only, private drive labels' }
+                    elseif ($scene -eq 'Compressed') { 'Owned Downloads containing folder with Archive.zip selected; source-native Extract all enabled and destination gallery disabled. Primary inside-ZIP member capture retained separately.' }
                     else { 'Native Quick Access namespace; read-only, private body' }
                 $row.sourceCapturePublishable = $false
                 $row.privateSourceInventory = $comparedCapture.Capture
+                $row.privateSourceScreenshot = $comparedCapture.Screenshot
             }
             $comparisonDirectory = if ($scene -eq 'Recycle') { Join-Path $runDirectory 'private-source/Recycle/comparison' }
                 else { Join-Path $runDirectory 'comparison' }
@@ -393,7 +635,9 @@ $summary = [ordered]@{ headless = $true; privateDesktop = $true; captureOnly = [
     crashDiagnostics = [bool]$CrashDiagnostics; diagnosticPdbSha256 = $diagnosticPdbSha256;
     chosenLayout = $(if ($InstalledRibbon) { 'InstalledWindows10' } else { 'Authored' });
     referenceManifestSha256 = $manifestSha256; referenceManifest = $manifestPath; comparisonToolSha256 = $comparerSha256;
+    captureScriptSha256 = $captureScriptSha256;
     fixtureBuilderSha256 = $fixtureBuilderSha256; fixtureBuilderReport = $fixtureBuilderReport;
+    fixtureBuilderFirstStageReport = $fixtureBuilderFirstReport; fixtureBuilderStages = $fixtureBuilderStages.ToArray();
     publicationReviewRequired = $true;
     publicationScope = 'Owned file contents; native navigation may show current-profile pins. Publish clean CI-profile captures or review local images before distribution. Never publish private-source files.';
     passed = $failed -eq 0; failed = $failed; results = $results; referenceScenesCompared = $compared;

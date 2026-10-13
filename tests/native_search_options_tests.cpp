@@ -1,3 +1,4 @@
+#include "explorer/native_apartment.hpp"
 #include "explorer/search.hpp"
 #include "explorer/context_menu.hpp"
 #include "explorer/namespace_actions.hpp"
@@ -659,12 +660,13 @@ int main() {
     if (FAILED(desktop.initialize()) || FAILED(desktop.verifyIsolation())) {
         std::cerr << "Cannot initialize isolated native-search desktop\n"; return 2;
     }
-    const auto initialized = OleInitialize(nullptr);
+    explorer::NativeApartmentOwner nativeApartment;
+    const auto initialized = nativeApartment.initializeOle();
     if (FAILED(initialized)) return 2;
     int result = 0;
     try { auditAndTest(); }
     catch (const std::exception& error) { std::cerr << "FAIL: native search option verification: " << error.what() << '\n'; result = 1; }
-    OleUninitialize();
+    nativeApartment.finishOrTerminate();
     if (FAILED(desktop.verifyIsolation())) result = 1;
     return result;
 }

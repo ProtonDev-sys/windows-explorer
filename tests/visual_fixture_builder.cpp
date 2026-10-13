@@ -4,6 +4,7 @@
 #include "explorer/headless_visual.hpp"
 
 #include <windows.h>
+#include <bcrypt.h>
 #include <shlobj.h>
 #include <propkey.h>
 #include <propvarutil.h>
@@ -15,17 +16,27 @@
 #include <algorithm>
 #include <compare>
 #include <cstdint>
+#include <cstring>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace {
 using Microsoft::WRL::ComPtr;
 namespace fs = std::filesystem;
+
+void phase(const char* operation) noexcept {
+    std::fprintf(stderr, "visual-fixture phase=%s tick=%llu\n", operation,
+        static_cast<unsigned long long>(GetTickCount64()));
+    std::fflush(stderr);
+}
 
 void check(HRESULT status, const char* operation) {
     if (FAILED(status)) throw std::runtime_error(std::string(operation) + " HRESULT=" + std::to_string(static_cast<unsigned long>(status)));
@@ -229,6 +240,12 @@ ComPtr<IShellItem> item(const fs::path& path) {
     auto nativePath = path; nativePath.make_preferred();
     ComPtr<IShellItem> value; check(SHCreateItemFromParsingName(nativePath.c_str(),nullptr,IID_PPV_ARGS(&value)),"Read owned native item"); return value;
 }
+fs::path nativeItemPath(IShellItem* value) {
+    struct Text {PWSTR value=nullptr;~Text(){CoTaskMemFree(value);}} text;
+    require(value!=nullptr,"Read path from actual native item");
+    check(value->GetDisplayName(SIGDN_FILESYSPATH,&text.value),"Read actual native filesystem path");
+    require(text.value&&*text.value,"Native item has no filesystem path");return fs::path(text.value);
+}
 struct FileIdentity {
     ULONGLONG volume = 0;
     std::array<BYTE,16> id{};
@@ -242,6 +259,129 @@ FileIdentity fileIdentity(const fs::path& path) {
     const auto status=read?S_OK:HRESULT_FROM_WIN32(GetLastError());CloseHandle(handle);check(status,"Read owned native file identity");
     FileIdentity result{value.VolumeSerialNumber};std::copy_n(value.FileId.Identifier,result.id.size(),result.id.begin());return result;
 }
+struct DescriptorSnapshot {
+    FileIdentity identity{};
+    FILE_BASIC_INFO basic{};
+    ULONGLONG bytes=0;
+    std::array<BYTE,32> sha256{};
+};
+bool sameDescriptor(const DescriptorSnapshot& a,const DescriptorSnapshot& b) {
+    return a.identity==b.identity&&a.bytes==b.bytes&&a.sha256==b.sha256&&
+        a.basic.FileAttributes==b.basic.FileAttributes&&a.basic.CreationTime.QuadPart==b.basic.CreationTime.QuadPart&&
+        a.basic.LastWriteTime.QuadPart==b.basic.LastWriteTime.QuadPart&&a.basic.ChangeTime.QuadPart==b.basic.ChangeTime.QuadPart;
+}
+DescriptorSnapshot descriptorSnapshot(const fs::path& path,ULONGLONG maximumBytes=1024*1024) {
+    require(maximumBytes>0&&maximumBytes<=64ULL*1024*1024,"Invalid owned snapshot byte bound");
+    // This is a bounded sampled snapshot, not a write/delete-denying lease.
+    // Shared native library handles may remain open; metadata and the current
+    // path identity are checked again after hashing and at each stage boundary.
+    struct File {HANDLE value=INVALID_HANDLE_VALUE;~File(){if(value!=INVALID_HANDLE_VALUE)CloseHandle(value);}} file{
+        CreateFileW(path.c_str(),GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT|FILE_FLAG_SEQUENTIAL_SCAN,nullptr)};
+    require(file.value!=INVALID_HANDLE_VALUE,"Open owned native descriptor snapshot");
+    DescriptorSnapshot result;FILE_ID_INFO id{};LARGE_INTEGER bytes{};
+    require(GetFileInformationByHandleEx(file.value,FileIdInfo,&id,sizeof(id))&&
+        GetFileInformationByHandleEx(file.value,FileBasicInfo,&result.basic,sizeof(result.basic))&&GetFileSizeEx(file.value,&bytes),
+        "Read complete native descriptor identity/metadata");
+    require(!(result.basic.FileAttributes&(FILE_ATTRIBUTE_DIRECTORY|FILE_ATTRIBUTE_REPARSE_POINT))&&
+        bytes.QuadPart>0&&static_cast<ULONGLONG>(bytes.QuadPart)<=maximumBytes,"Owned descriptor must be a bounded regular file");
+    result.identity.volume=id.VolumeSerialNumber;std::copy_n(id.FileId.Identifier,result.identity.id.size(),result.identity.id.begin());
+    result.bytes=static_cast<ULONGLONG>(bytes.QuadPart);
+    const auto cng=[](NTSTATUS status,const char* operation){if(status<0)check(HRESULT_FROM_NT(status),operation);};
+    struct Algorithm {BCRYPT_ALG_HANDLE value=nullptr;~Algorithm(){if(value)BCryptCloseAlgorithmProvider(value,0);}} algorithm;
+    cng(BCryptOpenAlgorithmProvider(&algorithm.value,BCRYPT_SHA256_ALGORITHM,MS_PRIMITIVE_PROVIDER,0),"Open native SHA256 provider");
+    struct Hash {BCRYPT_HASH_HANDLE value=nullptr;~Hash(){if(value)BCryptDestroyHash(value);}} hash;
+    // Public Windows7+ object allocation is freed by BCryptDestroyHash.
+    cng(BCryptCreateHash(algorithm.value,&hash.value,nullptr,0,nullptr,0,0),"Create native descriptor hash");
+    std::array<BYTE,4096> buffer{};ULONGLONG total=0;
+    for(;;) {
+        DWORD count=0;require(ReadFile(file.value,buffer.data(),static_cast<DWORD>(buffer.size()),&count,nullptr),"Read owned descriptor bytes");
+        if(!count)break;
+        require(total<=result.bytes&&count<=result.bytes-total,"Owned descriptor grew during native snapshot");
+        cng(BCryptHashData(hash.value,buffer.data(),count,0),"Hash complete native descriptor bytes");total+=count;
+    }
+    require(total==result.bytes,"Owned descriptor changed length during native snapshot");
+    cng(BCryptFinishHash(hash.value,result.sha256.data(),static_cast<ULONG>(result.sha256.size()),0),"Finish native descriptor hash");
+    FILE_ID_INFO afterId{};FILE_BASIC_INFO afterBasic{};LARGE_INTEGER afterBytes{};
+    require(GetFileInformationByHandleEx(file.value,FileIdInfo,&afterId,sizeof(afterId))&&
+        GetFileInformationByHandleEx(file.value,FileBasicInfo,&afterBasic,sizeof(afterBasic))&&GetFileSizeEx(file.value,&afterBytes),
+        "Read descriptor snapshot completion metadata");
+    require(id.VolumeSerialNumber==afterId.VolumeSerialNumber&&std::memcmp(id.FileId.Identifier,afterId.FileId.Identifier,16)==0&&
+        afterBytes.QuadPart==bytes.QuadPart&&afterBasic.FileAttributes==result.basic.FileAttributes&&
+        afterBasic.CreationTime.QuadPart==result.basic.CreationTime.QuadPart&&
+        afterBasic.LastWriteTime.QuadPart==result.basic.LastWriteTime.QuadPart&&afterBasic.ChangeTime.QuadPart==result.basic.ChangeTime.QuadPart&&
+        fileIdentity(path)==result.identity,"Owned descriptor identity/bytes/metadata changed during read");
+    return result;
+}
+constexpr std::array<const wchar_t*,3> libraryFolderNames{L"Documents",L"Pictures",L"Music"};
+constexpr std::array<const wchar_t*,3> firstArtifactNames{L"Owned search.search-ms",L"Application.exe",L"Application shortcut.lnk"};
+constexpr std::array<const wchar_t*,2> searchFolderNames{L"Search scope",L"Search scope/Child"};
+constexpr std::array<const wchar_t*,5> searchFileNames{L"Search scope/Today.txt",L"Search scope/Earlier.txt",
+    L"Search scope/Child/Today child.txt",L"Search scope/Child/Earlier child.txt",L"Outside today.txt"};
+struct SearchSourceSnapshot {
+    std::array<FileIdentity,2> folders{};
+    std::array<DescriptorSnapshot,5> files{};
+};
+SearchSourceSnapshot searchSourceSnapshot(const fs::path& root) {
+    SearchSourceSnapshot result;
+    for(size_t index=0;index<result.folders.size();++index){regularPath(root/searchFolderNames[index],true);result.folders[index]=fileIdentity(root/searchFolderNames[index]);}
+    require(result.folders[0]!=result.folders[1],"Owned search scope folders have duplicate identities");
+    std::set<FileIdentity> distinct;
+    for(size_t index=0;index<result.files.size();++index){result.files[index]=descriptorSnapshot(root/searchFileNames[index],6);
+        require(result.files[index].bytes==6&&distinct.insert(result.files[index].identity).second,"Owned search source bytes/identities changed");}
+    return result;
+}
+bool sameSearchSource(const SearchSourceSnapshot& a,const SearchSourceSnapshot& b) {
+    if(a.folders!=b.folders)return false;
+    for(size_t index=0;index<a.files.size();++index)if(!sameDescriptor(a.files[index],b.files[index]))return false;
+    return true;
+}
+std::array<FileIdentity,3> sourceFolderIdentities(const fs::path& root) {
+    std::array<FileIdentity,3> result{};
+    for(size_t index=0;index<result.size();++index){regularPath(root/libraryFolderNames[index],true);result[index]=fileIdentity(root/libraryFolderNames[index]);}
+    require(std::set<FileIdentity>(result.begin(),result.end()).size()==result.size(),"Owned library source folders have duplicate identities");
+    return result;
+}
+GUID fixtureGuid(const fs::path& root) {
+    std::ifstream input(root/L".native-visual-fixture",std::ios::binary);
+    std::string text((std::istreambuf_iterator<char>(input)),{});
+    while(!text.empty()&&(text.back()=='\r'||text.back()=='\n'))text.pop_back();
+    require(text.size()==36||text.size()==38,"Read exact owned fixture GUID");
+    if(text.size()==36)text="{"+text+"}";
+    const std::wstring wide(text.begin(),text.end());GUID value{};check(CLSIDFromString(wide.c_str(),&value),"Read owned fixture GUID");return value;
+}
+struct LibraryStageHandoff {
+    std::uint64_t magic=0x3142494c465745ULL;
+    std::uint32_t version=1,bytes=static_cast<std::uint32_t>(sizeof(LibraryStageHandoff));
+    GUID fixture{};
+    FileIdentity root{},marker{};
+    std::array<FileIdentity,3> sourceFolders{};
+    DescriptorSnapshot library{};
+    std::array<DescriptorSnapshot,3> firstArtifacts{};
+    SearchSourceSnapshot searchSources{};
+    std::array<DWORD,4> reserved{};
+};
+static_assert(std::is_trivially_copyable_v<LibraryStageHandoff>);
+LibraryStageHandoff readLibraryHandoff(const fs::path& path) {
+    regularPath(path,false);
+    struct File {HANDLE value=INVALID_HANDLE_VALUE;~File(){if(value!=INVALID_HANDLE_VALUE)CloseHandle(value);}} file{
+        CreateFileW(path.c_str(),GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT,nullptr)};
+    require(file.value!=INVALID_HANDLE_VALUE,"Open exact first-stage library handoff");
+    LibraryStageHandoff value{};LARGE_INTEGER size{};DWORD read=0;
+    require(GetFileSizeEx(file.value,&size)&&size.QuadPart==static_cast<LONGLONG>(sizeof(value))&&
+        ReadFile(file.value,&value,static_cast<DWORD>(sizeof(value)),&read,nullptr)&&read==sizeof(value),"Read complete fixed-size library handoff");
+    require(value.magic==LibraryStageHandoff{}.magic&&value.version==1u&&value.bytes==sizeof(value)&&
+        std::all_of(value.reserved.begin(),value.reserved.end(),[](DWORD item){return item==0u;}),"Invalid library handoff version/shape");
+    return value;
+}
+void verifyLibraryMembers(explorer::ShellLibrary& library,const std::array<FileIdentity,3>& expected,size_t count) {
+    std::vector<explorer::LibraryFolder> locations;check(library.folders(locations),"Read actual persisted native library locations");
+    require(locations.size()==count,"Saved library has an unexpected native member count");
+    std::set<FileIdentity> actual;
+    for(const auto& location:locations){require(location.item&&!location.path.empty(),"Owned library member is not a filesystem item");
+        regularPath(location.path,true);require(actual.insert(fileIdentity(location.path)).second,"Native library contains a duplicate folder identity");}
+    require(actual==std::set<FileIdentity>(expected.begin(),expected.begin()+count),"Native library contains another folder identity");
+}
 void modified(const fs::path& path,const FILETIME& value) {
     const auto handle=CreateFileW(path.c_str(),FILE_WRITE_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
         nullptr,OPEN_EXISTING,FILE_FLAG_BACKUP_SEMANTICS,nullptr);
@@ -249,14 +389,15 @@ void modified(const fs::path& path,const FILETIME& value) {
     const auto written=SetFileTime(handle,nullptr,nullptr,&value);
     const auto status=written?S_OK:HRESULT_FROM_WIN32(GetLastError());CloseHandle(handle);check(status,"Set owned search fixture date");
 }
+void verifyTodaySearch(const fs::path& root);
 void createTodaySearch(const fs::path& root) {
     const auto scope=root/L"Search scope",child=scope/L"Child";
     require(fs::create_directory(scope)&&fs::create_directory(child),"Exclusively create owned search scope");
     FILETIME today{},earlier{};GetSystemTimeAsFileTime(&today);
     SYSTEMTIME old{};old.wYear=2020;old.wMonth=1;old.wDay=2;
     require(SystemTimeToFileTime(&old,&earlier),"Create old search fixture date");
-    const std::array<fs::path,5> files{scope/L"Today.txt",scope/L"Earlier.txt",child/L"Today child.txt",
-        child/L"Earlier child.txt",root/L"Outside today.txt"};
+    std::array<fs::path,5> files{};
+    for(size_t index=0;index<files.size();++index)files[index]=root/searchFileNames[index];
     for(size_t index=0;index<files.size();++index) {
         createBytes(files[index],std::vector<std::uint8_t>{'O','w','n','e','d','\n'});
         modified(files[index],index==1||index==3?earlier:today);
@@ -270,7 +411,16 @@ void createTodaySearch(const fs::path& root) {
             "Today persistence proof accepted a different relative date, absolute date or extra condition");
     const auto saved=root/L"Owned search.search-ms";
     const auto scoped=item(scope);
+    phase("save-native-relative-today");
     check(explorer::saveSearch(query,scoped.Get(),true,saved),"Save genuine unresolved Today search fixture");
+    verifyTodaySearch(root);
+}
+void verifyTodaySearch(const fs::path& root) {
+    const auto scoped=item(root/L"Search scope");
+    const auto saved=root/L"Owned search.search-ms";
+    std::array<fs::path,5> files{};
+    for(size_t index=0;index<files.size();++index)files[index]=root/searchFileNames[index];
+    phase("read-native-relative-today");
     explorer::SavedSearchMetadata metadata;check(explorer::readSavedSearch(saved,&metadata),"Reload actual saved Today search metadata");
     check(explorer::validateRelativeTodayQuery(metadata.query),"Saved Today condition was frozen, omitted or replaced");
     require(metadata.scope&&metadata.recursive&&metadata.scopeRules.size()==1&&metadata.scopeRules[0].recursive&&
@@ -284,10 +434,13 @@ void createTodaySearch(const fs::path& root) {
     require(expected.size()==2,"Owned Today fixtures must have distinct native file identities");
     const auto deadline=GetTickCount64()+5000;
     for(;;) {
+        phase("bind-native-relative-today-folder");
         ComPtr<IShellFolder> folder;check(item(saved)->BindToHandler(nullptr,BHID_SFObject,IID_PPV_ARGS(&folder)),"Bind actual saved Today native folder");
+        phase("enumerate-native-relative-today-folder");
         ComPtr<IEnumIDList> enumerator;check(folder->EnumObjects(nullptr,static_cast<SHCONTF>(SHCONTF_FOLDERS|SHCONTF_NONFOLDERS),&enumerator),"Enumerate actual saved Today native results");
         std::set<FileIdentity> actual;size_t count=0;
         while(enumerator) {
+            phase("read-native-relative-today-result");
             PITEMID_CHILD pidl=nullptr;const auto next=enumerator->Next(1,&pidl,nullptr);if(next==S_FALSE)break;
             check(next,"Read actual saved Today result");require(pidl!=nullptr,"Today result lacks native identity");
             ComPtr<IShellItem> result;const auto created=SHCreateItemWithParent(nullptr,folder.Get(),pidl,IID_PPV_ARGS(&result));
@@ -304,6 +457,7 @@ void createTodaySearch(const fs::path& root) {
             require(expectedIndex<expectedItems.size(),"Today native search included an earlier, outside-scope or unexpected item");
             require(actual.insert(fileIdentity(resultPath)).second,"Today native search returned a duplicate identity");++count;
         }
+        phase("native-relative-today-membership-readback");
         if(count==2&&actual==expected)break;
         require(GetTickCount64()<deadline,"Actual saved Today query did not return both exact recursive owned identities");
         MSG message{};while(PeekMessageW(&message,nullptr,0,0,PM_REMOVE)){TranslateMessage(&message);DispatchMessageW(&message);}
@@ -319,6 +473,41 @@ std::string jsonString(const std::string& value) {
     std::string result = "\"";
     for (const auto character : value) { if (character == '\\' || character == '"') result.push_back('\\'); result.push_back(character); }
     return result + "\"";
+}
+template<size_t Count> std::string hexBytes(const std::array<BYTE,Count>& bytes) {
+    constexpr char digits[]="0123456789abcdef";std::string result;result.reserve(Count*2);
+    for(const auto value:bytes){result.push_back(digits[value>>4]);result.push_back(digits[value&15]);}return result;
+}
+std::string identityJson(const FileIdentity& value) {
+    // Decimal volume is a string so PowerShell JSON does not lose uint64 bits.
+    return "{\"volume\":"+jsonString(std::to_string(value.volume))+",\"fileId\":"+jsonString(hexBytes(value.id))+"}";
+}
+std::string descriptorJson(const DescriptorSnapshot& value) {
+    return "{\"identity\":"+identityJson(value.identity)+",\"bytes\":"+std::to_string(value.bytes)+
+        ",\"sha256\":"+jsonString(hexBytes(value.sha256))+",\"attributes\":"+std::to_string(value.basic.FileAttributes)+
+        ",\"creation\":"+std::to_string(value.basic.CreationTime.QuadPart)+",\"write\":"+std::to_string(value.basic.LastWriteTime.QuadPart)+
+        ",\"change\":"+std::to_string(value.basic.ChangeTime.QuadPart)+",\"access\":"+std::to_string(value.basic.LastAccessTime.QuadPart)+"}";
+}
+std::string searchSourceJson(const SearchSourceSnapshot& value,const char* stage) {
+    std::string json="\"searchVerificationStage\":"+jsonString(stage)+",\"searchSourceStatePreserved\":true,\"searchSourceFolders\":[";
+    for(size_t index=0;index<value.folders.size();++index){if(index)json+=',';json+="{\"name\":"+jsonString(ascii(searchFolderNames[index]))+
+        ",\"identity\":"+identityJson(value.folders[index])+"}";}
+    json+="],\"searchSourceFiles\":[";
+    for(size_t index=0;index<value.files.size();++index){if(index)json+=',';json+="{\"name\":"+jsonString(ascii(searchFileNames[index]))+
+        ",\"snapshot\":"+descriptorJson(value.files[index])+"}";}
+    return json+"]";
+}
+std::string libraryStageJson(const char* stage,const fs::path& root,const std::array<FileIdentity,3>& folders,
+                             const DescriptorSnapshot* before,const DescriptorSnapshot& after,const DescriptorSnapshot* handoff) {
+    const auto guid=fixtureGuid(root);wchar_t text[40]{};require(StringFromGUID2(guid,text,static_cast<int>(std::size(text)))!=0,"Format owned fixture GUID receipt");
+    std::string json="\"stage\":"+jsonString(stage)+",\"fixtureGuid\":"+jsonString(ascii(text))+
+        ",\"fixtureRoot\":"+identityJson(fileIdentity(root))+",\"sourceFolders\":[";
+    for(size_t index=0;index<folders.size();++index){if(index)json+=',';json+="{\"name\":"+jsonString(ascii(libraryFolderNames[index]))+
+        ",\"identity\":"+identityJson(folders[index])+"}";}
+    json+="],\"libraryDescriptorBefore\":"+(before?descriptorJson(*before):std::string("null"))+
+        ",\"libraryDescriptorAfter\":"+descriptorJson(after)+",\"libraryDescriptorIdentityReplaced\":"+
+        (before&&before->identity!=after.identity?"true":"false")+",\"handoff\":"+(handoff?descriptorJson(*handoff):std::string("null"));
+    return json;
 }
 std::string metadata(const fs::path& root, const fs::path& relative, const wchar_t* expectedType, const wchar_t* expectedKind = nullptr) {
     ComPtr<IShellItem2> native; check(item(root/relative).As(&native),"Read native fixture property interface");
@@ -347,6 +536,7 @@ std::string metadata(const fs::path& root, const fs::path& relative, const wchar
 int wmain(int count, wchar_t** arguments) {
     try {
         fs::path root, executable, report;
+        enum class Stage { All, First, Complete };Stage stage=Stage::All;bool stageSpecified=false;
         for (int index = 1; index < count; ++index) {
             const std::wstring_view option(arguments[index]);
             require(index+1 < count,"Each fixture argument requires a value");
@@ -354,6 +544,13 @@ int wmain(int count, wchar_t** arguments) {
             if (option == L"--path" && root.empty()) root = fs::absolute(value).lexically_normal();
             else if (option == L"--executable" && executable.empty()) executable = fs::absolute(value).lexically_normal();
             else if (option == L"--report" && report.empty()) report = value;
+            else if (option == L"--stage" && !stageSpecified) {
+                stageSpecified=true;
+                if(value==L"first")stage=Stage::First;
+                else if(value==L"complete")stage=Stage::Complete;
+                else if(value==L"all")stage=Stage::All;
+                else throw std::runtime_error("Unknown native fixture stage");
+            }
             else throw std::runtime_error("Unknown or duplicate fixture argument");
         }
         require(!root.empty() && !executable.empty() && !report.empty(),"Require --path, --executable and --report");
@@ -361,52 +558,142 @@ int wmain(int count, wchar_t** arguments) {
         validateRoot(root); regularPath(executable,false);
         require(report.parent_path() == root,"Fixture report must remain inside the owned root");
         const std::array<fs::path,7> outputs{L"Owned search.search-ms",L"Owned library.library-ms",L"Application.exe",L"Application shortcut.lnk",L"Music/Owned audio.wav",L"Videos/Owned video.avi",L"Owned disc image.iso"};
-        for (const auto& output : outputs) absent(root/output);
+        for(size_t index=0;index<outputs.size();++index) {
+            if(stage==Stage::Complete&&index<4)regularPath(root/outputs[index],false);else absent(root/outputs[index]);
+        }
+        const auto handoffPath=root/L".native-library-stage.bin";
+        if(stage==Stage::First)absent(handoffPath);
         absent(report);
         const auto originalInputDesktop = inputDesktopName();
         require(!visibleProcessInputWindows(),"Fixture process must have no visible input-desktop windows");
         PrivateDesktop desktop; ComApartment apartment;
-        require(CopyFileW(executable.c_str(),(root/L"Application.exe").c_str(),TRUE),"Exclusively copy owned application fixture without executing it");
-        ComPtr<IShellLinkW> link; check(CoCreateInstance(CLSID_ShellLink,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&link)),"Create owned native shortcut");
-        check(link->SetPath((root/L"Application.exe").c_str()),"Set owned shortcut target");
-        check(link->SetWorkingDirectory(root.c_str()),"Set owned shortcut working directory");
-        ComPtr<IPersistFile> persist; check(link.As(&persist),"Query owned shortcut writer");
-        check(persist->Save((root/L"Application shortcut.lnk").c_str(),TRUE),"Save owned shortcut");
-        createTodaySearch(root);
-        explorer::ShellLibrary library; check(explorer::ShellLibrary::create(library),"Create owned native library");
-        check(library.addFolder(root/L"Documents"),"Include owned Documents in library");
-        check(library.addFolder(root/L"Pictures"),"Include owned Pictures in library");
-        check(library.addFolder(root/L"Music"),"Include owned Music in library");
-        check(library.setDefaultSaveFolder(root/L"Documents"),"Set owned library save location");
-        check(library.optimize(explorer::LibraryKind::Documents),"Set native Documents library type");
-        ComPtr<IShellItem> saved; check(library.save(root,L"Owned library",saved),"Save genuine owned library");
+        const auto sourceFolders=sourceFolderIdentities(root);
+        const auto rootIdentity=fileIdentity(root);
+        std::optional<LibraryStageHandoff> prior;
+        DescriptorSnapshot libraryBefore{},libraryAfter{},handoffSnapshot{};
+        SearchSourceSnapshot searchSources{};
+        if(stage==Stage::Complete) {
+            phase("verify-exact-first-stage-native-handoff");
+            handoffSnapshot=descriptorSnapshot(handoffPath);prior=readLibraryHandoff(handoffPath);
+            require(sameDescriptor(handoffSnapshot,descriptorSnapshot(handoffPath)),"Library handoff changed during read");
+            require(IsEqualGUID(prior->fixture,fixtureGuid(root))&&prior->root==rootIdentity&&
+                prior->marker==fileIdentity(root/L".native-visual-fixture")&&prior->sourceFolders==sourceFolders,
+                "First-stage native fixture/root/source identity changed");
+            libraryBefore=descriptorSnapshot(root/outputs[1]);
+            require(sameDescriptor(prior->library,libraryBefore),"Native library descriptor differs from exact first-stage publication");
+            for(size_t index=0;index<firstArtifactNames.size();++index)
+                require(sameDescriptor(prior->firstArtifacts[index],descriptorSnapshot(root/firstArtifactNames[index],64ULL*1024*1024)),
+                    "First-stage native search/application/shortcut changed");
+            searchSources=searchSourceSnapshot(root);
+            require(sameSearchSource(prior->searchSources,searchSources),"First-stage Today search source identities/bytes/metadata changed");
+        } else {
+            phase("owned-native-shortcut");
+            require(CopyFileW(executable.c_str(),(root/L"Application.exe").c_str(),TRUE),"Exclusively copy owned application fixture without executing it");
+            ComPtr<IShellLinkW> link;check(CoCreateInstance(CLSID_ShellLink,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&link)),"Create owned native shortcut");
+            check(link->SetPath((root/L"Application.exe").c_str()),"Set owned shortcut target");
+            check(link->SetWorkingDirectory(root.c_str()),"Set owned shortcut working directory");
+            ComPtr<IPersistFile> persist;check(link.As(&persist),"Query owned shortcut writer");
+            check(persist->Save((root/L"Application shortcut.lnk").c_str(),TRUE),"Save owned shortcut");
+            phase("owned-native-relative-today-search");createTodaySearch(root);
+            searchSources=searchSourceSnapshot(root);
+        }
+        explorer::ShellLibrary library;
+        if(stage==Stage::Complete) {
+            phase("load-owned-native-library-for-completion");
+            check(explorer::ShellLibrary::load(item(root/outputs[1]).Get(),true,library),"Load exact first-stage native library writable");
+            require(sameDescriptor(libraryBefore,descriptorSnapshot(root/outputs[1])),"Native load changed the published library descriptor");
+            verifyLibraryMembers(library,sourceFolders,1);
+        } else {
+            phase("owned-native-library");check(explorer::ShellLibrary::create(library),"Create owned native library");
+            phase("include-owned-library-documents");check(library.addFolder(root/L"Documents"),"Include owned Documents in library");
+        }
+        if(stage!=Stage::First) {
+            phase("include-owned-library-pictures");check(library.addFolder(root/L"Pictures"),"Include owned Pictures in library");
+            phase("include-owned-library-music");check(library.addFolder(root/L"Music"),"Include owned Music in library");
+            phase("set-owned-library-default-save-folder");check(library.setDefaultSaveFolder(root/L"Documents"),"Set owned library save location");
+            phase("set-owned-library-template");check(library.optimize(explorer::LibraryKind::Documents),"Set native Documents library type");
+        }
+        ComPtr<IShellItem> saved;
+        if(stage==Stage::Complete) {
+            require(sameDescriptor(libraryBefore,descriptorSnapshot(root/outputs[1])),"Uncommitted native library unexpectedly changed its backing file");
+            phase("commit-owned-native-library");check(library.commit(),"Commit genuine owned library completion");
+        } else {
+            phase("save-owned-native-library");check(library.save(root,L"Owned library",saved),"Save genuine owned library");
+            require(saved&&fileIdentity(nativeItemPath(saved.Get()))==fileIdentity(root/outputs[1]),"Saved library has another native file identity");
+            saved.Reset();
+        }
+        phase("release-owned-native-library");
         library = explorer::ShellLibrary{};
         explorer::ShellLibrary persisted;
-        check(explorer::ShellLibrary::load(saved.Get(),false,persisted),"Reload actual owned library file");
-        std::vector<explorer::LibraryFolder> locations;
-        check(persisted.folders(locations),"Read actual saved library locations");
-        require(locations.size() == 3,"Saved library does not contain all three owned locations");
+        phase("reload-owned-native-library");
+        check(explorer::ShellLibrary::load(item(root/outputs[1]).Get(),false,persisted),"Reload actual owned library file");
+        phase("read-owned-library-locations");verifyLibraryMembers(persisted,sourceFolders,stage==Stage::First?1u:3u);
+        libraryAfter=descriptorSnapshot(root/outputs[1]);
+        require(sourceFolderIdentities(root)==sourceFolders&&fileIdentity(root)==rootIdentity,"Native library setup replaced owned source/root identities");
+        if(stage==Stage::First) {
+            persisted=explorer::ShellLibrary{};
+            std::string fixtureFiles;
+            constexpr std::array<const wchar_t*,4> types{L".search-ms",L".library-ms",L".exe",L".lnk"};
+            for(size_t index=0;index<types.size();++index){if(index)fixtureFiles+=',';fixtureFiles+=metadata(root,outputs[index],types[index]);}
+            libraryAfter=descriptorSnapshot(root/outputs[1]);
+            LibraryStageHandoff handoff;handoff.fixture=fixtureGuid(root);handoff.root=rootIdentity;
+            handoff.marker=fileIdentity(root/L".native-visual-fixture");handoff.sourceFolders=sourceFolders;handoff.library=libraryAfter;
+            handoff.searchSources=searchSources;
+            for(size_t index=0;index<firstArtifactNames.size();++index)handoff.firstArtifacts[index]=descriptorSnapshot(root/firstArtifactNames[index],64ULL*1024*1024);
+            const auto bytes=reinterpret_cast<const std::uint8_t*>(&handoff);
+            createBytes(handoffPath,std::vector<std::uint8_t>(bytes,bytes+sizeof(handoff)));handoffSnapshot=descriptorSnapshot(handoffPath);
+            std::string json="{\"headless\":true,\"privateDesktop\":true,\"inputDesktopUnchanged\":true,\"visibleInputDesktopWindows\":false,\"passed\":true,"
+                "\"completeFixture\":false,\"executedFixture\":false,\"created\":4,\"createdThisStage\":4,\"libraryLocations\":1,\"searchScope\":\"Search scope\",\"searchRelativeToday\":true,\"searchRecursive\":true,"
+                "\"searchResultCount\":2,\"searchExactIdentities\":true,\"searchEarlierExcluded\":true,\"searchOutsideScopeExcluded\":true,";
+            json+=libraryStageJson("first",root,sourceFolders,nullptr,libraryAfter,&handoffSnapshot)+","+
+                searchSourceJson(searchSources,"first")+",\"fixtureFiles\":["+fixtureFiles+"]}\n";
+            require(sourceFolderIdentities(root)==sourceFolders&&fileIdentity(root)==rootIdentity&&
+                sameDescriptor(libraryAfter,descriptorSnapshot(root/outputs[1]))&&sameSearchSource(searchSources,searchSourceSnapshot(root)),
+                "First-stage publication changed native source/descriptor identities");
+            require(inputDesktopName()==originalInputDesktop&&!visibleProcessInputWindows(),"First-stage private/input desktop invariant changed");
+            phase("native-fixture-first-stage-report");createBytes(report,std::vector<std::uint8_t>(json.begin(),json.end()));
+            std::cout<<"Persisted one genuine owned native library member; complete fixture is not yet available.\n";return 0;
+        }
         fs::path defaultLocation;
+        phase("read-owned-library-default-save-path");
         check(persisted.defaultSavePath(defaultLocation),"Read actual saved library default");
-        require(defaultLocation == root/L"Documents","Saved library default differs from owned Documents");
+        regularPath(defaultLocation,true);require(fileIdentity(defaultLocation)==sourceFolders[0],"Saved library default has another native folder identity");
+        phase("read-owned-library-template");
         GUID type{}; check(persisted.folderType(type),"Read actual saved library template");
         require(explorer::libraryKindForType(type) == explorer::LibraryKind::Documents,"Saved library template differs from Documents");
+        phase("owned-native-media");
         createBytes(root/L"Music/Owned audio.wav",wave());
         createBytes(root/L"Videos/Owned video.avi",avi());
         validateMedia(root/L"Music/Owned audio.wav",streamtypeAUDIO,44100,2);
         validateMedia(root/L"Videos/Owned video.avi",streamtypeVIDEO,1,16);
+        phase("owned-native-recorder-free-iso");
         createDiscImage(root);
-        std::string json = "{\"headless\":true,\"privateDesktop\":true,\"inputDesktopUnchanged\":true,\"visibleInputDesktopWindows\":false,\"passed\":true,\"executedFixture\":false,\"created\":7,\"isoBuilder\":\"IMAPI2FS\",\"isoBuilderStatus\":0,\"isoVolumeVerified\":true,\"libraryLocations\":3,\"libraryDefault\":\"Documents\",\"libraryTemplate\":\"Documents\",\"searchScope\":\"Search scope\",\"searchRelativeToday\":true,\"searchRecursive\":true,\"searchResultCount\":2,\"searchExactIdentities\":true,\"searchEarlierExcluded\":true,\"searchOutsideScopeExcluded\":true,\"fixtureFiles\":[";
+        if(stage==Stage::Complete){phase("verify-completed-native-relative-today-search");verifyTodaySearch(root);}
+        require(sameSearchSource(searchSources,searchSourceSnapshot(root)),"Native completion changed the exact Today search source state");
+        phase("native-fixture-fast-property-readback");
+        std::string json = "{\"headless\":true,\"privateDesktop\":true,\"inputDesktopUnchanged\":true,\"visibleInputDesktopWindows\":false,\"passed\":true,\"completeFixture\":true,\"executedFixture\":false,\"created\":7,\"isoBuilder\":\"IMAPI2FS\",\"isoBuilderStatus\":0,\"isoVolumeVerified\":true,\"libraryLocations\":3,\"libraryDefault\":\"Documents\",\"libraryTemplate\":\"Documents\",\"searchScope\":\"Search scope\",\"searchRelativeToday\":true,\"searchRecursive\":true,\"searchResultCount\":2,\"searchExactIdentities\":true,\"searchEarlierExcluded\":true,\"searchOutsideScopeExcluded\":true,";
+        json+="\"createdThisStage\":"+std::to_string(stage==Stage::Complete?3:7)+",";
+        json+=libraryStageJson(stage==Stage::Complete?"complete":"all",root,sourceFolders,prior?&libraryBefore:nullptr,libraryAfter,prior?&handoffSnapshot:nullptr)+","+
+            searchSourceJson(searchSources,stage==Stage::Complete?"complete":"all")+",\"fixtureFiles\":[";
         const std::array<const wchar_t*,7> types{L".search-ms",L".library-ms",L".exe",L".lnk",L".wav",L".avi",L".iso"};
         for (std::size_t index = 0; index < outputs.size(); ++index) {
             if (index) json += ',';
             json += metadata(root,outputs[index],types[index],index == 4 ? L"music" : index == 5 ? L"video" : nullptr);
         }
         json += "]}\n";
+        require(sameDescriptor(libraryAfter,descriptorSnapshot(root/outputs[1])),"Native fixture property read changed the committed library descriptor");
+        require(fileIdentity(root)==rootIdentity&&sourceFolderIdentities(root)==sourceFolders&&sameSearchSource(searchSources,searchSourceSnapshot(root)),
+            "Final fixture root/source-folder/search-source state changed");
+        if(prior) {
+            require(sameDescriptor(handoffSnapshot,descriptorSnapshot(handoffPath)),"First-stage handoff changed during completion");
+            for(size_t index=0;index<firstArtifactNames.size();++index)
+                require(sameDescriptor(prior->firstArtifacts[index],descriptorSnapshot(root/firstArtifactNames[index],64ULL*1024*1024)),"First-stage semantic fixture changed during completion");
+        }
         require(inputDesktopName() == originalInputDesktop,"Input desktop changed during fixture creation");
         require(!visibleProcessInputWindows(),"Fixture process published a visible input-desktop window");
+        phase("native-fixture-report");
         createBytes(report,std::vector<std::uint8_t>(json.begin(),json.end()));
-        std::cout << "Created 7 genuine owned native visual fixtures; no application execution, mount, burning or user namespace changes.\n";
+        std::cout << "Verified 7 genuine owned native visual fixtures; no application execution, mount, burning or user namespace changes.\n";
         return 0;
     } catch (const std::exception& error) { std::cerr << "Native fixture builder: " << error.what() << '\n'; return 1; }
 }

@@ -402,8 +402,16 @@ bool drawRibbonCollapseButton(const DRAWITEMSTRUCT& draw, bool minimized, UINT d
     background(draw.hwndItem, draw.hDC, draw.rcItem, state, ThemeSurface::Content);
     const auto theme = themeState();
     const auto color = theme.highContrast || theme.actual == ThemeMode::Dark ? glyphColor(state) :
-        state.enabled ? RGB(128, 128, 128) : themePalette().disabledText;
-    if (!fontGlyph(draw.hDC, draw.rcItem, minimized ? L'\xe70d' : L'\xe70e', px(10, dpi), color)) {
+        state.enabled ? GetSysColor(COLOR_BTNTEXT) : themePalette().disabledText;
+    // The fixed Windows 10 Light reference uses an 8px grayscale caret.
+    // Explicit grayscale antialiasing avoids ClearType color fringes in this
+    // icon font; the original Dark/high-contrast presentation remains native.
+    const bool referenceLight = theme.actual == ThemeMode::Light && !theme.highContrast;
+    auto glyphBounds = draw.rcItem;
+    if (referenceLight) OffsetRect(&glyphBounds, 0, -px(1, dpi));
+    if (!fontGlyph(draw.hDC, glyphBounds, minimized ? L'\xe70d' : L'\xe70e',
+            px(referenceLight ? 8 : 10, dpi), color, FW_NORMAL,
+            referenceLight ? ANTIALIASED_QUALITY : DEFAULT_QUALITY)) {
         const int middleX = (draw.rcItem.left + draw.rcItem.right) / 2;
         const int middleY = (draw.rcItem.top + draw.rcItem.bottom) / 2;
         const int direction = minimized ? 1 : -1;

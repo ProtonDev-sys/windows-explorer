@@ -33,7 +33,10 @@ constexpr std::array<Entry, static_cast<size_t>(UiText::Count)> catalogue{{
     {Module::Ribbon,6104,Shape::Plain,L"Minimize the Ribbon"},
     {Module::Ribbon,6100,Shape::Plain,L"Minimize the Ribbon (Ctrl+F1)"},
     {Module::None,0,Shape::FallbackOnly,L"Expand the Ribbon"},
-    {Module::Ribbon,6101,Shape::Plain,L"Expand the Ribbon (Ctrl+F1)"}
+    {Module::Ribbon,6101,Shape::Plain,L"Expand the Ribbon (Ctrl+F1)"},
+    {Module::Shell,38228,Shape::Plain,L"Preview Pane"},
+    {Module::Shell,38245,Shape::Plain,L"Select a file to preview."},
+    {Module::Shell,38246,Shape::Plain,L"No preview available."}
 }};
 constexpr std::array<const wchar_t*,static_cast<size_t>(Module::Count)> moduleNames{
     L"ExplorerFrame.dll",L"shell32.dll",L"uiribbon.dll"};

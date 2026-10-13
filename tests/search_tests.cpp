@@ -989,7 +989,6 @@ void rejectedInputsAndNoOverwrite() {
     require(explorer::saveSearch(L"System.FileName:=\"report\"", file.Get(), true, rejected) == HRESULT_FROM_WIN32(ERROR_DIRECTORY), "file used as search scope");
     ComPtr<IShellItem> result;
     require(explorer::createSearchFolder(L"report", nullptr, &result, false) == unsupported && !result, "shallow virtual scope was silently recursive");
-    require(explorer::saveSearch(L"System.FileName:=\"report\"", nullptr, false, rejected) == unsupported, "saved shallow virtual scope was silently recursive");
     require(explorer::createSearchFolder(L"report", scope.Get(), nullptr) == E_POINTER, "null search output accepted");
     require(explorer::createSearchFolder(L"", scope.Get(), &result) == E_INVALIDARG && !result, "invalid live search retained result");
     // Native filename word-prefix membership and persistence are covered by
@@ -1085,6 +1084,162 @@ std::set<std::wstring> fixtureMembers(const fs::path& root) {
     std::set<std::wstring> paths;
     for (const auto& entry : fs::recursive_directory_iterator(root)) paths.insert(entry.path().lexically_relative(root).native());
     return paths;
+}
+
+void knownFolderDepthAndMixedDescriptors() {
+    Fixture fixture;
+    using Rule = explorer::SearchScopeRule;
+    const auto sameRules = [](const std::vector<Rule>& actual, const std::vector<Rule>& expected) {
+        require(actual.size() == expected.size(), "descriptor import changed include rule count");
+        for (size_t index = 0; index < expected.size(); ++index) {
+            require(actual[index].folder && expected[index].folder, "descriptor omitted native include identity");
+            int order = 1;
+            const auto hr = actual[index].folder->Compare(expected[index].folder.Get(), SICHINT_CANONICAL, &order);
+            require(hr == S_OK && order == 0 && actual[index].recursive == expected[index].recursive &&
+                    actual[index].excluded == expected[index].excluded,
+                    "descriptor import changed native include identity, depth, exclusion or order");
+        }
+    };
+    const auto checkKnownInclude = [](const fs::path& path, const GUID& id, bool recursive, unsigned index) {
+        const auto document = loadXml(path);
+        const auto xpath = L"/persistedQuery/query/scope/include[" + std::to_wstring(index + 1) + L"]";
+        const auto include = xmlElement(document.Get(), xpath.c_str());
+        wchar_t identifier[40]{};
+        require(StringFromGUID2(id, identifier, 40) != 0, "format descriptor known-folder identity");
+        require(xmlAttribute(include.Get(), L"knownFolder") == identifier &&
+                xmlAttribute(include.Get(), L"nonRecursive") == (recursive ? L"false" : L"true"),
+                "descriptor lost exact native known-folder identity or individual depth");
+        AutomationVariant physical;
+        XmlString physicalName(L"path");
+        succeeded(include->getAttribute(physicalName.value, &physical.value), "read known-folder physical substitute");
+        require(physical.value.vt == VT_NULL || physical.value.vt == VT_EMPTY,
+                "descriptor substituted a filesystem path for its native known-folder scope");
+    };
+
+    ComPtr<IShellItem> computer, controlPanel;
+    succeeded(SHGetKnownFolderItem(FOLDERID_ComputerFolder, KF_FLAG_DEFAULT, nullptr, IID_PPV_ARGS(&computer)),
+              "retain actual This PC scope without enumeration");
+    succeeded(SHGetKnownFolderItem(FOLDERID_ControlPanelFolder, KF_FLAG_DEFAULT, nullptr, IID_PPV_ARGS(&controlPanel)),
+              "retain actual Control Panel scope without mutation");
+    const std::wstring impossible = L"System.FileName:=\"owned-search-virtual-" + fixture.root.filename().native() + L"\"";
+    unsigned sequence = 0;
+    for (const auto& known : {std::pair{computer, FOLDERID_ComputerFolder},
+                             std::pair{controlPanel, FOLDERID_ControlPanelFolder}}) {
+        for (const bool recursive : {false, true}) {
+            const std::vector<Rule> rules{{known.first, recursive, false}};
+            const auto path = fixture.root / (L"known-" + std::to_wstring(++sequence) + L".search-ms");
+            succeeded(explorer::saveSearchForScopeRules(impossible, rules, path), "save exact native known-folder depth");
+            checkKnownInclude(path, known.second, recursive, 0);
+            explorer::SavedSearchMetadata metadata;
+            succeeded(explorer::readSavedSearch(path, &metadata), "import exact native known-folder depth");
+            sameRules(metadata.scopeRules, rules);
+            require(metadata.scope && metadata.recursive == recursive, "first native include depth was replaced");
+            reopenSearch(path); // Native bind/PIDL identity only; never enumerate This PC.
+            const auto again = fixture.root / (L"known-again-" + std::to_wstring(sequence) + L".search-ms");
+            succeeded(explorer::saveSearchForScopeRules(metadata.query, metadata.scopeRules, again),
+                      "resave imported exact native known-folder depth");
+            checkKnownInclude(again, known.second, recursive, 0);
+            explorer::SavedSearchMetadata restored;
+            succeeded(explorer::readSavedSearch(again, &restored), "read resaved native known-folder depth");
+            sameRules(restored.scopeRules, rules);
+            if (!recursive) {
+                ComPtr<IShellItem> live;
+                require(explorer::createSearchFolderForScopeRules(impossible, rules, &live) == unsupported && !live,
+                        "file-free factory claimed unsupported virtual depth fidelity");
+            }
+        }
+    }
+
+    const auto physicalPath = fixture.root / L"Physical include 資料";
+    require(fs::create_directories(physicalPath / L"nested"), "create owned mixed-depth hierarchy");
+    const auto prefix = L"owned-mixed-" + fixture.root.filename().native() + L"-";
+    const auto direct = physicalPath / (prefix + L"direct.txt");
+    const auto nested = physicalPath / L"nested" / (prefix + L"nested.txt");
+    write(direct, "unchanged mixed-depth direct source");
+    write(nested, "unchanged mixed-depth nested source");
+    const std::vector<fs::path> initial{direct, nested};
+    std::vector<FileIdentity> identities;
+    std::vector<FILE_BASIC_INFO> basics;
+    for (const auto& path : initial) { identities.push_back(fileIdentity(path.native())); basics.push_back(fileBasic(path)); }
+    auto physical = shellItem(physicalPath);
+    const auto query = L"System.FileName:~<\"" + prefix + L"\"";
+    struct Example {
+        bool virtualRecursive, physicalRecursive;
+        fs::path saved, again;
+        std::vector<Rule> rules;
+    };
+    std::vector<Example> examples;
+    for (const auto [virtualRecursive, physicalRecursive] :
+         {std::pair{true, false}, std::pair{false, true}, std::pair{false, false}}) {
+        const auto index = examples.size();
+        Example example{virtualRecursive, physicalRecursive,
+            fixture.root / (L"mixed-" + std::to_wstring(index) + L".search-ms"),
+            fixture.root / (L"mixed-again-" + std::to_wstring(index) + L".search-ms"),
+            {{controlPanel, virtualRecursive, false}, {physical, physicalRecursive, false}}};
+        ComPtr<IShellItem> fileFree;
+        require(explorer::createSearchFolderForScopeRules(query, example.rules, &fileFree) == unsupported && !fileFree,
+                "file-free factory silently dropped a mixed virtual scope or changed its depth");
+        succeeded(explorer::saveSearchForScopeRules(query, example.rules, example.saved), "save native mixed-depth descriptor");
+        checkKnownInclude(example.saved, FOLDERID_ControlPanelFolder, virtualRecursive, 0);
+        explorer::SavedSearchMetadata imported;
+        succeeded(explorer::readSavedSearch(example.saved, &imported), "import mixed physical/virtual native depths");
+        sameRules(imported.scopeRules, example.rules);
+        std::set<std::wstring> expected{direct.native()};
+        if (physicalRecursive) expected.insert(nested.native());
+        // Control Panel is a native settings namespace, not a userwide index
+        // or network root. Only our GUID-qualified owned filenames can match.
+        requireReopenedResults(example.saved, expected, "mixed descriptor changed complete physical-depth FileIDs");
+        succeeded(explorer::saveSearchForScopeRules(imported.query, imported.scopeRules, example.again),
+                  "resave imported mixed native depths");
+        requireReopenedResults(example.again, expected, "resaved mixed descriptor changed complete physical-depth FileIDs");
+        examples.push_back(std::move(example));
+    }
+
+    const auto newDirect = physicalPath / (prefix + L"new-direct.txt");
+    const auto newNested = physicalPath / L"nested" / (prefix + L"new-nested.txt");
+    write(newDirect, "new direct match after saved publication");
+    write(newNested, "new nested match after saved publication");
+    for (const auto& example : examples) {
+        std::set<std::wstring> expected{direct.native(), newDirect.native()};
+        if (example.physicalRecursive) { expected.insert(nested.native()); expected.insert(newNested.native()); }
+        requireReopenedResults(example.saved, expected, "original mixed descriptor froze its native result membership");
+        requireReopenedResults(example.again, expected, "resaved mixed descriptor froze its native result membership");
+    }
+    for (size_t index = 0; index < initial.size(); ++index) {
+        const auto now = fileBasic(initial[index]);
+        require(fileIdentity(initial[index].native()) == identities[index] &&
+                now.FileAttributes == basics[index].FileAttributes && now.CreationTime.QuadPart == basics[index].CreationTime.QuadPart &&
+                now.LastWriteTime.QuadPart == basics[index].LastWriteTime.QuadPart && now.ChangeTime.QuadPart == basics[index].ChangeTime.QuadPart &&
+                read(initial[index]) == (index == 0 ? "unchanged mixed-depth direct source" : "unchanged mixed-depth nested source"),
+                "native mixed descriptor execution changed owned source identity/bytes/basic metadata");
+    }
+
+    const auto output = examples.front().saved;
+    const auto originalBytes = read(output);
+    const auto originalId = fileIdentity(output.native());
+    const auto originalBasic = fileBasic(output);
+    const auto originalMembers = fixtureMembers(fixture.root);
+    const auto duplicate = explorer::saveSearchForScopeRules(query, examples.back().rules, output);
+    require(duplicate == HRESULT_FROM_WIN32(ERROR_FILE_EXISTS) || duplicate == HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS),
+            "mixed native descriptor overwrote an existing target without confirmation");
+    for (const auto& invalid : {std::vector<Rule>{{nullptr, false, false}}, std::vector<Rule>(257, {controlPanel, false, false})}) {
+        require(FAILED(explorer::saveSearchForScopeRules(query, invalid, output, explorer::SearchSaveMode::UserConfirmed)),
+                "invalid mixed native descriptor accepted confirmed replacement");
+    }
+    const auto preserved = fileBasic(output);
+    require(read(output) == originalBytes && fileIdentity(output.native()) == originalId &&
+            preserved.CreationTime.QuadPart == originalBasic.CreationTime.QuadPart &&
+            preserved.LastWriteTime.QuadPart == originalBasic.LastWriteTime.QuadPart &&
+            preserved.ChangeTime.QuadPart == originalBasic.ChangeTime.QuadPart && preserved.FileAttributes == originalBasic.FileAttributes &&
+            fixtureMembers(fixture.root) == originalMembers,
+            "rejected mixed descriptor save changed target metadata/identity/bytes or leaked staging files");
+    succeeded(explorer::saveSearchForScopeRules(query, examples.back().rules, output, explorer::SearchSaveMode::UserConfirmed),
+              "publish user-confirmed native mixed-depth replacement");
+    explorer::SavedSearchMetadata replacement;
+    succeeded(explorer::readSavedSearch(output, &replacement), "import user-confirmed native mixed-depth replacement");
+    sameRules(replacement.scopeRules, examples.back().rules);
+    requireReopenedResults(output, {direct.native(), newDirect.native()},
+                           "confirmed mixed descriptor replacement changed native shallow semantics");
 }
 
 void protectiveScopeGuardsAndNewMatches() {
@@ -1344,6 +1499,13 @@ void protectiveScopeGuardsAndNewMatches() {
 }
 
 void confirmedSearchReplacement() {
+    const auto requireNewWriteTime = [](const FILE_BASIC_INFO& before, const FILE_BASIC_INFO& after, unsigned stage) {
+        std::cout << "INFO: confirmed save publication stage=" << stage
+                  << " previousWrite=" << before.LastWriteTime.QuadPart
+                  << " replacementWrite=" << after.LastWriteTime.QuadPart << '\n';
+        require(after.LastWriteTime.QuadPart != before.LastWriteTime.QuadPart,
+                "confirmed replacement retained the previous query's native write timestamp");
+    };
     Fixture fixture;
     const auto scopePath = fixture.root / L"scope";
     require(fs::create_directory(scopePath), "create owned replacement search scope");
@@ -1380,6 +1542,7 @@ void confirmedSearchReplacement() {
     require(fixtureMembers(fixture.root) == members, "confirmed replacement leaked a temporary/backup file");
     loadXml(output);
     requireReopenedResults(output, {second.native()}, "replaced native saved query has stale membership");
+    requireNewWriteTime(basic, replaced, 1);
     explorer::SavedSearchMetadata imported;
     succeeded(explorer::readSavedSearch(output, &imported), "read replaced saved-query metadata");
     require(imported.query.find(L"second.bin") != std::wstring::npos, "replaced query retained stale metadata");
@@ -1435,11 +1598,13 @@ void confirmedSearchReplacement() {
     // an absent path after a successful Save dialog selected a fresh name.
     ComPtr<IShellItemArray> scopes;
     succeeded(SHCreateShellItemArrayFromShellItem(scope.Get(), IID_PPV_ARGS(&scopes)), "create owned union scope");
+    const auto beforeUnionBasic = fileBasic(output);
     succeeded(explorer::saveSearchForScopes(L"System.FileName:=\"first.txt\"", scopes.Get(), true, output,
         explorer::SearchSaveMode::UserConfirmed), "replace confirmed union-scope query");
     require(read(output).find("first.txt") != std::string::npos && read(output).find("second.bin") == std::string::npos,
             "union replacement did not publish the requested XML");
     requireReopenedResults(output, {first.native()}, "union replacement kept stale query membership");
+    requireNewWriteTime(beforeUnionBasic, fileBasic(output), 2);
     const std::vector<explorer::SearchScopeRule> rules{{scope, false, false}};
     const auto beforeRuleBytes = read(output);
     const auto beforeRuleId = fileIdentity(output.native());
@@ -1513,6 +1678,7 @@ void confirmedSearchReplacement() {
             liveEvidence(7, L"System.FileName:=\"second.bin\"", rules);
             if (SUCCEEDED(importedStatus)) liveEvidence(8, metadata.query, metadata.scopeRules);
         });
+    requireNewWriteTime(beforeRuleBasic, fileBasic(output), 3);
     const auto fresh = fixture.root / L"new-confirmed.search-ms";
     succeeded(explorer::saveSearchForScopeRules(L"System.Size:>0", rules, fresh,
         explorer::SearchSaveMode::UserConfirmed), "confirmed dialog fresh path creates a new query");
@@ -1537,6 +1703,7 @@ void confirmedSearchReplacement() {
     require((fileBasic(output).FileAttributes & FILE_ATTRIBUTE_COMPRESSED) != 0 && fileDacl(output) == dacl,
             "confirmed save lost native compression or permissions");
     requireReopenedResults(output, {first.native()}, "compressed replacement has incorrect native results");
+    requireNewWriteTime(compressed, fileBasic(output), 4);
     require(fileIdentity(first.native()) == firstId && fileIdentity(second.native()) == secondId &&
             read(first) == "original source must survive" && read(second) == "second source must survive",
             "saved-query replacement changed source file identity or content");
@@ -1671,6 +1838,7 @@ int runSearchTests() {
         {"typed day/range inclusive boundaries and live/saved/restored native identities", absoluteDateDayAndRangeResults},
         {"native saved numeric/string/wildcard/Boolean comparison results", comparisonOperatorSemantics},
         {"saved-search XML escaping, Unicode and This PC identity", xmlEscapingAndThisPcScope},
+        {"native known-folder depth and mixed descriptor FileIDs/persistence", knownFolderDepthAndMixedDescriptors},
         {"full-field native scope guards, aliases and newly matching four-route FileIDs", protectiveScopeGuardsAndNewMatches},
         {"confirmed saved-search replacement, native results, permissions and failure preservation", confirmedSearchReplacement},
         {"confirmed saves preserve exact legacy/protected/modern/deny ACLs and native identities", confirmedSearchSecurityProfiles},

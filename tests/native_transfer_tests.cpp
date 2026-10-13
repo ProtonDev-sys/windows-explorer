@@ -1,3 +1,4 @@
+#include "explorer/native_apartment.hpp"
 #include "explorer/breadcrumb.hpp"
 #include "explorer/context_menu.hpp"
 #include "explorer/headless_visual.hpp"
@@ -733,12 +734,27 @@ struct Publication {
         }
     }
     void publish(const std::vector<const Source*>& sources, bool cut) {
-        require(clipboardEmpty(owner), "Refuse to replace unrelated clipboard contents");
         const auto selection = sourceArray(sources);
-        succeeded(nativeCall("ShellOperations.copyToClipboard", [&] { return explorer::ShellOperations::copyToClipboard(owner, selection.Get(), cut, &producer); }, cut ? "cut" : "copy"), "Publish actual normal Shell copy/cut producer");
+        if (!cut) {
+            SFGAOF attributes = 0;
+            const HRESULT capability = nativeCall("IShellItemArray.GetAttributes.CANLINK", [&] {
+                return selection->GetAttributes(static_cast<SIATTRIBFLAGS>(SIATTRIBFLAGS_AND | SIATTRIBFLAGS_ALLITEMS),
+                    SFGAO_CANLINK, &attributes);
+            }, "owned-native-copy");
+            std::cout << "Native owned Copy whole-array capability HRESULT=" << static_cast<ULONG>(capability)
+                << " attributes=" << attributes << " expectedSourceCount=" << sources.size() << std::endl;
+            require(capability == S_OK && (attributes & SFGAO_CANLINK),
+                "Owned native Copy sources must independently support links across the complete array");
+        }
+        publishArray(sources, selection.Get(), cut,
+            cut ? static_cast<DWORD>(DROPEFFECT_MOVE) : static_cast<DWORD>(DROPEFFECT_COPY | DROPEFFECT_LINK));
+    }
+    void publishArray(const std::vector<const Source*>& sources, IShellItemArray* selection,
+                      bool cut, DWORD expectedEffect) {
+        require(clipboardEmpty(owner), "Refuse to replace unrelated clipboard contents");
+        succeeded(nativeCall("ShellOperations.copyToClipboard", [&] { return explorer::ShellOperations::copyToClipboard(owner, selection, cut, &producer); }, cut ? "cut" : "copy"), "Publish actual normal Shell copy/cut producer");
         require(producer && nativeCall("OleIsCurrentClipboard", [&] { return OleIsCurrentClipboard(producer.Get()); }) == S_OK, "Actual producer owns the clipboard");
         verifyCida(producer.Get(), sources);
-        const DWORD expectedEffect = cut ? static_cast<DWORD>(DROPEFFECT_MOVE) : static_cast<DWORD>(DROPEFFECT_COPY);
         require(effectData(producer.Get(), CFSTR_PREFERREDDROPEFFECT) == expectedEffect,
             "Normal copy/cut preferred effect differs");
         ComPtr<IDataObject> consumer; succeeded(nativeCall("OleGetClipboard", [&] { return OleGetClipboard(&consumer); }, "helper-consumer"), "Read actual clipboard consumer wrapper");
@@ -774,6 +790,78 @@ struct Publication {
         }
     }
 };
+
+// Controlled aggregate capability only: the complete owned filesystem array
+// still supplies the genuine native IDataObject and every clipboard format.
+// These negatives exercise unknown/unlinkable provider reports, not coverage
+// of a real namespace provider or permission to fabricate an enabled command.
+class CapabilityArray final : public RuntimeClass<RuntimeClassFlags<ClassicCom>, IShellItemArray> {
+public:
+    CapabilityArray(IShellItemArray* original, HRESULT status, SFGAOF attributes)
+        : original_(original), status_(status), attributes_(attributes) {}
+    unsigned attributeCalls = 0, itemCalls = 0, dataBindings = 0;
+    SIATTRIBFLAGS requestedFlags = static_cast<SIATTRIBFLAGS>(0);
+    SFGAOF requestedMask = 0;
+    IFACEMETHODIMP BindToHandler(IBindCtx* context, REFGUID handler, REFIID iid, void** output) override {
+        if (handler == BHID_DataObject) ++dataBindings;
+        return original_->BindToHandler(context, handler, iid, output);
+    }
+    IFACEMETHODIMP GetPropertyStore(GETPROPERTYSTOREFLAGS flags, REFIID iid, void** output) override {
+        return original_->GetPropertyStore(flags, iid, output);
+    }
+    IFACEMETHODIMP GetPropertyDescriptionList(REFPROPERTYKEY key, REFIID iid, void** output) override {
+        return original_->GetPropertyDescriptionList(key, iid, output);
+    }
+    IFACEMETHODIMP GetAttributes(SIATTRIBFLAGS flags, SFGAOF mask, SFGAOF* output) override {
+        ++attributeCalls;
+        requestedFlags = flags; requestedMask = mask;
+        if (!output) return E_POINTER;
+        *output = attributes_;
+        if (flags != static_cast<SIATTRIBFLAGS>(SIATTRIBFLAGS_AND | SIATTRIBFLAGS_ALLITEMS) || mask != SFGAO_CANLINK)
+            return E_INVALIDARG;
+        return status_;
+    }
+    IFACEMETHODIMP GetCount(DWORD* output) override { return original_->GetCount(output); }
+    IFACEMETHODIMP GetItemAt(DWORD, IShellItem** output) override {
+        ++itemCalls;
+        if (!output) return E_POINTER;
+        *output = nullptr; return E_ACCESSDENIED;
+    }
+    IFACEMETHODIMP EnumItems(IEnumShellItems** output) override { return original_->EnumItems(output); }
+private:
+    ComPtr<IShellItemArray> original_;
+    HRESULT status_;
+    SFGAOF attributes_;
+};
+
+void controlledClipboardCapabilities(Browser& browser, Fixture& fixture) {
+    const std::vector<const Source*> sources{&fixture.sources[0], &fixture.sources[1]};
+    const auto original = sourceArray(sources);
+    DWORD count = 0;
+    succeeded(original->GetCount(&count), "Read complete native capability-control count");
+    require(count == 2, "Capability control must retain both actual owned source items");
+    struct Case { HRESULT status; SFGAOF attributes; bool cut; DWORD effect; };
+    const std::array cases{
+        Case{S_FALSE, 0, false, DROPEFFECT_COPY},
+        Case{E_ACCESSDENIED, SFGAO_CANLINK, false, DROPEFFECT_COPY},
+        Case{S_OK, SFGAO_CANLINK, true, DROPEFFECT_MOVE}
+    };
+    for (const auto& control : cases) {
+        auto array = Make<CapabilityArray>(original.Get(), control.status, control.attributes);
+        require(array != nullptr, "Retain actual native array for controlled aggregate capability");
+        Publication clipboard(browser.owner);
+        clipboard.publishArray(sources, array.Get(), control.cut, control.effect);
+        require(array->attributeCalls == (control.cut ? 0u : 1u) && array->itemCalls == 0u && array->dataBindings == 1u,
+            "Copy must query the complete aggregate once; Cut must skip it and neither may sample items");
+        require(control.cut || (array->requestedFlags == static_cast<SIATTRIBFLAGS>(SIATTRIBFLAGS_AND | SIATTRIBFLAGS_ALLITEMS) &&
+            array->requestedMask == SFGAO_CANLINK), "Copy aggregate capability must request all original items with AND semantics");
+        clipboard.clear();
+        fixture.verifySources({});
+        std::cout << "PASS controlled aggregate clipboard capability HRESULT=" << static_cast<ULONG>(control.status)
+            << " attributes=" << control.attributes << " cut=" << control.cut
+            << " actualPreferredEffect=" << control.effect << " completeSourceCount=" << count << std::endl;
+    }
+}
 
 void describeTransferFormats(const char* label, IDataObject* object) {
     ComPtr<IEnumFORMATETC> enumeration;
@@ -871,8 +959,14 @@ struct ShortcutState {
     unsigned viewBackgroundMatches = 0;
     bool viewBackgroundEnabled = false;
 };
+struct ShortcutFolderOracle {
+    Identity source, destination;
+    HRESULT status = E_PENDING;
+    unsigned matches = 0;
+    bool enabled = false;
+};
 ShortcutState describeShortcutState(Browser& browser, IDataObject* producer, const Source& source,
-                                    const char* phase, bool formats) {
+                                    const char* phase, bool formats, DWORD expectedPreference = DROPEFFECT_COPY | DROPEFFECT_LINK) {
     // Inspect the normal registered leaf and independently created, fully
     // populated native folder background menu. Neither route invokes a leaf.
     ShortcutState result;
@@ -939,8 +1033,8 @@ ShortcutState describeShortcutState(Browser& browser, IDataObject* producer, con
     const DWORD producerEffect = producer ? effectData(producer, CFSTR_PREFERREDDROPEFFECT) : MAXDWORD;
     const DWORD consumerEffect = effectData(consumer.Get(), CFSTR_PREFERREDDROPEFFECT);
     std::cout << "Native shortcut clipboard phase=" << phase << " completeCidaIdentityMatches=1 producerEffect="
-        << producerEffect << " consumerEffect=" << consumerEffect << std::endl;
-    require((!producer || producerEffect == DROPEFFECT_COPY) && consumerEffect == DROPEFFECT_COPY,
+        << producerEffect << " consumerEffect=" << consumerEffect << " expectedPreference=" << expectedPreference << std::endl;
+    require((!producer || producerEffect == expectedPreference) && consumerEffect == expectedPreference,
         "Paste Shortcut producer/consumer changed its native COPY preference");
     if (producer) describeShortcutHdrop(phase, "producer", producer, source);
     describeShortcutHdrop(phase, "consumer", consumer.Get(), source);
@@ -951,7 +1045,10 @@ ShortcutState describeShortcutState(Browser& browser, IDataObject* producer, con
     return result;
 }
 
-void waitShortcutEnabled(Browser& browser, Publication& clipboard, const Source& source) {
+void waitShortcutEnabled(Browser& browser, Publication& clipboard, const Source& source,
+                         const ShortcutFolderOracle& original) {
+    require(original.source == source.id && original.destination == identity(itemPath(browser.folder.Get())),
+        "Paste Shortcut folder oracle must describe the same actual owned source and destination");
     const auto started = GetTickCount64();
     const auto initial = describeShortcutState(browser, clipboard.producer.Get(), source, "published", true);
     bool enabled = SUCCEEDED(initial.registeredStatus) && initial.registered.enabled;
@@ -968,10 +1065,18 @@ void waitShortcutEnabled(Browser& browser, Publication& clipboard, const Source&
     }
     const auto settled = describeShortcutState(browser, clipboard.producer.Get(), source, "settled", !enabled);
     std::cout << "Native shortcut readiness samples=" << samples << " elapsedMs=" << GetTickCount64() - started << std::endl;
-    require(SUCCEEDED(settled.registeredStatus) && settled.registered.enabled,
-        "Native Paste Shortcut remained disabled after normal clipboard/view dispatch");
-    require(SUCCEEDED(settled.backgroundStatus) && settled.backgroundMatches == 1 && settled.backgroundEnabled,
-        "Native registered Paste Shortcut differs from the unique enabled folder-background leaf");
+    require(SUCCEEDED(settled.registeredStatus) && settled.registered.enabled &&
+        !settled.registered.submenu && settled.registered.commandId &&
+        settled.registered.route == explorer::NamespaceInvocationRoute::CommandStoreMenu,
+        "Native Paste Shortcut must have one exact enabled registered leaf after normal clipboard/view dispatch");
+    std::cout << "Native shortcut original folder oracle HRESULT=" << static_cast<ULONG>(original.status)
+        << " matches=" << original.matches << " enabled=" << original.enabled
+        << " helperHRESULT=" << static_cast<ULONG>(settled.backgroundStatus)
+        << " helperMatches=" << settled.backgroundMatches << " helperEnabled=" << settled.backgroundEnabled << std::endl;
+    require(settled.backgroundStatus == original.status && settled.backgroundMatches == original.matches &&
+        settled.backgroundEnabled == original.enabled && original.source == source.id &&
+        original.destination == identity(itemPath(browser.folder.Get())),
+        "Helper Paste Shortcut differs from the original native Copy folder-background oracle for the same source/destination");
     require(SUCCEEDED(settled.viewBackgroundStatus) && settled.viewBackgroundMatches == 1 && settled.viewBackgroundEnabled,
         "Native registered Paste Shortcut differs from the unique enabled actual view-background leaf");
 }
@@ -1029,10 +1134,17 @@ public:
             << " sourceContentMatches=" << sourceContentMatches << " sourceModifiedMatches=" << sourceModifiedMatches
             << " expectedSourceBytes=" << source_.bytes.size() << std::endl;
         describeShortcutHdrop("native-copy-capture", "consumer", consumer.Get(), source_);
-        require(preferredEffect == DROPEFFECT_COPY && sourceExists && sourceIdentityMatches &&
+        // DROPEFFECT is a flag set: Microsoft requires masked comparisons.
+        // https://learn.microsoft.com/en-us/windows/win32/com/dropeffect-constants
+        require((preferredEffect & DROPEFFECT_COPY) != 0 && (preferredEffect & DROPEFFECT_MOVE) == 0 &&
+            sourceExists && sourceIdentityMatches &&
             sourceContentMatches && sourceModifiedMatches,
             "Original native Copy changed its exact selection/effect/source");
         require(ownedPublication(), "Original native Copy publication changed during capture");
+        // Preserve the exact flags published by the native Copy command.
+        // A native COPY|LINK publication is distinct from the helper's
+        // explicitly authored COPY-only producer; later reads must match it.
+        preferredEffect_ = preferredEffect;
         captured_ = true;
         std::cout << "Native Copy ownership ownerPrivateSTA=1 sequence=" << sequence_
             << " exactCidaCopySource=1" << std::endl;
@@ -1040,6 +1152,7 @@ public:
     void verify() const {
         require(captured_ && ownedPublication(), "Original native Copy clipboard owner/sequence was replaced");
     }
+    DWORD preferredEffect() const { verify(); return preferredEffect_; }
     void clear() {
         verify();
         const auto deadline = GetTickCount64() + 2000;
@@ -1073,14 +1186,18 @@ private:
     }
     HWND frame_ = nullptr, owner_ = nullptr;
     const Source& source_;
-    DWORD before_ = 0, sequence_ = 0;
+    DWORD before_ = 0, sequence_ = 0, preferredEffect_ = MAXDWORD;
     bool captured_ = false, cleared_ = false;
     OperationLease operation_;
 };
 
-void originalViewCopyControl(Browser& destination, Fixture& fixture) {
+ShortcutFolderOracle originalViewCopyControl(Browser& destination, Fixture& fixture) {
     nativePhase("originalViewCopyControl.begin");
     const auto& source = fixture.sources[3];
+    const auto destinationId = identity(itemPath(destination.folder.Get()));
+    const auto destinationView = destination.view;
+    const auto destinationFolder = destination.folder;
+    ShortcutFolderOracle oracle{source.id, destinationId};
     Browser original;
     original.initialize(source.path.parent_path(), static_cast<int>(fixture.sources.size() - 1), true);
     const auto item = shellItem(source.path);
@@ -1132,25 +1249,40 @@ void originalViewCopyControl(Browser& destination, Fixture& fixture) {
         SetActiveWindow(destination.owner);
         require(GetActiveWindow() == destination.owner, "Reactivate exact private native Copy destination frame");
         succeeded(nativeCall("view.UIActivate", [&] { return destination.view->UIActivate(SVUIA_ACTIVATE_NOFOCUS); }, "native-copy-destination"), "Reactivate exact native Copy destination view");
-        const auto initial = describeShortcutState(destination, nullptr, source, "native-copy-published", true);
+        const auto initial = describeShortcutState(destination, nullptr, source, "native-copy-published", true, publication.preferredEffect());
         bool ready = SUCCEEDED(initial.registeredStatus) && initial.registered.enabled;
         const auto started = GetTickCount64();
         while (!ready && GetTickCount64() - started < 5000) {
             pump(); publication.verify();
             ready = destination.plan(L"Windows.pastelink").enabled;
         }
-        const auto settled = describeShortcutState(destination, nullptr, source, "native-copy-settled", !ready);
+        const auto settled = describeShortcutState(destination, nullptr, source, "native-copy-settled", !ready, publication.preferredEffect());
         publication.verify();
         std::cout << "Native original Copy control registeredEnabled=" << settled.registered.enabled
             << " viewEnabled=" << settled.viewBackgroundEnabled << " viewMatches=" << settled.viewBackgroundMatches
             << " folderEnabled=" << settled.backgroundEnabled << " folderMatches=" << settled.backgroundMatches << std::endl;
+        require(SUCCEEDED(settled.registeredStatus) && settled.registered.enabled &&
+            !settled.registered.submenu && settled.registered.commandId &&
+            settled.registered.route == explorer::NamespaceInvocationRoute::CommandStoreMenu,
+            "Original native Copy must expose one exact enabled registered Paste Shortcut leaf");
+        require(SUCCEEDED(settled.viewBackgroundStatus) && settled.viewBackgroundMatches == 1 && settled.viewBackgroundEnabled,
+            "Original native Copy must expose one unique enabled actual view-background Paste Shortcut leaf");
+        require(settled.backgroundStatus == S_OK && settled.backgroundMatches <= 1u,
+            "Original native Copy folder-background oracle must be a successful unambiguous native enumeration");
+        oracle.status = settled.backgroundStatus;
+        oracle.matches = settled.backgroundMatches;
+        oracle.enabled = settled.backgroundEnabled;
         publication.clear();
     }
     require(preserved(source), "Original native Copy control changed its source");
     nativeCall("nativeCopyControl.release", [&] { menu.reset(); context.Reset(); viewData.Reset(); selectedItem.Reset(); selected.Reset(); });
     original.close();
     require(GetActiveWindow() == destination.owner, "Original native Copy control lost the exact destination activation");
+    require(destination.view.Get() == destinationView.Get() && destination.folder.Get() == destinationFolder.Get() &&
+        identity(itemPath(destination.folder.Get())) == destinationId && preserved(source),
+        "Original native Copy folder oracle lost its retained same-source/destination native view");
     nativePhase("originalViewCopyControl.complete");
+    return oracle;
 }
 
 void waitMembership(Browser& browser, const fs::path& destination, size_t count) {
@@ -1181,6 +1313,13 @@ void verifyShortcut(const Source& source, const fs::path& shortcut) {
         "Native shortcut target/source differs from owned original");
 }
 void drop(Browser& browser, const Source& source, const fs::path& destination, DWORD requested, DWORD keys) {
+    require((keys & ~(MK_CONTROL | MK_SHIFT)) == 0,
+        "Left-drag fixture keys must contain only Control/Shift modifiers");
+    // QueryContinueDrag continues while the initiating button is held and
+    // requests Drop when it is released; retain modifiers across that release.
+    // https://learn.microsoft.com/en-us/windows/win32/api/oleidl/nf-oleidl-idropsource-querycontinuedrag
+    const DWORD dragKeys = keys | MK_LBUTTON;
+    const DWORD dropKeys = keys;
     const auto selection = sourceArray({&source}); ComPtr<IDataObject> data;
     succeeded(nativeCall("selection.BindToHandler.DataObject", [&] { return selection->BindToHandler(nullptr, BHID_DataObject, IID_PPV_ARGS(&data)); }, "drop", requested), "Bind original native drop data object");
     verifyCida(data.Get(), {&source});
@@ -1198,8 +1337,9 @@ void drop(Browser& browser, const Source& source, const fs::path& destination, D
             << " asyncModeHRESULT=" << static_cast<ULONG>(asynchronousModeStatus) << " asyncMode=" << asynchronousMode
             << " operationHRESULT=" << static_cast<ULONG>(operationStatus) << " operationActive=" << operationActive
             << " sourcePreserved=" << preserved(source) << " sourceBytes=" << source.bytes.size()
-            << " dragEnterKeys=" << keys << " dragOverKeys=" << keys << " dropKeys=" << keys
-            << " leftButton=" << ((keys & MK_LBUTTON) != 0) << " rightButton=" << ((keys & MK_RBUTTON) != 0) << std::endl;
+            << " dragEnterKeys=" << dragKeys << " dragOverKeys=" << dragKeys << " dropKeys=" << dropKeys
+            << " dragLeftButton=" << ((dragKeys & MK_LBUTTON) != 0) << " dropLeftButton=" << ((dropKeys & MK_LBUTTON) != 0)
+            << " rightButton=" << ((dragKeys & MK_RBUTTON) != 0) << std::endl;
     }
     explorer::BreadcrumbDropOptions options; options.site = browser.view;
     options.hitTest = [destination = browser.folder](POINTL, IShellItem** result) -> HRESULT {
@@ -1219,11 +1359,11 @@ void drop(Browser& browser, const Source& source, const fs::path& destination, D
     require(ClientToScreen(browser.owner, &point) != FALSE, "Read owned drop screen point");
     const POINTL position{point.x, point.y}; DWORD effect = requested;
     OperationLease operation;
-    succeeded(nativeCall("IDropTarget.DragEnter", [&] { return controller->DragEnter(data.Get(), keys, position, &effect); }, "drop", requested), "Forward actual native DragEnter");
+    succeeded(nativeCall("IDropTarget.DragEnter", [&] { return controller->DragEnter(data.Get(), dragKeys, position, &effect); }, "drop", requested), "Forward actual native DragEnter");
     require((effect & (DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK)) == requested, "Native DragEnter did not accept requested action");
-    effect = requested; succeeded(nativeCall("IDropTarget.DragOver", [&] { return controller->DragOver(keys, position, &effect); }, "drop", requested), "Forward actual native DragOver");
+    effect = requested; succeeded(nativeCall("IDropTarget.DragOver", [&] { return controller->DragOver(dragKeys, position, &effect); }, "drop", requested), "Forward actual native DragOver");
     require((effect & (DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK)) == requested, "Native DragOver changed requested action");
-    effect = requested; succeeded(nativeCall("IDropTarget.Drop", [&] { return controller->Drop(data.Get(), keys, position, &effect); }, "drop", requested), "Forward actual native Drop");
+    effect = requested; succeeded(nativeCall("IDropTarget.Drop", [&] { return controller->Drop(data.Get(), dropKeys, position, &effect); }, "drop", requested), "Forward actual native Drop");
     const DWORD completedEffect = effect & (DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK);
     // An optimized move has already moved the original and can return NONE,
     // avoiding a second source-side deletion. Exact source/output identity is
@@ -1284,6 +1424,7 @@ void run(bool dropsOnly) {
         "Fresh disposable transfer VM must have no pre-existing native history");
     require(!browser.plan(L"Windows.paste").enabled && !browser.plan(L"Windows.pastelink").enabled,
         "Native paste commands must be disabled with empty clipboard");
+    controlledClipboardCapabilities(browser, fixture);
     {
         Publication clipboard(browser.owner); clipboard.publish({&fixture.sources[0], &fixture.sources[1]}, false);
         OperationLease operation;
@@ -1310,10 +1451,10 @@ void run(bool dropsOnly) {
         std::cout << "PASS native Cut/Paste: MOVE preference, same-volume exact ID/content, source removal and native view\n";
     }
     browser.navigate(fixture.root / L"Shortcut");
-    originalViewCopyControl(browser, fixture);
+    const auto originalShortcutFolder = originalViewCopyControl(browser, fixture);
     {
         Publication clipboard(browser.owner); clipboard.publish({&fixture.sources[3]}, false);
-        waitShortcutEnabled(browser, clipboard, fixture.sources[3]);
+        waitShortcutEnabled(browser, clipboard, fixture.sources[3], originalShortcutFolder);
         OperationLease operation;
         browser.invoke(L"Windows.pastelink"); clipboard.waitComplete(); waitMembership(browser, fixture.root / L"Shortcut", 1);
         verifyShortcut(fixture.sources[3], children(fixture.root / L"Shortcut").front()); fixture.verifySources({2}); operation.complete(); clipboard.clear();
@@ -1359,7 +1500,8 @@ int main(int argc, char** argv) {
     std::unique_ptr<NativeCallWatchdog> watchdog;
     try { watchdog = std::make_unique<NativeCallWatchdog>(); }
     catch (...) { std::cerr << "FAIL: start owned native-call watchdog\n"; return 1; }
-    const auto initialized = nativeCall("OleInitialize", [] { return OleInitialize(nullptr); });
+    explorer::NativeApartmentOwner nativeApartment;
+    const auto initialized = nativeCall("OleInitialize", [&] { return nativeApartment.initializeOle(); });
     if (FAILED(initialized)) { std::cerr << "FAIL: initialize isolated transfer STA\n"; return 1; }
     int result = 0;
     try { run(dropsOnly); }
@@ -1372,7 +1514,7 @@ int main(int argc, char** argv) {
         if (!TerminateProcess(GetCurrentProcess(), 1)) std::_Exit(1);
         std::_Exit(1);
     }
-    nativeCall("OleUninitialize", [] { OleUninitialize(); });
+    nativeCall("OleUninitialize", [&] { nativeApartment.finishOrTerminate(); });
     if (FAILED(desktop.verifyIsolation())) result = 1;
     return result;
 }

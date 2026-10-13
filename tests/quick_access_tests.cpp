@@ -71,11 +71,26 @@ void eligibleCommandsAndBounds() {
     toolbar.clear();
     for (const auto command : ineligible) require(!explorer::quickAccessCommand(command) && !toolbar.add(command), "Unsupported or menu command admitted to QAT");
     const auto catalog = explorer::quickAccessCommands();
+    require(QuickAccessToolbar::MaximumCommands == 20, "QAT capacity must match the native twenty-command limit");
     require(catalog.size() > QuickAccessToolbar::MaximumCommands, "Catalog must support meaningful bounded customization");
-    for (std::size_t index = 0; index < QuickAccessToolbar::MaximumCommands; ++index) require(toolbar.add(catalog[index].command), "QAT rejected a command below capacity");
+    toolbar.setBelowRibbon(true);
+    std::vector<explorer::Command> expected;
+    for (std::size_t index = 0; index < 19; ++index) {
+        expected.push_back(catalog[index].command);
+        require(toolbar.add(catalog[index].command), "QAT rejected a command below nineteen");
+    }
+    require(toolbar.commands() == expected && toolbar.commands().size() == 19 && toolbar.belowRibbon(), "Nineteen-command QAT lost order or placement");
+    expected.push_back(catalog[19].command);
+    require(toolbar.add(catalog[19].command) && toolbar.commands() == expected && toolbar.commands().size() == 20, "QAT rejected or reordered the twentieth command");
     const auto full = toolbar.commands();
-    require(!toolbar.add(catalog[QuickAccessToolbar::MaximumCommands].command) && toolbar.commands() == full, "QAT exceeded its capacity");
-    require(toolbar.remove(full.front()) && toolbar.add(catalog[QuickAccessToolbar::MaximumCommands].command), "QAT capacity was not released after removal");
+    require(!toolbar.add(catalog[20].command) && !toolbar.add(full.back()) && toolbar.commands() == full && toolbar.belowRibbon(), "Twenty-first or duplicate QAT add mutated full state");
+    expected.erase(expected.begin() + 9);
+    require(toolbar.remove(full[9]) && toolbar.commands() == expected && toolbar.commands().size() == 19 && toolbar.belowRibbon(), "Removal from a full QAT lost remaining order or placement");
+    require(toolbar.add(full[9], 9) && toolbar.commands() == full && toolbar.belowRibbon(), "Re-adding the twentieth command did not restore its exact position");
+    expected = full;
+    expected.erase(expected.begin());
+    expected.push_back(catalog[20].command);
+    require(toolbar.remove(full.front()) && toolbar.add(catalog[20].command) && toolbar.commands() == expected && toolbar.commands().size() == 20 && toolbar.belowRibbon(), "QAT capacity was not released for a different command after removal");
 }
 
 void unicodePersistenceAndReplacement() {
@@ -142,6 +157,31 @@ void corruptAndFutureSettings() {
     require(loaded.commands().size() == QuickAccessToolbar::MaximumCommands && loaded.belowRibbon(), "Persisted QAT exceeded bounds or lost placement");
     const auto catalog = explorer::quickAccessCommands();
     for (std::size_t index = 0; index < loaded.commands().size(); ++index) require(loaded.commands()[index] == catalog[index].command, "Bounded QAT load lost command order");
+    require(catalog.size() > 21 && QuickAccessToolbar::MaximumCommands == 20, "QAT persistence boundary fixture lacks its declared commands");
+    const auto replacement = fixture.root / L"replacement.ini";
+    for (const std::size_t count : std::array<std::size_t, 4>{16, 19, 20, 21}) {
+        std::string settings = "version=1\nbelowRibbon=true\ncommands=";
+        std::vector<explorer::Command> expected;
+        for (std::size_t index = 0; index < count; ++index) {
+            const auto& entry = catalog[count - 1 - index];
+            if (index) settings += ',';
+            settings += entry.token;
+            if (index < 20) expected.push_back(entry.command);
+            if (count == 21 && index == 4) {
+                settings += ",unknown-future,";
+                settings += catalog[count - 3].token;
+            }
+        }
+        write(path, settings + '\n');
+        loaded = explorer::loadQuickAccessToolbar(path);
+        require(loaded.commands() == expected && loaded.belowRibbon(), "Legacy sixteen or new boundary settings lost ordered commands or placement");
+        const auto unchanged = loaded.commands();
+        require(!loaded.add(unchanged.front()) && loaded.commands() == unchanged && loaded.belowRibbon(), "Loaded QAT duplicate changed commands or placement");
+        loaded.setBelowRibbon(false);
+        require(explorer::saveQuickAccessToolbar(replacement, loaded), "Cannot serialize the legacy or expanded QAT command list");
+        const auto restored = explorer::loadQuickAccessToolbar(replacement);
+        require(restored.commands() == expected && !restored.belowRibbon(), "Saving and loading legacy sixteen or expanded twenty lost state");
+    }
 }
 } // namespace
 

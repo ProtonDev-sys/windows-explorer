@@ -34,6 +34,8 @@ std::optional<Command> shortcutCommand(UINT key, bool control, bool shift,
         if (key == 'W') return Close;
         if (key == VK_F1) return Collapse;
         if (editing) return std::nullopt;
+        if (key == 'Z') return Undo;
+        if (key == 'Y') return Redo;
         if (key == 'C') return Copy;
         if (key == 'X') return Cut;
         if (key == 'V') return Paste;
@@ -72,20 +74,23 @@ std::optional<Command> shortcutCommand(UINT key, bool control, bool shift,
 std::optional<FocusRegion> cycleFocusRegion(std::optional<FocusRegion> current,
                                            bool backwards,
                                            const FocusAvailability& available) noexcept {
-    constexpr int regionCount = 5;
+    constexpr std::array order{
+        FocusRegion::FolderView, FocusRegion::Preview, FocusRegion::Sorting,
+        FocusRegion::Status, FocusRegion::Toolbar, FocusRegion::Navigation};
+    constexpr int regionCount = static_cast<int>(order.size());
     const std::array<bool, regionCount> enabled{
-        available.folderView, available.sorting, available.status,
+        available.folderView, available.preview, available.sorting, available.status,
         available.toolbar, available.navigation};
     int index = backwards ? 0 : regionCount - 1;
     if (current) {
-        const int candidate = static_cast<int>(*current);
-        if (candidate >= 0 && candidate < regionCount) index = candidate;
+        for (int candidate = 0; candidate < regionCount; ++candidate)
+            if (order[static_cast<std::size_t>(candidate)] == *current) { index = candidate; break; }
     }
 
     for (int attempted = 0; attempted < regionCount; ++attempted) {
         index = (index + (backwards ? regionCount - 1 : 1)) % regionCount;
         if (enabled[static_cast<std::size_t>(index)])
-            return static_cast<FocusRegion>(index);
+            return order[static_cast<std::size_t>(index)];
     }
     return std::nullopt;
 }

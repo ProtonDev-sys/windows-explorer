@@ -1,3 +1,4 @@
+#include "explorer/native_apartment.hpp"
 #include "explorer/namespace_actions.hpp"
 #include "explorer/headless_visual.hpp"
 #include "explorer/worker_sta.hpp"
@@ -242,7 +243,34 @@ private:
     HRESULT status_ = E_PENDING;
 };
 
+// Preserve the actual native call and result, retaining only a verified
+// already-loaded executable reference while its actual provider is alive.
+template<class Call> HRESULT observeProviderCall(Call&& call) {
+    const auto admission=NativeApartmentOwner::currentAdmissionStatus();if(FAILED(admission))return admission;
+    const HRESULT actual=call();
+    const auto captured=NativeApartmentOwner::observeLoadedExplorerFrame();
+    return FAILED(captured)?captured:actual;
+}
+// Cleanup preserves the original native detach action even when a retained
+// normal reference has a sticky verification failure; finish surfaces it.
+template<class Call> HRESULT observeProviderCleanup(Call&& call) {
+    const auto context=NativeApartmentOwner::currentCleanupStatus();if(FAILED(context))return context;
+    const HRESULT actual=call();
+    const auto captured=NativeApartmentOwner::observeLoadedExplorerFrame();
+    return FAILED(captured)?captured:actual;
+}
+
+void captureMetadataText(NamespaceMetadataTextReceipt& receipt,HRESULT status,const wchar_t* text) noexcept {
+    receipt.attempted=true;receipt.status=status;receipt.present=text!=nullptr;
+    if(!text)return;
+    const auto length=wcsnlen_s(text,receipt.text.size());receipt.truncated=length==receipt.text.size();
+    const auto copied=std::min(length,receipt.text.size()-1);
+    if(copied)std::memcpy(receipt.text.data(),text,copied*sizeof(wchar_t));receipt.text[copied]=L'\0';
+}
+
 struct RegisteredProvider {
+    NativeApartmentClient apartmentClient; // Last release, after all native COM fields.
+    HRESULT lifetimeStatus=S_OK;
     CLSID handler = CLSID_NULL;
     ComPtr<IExplorerCommand> command;
     ComPtr<IExplorerCommandState> state;
@@ -250,7 +278,16 @@ struct RegisteredProvider {
     ComPtr<IObjectWithSite> withSite;
     bool initialized = false;
     bool siteAttached = false;
-    ~RegisteredProvider() { if (siteAttached && withSite) withSite->SetSite(nullptr); }
+    NamespaceCommandMetadataDiagnostics* diagnostics=nullptr; // Borrowed through synchronous retirement.
+    ~RegisteredProvider() {
+        apartmentClient.beforeNativeRelease();
+        if (siteAttached && withSite) {
+            const auto detached=observeProviderCleanup([&]{const auto actual=withSite->SetSite(nullptr);
+                if(diagnostics)diagnostics->nativeSiteDetach=actual;return actual;});
+            if(diagnostics)diagnostics->siteDetach=detached;
+        }
+        apartmentClient.beforeNativeRelease();
+    }
 };
 
 HRESULT recyclePropertiesMenuComposite(std::wstring_view command) {
@@ -292,7 +329,8 @@ HRESULT recyclePropertiesMenuComposite(std::wstring_view command) {
 }
 
 HRESULT loadRegisteredProvider(std::wstring_view command,IUnknown* site,bool allowStateHandler,
-                               RegisteredProvider& result) {
+                               RegisteredProvider& result,NamespaceCommandMetadataDiagnostics* diagnostics=nullptr) {
+    result.diagnostics=diagnostics;
     APTTYPE apartment{};
     APTTYPEQUALIFIER qualifier{};
     HRESULT hr = CoGetApartmentType(&apartment,&qualifier);
@@ -302,40 +340,55 @@ HRESULT loadRegisteredProvider(std::wstring_view command,IUnknown* site,bool all
     const std::wstring path = std::wstring(commandStorePath) + L"\\shell\\" + name;
     RegistryKey key;
     const LONG error = RegOpenKeyExW(HKEY_LOCAL_MACHINE,path.c_str(),0,KEY_READ,&key.value);
+    if(diagnostics)diagnostics->providerRegistryOpen=HRESULT_FROM_WIN32(error);
     if (error != ERROR_SUCCESS) return HRESULT_FROM_WIN32(error);
     std::wstring handler;
     hr = readRegistryText(key.value,L"ExplorerCommandHandler",handler);
+    if(diagnostics){diagnostics->handlerRead=hr;captureMetadataText(diagnostics->handlerText,hr,SUCCEEDED(hr)?handler.c_str():nullptr);diagnostics->handlerText.returned=hr;}
     const bool explorerCommand = SUCCEEDED(hr);
     if (hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) && allowStateHandler)
         hr = readRegistryText(key.value,L"CommandStateHandler",handler);
     if (hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)) return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
     if (FAILED(hr)) return hr;
-    if (!guidText(handler)) return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+    if (!guidText(handler)) {if(diagnostics)diagnostics->handlerParse=HRESULT_FROM_WIN32(ERROR_INVALID_DATA);return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);}
     hr = CLSIDFromString(handler.c_str(),&result.handler);
+    if(diagnostics){diagnostics->handlerParse=hr;diagnostics->handler=result.handler;}
     if (FAILED(hr)) return hr;
+    hr=result.apartmentClient.acquire();result.lifetimeStatus=hr;if(FAILED(hr))return hr;
     if (explorerCommand) {
-        hr = CoCreateInstance(result.handler,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&result.command));
-        if (SUCCEEDED(hr)) hr = result.command.As(&result.object);
+        hr = observeProviderCall([&]{const auto actual=CoCreateInstance(result.handler,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&result.command));
+            if(diagnostics)diagnostics->nativeProviderCreate=actual;return actual;});
+        if(diagnostics)diagnostics->providerCreate=hr;
+        if (SUCCEEDED(hr)) {hr = result.command.As(&result.object);if(diagnostics)diagnostics->objectQuery=hr;}
     } else {
-        hr = CoCreateInstance(result.handler,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&result.state));
-        if (SUCCEEDED(hr)) hr = result.state.As(&result.object);
+        hr = observeProviderCall([&]{const auto actual=CoCreateInstance(result.handler,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&result.state));
+            if(diagnostics)diagnostics->nativeProviderCreate=actual;return actual;});
+        if(diagnostics)diagnostics->providerCreate=hr;
+        if (SUCCEEDED(hr)) {hr = result.state.As(&result.object);if(diagnostics)diagnostics->objectQuery=hr;}
     }
     if (FAILED(hr)) return hr;
     ComPtr<IInitializeCommand> initialize;
     hr = result.object.As(&initialize);
+    if(diagnostics)diagnostics->initializerQuery=hr;
     if (SUCCEEDED(hr)) {
         auto bag = Microsoft::WRL::Make<RegistryPropertyBag>(path);
         if (!bag) return E_OUTOFMEMORY;
         hr = bag->status();
-        if (SUCCEEDED(hr)) hr = initialize->Initialize(name.c_str(),bag.Get());
+        if(diagnostics)diagnostics->propertyBagOpen=hr;
+        if (SUCCEEDED(hr)) {hr = observeProviderCall([&]{const auto actual=initialize->Initialize(name.c_str(),bag.Get());
+            if(diagnostics)diagnostics->nativeInitialize=actual;return actual;});if(diagnostics)diagnostics->initialize=hr;}
         if (FAILED(hr)) return hr;
         result.initialized = true;
+        if(diagnostics)diagnostics->initialized=true;
     } else if (hr != E_NOINTERFACE) return hr;
     hr = result.object.As(&result.withSite);
+    if(diagnostics)diagnostics->siteQuery=hr;
     if (FAILED(hr) && hr != E_NOINTERFACE) return hr;
     if (site && result.withSite) {
         result.siteAttached = true;
-        hr = result.withSite->SetSite(site);
+        hr = observeProviderCall([&]{const auto actual=result.withSite->SetSite(site);
+            if(diagnostics)diagnostics->nativeSiteAttach=actual;return actual;});
+        if(diagnostics){diagnostics->siteAttach=hr;diagnostics->siteAttached=SUCCEEDED(hr);}
         if (FAILED(hr)) return hr;
     }
     return S_OK;
@@ -351,8 +404,8 @@ HRESULT registeredCommandState(std::wstring_view command,IShellItemArray* select
     state.explorerCommand = provider.command != nullptr;
     state.initialized = provider.initialized;
     state.siteAttached = provider.siteAttached;
-    hr = provider.command ? provider.command->GetState(background ? nullptr : selection,slow,&state.state)
-                          : provider.state->GetState(selection,slow,&state.state);
+    hr = provider.command ? observeProviderCall([&]{return provider.command->GetState(background ? nullptr : selection,slow,&state.state);})
+                          : observeProviderCall([&]{return provider.state->GetState(selection,slow,&state.state);});
     if (SUCCEEDED(hr)) { *result = std::move(state); return hr; }
 
     // This installed composite has no public initialization interface. The
@@ -417,7 +470,7 @@ HRESULT commandChildren(IExplorerCommand* command, IShellItemArray* selection,
                         std::vector<NamespaceSubcommandMetadata>& result) {
     if (depth > 8) return HRESULT_FROM_WIN32(ERROR_TOO_MANY_NAMES);
     ComPtr<IEnumExplorerCommand> enumerator;
-    HRESULT hr = command->EnumSubCommands(&enumerator);
+    HRESULT hr = observeProviderCall([&]{return command->EnumSubCommands(&enumerator);});
     if (hr == E_NOTIMPL || hr == E_NOINTERFACE || hr == S_FALSE) return S_FALSE;
     if (FAILED(hr)) return hr;
     if (!enumerator) return S_FALSE;
@@ -433,22 +486,22 @@ HRESULT commandChildren(IExplorerCommand* command, IShellItemArray* selection,
         --budget;
         NamespaceSubcommandMetadata metadata;
         child->GetCanonicalName(&metadata.canonicalName);
-        hr = child->GetFlags(&metadata.flags);
+        hr = observeProviderCall([&]{return child->GetFlags(&metadata.flags);});
         if (FAILED(hr)) return hr;
         PWSTR raw = nullptr;
-        hr = child->GetTitle(selection, &raw);
+        hr = observeProviderCall([&]{return child->GetTitle(selection, &raw);});
         OwnedText label(raw);
         if (FAILED(hr) && !(metadata.flags & ECF_ISSEPARATOR)) return hr;
         if (label) metadata.label = label.get();
         raw = nullptr;
-        hr = child->GetIcon(selection, &raw);
+        hr = observeProviderCall([&]{return child->GetIcon(selection, &raw);});
         OwnedText icon(raw);
         if (SUCCEEDED(hr) && icon) metadata.icon = icon.get();
         raw = nullptr;
-        hr = child->GetToolTip(selection, &raw);
+        hr = observeProviderCall([&]{return child->GetToolTip(selection, &raw);});
         OwnedText description(raw);
         if (SUCCEEDED(hr) && description) metadata.description = description.get();
-        metadata.stateStatus = child->GetState(selection, FALSE, &metadata.state);
+        metadata.stateStatus = observeProviderCall([&]{return child->GetState(selection, FALSE, &metadata.state);});
         if (FAILED(metadata.stateStatus)) metadata.state = ECS_DISABLED;
         if ((metadata.flags & ECF_HASSUBCOMMANDS) && SUCCEEDED(metadata.stateStatus) &&
             !(metadata.state & (ECS_DISABLED | ECS_HIDDEN))) {
@@ -824,36 +877,56 @@ bool namespaceActionApplicable(NamespaceAction action,const NamespaceFacts& fact
     return static_cast<size_t>(action) < actions.size() && applicable(action,facts);
 }
 
-HRESULT namespaceCommandMetadata(std::wstring_view command, NamespaceCommandMetadata* result,
-                                 IShellItemArray* selection,IUnknown* site) {
+namespace {
+HRESULT namespaceCommandMetadataImpl(std::wstring_view command, NamespaceCommandMetadata* result,
+                                 IShellItemArray* selection,IUnknown* site,NamespaceCommandMetadataDiagnostics* diagnostics) {
     if (!result) return E_POINTER;
     if (!validCommand(command)) return E_INVALIDARG;
     const std::wstring path = std::wstring(commandStorePath) + L"\\shell\\" + std::wstring(command);
     RegistryKey key;
     const LONG error = RegOpenKeyExW(HKEY_LOCAL_MACHINE, path.c_str(), 0, KEY_READ, &key.value);
+    if(diagnostics)diagnostics->metadataRegistryOpen=HRESULT_FROM_WIN32(error);
     if (error != ERROR_SUCCESS) return HRESULT_FROM_WIN32(error);
     NamespaceCommandMetadata metadata;
     metadata.command = command;
     std::wstring raw;
     HRESULT hr = readRegistryText(key.value, L"MUIVerb", raw);
+    if(diagnostics){captureMetadataText(diagnostics->muiVerb,hr,SUCCEEDED(hr)?raw.c_str():nullptr);diagnostics->muiVerb.returned=hr;}
     if (SUCCEEDED(hr)) metadata.label = loadIndirect(raw);
     else if (hr != HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)) return hr;
-    if (metadata.label.empty() && SUCCEEDED(readRegistryText(key.value, nullptr, raw))) metadata.label = loadIndirect(raw);
+    if (metadata.label.empty()) {
+        const auto defaultRead=readRegistryText(key.value,nullptr,raw);
+        if(diagnostics){captureMetadataText(diagnostics->defaultVerb,defaultRead,SUCCEEDED(defaultRead)?raw.c_str():nullptr);diagnostics->defaultVerb.returned=defaultRead;}
+        if(SUCCEEDED(defaultRead))metadata.label=loadIndirect(raw);
+    }
     hr = readRegistryText(key.value, L"Description", raw);
+    if(diagnostics){captureMetadataText(diagnostics->description,hr,SUCCEEDED(hr)?raw.c_str():nullptr);diagnostics->description.returned=hr;}
     if (SUCCEEDED(hr)) metadata.description = loadIndirect(raw);
     else if (hr != HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)) return hr;
     hr = readRegistryText(key.value, L"Icon", metadata.icon);
+    if(diagnostics){captureMetadataText(diagnostics->icon,hr,SUCCEEDED(hr)?metadata.icon.c_str():nullptr);diagnostics->icon.returned=hr;}
     if (FAILED(hr) && hr != HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)) return hr;
     // Registry icons can be missing or describe a legacy command. The installed
     // IExplorerCommand supplies the current native artwork and localized text.
     RegisteredProvider provider;
-    if (SUCCEEDED(loadRegisteredProvider(command,site,false,provider))) {
+    const auto loaded=loadRegisteredProvider(command,site,false,provider,diagnostics);
+    if(diagnostics)diagnostics->providerLoad=loaded;
+    if(FAILED(provider.lifetimeStatus))return provider.lifetimeStatus;
+    if(provider.apartmentClient.active()) {
+        const auto ownership=NativeApartmentOwner::currentAdmissionStatus();if(FAILED(ownership))return ownership;
+    }
+    if (SUCCEEDED(loaded)) {
         for (unsigned field = 0; field < 3; ++field) {
             PWSTR rawText = nullptr;
-            hr = field == 0 ? provider.command->GetTitle(selection,&rawText)
-                : field == 1 ? provider.command->GetIcon(selection,&rawText)
-                             : provider.command->GetToolTip(selection,&rawText);
+            hr = field == 0 ? observeProviderCall([&]{const auto actual=provider.command->GetTitle(selection,&rawText);
+                    if(diagnostics)captureMetadataText(diagnostics->providerFields[0],actual,rawText);return actual;})
+                : field == 1 ? observeProviderCall([&]{const auto actual=provider.command->GetIcon(selection,&rawText);
+                    if(diagnostics)captureMetadataText(diagnostics->providerFields[1],actual,rawText);return actual;})
+                             : observeProviderCall([&]{const auto actual=provider.command->GetToolTip(selection,&rawText);
+                    if(diagnostics)captureMetadataText(diagnostics->providerFields[2],actual,rawText);return actual;});
             OwnedText text(rawText);
+            if(diagnostics)diagnostics->providerFields[field].returned=hr;
+            const auto ownership=NativeApartmentOwner::currentAdmissionStatus();if(FAILED(ownership))return ownership;
             if (SUCCEEDED(hr) && text && *text) {
                 auto& destination = field == 0 ? metadata.label : field == 1 ? metadata.icon : metadata.description;
                 destination = text.get();
@@ -862,6 +935,21 @@ HRESULT namespaceCommandMetadata(std::wstring_view command, NamespaceCommandMeta
     }
     *result = std::move(metadata);
     return S_OK;
+}
+
+} // namespace
+HRESULT namespaceCommandMetadata(std::wstring_view command,NamespaceCommandMetadata* result,
+                                 IShellItemArray* selection,IUnknown* site) {
+    return namespaceCommandMetadataImpl(command,result,selection,site,nullptr);
+}
+HRESULT namespaceCommandMetadataWithDiagnostics(std::wstring_view command,NamespaceCommandMetadata* result,
+    IShellItemArray* selection,IUnknown* site,NamespaceCommandMetadataDiagnostics* diagnostics) noexcept {
+    if(!diagnostics)return E_POINTER;
+    *diagnostics={};diagnostics->creatorThread=GetCurrentThreadId();diagnostics->siteSupplied=site!=nullptr;
+    try{diagnostics->returned=namespaceCommandMetadataImpl(command,result,selection,site,diagnostics);}
+    catch(const std::bad_alloc&){diagnostics->diagnosticException=true;diagnostics->returned=E_OUTOFMEMORY;}
+    catch(...){diagnostics->diagnosticException=true;diagnostics->returned=E_FAIL;}
+    return diagnostics->returned;
 }
 
 HRESULT namespaceCommandState(std::wstring_view command, IShellItemArray* selection,
@@ -913,11 +1001,13 @@ struct NamespaceCommandStateTask::Impl {
         bool ready = false;
         HRESULT status = E_PENDING;
         NamespaceCommandState result;
+        NamespaceSelectionKinds kinds;
         std::vector<NamespaceSelectionVerbState> verbResults;
         NamespaceCommandStateTimings timings;
     };
     DWORD thread = GetCurrentThreadId();
     bool independentVerbs = false;
+    Work work = Work::CommandState;
     std::shared_ptr<NamespaceStateRegistration> registration;
     std::shared_ptr<Shared> shared = std::make_shared<Shared>();
     ~Impl() { shared->cancelled.store(true); }
@@ -1229,13 +1319,21 @@ HRESULT NamespaceCommandStateTask::startRegisteredMenu(std::wstring_view command
     catch(...){return E_FAIL;}
 }
 
+HRESULT NamespaceCommandStateTask::startSelectionKinds(IShellItemArray* selection,IUnknown* site,
+                                                       std::unique_ptr<NamespaceCommandStateTask>* result) {
+    if(!result||!selection)return E_POINTER;
+    return startImpl({},selection,site,false,{},result,false,{},Work::SelectionKinds);
+}
+
 HRESULT NamespaceCommandStateTask::startImpl(std::wstring_view command,IShellItemArray* selection,IUnknown* site,
                                             bool background,std::vector<std::wstring> selectionVerbs,
                                             std::unique_ptr<NamespaceCommandStateTask>* result,bool independentVerbs,
-                                            std::shared_ptr<NamespaceStateRegistration> registration) {
+                                            std::shared_ptr<NamespaceStateRegistration> registration,Work work) {
     if (!result) return E_POINTER;
     const bool selectionVerb=!selectionVerbs.empty();
-    if(selectionVerb?!selection:!validCommand(command))return E_INVALIDARG;
+    const bool kindWork=work==Work::SelectionKinds;
+    if(kindWork ? (!selection||background||selectionVerb||!command.empty()) :
+        (selectionVerb?!selection:!validCommand(command)))return E_INVALIDARG;
     APTTYPE apartment{};
     APTTYPEQUALIFIER qualifier{};
     HRESULT hr = CoGetApartmentType(&apartment,&qualifier);
@@ -1272,12 +1370,13 @@ HRESULT NamespaceCommandStateTask::startImpl(std::wstring_view command,IShellIte
         if(FAILED(hr))return hr;
         auto impl = std::make_unique<Impl>();
         impl->independentVerbs=independentVerbs;
+        impl->work=work;
         if (!registration) hr = NamespaceStateRegistration::create(selection,site,&registration);
         if (FAILED(hr)) return hr;
         impl->registration = registration;
         const auto shared = impl->shared;
         auto task = std::unique_ptr<NamespaceCommandStateTask>(new NamespaceCommandStateTask(std::move(impl)));
-        std::thread([shared,name=std::wstring(command),verbs=std::move(selectionVerbs),registration=std::move(registration),background,selectionVerb,independentVerbs,
+        std::thread([shared,name=std::wstring(command),verbs=std::move(selectionVerbs),registration=std::move(registration),background,selectionVerb,independentVerbs,kindWork,
                      lease=std::move(lease),workerCount=&workers,defaultMenuCount=defaultReservation.value] () mutable {
             struct WorkerRelease {
                 std::atomic<unsigned>* value;
@@ -1287,9 +1386,11 @@ HRESULT NamespaceCommandStateTask::startImpl(std::wstring_view command,IShellIte
             NamespaceCommandStateTimings timings;
             const auto started=std::chrono::steady_clock::now();
             HRESULT final = lease->attach();
-            if (SUCCEEDED(final)) final = selectionVerb?OleInitialize(nullptr):CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);
+            NativeApartmentOwner nativeApartment;
+            if (SUCCEEDED(final)) final = selectionVerb?nativeApartment.initializeOle():nativeApartment.initializeSta();
             const bool initialized = SUCCEEDED(final);
             NamespaceCommandState state;
+            NamespaceSelectionKinds kinds;
             std::vector<NamespaceSelectionVerbState> states;
             try {
                 if (initialized && !shared->cancelled.load()) {
@@ -1299,9 +1400,15 @@ HRESULT NamespaceCommandStateTask::startImpl(std::wstring_view command,IShellIte
                     ComPtr<IUnknown> view;
                     final = CoCreateInstance(CLSID_StdGlobalInterfaceTable,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&git));
                     if (SUCCEEDED(final) && registration->selection) final = git->GetInterfaceFromGlobal(registration->selection,IID_PPV_ARGS(&items));
-                    if (SUCCEEDED(final) && registration->site) final = git->GetInterfaceFromGlobal(registration->site,IID_PPV_ARGS(&view));
+                    if (SUCCEEDED(final) && registration->site && !kindWork) final = git->GetInterfaceFromGlobal(registration->site,IID_PPV_ARGS(&view));
                     if (SUCCEEDED(final) && !shared->cancelled.load()) {
-                        if(selectionVerb) {
+                        if(kindWork) {
+                            StatePhaseTimer timer{&timings.kindReadMicroseconds};
+                            final=items?namespaceSelectionKinds(items.Get(),&kinds):E_UNEXPECTED;
+                            DWORD afterCount=0;
+                            if(SUCCEEDED(final))final=items->GetCount(&afterCount);
+                            if(SUCCEEDED(final)&&afterCount!=kinds.count)final=HRESULT_FROM_WIN32(ERROR_RETRY);
+                        } else if(selectionVerb) {
                             std::vector<std::wstring_view> names;names.reserve(verbs.size());
                             for(const auto& verb:verbs)names.emplace_back(verb);
                             final=readSelectionVerbState(items.Get(),view.Get(),names,&shared->cancelled,&state,true,name,independentVerbs?&states:nullptr,&timings,background);
@@ -1315,7 +1422,7 @@ HRESULT NamespaceCommandStateTask::startImpl(std::wstring_view command,IShellIte
             // initialization retires its final lease on the pumping creator.
             if (initialized) {
                 registration.reset();
-                if(selectionVerb)OleUninitialize();else CoUninitialize();
+                nativeApartment.finishOrTerminate();
             } else {
                 std::shared_ptr<void> keepalive = std::move(registration);
                 const auto deferred = lease->deferCreatorRelease(keepalive);
@@ -1329,6 +1436,7 @@ HRESULT NamespaceCommandStateTask::startImpl(std::wstring_view command,IShellIte
             std::lock_guard lock(shared->mutex);
             shared->status = final;
             shared->result = state;
+            shared->kinds = kinds;
             shared->verbResults=std::move(states);
             shared->timings=timings;
             shared->ready = true;
@@ -1344,7 +1452,7 @@ HRESULT NamespaceCommandStateTask::startImpl(std::wstring_view command,IShellIte
 HRESULT NamespaceCommandStateTask::poll(NamespaceCommandState* result) {
     if (!result) return E_POINTER;
     if (impl_->thread != GetCurrentThreadId()) return RPC_E_WRONG_THREAD;
-    if(impl_->independentVerbs)return E_INVALIDARG;
+    if(impl_->independentVerbs||impl_->work!=Work::CommandState)return E_INVALIDARG;
     if (impl_->shared->cancelled.load()) return HRESULT_FROM_WIN32(ERROR_CANCELLED);
     std::lock_guard lock(impl_->shared->mutex);
     if (!impl_->shared->ready) return E_PENDING;
@@ -1353,10 +1461,21 @@ HRESULT NamespaceCommandStateTask::poll(NamespaceCommandState* result) {
     return impl_->shared->status;
 }
 
+HRESULT NamespaceCommandStateTask::pollSelectionKinds(NamespaceSelectionKinds* result) {
+    if(!result)return E_POINTER;
+    if(impl_->thread!=GetCurrentThreadId())return RPC_E_WRONG_THREAD;
+    if(impl_->work!=Work::SelectionKinds)return E_INVALIDARG;
+    if(impl_->shared->cancelled.load())return HRESULT_FROM_WIN32(ERROR_CANCELLED);
+    std::lock_guard lock(impl_->shared->mutex);
+    if(!impl_->shared->ready)return E_PENDING;
+    if(FAILED(impl_->shared->status))return impl_->shared->status;
+    *result=impl_->shared->kinds;return impl_->shared->status;
+}
+
 HRESULT NamespaceCommandStateTask::pollSelectionVerbBatch(std::vector<NamespaceSelectionVerbState>* result) {
     if(!result)return E_POINTER;
     if(impl_->thread!=GetCurrentThreadId())return RPC_E_WRONG_THREAD;
-    if(!impl_->independentVerbs)return E_INVALIDARG;
+    if(!impl_->independentVerbs||impl_->work!=Work::CommandState)return E_INVALIDARG;
     if(impl_->shared->cancelled.load())return HRESULT_FROM_WIN32(ERROR_CANCELLED);
     std::lock_guard lock(impl_->shared->mutex);
     if(!impl_->shared->ready)return E_PENDING;
@@ -1397,7 +1516,7 @@ struct NativeNamespaceCommandChildren::Impl {
         ComPtr<IObjectWithSite> withSite;
         std::vector<std::unique_ptr<Child>> children;
         bool attached = false;
-        ~Child() { children.clear(); if (attached && withSite) withSite->SetSite(nullptr); }
+        ~Child() { children.clear(); if (attached && withSite) observeProviderCleanup([&]{return withSite->SetSite(nullptr);}); }
     };
     std::vector<std::unique_ptr<Child>> children;
     std::vector<NamespaceSubcommandMetadata> metadata;
@@ -1407,7 +1526,7 @@ struct NativeNamespaceCommandChildren::Impl {
                     std::vector<NamespaceSubcommandMetadata>& presentation) {
         if (depth > 8) return HRESULT_FROM_WIN32(ERROR_TOO_MANY_NAMES);
         ComPtr<IEnumExplorerCommand> enumerator;
-        HRESULT hr = command->EnumSubCommands(&enumerator);
+        HRESULT hr = observeProviderCall([&]{return command->EnumSubCommands(&enumerator);});
         if (hr == E_NOTIMPL || hr == E_NOINTERFACE || hr == S_FALSE) return S_FALSE;
         if (FAILED(hr)) return hr;
         if (!enumerator) return S_FALSE;
@@ -1423,18 +1542,18 @@ struct NativeNamespaceCommandChildren::Impl {
             if (FAILED(hr) && hr != E_NOINTERFACE) return hr;
             if (site && child->withSite) {
                 child->attached = true;
-                hr = child->withSite->SetSite(site.Get());
+                hr = observeProviderCall([&]{return child->withSite->SetSite(site.Get());});
                 if (FAILED(hr)) return hr;
             }
             NamespaceSubcommandMetadata entry;
             child->command->GetCanonicalName(&entry.canonicalName);
-            hr = child->command->GetFlags(&entry.flags);
+            hr = observeProviderCall([&]{return child->command->GetFlags(&entry.flags);});
             if (FAILED(hr)) return hr;
             IShellItemArray* items = background ? nullptr : selection.Get();
             for (unsigned field=0;field<3;++field) {
                 PWSTR raw = nullptr;
-                hr = field == 0 ? child->command->GetTitle(items,&raw)
-                    : field == 1 ? child->command->GetIcon(items,&raw) : child->command->GetToolTip(items,&raw);
+                hr = field == 0 ? observeProviderCall([&]{return child->command->GetTitle(items,&raw);})
+                    : field == 1 ? observeProviderCall([&]{return child->command->GetIcon(items,&raw);}) : observeProviderCall([&]{return child->command->GetToolTip(items,&raw);});
                 OwnedText text(raw);
                 if (field == 0 && FAILED(hr) && !(entry.flags & ECF_ISSEPARATOR)) return hr;
                 if (SUCCEEDED(hr) && text) {
@@ -1442,7 +1561,7 @@ struct NativeNamespaceCommandChildren::Impl {
                     destination = text.get();
                 }
             }
-            entry.stateStatus = child->command->GetState(items,FALSE,&entry.state);
+            entry.stateStatus = observeProviderCall([&]{return child->command->GetState(items,FALSE,&entry.state);});
             if ((entry.flags & ECF_HASSUBCOMMANDS) && SUCCEEDED(entry.stateStatus) &&
                 !(entry.state & (ECS_DISABLED | ECS_HIDDEN))) {
                 hr = capture(child->command.Get(),depth+1,budget,child->children,entry.children);
@@ -1470,7 +1589,7 @@ HRESULT NativeNamespaceCommandChildren::invokePath(std::span<const size_t> path,
     if (GetWindowThreadProcessId(impl_->owner,&process) != impl_->thread || process != GetCurrentProcessId()) return E_ACCESSDENIED;
     if (path.empty() || path.size() > 9) return E_INVALIDARG;
     EXPCMDSTATE parentState = ECS_DISABLED;
-    auto hr = impl_->provider.command->GetState(impl_->background ? nullptr : impl_->selection.Get(),FALSE,&parentState);
+    auto hr = observeProviderCall([&]{return impl_->provider.command->GetState(impl_->background ? nullptr : impl_->selection.Get(),FALSE,&parentState);});
     if (FAILED(hr)) return hr;
     if (parentState & (ECS_DISABLED | ECS_HIDDEN)) return HRESULT_FROM_WIN32(ERROR_ACCESS_DISABLED_BY_POLICY);
     const auto* children = &impl_->children;
@@ -1478,16 +1597,16 @@ HRESULT NativeNamespaceCommandChildren::invokePath(std::span<const size_t> path,
         if (path[depth] >= children->size()) return E_INVALIDARG;
         auto& child = *(*children)[path[depth]];
         EXPCMDFLAGS flags{};
-        hr = child.command->GetFlags(&flags);
+        hr = observeProviderCall([&]{return child.command->GetFlags(&flags);});
         if (FAILED(hr)) return hr;
         if (flags & ECF_ISSEPARATOR) return E_INVALIDARG;
         EXPCMDSTATE state = ECS_DISABLED;
-        hr = child.command->GetState(impl_->background ? nullptr : impl_->selection.Get(),FALSE,&state);
+        hr = observeProviderCall([&]{return child.command->GetState(impl_->background ? nullptr : impl_->selection.Get(),FALSE,&state);});
         if (FAILED(hr)) return hr;
         if (state & (ECS_DISABLED | ECS_HIDDEN)) return HRESULT_FROM_WIN32(ERROR_ACCESS_DISABLED_BY_POLICY);
         if (depth+1 == path.size()) {
             if (flags & ECF_HASSUBCOMMANDS) return E_INVALIDARG;
-            return child.command->Invoke(impl_->background ? nullptr : impl_->selection.Get(),nullptr);
+            return observeProviderCall([&]{return child.command->Invoke(impl_->background ? nullptr : impl_->selection.Get(),nullptr);});
         }
         if (!(flags & ECF_HASSUBCOMMANDS)) return E_INVALIDARG;
         children = &child.children;
@@ -1507,7 +1626,7 @@ HRESULT namespaceCommandChildren(std::wstring_view command, IShellItemArray* sel
     // EnumSubCommands requires that context on this same provider instance.
     if (command.starts_with(L"Windows.Library")) {
         EXPCMDSTATE state = ECS_DISABLED;
-        hr = provider.command->GetState(selection,FALSE,&state);
+        hr = observeProviderCall([&]{return provider.command->GetState(selection,FALSE,&state);});
         if (FAILED(hr)) return hr;
         if (state & (ECS_DISABLED | ECS_HIDDEN)) return HRESULT_FROM_WIN32(ERROR_ACCESS_DISABLED_BY_POLICY);
     }
@@ -1609,6 +1728,7 @@ struct NativeNamespaceActions::Impl {
     std::vector<ContextMenuEntry> backgroundEntries;
     RegistryKey commandStore;
     bool selectionLoaded = false;
+    bool selectionFullyPopulated = false;
     bool commandsLoaded = false;
     bool backgroundLoaded = false;
     HRESULT selectionStatus = E_PENDING;
@@ -1635,7 +1755,7 @@ struct NativeNamespaceActions::Impl {
     HRESULT extractStatus = E_PENDING;
     UINT extractCommand = 0;
     bool extractEnabled = false;
-    RegistryKey castKey;
+    std::shared_ptr<RegistryKey> castKey;
     NativeContextMenu castMenu;
     bool castLoaded = false;
     HRESULT castStatus = E_PENDING;
@@ -1692,14 +1812,15 @@ struct NativeNamespaceActions::Impl {
     }
 
     HRESULT startState(std::wstring_view name,NamespaceMenuScope scope,std::vector<std::wstring> verbs,
-                       bool independent,std::unique_ptr<NamespaceCommandStateTask>* result) {
+                       bool independent,std::unique_ptr<NamespaceCommandStateTask>* result,
+                       NamespaceCommandStateTask::Work work=NamespaceCommandStateTask::Work::CommandState) {
         if (!result) return E_POINTER;
         const auto generation = targetGeneration;
         std::shared_ptr<NamespaceStateRegistration> registration;
         auto hr = stateRegistration(scope,&registration);if (FAILED(hr)) return hr;
         std::unique_ptr<NamespaceCommandStateTask> task;
         hr = NamespaceCommandStateTask::startImpl(name,registration->selectionSource,registration->siteSource,
-            scope == NamespaceMenuScope::Background,std::move(verbs),&task,independent,registration);
+            scope == NamespaceMenuScope::Background,std::move(verbs),&task,independent,registration,work);
         if (FAILED(hr)) return hr;
         // Native registration/preparation may dispatch creator callbacks. A
         // target replacement never publishes an old-generation task/cache.
@@ -1733,6 +1854,7 @@ struct NativeNamespaceActions::Impl {
         facts.castHandlerAvailable = facts.castHandlerEnabled = facts.castHandlerSubmenu = false;
         facts.castCommandId = 0;
         selectionLoaded = commandsLoaded = backgroundLoaded = false;
+        selectionFullyPopulated = false;
         selectionStatus = commandsStatus = backgroundStatus = E_PENDING;
         mailRecipient.Reset();
         mailDropTarget.Reset();
@@ -1829,13 +1951,13 @@ struct NativeNamespaceActions::Impl {
         ComPtr<IObjectWithSite> withSite;
         zipDropTarget.As(&withSite);
         if (target.site && withSite) {
-            hr = withSite->SetSite(target.site.Get());
+            hr = observeProviderCall([&]{return withSite->SetSite(target.site.Get());});
             if (FAILED(hr)) return hr;
         }
         struct DetachSite {
             ComPtr<IObjectWithSite> value;
             bool attached;
-            ~DetachSite() { if (attached && value) value->SetSite(nullptr); }
+            ~DetachSite() { if (attached && value) observeProviderCleanup([&]{return value->SetSite(nullptr);}); }
         } detach{withSite,target.site != nullptr && withSite != nullptr};
         DWORD effect = DROPEFFECT_COPY;
         const POINTL location{point.x,point.y};
@@ -1904,7 +2026,7 @@ struct NativeNamespaceActions::Impl {
         ComPtr<IDataObject> data;
         if (SUCCEEDED(hr)) hr = targets->BindToHandler(nullptr,BHID_DataObject,IID_PPV_ARGS(&data));
         if (SUCCEEDED(hr)) hr = HRESULT_FROM_WIN32(RegOpenKeyExW(HKEY_CLASSES_ROOT,L"CompressedFolder",0,KEY_READ,&extractKey.value));
-        if (SUCCEEDED(hr)) hr = initialize->Initialize(nullptr,data.Get(),extractKey.value);
+        if (SUCCEEDED(hr)) hr = observeProviderCall([&]{return initialize->Initialize(nullptr,data.Get(),extractKey.value);});
         if (SUCCEEDED(hr)) hr = extractMenu.create(owner,context.Get(),target.site.Get(),CMF_NORMAL);
         std::vector<ContextMenuEntry> entries;
         if (SUCCEEDED(hr)) hr = extractMenu.enumerate(entries);
@@ -1926,13 +2048,13 @@ struct NativeNamespaceActions::Impl {
         ComPtr<IObjectWithSite> withSite;
         mailDropTarget.As(&withSite);
         if (target.site && withSite) {
-            hr = withSite->SetSite(target.site.Get());
+            hr = observeProviderCall([&]{return withSite->SetSite(target.site.Get());});
             if (FAILED(hr)) return hr;
         }
         struct DetachSite {
             ComPtr<IObjectWithSite> value;
             bool attached;
-            ~DetachSite() { if (attached && value) value->SetSite(nullptr); }
+            ~DetachSite() { if (attached && value) observeProviderCleanup([&]{return value->SetSite(nullptr);}); }
         } detach{withSite, target.site != nullptr && withSite != nullptr};
         DWORD effect = DROPEFFECT_COPY;
         const POINTL location{point.x,point.y};
@@ -1946,6 +2068,14 @@ struct NativeNamespaceActions::Impl {
     HRESULT loadCastHandler() {
         if (castLoaded) return castStatus;
         castLoaded = true;
+        const auto generation = menuGeneration;
+        const auto retainedTargets = targets;
+        const auto retainedSite = target.site;
+        const auto retainedOwner = owner;
+        const auto current = [&] {
+            return menuGeneration == generation && targets.Get() == retainedTargets.Get() &&
+                target.site.Get() == retainedSite.Get() && owner == retainedOwner;
+        };
         if (!facts.detailedTargetsKnown) {
             castStatus = HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
             return castStatus;
@@ -1962,32 +2092,68 @@ struct NativeNamespaceActions::Impl {
         if (!guidText(handler)) { castStatus = HRESULT_FROM_WIN32(ERROR_INVALID_DATA); return castStatus; }
         CLSID clsid{};
         hr = CLSIDFromString(handler.c_str(), &clsid);
+        // Keep the exact Initialize key alive across callbacks which reset the
+        // owning namespace. The original local handler aliases outlive those
+        // callbacks, so the borrowed key must outlive those aliases too.
+        auto associationKey = std::make_shared<RegistryKey>();
         ComPtr<IContextMenu> context;
         if (SUCCEEDED(hr)) hr = CoCreateInstance(clsid, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&context));
+        if (!current()) return E_ABORT;
+        if (SUCCEEDED(hr) && !context) hr = E_NOINTERFACE;
         ComPtr<IShellExtInit> initialize;
         if (SUCCEEDED(hr)) hr = context.As(&initialize);
+        if (!current()) return E_ABORT;
+        if (SUCCEEDED(hr) && !initialize) hr = E_NOINTERFACE;
         ComPtr<IDataObject> data;
-        if (SUCCEEDED(hr)) hr = targets->BindToHandler(nullptr, BHID_DataObject, IID_PPV_ARGS(&data));
+        if (SUCCEEDED(hr)) hr = retainedTargets->BindToHandler(nullptr, BHID_DataObject, IID_PPV_ARGS(&data));
+        if (!current()) return E_ABORT;
+        if (SUCCEEDED(hr) && !data) hr = E_NOINTERFACE;
         if (SUCCEEDED(hr)) {
-            error = RegOpenKeyExW(HKEY_CLASSES_ROOT, association, 0, KEY_READ, &castKey.value);
+            error = RegOpenKeyExW(HKEY_CLASSES_ROOT, association, 0, KEY_READ, &associationKey->value);
             if (error != ERROR_SUCCESS) hr = HRESULT_FROM_WIN32(error);
         }
-        if (SUCCEEDED(hr)) hr = initialize->Initialize(nullptr, data.Get(), castKey.value);
-        if (SUCCEEDED(hr)) hr = castMenu.create(owner, context.Get(), target.site.Get(), CMF_NORMAL);
-        std::vector<ContextMenuEntry> entries;
-        if (SUCCEEDED(hr)) hr = castMenu.enumerate(entries);
-        const ContextMenuEntry* cast = nullptr;
         if (SUCCEEDED(hr)) {
+            castKey = associationKey;
+            hr = observeProviderCall([&]{return initialize->Initialize(nullptr, data.Get(), associationKey->value);});
+        }
+        if (!current()) return E_ABORT;
+        // This isolated native handler requires synchronous QueryContextMenu
+        // cascades to insert its parent. Inspect the resulting metadata without
+        // notifying the artificial root; only its enabled actual submenu may
+        // receive the targeted popup notification below.
+        if (SUCCEEDED(hr)) hr = castMenu.create(retainedOwner, context.Get(), retainedSite.Get(), CMF_NORMAL);
+        if (!current()) return E_ABORT;
+        std::vector<ContextMenuEntry> entries;
+        if (SUCCEEDED(hr)) hr = castMenu.enumerate(entries, false);
+        if (!current()) return E_ABORT;
+        const ContextMenuEntry* cast = nullptr;
+        const auto parent = [&]() -> HRESULT {
+            cast = nullptr;
             // This is the isolated, registered PlayTo handler's own menu. Its
             // single command/cascade has no canonical verb on Windows 10. No
             // translated text or composed-menu command offsets are inferred.
             for (const auto& candidate : entries) {
                 if (candidate.separator()) continue;
-                if (cast) { hr = E_UNEXPECTED; break; }
+                if (cast) return E_UNEXPECTED;
                 cast = &candidate;
             }
-            if (!cast || !cast->id || cast->id > 0x7fff) hr = HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+            return cast && cast->id && cast->id <= 0x7fff ? S_OK : HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+        };
+        if (SUCCEEDED(hr)) hr = parent();
+        if (!retainedOwner || !IsWindowVisible(retainedOwner)) {
+            std::fprintf(stderr,"namespace-cast-native-snapshot hr=0x%08lx; owner=%p; site=%u; root=%p; rows=%zu; parentID/state/submenu=%u/%u/%u; rootWM_INIT=0\n",
+                static_cast<ULONG>(hr),static_cast<void*>(retainedOwner),static_cast<unsigned>(retainedSite!=nullptr),
+                static_cast<void*>(castMenu.menu()),entries.size(),cast?cast->id:0,cast?cast->state:0,
+                static_cast<unsigned>(cast&&cast->submenu));std::fflush(stderr);
         }
+        if (SUCCEEDED(hr) && cast->enabled() && cast->submenu) {
+            const auto command = cast->id;
+            hr = castMenu.enumerateForCommand(command, entries);
+            if (!current()) return E_ABORT;
+            if (SUCCEEDED(hr)) hr = parent();
+            if (SUCCEEDED(hr) && cast->id != command) hr = E_ABORT;
+        }
+        if (!current()) return E_ABORT;
         if (SUCCEEDED(hr)) {
             facts.castHandlerAvailable = true;
             facts.castCommandId = cast->id;
@@ -2074,14 +2240,27 @@ struct NativeNamespaceActions::Impl {
         return hr;
     }
 
-    HRESULT loadSelection() {
+    HRESULT loadSelection(std::span<const std::wstring_view> verbs = {}, bool full = false) {
         HRESULT hr = onThread();
         if (FAILED(hr)) return hr;
-        if (selectionLoaded) return selectionStatus;
-        selectionLoaded = true;
-        hr = selection.createSelection(owner, targets.Get(), target.site.Get(), CMF_EXTENDEDVERBS);
-        if (SUCCEEDED(hr)) hr = selection.enumerate(selectionEntries);
-        selectionStatus = hr;
+        const auto generation = menuGeneration;
+        if (!selectionLoaded) {
+            selectionLoaded = true;
+            const auto retainedTargets = targets;
+            const auto retainedSite = target.site;
+            hr = selection.createSelectionForPlanning(owner, retainedTargets.Get(), retainedSite.Get(), CMF_EXTENDEDVERBS);
+            if (generation != menuGeneration) return E_ABORT;
+            selectionStatus = hr;
+        }
+        if (FAILED(selectionStatus)) return selectionStatus;
+        if (selectionFullyPopulated) return S_OK;
+        std::vector<ContextMenuEntry> staged;
+        hr = full ? selection.enumerate(staged) : selection.enumerateForVerbs(verbs, staged);
+        if (generation != menuGeneration) return E_ABORT;
+        if (SUCCEEDED(hr)) {
+            selectionEntries.swap(staged);
+            selectionFullyPopulated = full;
+        }
         return hr;
     }
 
@@ -2279,6 +2458,7 @@ void NativeNamespaceActions::reset(bool cancelPending) noexcept {
     impl_->owner = nullptr;
     impl_->thread = 0;
     impl_->selectionLoaded = impl_->commandsLoaded = impl_->backgroundLoaded = false;
+    impl_->selectionFullyPopulated = false;
     impl_->selectionStatus = impl_->commandsStatus = impl_->backgroundStatus = E_PENDING;
     impl_->mailRecipient.Reset();
     impl_->mailDropTarget.Reset();
@@ -2347,7 +2527,11 @@ HRESULT NativeNamespaceActions::planInvocation(NamespaceAction action, Namespace
     if (!applicable(action, impl_->facts)) return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
     if (action == NamespaceAction::RestoreAll || action == NamespaceAction::EmptyRecycleBin)
         return planNamespaceAction(action, impl_->facts, {}, {}, result);
-    const HRESULT selectionStatus = impl_->loadSelection();
+    const auto verbs = nativeVerbs(action);
+    const HRESULT selectionStatus = impl_->loadSelection(verbs);
+    // A real delayed-branch/snapshot failure is authoritative. A provider that
+    // cannot be constructed still retains the existing registered fallback.
+    if (selectionStatus == E_PENDING || (FAILED(selectionStatus) && SUCCEEDED(impl_->selectionStatus))) return selectionStatus;
     hr = planNamespaceAction(action, impl_->facts, impl_->selectionEntries, {}, result);
     if (SUCCEEDED(hr) || hr != HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED)) return hr;
     const HRESULT commandsStatus = impl_->loadCommands(NamespaceMenuScope::Selection);
@@ -2358,6 +2542,7 @@ HRESULT NativeNamespaceActions::planInvocation(NamespaceAction action, Namespace
     }
     if (hr == HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED) && action == NamespaceAction::CastToDevice) {
         const HRESULT handlerStatus = impl_->loadCastHandler();
+        if (FAILED(handlerStatus)) return handlerStatus;
         if (SUCCEEDED(handlerStatus)) hr = planNamespaceAction(action, impl_->facts, impl_->selectionEntries, impl_->commandsEntries, result);
     }
     if (FAILED(hr) && FAILED(selectionStatus) && FAILED(commandsStatus)) return commandsStatus;
@@ -2414,11 +2599,22 @@ HRESULT NativeNamespaceActions::planCommandStore(std::wstring_view command,
 }
 
 HRESULT NativeNamespaceActions::commandStoreEntries(std::vector<ContextMenuEntry>& result,
-                                                   NamespaceMenuScope scope) {
+                                                    NamespaceMenuScope scope) {
     const HRESULT hr = impl_->loadCommands(scope);
     if (FAILED(hr)) return hr;
     result = scope == NamespaceMenuScope::Selection ? impl_->commandsEntries : impl_->backgroundEntries;
     return S_OK;
+}
+
+HRESULT NativeNamespaceActions::selectionEntries(std::vector<ContextMenuEntry>& result) {
+    const auto hr=impl_->loadSelection({}, true);
+    if(FAILED(hr))return hr;
+    try {
+        auto staged=impl_->selectionEntries;
+        result.swap(staged);
+        return S_OK;
+    } catch(const std::bad_alloc&) {return E_OUTOFMEMORY;}
+      catch(...) {return E_FAIL;}
 }
 
 HRESULT NativeNamespaceActions::commandMetadata(std::wstring_view command,
@@ -2615,6 +2811,14 @@ HRESULT NativeNamespaceActions::startStaticVerbStateTask(std::wstring_view verb,
     catch(const std::bad_alloc&){return E_OUTOFMEMORY;}catch(...){return E_FAIL;}
 }
 
+HRESULT NativeNamespaceActions::startSelectionKindsTask(std::unique_ptr<NamespaceCommandStateTask>* result) {
+    if(!result)return E_POINTER;
+    const auto hr=impl_->onThread();if(FAILED(hr))return hr;
+    if(!impl_->facts.selectionCount||!impl_->target.selection)return E_INVALIDARG;
+    return impl_->startState({},NamespaceMenuScope::Selection,{},false,result,
+                            NamespaceCommandStateTask::Work::SelectionKinds);
+}
+
 HRESULT NativeNamespaceActions::startStaticVerbStateBatch(std::span<const std::wstring_view> verbs,std::unique_ptr<NamespaceCommandStateTask>* result) {
     if(!result)return E_POINTER;
     const auto hr=impl_->onThread();if(FAILED(hr))return hr;
@@ -2662,7 +2866,7 @@ HRESULT NativeNamespaceActions::queryCommandChildren(std::wstring_view command,s
         hr = loadRegisteredProvider(command,retained->site.Get(),false,retained->provider);
         if (FAILED(hr)) return hr;
         EXPCMDSTATE state = ECS_DISABLED;
-        hr = retained->provider.command->GetState(retained->background ? nullptr : retained->selection.Get(),FALSE,&state);
+        hr = observeProviderCall([&]{return retained->provider.command->GetState(retained->background ? nullptr : retained->selection.Get(),FALSE,&state);});
         if (FAILED(hr)) return hr;
         // Some disabled providers, such as ExtractTo outside an archive, still
         // expose read-only destinations. Library providers need an applicable
