@@ -11,7 +11,7 @@ permissions:
 jobs:
   build:
     # Pin the image with VS2022 rather than inheriting future VS-only updates.
-    runs-on: windows-2022
+    runs-on: ${{ contains(fromJSON('["push","schedule","workflow_dispatch","release"]'), github.event_name) && vars.CI_SERVER_WINDOWS == 'true' && fromJSON('["self-hosted","Windows","X64","desktop-3flaofg"]') || 'windows-2022' }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
@@ -70,7 +70,7 @@ jobs:
   native-transfer:
     # Clipboard transfers create real Shell undo records. Keep this fixture
     # on a fresh disposable machine, separate from the native history suite.
-    runs-on: windows-2022
+    runs-on: ${{ contains(fromJSON('["push","schedule","workflow_dispatch","release"]'), github.event_name) && vars.CI_SERVER_WINDOWS == 'true' && fromJSON('["self-hosted","Windows","X64","desktop-3flaofg"]') || 'windows-2022' }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
@@ -126,7 +126,7 @@ jobs:
           if-no-files-found: warn
   validated-application:
     needs: [build, native-transfer]
-    runs-on: windows-2022
+    runs-on: ${{ contains(fromJSON('["push","schedule","workflow_dispatch","release"]'), github.event_name) && vars.CI_SERVER_WINDOWS == 'true' && fromJSON('["self-hosted","Windows","X64","desktop-3flaofg"]') || 'windows-2022' }}
     timeout-minutes: 5
     steps:
       - name: Retrieve the tested application
