@@ -1691,7 +1691,7 @@ void ExplorerApp::updateNamespaceImpl() {
                 !(child.flags&(ECF_HASSUBCOMMANDS|ECF_ISSEPARATOR))&&child.children.empty();
         }
         NamespaceCommandMetadata open;
-        if (SUCCEEDED(namespaceCommandMetadata(L"Windows.open", &open, target.selection.Get(), target.site.Get()))) {
+        if (!compactChrome_ && SUCCEEDED(namespaceCommandMetadata(L"Windows.open", &open, target.selection.Get(), target.site.Get()))) {
             ribbon_.setCommandImageSpec(Open, open.icon);
             ribbon_.setCommandImageSpec(RibbonOpenMenu, open.icon);
         }
@@ -3292,7 +3292,10 @@ HRESULT ExplorerApp::execute(UINT command) {
         updateNamespace();
         CommandRefreshScope nativeCommand(*this);
         const auto action=command==SelectAll?SelectionAction::All:command==SelectNone?SelectionAction::None:SelectionAction::Invert;
-        return changeShellSelection(folderView_.Get(),view_.Get(),action,&backgroundActions_,headless_);
+        // Compact chrome owns these view actions. Use the documented bulk
+        // folder-view operation directly: constructing a CommandStore menu
+        // also loads unrelated extensions (including sharing handlers).
+        return changeShellSelection(folderView_.Get(),view_.Get(),action,compactChrome_?nullptr:&backgroundActions_,headless_);
     }
     case NavigationPane: case PreviewPane: case DetailsPane: case HiddenItems: break;
     case Extensions: {
@@ -3496,7 +3499,7 @@ void ExplorerApp::popup(UINT command, HWND anchor) {
         }
         separator();
         add(Fullscreen, L"Full screen\tF11", fullscreen_); separator();
-        add(Close, L"Close\tAlt+F4");
+        add(Close, embeddedParent_?L"Close tab\tCtrl+W":L"Close\tAlt+F4");
     } else if (command == ViewMenu) {
         for (int i = 0; i < 8; ++i) add(ViewFirst + i, ViewNames[i], static_cast<int>(preferences_.view) == i);
         if(compactChrome_) {

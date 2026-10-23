@@ -60,26 +60,44 @@ HRESULT ModernExplorerWindow::addTab(const std::wstring& location,TabId* result,
     if(entries_.size()>=MaxTabs)return HRESULT_FROM_WIN32(ERROR_TOO_MANY_OPEN_FILES);
     busy_=true;
     struct End {ModernExplorerWindow& host;~End(){host.busy_=false;host.collectRetired();if(host.closeRequested_&&host.window_)PostMessageW(host.window_,WM_CLOSE,0,0);}} end{*this};
+    ComPtr<ExplorerApp> app;TabId id=BrowserTabs::NoTab;
+    struct Rollback {
+        ModernExplorerWindow& host;TabId& id;ComPtr<ExplorerApp>& app;bool committed=false;
+        ~Rollback(){if(!committed)host.retireFailedTab(id,app.Get());}
+    } rollback{*this,id,app};
     try {
-        ComPtr<ExplorerApp> app;app.Attach(new ExplorerApp(instance_,headless_,RibbonLayout::Authored,ExplorerChrome::Compact));
+        app.Attach(new ExplorerApp(instance_,headless_,RibbonLayout::Authored,ExplorerChrome::Compact));
         auto hr=search?app->prepareSearchWindowContext(*search):S_OK;
         if(FAILED(hr))return hr;
         entries_.reserve(entries_.size()+1);
-        TabId id=0;hr=tabs_.add(L"New tab",&id);if(FAILED(hr))return hr;
+        hr=tabs_.add(L"New tab",&id);if(FAILED(hr))return hr;
         entries_.push_back({id,app,nullptr,false});
         hr=app->createEmbedded(window_,location);
         auto found=std::find_if(entries_.begin(),entries_.end(),[&](const Entry& row){return row.id==id;});
-        if(FAILED(hr)) {
-            if(found!=entries_.end())entries_.erase(found);
-            tabs_.remove(id);return hr;
-        }
+        if(FAILED(hr))return hr;
         if(found==entries_.end())return E_ABORT;
         found->child=app->window();
         tabs_.setLabel(id,app->currentTitle().empty()?L"Loading…":app->currentTitle());
         layout();
-        hr=selectTab(id);if(SUCCEEDED(hr)&&result)*result=id;
+        hr=selectTab(id);if(SUCCEEDED(hr)) {rollback.committed=true;if(result)*result=id;}
         return hr;
     }catch(const std::bad_alloc&) {return E_OUTOFMEMORY;}
+     catch(...) {return E_FAIL;}
+}
+
+void ModernExplorerWindow::retireFailedTab(TabId id,ExplorerApp* app) noexcept {
+    if(id==BrowserTabs::NoTab)return;
+    const auto found=std::find_if(entries_.begin(),entries_.end(),[&](const Entry& row){return row.id==id&&row.app.Get()==app;});
+    if(found==entries_.end()) {tabs_.remove(id);return;}
+    // createEmbedded may throw after creating its HWND. Retain its real owner
+    // and record that HWND until native teardown reports completion.
+    found->child=app->window();found->closing=true;
+    if(found->child) {
+        const auto child=found->child;
+        if(!PostMessageW(child,WM_CLOSE,0,0))SendMessageW(child,WM_CLOSE,0,0);
+    }else {
+        entries_.erase(found);tabs_.remove(id);
+    }
 }
 
 ExplorerApp* ModernExplorerWindow::activeBrowser() const noexcept {
@@ -91,9 +109,19 @@ HRESULT ModernExplorerWindow::selectTab(TabId id) {
     const auto found=std::find_if(entries_.begin(),entries_.end(),[&](const Entry& row){return row.id==id;});
     if(found==entries_.end()||found->closing||closing_)return E_INVALIDARG;
     const auto next=found->app;
+    const ComPtr<ExplorerApp> previous=activeBrowser();
+    const auto frame=window_;const auto revision=++activationRevision_;
     const auto hr=tabs_.select(id);if(FAILED(hr))return hr;
-    if(active_!=id)if(auto previous=activeBrowser())previous->setEmbeddedActive(false);
-    active_=id;next->setEmbeddedActive(true);layout();updateTitle();return S_OK;
+    const auto current=[&]{return window_==frame&&!closing_&&activationRevision_==revision;};
+    if(!current())return S_FALSE;
+    // Publish the target before native hide/show callbacks. A nested switch
+    // owns a newer revision and its final selection must win.
+    active_=id;
+    if(previous&&previous.Get()!=next.Get())previous->setEmbeddedActive(false);
+    if(!current())return S_FALSE;
+    next->setEmbeddedActive(true);
+    if(!current())return S_FALSE;
+    layout();updateTitle();return current()?S_OK:S_FALSE;
 }
 
 HRESULT ModernExplorerWindow::closeTab(TabId id) {
@@ -114,6 +142,7 @@ void ModernExplorerWindow::collectDestroyed(HWND child,ExplorerApp* app) {
     if(found==entries_.end()||found->app->window())return;
     const auto retained=found->app;const auto id=found->id;
     const bool wasActive=id==active_;
+    if(wasActive)++activationRevision_;
     const auto status=retained->shutdownStatus();if(FAILED(status))shutdownStatus_=status;
     entries_.erase(found);tabs_.remove(id);
     if(entries_.empty()) {
@@ -296,7 +325,7 @@ LRESULT ModernExplorerWindow::onMessage(UINT message,WPARAM wparam,LPARAM lparam
         return 0;
     case WM_CLOSE:
         if(busy_) {closeRequested_=true;return 0;}
-        closing_=true;closeRequested_=false;
+        closing_=true;closeRequested_=false;++activationRevision_;
         if(entries_.empty()) {DestroyWindow(window_);return 0;}
         {const auto ids=tabs_.ids();for(const auto id:ids)closeTab(id);}return 0;
     case WM_DESTROY:if(!headless_)PostQuitMessage(FAILED(shutdownStatus_)?8:0);return 0;

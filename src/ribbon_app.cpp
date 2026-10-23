@@ -494,6 +494,7 @@ void ExplorerApp::completeCommandState(UINT command,HRESULT status,const Namespa
     if(command==RibbonNewMenu)newItemTypes_.reset();
     if(command==RibbonExtractToGallery)extractDestinations_.reset();
     ribbon_.invalidateState(command);ribbon_.invalidateItems(command);
+    if(compactChrome_)updateCompactCommands();
 }
 
 void ExplorerApp::pollCommandStates() {

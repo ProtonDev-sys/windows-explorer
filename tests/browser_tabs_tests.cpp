@@ -91,7 +91,7 @@ std::wstring labelAt(HWND window, int index) {
 
 void accessible(HWND window, LONG expectedRole, const wchar_t* expectedName = nullptr) {
     Microsoft::WRL::ComPtr<IAccessible> object;
-    succeeded(AccessibleObjectFromWindow(window, OBJID_CLIENT, IID_PPV_ARGS(&object)), "Native MSAA object");
+    succeeded(AccessibleObjectFromWindow(window, static_cast<DWORD>(OBJID_CLIENT), IID_PPV_ARGS(&object)), "Native MSAA object");
     VARIANT self{};
     self.vt = VT_I4;
     self.lVal = CHILDID_SELF;
@@ -154,6 +154,15 @@ void basicAndSelection() {
     TabCtrl_SetCurFocus(control, 2);
     require(tabs.selected() == c && state.selections != 0 && state.selected == c,
         "Parent reads native selection during direct TCN_SELCHANGE");
+    // BM_CLICK follows native button hit testing at client (0, 0). Creation
+    // leaves zero-sized controls, so lay them out without showing the host.
+    tabs.layout({0, 0, 800, BrowserTabs::height(96)}, 96);
+    for (const HWND button : {tabs.newButton(), tabs.closeButton()}) {
+        RECT client{};
+        require(GetClientRect(button, &client) != FALSE && !IsRectEmpty(&client),
+            "Native command button has a nonempty client area before BM_CLICK");
+        require(!IsWindowVisible(button), "Laid-out command button remains hidden with its private host");
+    }
     SendMessageW(tabs.newButton(), BM_CLICK, 0, 0);
     SendMessageW(tabs.closeButton(), BM_CLICK, 0, 0);
     require(state.newClicks == 1 && state.closeClicks == 1, "Both native commands reach parent with dedicated HWNDs/IDs");

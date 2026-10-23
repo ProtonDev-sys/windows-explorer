@@ -56,13 +56,28 @@ LRESULT CALLBACK closeOnShow(HWND window,UINT message,WPARAM wparam,LPARAM lpara
     }
     return DefSubclassProc(window,message,wparam,lparam);
 }
+struct NestedSelection {
+    explorer::ModernExplorerWindow& frame;
+    explorer::ModernExplorerWindow::TabId target;
+    unsigned calls=0;
+    HRESULT status=E_PENDING;
+};
+LRESULT CALLBACK selectOnHide(HWND window,UINT message,WPARAM wparam,LPARAM lparam,UINT_PTR id,DWORD_PTR data) {
+    if(message==WM_SHOWWINDOW&&!wparam) {
+        RemoveWindowSubclass(window,selectOnHide,id);
+        auto& nested=*reinterpret_cast<NestedSelection*>(data);
+        ++nested.calls;nested.status=nested.frame.selectTab(nested.target);
+    }
+    return DefSubclassProc(window,message,wparam,lparam);
+}
 }
 int main() {
     SetErrorMode(SEM_FAILCRITICALERRORS|SEM_NOOPENFILEERRORBOX);
     explorer::PrivateDesktop desktop;
     if(FAILED(desktop.initialize()))return 2;
     // Preserve a native crash for headless diagnosis without a debugger UI.
-    succeeded(explorer::initializeHeadlessCrashDump(true,std::filesystem::current_path()/L"modern-window-crash.dmp"),"Configure owned crash diagnostic");
+    const auto crashFile=std::filesystem::current_path()/(L"modern-window-crash-"+std::to_wstring(GetCurrentProcessId())+L".dmp");
+    succeeded(explorer::initializeHeadlessCrashDump(true,crashFile),"Configure owned crash diagnostic");
     explorer::NativeApartmentOwner apartment;
     if(FAILED(apartment.initializeOle()))return 2;
     int result=0;
@@ -82,6 +97,10 @@ int main() {
         explorer::ComPtr<explorer::ExplorerApp> retainedFirst=first;
         succeeded(first->execute(explorer::SelectAll),"Select first tab's actual files");
         require(pumpUntil([&]{DWORD count=0;return first->headlessSelectionCount(&count)==S_OK&&count==2;}),"First tab exact selected count");
+        succeeded(first->execute(explorer::SelectNone),"Clear first tab selection through its native view");
+        require(pumpUntil([&]{DWORD count=0;return first->headlessSelectionCount(&count)==S_OK&&count==0;}),"First tab selection cleared");
+        succeeded(first->execute(explorer::Invert),"Invert empty first tab selection through its native view");
+        require(pumpUntil([&]{DWORD count=0;return first->headlessSelectionCount(&count)==S_OK&&count==2;}),"First tab inversion selects its exact complement");
         succeeded(first->navigate((fixture.root/L"third").native()),"Navigate first tab");
         require(pumpUntil([&]{return at(first,fixture.root/L"third");}),"First tab second location");
         succeeded(first->execute(explorer::Back),"First tab back history");
@@ -102,6 +121,19 @@ int main() {
         succeeded(frame.selectTab(secondId),"Activate second browser");
         require(at(second,fixture.root/L"second"),"Second tab unaffected by first history");
         require(second->execute(explorer::Back)==S_FALSE,"Second tab did not inherit first history");
+        explorer::ModernExplorerWindow::TabId thirdId=0;
+        succeeded(frame.addTab((fixture.root/L"third").native(),&thirdId),"Create nested activation target");
+        const explorer::ComPtr<explorer::ExplorerApp> third=frame.activeBrowser();
+        require(pumpUntil([&]{return at(third.Get(),fixture.root/L"third");}),"Nested activation target ready");
+        succeeded(frame.selectTab(firstId),"Activate source for native hide callback");
+        NestedSelection nested{frame,thirdId};
+        require(SetWindowSubclass(first->window(),selectOnHide,43,reinterpret_cast<DWORD_PTR>(&nested))!=FALSE,"Attach owned nested selection fixture");
+        succeeded(frame.selectTab(secondId),"Native hide callback supersedes outer activation");
+        require(nested.calls==1&&SUCCEEDED(nested.status)&&frame.activeTab()==thirdId&&frame.activeBrowser()==third.Get(),"Newest reentrant activation owns commands and selected tab");
+        require(IsWindowVisible(third->window())&&!IsWindowVisible(first->window())&&!IsWindowVisible(second->window()),"Only the newest selected browser remains visible on the private desktop");
+        succeeded(frame.closeTab(thirdId),"Retire nested activation target");
+        require(pumpUntil([&]{return frame.tabCount()==2;}),"Nested activation target fully retired");
+        succeeded(frame.selectTab(secondId),"Restore second browser after nested activation");
         const auto search=GetDlgItem(second->window(),explorer::Search);
         require(search!=nullptr,"Second tab search control exists");SetFocus(search);
         require(GetFocus()==search,"Focus second tab search");
@@ -124,7 +156,7 @@ int main() {
         succeeded(desktop.verifyIsolation(),"Input desktop unchanged");
         bool visible=false;succeeded(desktop.visibleWindowsOnInputDesktop(visible),"Read input-desktop ownership");
         require(!visible,"No owned windows appeared on input desktop");
-        std::cout<<"PASS: compact frame, independent native tab locations/history/selection, inactive close and full teardown\n";
+        std::cout<<"PASS: compact frame, independent native tab locations/history/selection, reentrant activation, inactive close and full teardown\n";
     }catch(const std::exception& error) {std::cerr<<"FAIL: "<<error.what()<<'\n';result=1;}
     apartment.finishOrTerminate();
     if(FAILED(desktop.verifyIsolation()))result=1;

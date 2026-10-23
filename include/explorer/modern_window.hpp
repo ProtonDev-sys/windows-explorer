@@ -35,6 +35,7 @@ private:
     void updateTitle();
     void collectDestroyed(HWND child,ExplorerApp* app);
     void collectRetired();
+    void retireFailedTab(TabId id,ExplorerApp* app) noexcept;
     void showFailure(HRESULT status);
     HINSTANCE instance_;
     bool headless_=false,closing_=false,busy_=false,closeRequested_=false,fullscreen_=false;
@@ -44,6 +45,7 @@ private:
     BrowserTabs tabs_;
     std::vector<Entry> entries_;
     TabId active_=BrowserTabs::NoTab;
+    std::uint64_t activationRevision_=0;
     HRESULT shutdownStatus_=S_OK;
     WINDOWPLACEMENT placement_{sizeof(WINDOWPLACEMENT)};
     LONG_PTR windowStyle_=0;

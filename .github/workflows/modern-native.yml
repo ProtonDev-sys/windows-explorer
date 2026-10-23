@@ -37,6 +37,6 @@ jobs:
           path: |
             modern-native-junit.xml
             build/Testing/Temporary/*
-            build/Release/modern-window-crash.dmp
+            build/Release/modern-window-crash*.dmp
           if-no-files-found: ignore
           retention-days: 7
