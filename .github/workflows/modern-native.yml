@@ -1,0 +1,42 @@
+name: Modern native Explorer
+on:
+  push:
+    branches: [codex/modern-native-tabs-20261023]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - name: Configure native C++
+        shell: pwsh
+        run: cmake -S . -B build -G 'Visual Studio 17 2022' -A x64 -DBUILD_TESTING=ON
+      - name: Build application and headless checks
+        shell: pwsh
+        run: cmake --build build --config Release --target WindowsExplorer modern_window_tests browser_tabs_tests modern_command_bar_tests explorer_tests native_selection_tests --parallel 2
+      - name: Preserve binaries for Windows 11 headless verification
+        uses: actions/upload-artifact@v7
+        with:
+          name: modern-native-binaries
+          path: |
+            build/Release/*.exe
+            build/Release/*.pdb
+            build/CMakeCache.txt
+          retention-days: 7
+      - name: Run owned private-desktop checks
+        shell: pwsh
+        run: ctest --test-dir build -C Release -R '^(core_and_shell_operations|native_browser_tabs|native_modern_command_bar|native_modern_window)$' -j 1 --output-on-failure --output-junit modern-native-junit.xml
+      - name: Preserve headless evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: modern-native-evidence
+          path: |
+            modern-native-junit.xml
+            build/Testing/Temporary/*
+            build/Release/modern-window-crash.dmp
+          if-no-files-found: ignore
+          retention-days: 7

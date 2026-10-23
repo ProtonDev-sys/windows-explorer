@@ -1166,7 +1166,7 @@ bool ExplorerApp::shutdownPinSourceCurrent(const ShutdownPinTransaction& transac
     DWORD process=0;
     if(shutdownPinTransaction_!=&transaction||!closing_||destroying_||navigating_||commandRefreshActive_||
        GetCurrentThreadId()!=transaction.thread||shutdownPinCloseEntry_!=transaction.closeEntry||
-       ribbon_.callbackEntryEpoch()!=transaction.ribbonEpoch||window_!=transaction.window||
+       ribbon_.callbackEntryEpoch()!=transaction.ribbonEpoch||ribbon_.closeViewLifetimeRejected()||window_!=transaction.window||
        !IsWindow(transaction.window)||GetWindowThreadProcessId(transaction.window,&process)!=transaction.thread||
        process!=GetCurrentProcessId()||browser_.Get()!=transaction.originalBrowser||
        view_.Get()!=transaction.originalSite||folderView_.Get()!=transaction.originalFolder||
@@ -1256,6 +1256,27 @@ void ExplorerApp::observeShutdownWindowMessage(UINT message,bool originalCloseMe
     }
     if(message==WM_DESTROY&&ownedCloseContinuation())ownedCloseFrame_->destroyForwarded=true;
 }
+void ExplorerApp::observeShutdownPhase(RibbonShutdownPhase phase) const noexcept {
+    if(!headless_||!headlessShutdownPhaseDiagnostics_)return;
+    RibbonShutdownPhaseContext facts;
+    facts.app=reinterpret_cast<std::uintptr_t>(this);facts.window=reinterpret_cast<std::uintptr_t>(window_);
+    facts.ownedWindow=reinterpret_cast<std::uintptr_t>(ownedCloseWindow_);
+    facts.browser=reinterpret_cast<std::uintptr_t>(browser_.Get());facts.view=reinterpret_cast<std::uintptr_t>(view_.Get());
+    facts.folder=reinterpret_cast<std::uintptr_t>(folderView_.Get());
+    facts.hookGeneration=ownedCloseGeneration_;facts.closeEntry=shutdownPinCloseEntry_;
+    facts.displayRevision=displayedFrequentPlacesRevision_;facts.generation=namespaceGeneration_;facts.navigation=navigationCount_;
+    facts.cleanupStarted=windowDestructionCleanupStarted_;
+    if(ownedCloseFrame_) {
+        facts.originalWindow=reinterpret_cast<std::uintptr_t>(ownedCloseFrame_->window);
+        facts.originalFrame=ownedCloseFrame_->original;facts.nativeCallActive=ownedCloseFrame_->nativeDispatchActive;
+        facts.forwarded=ownedCloseFrame_->forwarded;facts.destroyForwarded=ownedCloseFrame_->destroyForwarded;
+    }
+    if(shutdownPinTransaction_) {
+        facts.transaction=true;facts.capturing=shutdownPinTransaction_->capturing;
+        facts.pinDispatching=shutdownPinTransaction_->dispatching;facts.sourceRevoked=shutdownPinTransaction_->revoked;
+    }
+    ribbon_.observeShutdownPhase(phase,facts);
+}
 LRESULT ExplorerApp::dispatchOwnedClose(HWND window,WPARAM wparam,LPARAM lparam,WNDPROC next) noexcept {
     const bool fresh=!ownedCloseFrame_&&(!closing_||previewClosePending_||searchClosePending_);
     OwnedCloseFrame frame{ownedCloseFrame_,window,ownedCloseGeneration_,fresh,false,false};
@@ -1329,9 +1350,11 @@ LRESULT ExplorerApp::dispatchOwnedClose(HWND window,WPARAM wparam,LPARAM lparam,
                 ~NativeDispatch(){if(armed){frame.nativeDispatchActive=false;frame.nativeReceiver=nullptr;}}
             } nativeDispatch{frame,frame.original&&capturedCurrent};
             if(nativeDispatch.armed){frame.nativeReceiver=next;frame.nativeDispatchActive=true;}
+            observeShutdownPhase(RibbonShutdownPhase::NativeLowerBegin);
             dispatched=true;result=CallWindowProcW(receiver?receiver:windowProc,window,WM_CLOSE,wparam,lparam);
         }
         if(headless_&&frame.original&&capturedCurrent)headlessShutdownNativeCloseReturned_=true;
+        observeShutdownPhase(RibbonShutdownPhase::NativeLowerReturned);
         // Coalescing the genuine request cannot renew this close's pins.
         // The existing once class/dead-window continuations below remain
         // responsible for the original owner, including its nested request.
@@ -1458,6 +1481,7 @@ ExplorerApp::HeadlessShutdownPinFacts ExplorerApp::headlessShutdownPinFacts() co
 }
 
 void ExplorerApp::resetRibbonForClose() noexcept {
+    if(compactChrome_)return;
     if(headless_){headlessShutdownPinAdmission_=1;headlessShutdownPinAdmissionFacts_=headlessShutdownPinFacts();}
     if(shutdownPinTransaction_) {
         auto& transaction=*shutdownPinTransaction_;

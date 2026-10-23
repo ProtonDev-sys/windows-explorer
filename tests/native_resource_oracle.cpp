@@ -1,4 +1,5 @@
-// Read-only diagnosis, never UI-parity or stock-Explorer-owner proof.
+// Default read-only diagnosis; optional owned-framework-only palette feasibility.
+// Never UI-parity or stock-Explorer-owner proof.
 #include "explorer/headless_visual.hpp"
 #include "explorer/namespace_actions.hpp"
 #include "explorer/ribbon.hpp"
@@ -6,6 +7,7 @@
 #include "explorer/native_apartment.hpp"
 #include "explorer/worker_sta.hpp"
 #include "stock_image_observer.hpp"
+#include "native_icon_reference.hpp"
 #include <shlobj.h>
 #include <shlwapi.h>
 #include <propvarutil.h>
@@ -24,6 +26,8 @@
 #include <limits>
 #include <memory>
 #include <stdexcept>
+#include <thread>
+#include <propkey.h>
 #include <string>
 #include <utility>
 #include <vector>
@@ -344,43 +348,56 @@ struct Collector{
 };
 
 std::uint64_t hash(const std::vector<BYTE>& bytes)noexcept{std::uint64_t value=14695981039346656037ULL;for(const auto byte:bytes){value^=byte;value*=1099511628211ULL;}return value;}
-std::vector<BYTE> topDown(const RawDib& raw){const auto rows=raw.header.biHeight<0?-static_cast<std::int64_t>(raw.header.biHeight):raw.header.biHeight;
-    require(raw.width>0&&raw.width<=128&&rows>0&&rows<=128&&raw.stride>=raw.width*4,"Actual icon raster dimensions exceed the diagnostic bound");
-    std::vector<BYTE> result(static_cast<std::size_t>(rows)*static_cast<std::size_t>(raw.width)*4);
-    for(std::int64_t y=0;y<rows;++y){const auto original=raw.header.biHeight<0?y:rows-y-1;
-        std::memcpy(result.data()+static_cast<std::size_t>(y)*static_cast<std::size_t>(raw.width)*4,
-            raw.storedBytes.data()+static_cast<std::size_t>(original)*static_cast<std::size_t>(raw.stride),static_cast<std::size_t>(raw.width)*4);}return result;}
 struct Pixels{HRESULT status=E_PENDING;LONG width=0,height=0;std::vector<BYTE> bgra;};
 Pixels actualPixels(IUIImage* image,HWND owner){guard(owner);Pixels result;RawDib raw;
     result.status=installed_image_contract_draft::copyActualRawDib(image,GetCurrentThreadId(),raw);guard(owner);
-    if(result.status==S_OK){result.width=raw.width;result.height=raw.header.biHeight<0?-raw.header.biHeight:raw.header.biHeight;result.bgra=topDown(raw);
-        result.status=installed_image_contract_draft::verifyActualRawDib(image,GetCurrentThreadId(),raw);guard(owner);if(FAILED(result.status))result.bgra.clear();}
-    return result;}
+    if(result.status==S_OK){
+        const auto rows=raw.header.biHeight<0?-static_cast<std::int64_t>(raw.header.biHeight):raw.header.biHeight;
+        require(raw.width>0&&raw.width<=128&&rows==raw.width&&raw.height==raw.width&&raw.stride==raw.width*4,
+            "Actual icon raster dimensions exceed the square diagnostic bound");
+        result.width=raw.width;result.height=static_cast<LONG>(rows);
+        // The real native factory can report positive GetObject height for an
+        // originally negative-height DIB. Never infer stored row order from
+        // that sign. The established oracle independently requests top-down
+        // GetDIBits RGB sanity, then compares all four original bmBits bytes.
+        result.bgra=native_icon_reference::bitmapPixels(raw.bitmap,static_cast<UINT>(raw.width));guard(owner);
+        require(result.bgra==raw.storedBytes,"Canonical readback changed original stored four-byte pixels");
+        result.status=installed_image_contract_draft::verifyActualRawDib(image,GetCurrentThreadId(),raw);guard(owner);
+        std::cout<<"RASTER_FORMAT nativeBitmapHeight="<<raw.height<<" nativeHeaderHeight="<<raw.header.biHeight
+            <<" originalStoredRows=1 independentTopDownRgbSanity=1 alphaFromRawBits=1 noSignBasedRowFlip=1\n";
+        if(FAILED(result.status))result.bgra.clear();
+    }
+    return result;
+}
 struct Icon{HICON value=nullptr;~Icon(){if(value)DestroyIcon(value);}};
-struct Raster{HBITMAP bitmap=nullptr;HDC dc=nullptr;HGDIOBJ previous=nullptr;~Raster(){if(previous&&dc)SelectObject(dc,previous);if(dc)DeleteDC(dc);if(bitmap)DeleteObject(bitmap);}};
-Pixels providerPixels(const std::wstring& specification,UINT pixels,HWND owner){
+Pixels providerPixels(const std::wstring& specification,UINT pixels,HWND owner,bool paired=false){
     guard(owner);Pixels result;if(specification.empty()){result.status=E_NOTIMPL;return result;}
     if(specification.find(L":IMAGE:")!=std::wstring::npos){result.status=HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);return result;}
     auto location=specification;const auto comma=location.rfind(L',');if(comma==std::wstring::npos){result.status=E_NOTIMPL;return result;}
     wchar_t* end=nullptr;const long index=wcstol(location.c_str()+comma+1,&end,10);
-    if(!end||*end||index<std::numeric_limits<int>::min()||index>std::numeric_limits<int>::max()){result.status=E_INVALIDARG;return result;}
+    if(!end||end==location.c_str()+comma+1||*end||index<std::numeric_limits<int>::min()||index>std::numeric_limits<int>::max()){result.status=E_INVALIDARG;return result;}
     location.resize(comma);if(location.size()>1&&location.front()==L'"'&&location.back()==L'"')location=location.substr(1,location.size()-2);
     if(!location.empty()&&location.front()==L'@')location.erase(location.begin());std::array<wchar_t,32768> expanded{};
     const auto characters=ExpandEnvironmentStringsW(location.c_str(),expanded.data(),static_cast<DWORD>(expanded.size()));
     if(!characters||characters>expanded.size()){result.status=E_INVALIDARG;return result;}
-    Icon icon;result.status=SHDefExtractIconW(expanded.data(),static_cast<int>(index),0,&icon.value,nullptr,MAKELONG(pixels,0));guard(owner);
-    std::cout<<"EXTRACT pixels="<<pixels<<" nativeIndex="<<index;printText("actualExpandedSource",expanded.data());printHr("SHDefExtractIcon",result.status);std::cout<<" iconPresent="<<(icon.value!=nullptr)<<'\n';
-    if(FAILED(result.status)||!icon.value){if(SUCCEEDED(result.status))result.status=E_FAIL;return result;}
-    Raster raster;BITMAPINFO info{};info.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);info.bmiHeader.biWidth=static_cast<LONG>(pixels);
-    info.bmiHeader.biHeight=-static_cast<LONG>(pixels);info.bmiHeader.biPlanes=1;info.bmiHeader.biBitCount=32;info.bmiHeader.biCompression=BI_RGB;void* bits=nullptr;
-    raster.bitmap=CreateDIBSection(nullptr,&info,DIB_RGB_COLORS,&bits,nullptr,0);require(raster.bitmap&&bits,"Create owned independent provider icon DIB");
-    raster.dc=CreateCompatibleDC(nullptr);require(raster.dc!=nullptr,"Create owned independent provider icon DC");raster.previous=SelectObject(raster.dc,raster.bitmap);
-    require(raster.previous&&raster.previous!=HGDI_ERROR,"Select only owned provider icon DIB");std::memset(bits,0,static_cast<std::size_t>(pixels)*pixels*4);
-    require(DrawIconEx(raster.dc,0,0,icon.value,static_cast<int>(pixels),static_cast<int>(pixels),0,nullptr,DI_NORMAL)!=FALSE,"Render only the native returned provider resource");
-    require(GdiFlush()!=FALSE,"Complete native provider icon rendering");const auto restored=SelectObject(raster.dc,raster.previous);
-    require(restored&&restored!=HGDI_ERROR,"Restore owned provider drawing DC");raster.previous=nullptr;
-    result.width=static_cast<LONG>(pixels);result.height=static_cast<LONG>(pixels);const auto* bytes=static_cast<const BYTE*>(bits);
-    result.bgra.assign(bytes,bytes+static_cast<std::size_t>(pixels)*pixels*4);result.status=S_OK;guard(owner);return result;
+    require(pixels==16||pixels==32,"Provider diagnostic only admits actual 96-DPI startup sizes");
+    std::cout<<"EXTRACT mode="<<(paired?"paired":"original-single")<<" pixels="<<pixels<<" nativeIndex="<<index;
+    printText("actualExpandedSource",expanded.data());std::cout<<" flags=0\n";
+    if(!paired){
+        auto reference=native_icon_reference::singleIconReference(expanded.data(),static_cast<int>(index),pixels);guard(owner);
+        result.status=reference.imageStatus();result.bgra=std::move(reference.pixels);
+    }else{
+        Icon larger,smaller;result.status=SHDefExtractIconW(expanded.data(),static_cast<int>(index),0,&larger.value,&smaller.value,MAKELONG(32,16));guard(owner);
+        const auto selected=pixels==32?larger.value:smaller.value;
+        std::cout<<"PAIRED_EXTRACT largePixels=32 smallPixels=16 packedSize="<<MAKELONG(32,16);
+        printHr("actualExtraction",result.status);std::cout<<" largePresent="<<(larger.value!=nullptr)<<" smallPresent="<<(smaller.value!=nullptr)<<'\n';
+        // A missing pair is evidence. Do not run the production single-size
+        // fallback here or disguise which native extraction produced bytes.
+        if(result.status==S_OK&&selected){result.bgra=native_icon_reference::iconPixels(selected,pixels);guard(owner);}
+        else if(result.status==S_OK)result.status=E_FAIL;
+    }
+    if(result.status==S_OK){result.width=static_cast<LONG>(pixels);result.height=static_cast<LONG>(pixels);}
+    guard(owner);return result;
 }
 void printPixels(const char* source,const Pixels& pixels){std::cout<<"PIXELS source="<<source;printHr("status",pixels.status);
     std::cout<<" width="<<pixels.width<<" height="<<pixels.height<<" storedBgraBytes="<<pixels.bgra.size()<<" bgraHash="<<hash(pixels.bgra)<<'\n';}
@@ -395,6 +412,74 @@ GlobalColors readColors(IUIFramework* framework,HWND owner){guard(owner);require
     store.Reset();guard(owner);return result;}
 void printColors(const char* source,const GlobalColors& value){std::cout<<"GLOBAL_COLORS source="<<source;printHr("QIPropertyStore",value.query);
     constexpr std::array names{"background","highlight","text"};for(std::size_t i=0;i<names.size();++i){printHr(names[i],value.reads[i]);std::cout<<' '<<names[i]<<"VT="<<value.types[i]<<' '<<names[i]<<"PackedHSB="<<value.hsb[i];}std::cout<<" valuesAreHSBNotRgb=1\n";}
+
+// This optional feasibility measurement changes only the already-owned
+// independent framework, after the original resource evidence was fenced.
+// The single style input is derived from the pinned reference's File accent.
+// Microsoft's HSL->HSB formula describes a flat tab-row surface, so this is a
+// candidate style input, not a claim that the File raster equals this RGB.
+// Windows 8+ documents Highlight/Background coupling; record it, never hide it.
+void measureReferenceHighlight(Independent& independent){
+    const auto owner=independent.window.value;
+    auto* const framework=independent.framework.Get();
+    const auto token=ownedWindowToken(owner);
+    const auto current=[&]{guard(owner);require(token&&ownedWindowToken(owner)==token&&
+        independent.framework.Get()==framework&&independent.initialized&&independent.handler&&
+        independent.handler->binding(),"Original independent palette owner was replaced/retired");};
+    const auto present=[](const GlobalColors& colors){if(colors.query!=S_OK)return false;
+        for(std::size_t i=0;i<colors.reads.size();++i)
+            if(colors.reads[i]!=S_OK||colors.types[i]!=VT_UI4)return false;
+        return true;};
+    const auto same=[&](const GlobalColors& left,const GlobalColors& right){
+        return present(left)&&present(right)&&left.hsb==right.hsb;};
+    current();const auto originalColors=readColors(framework,owner);current();
+    printColors("referenceHighlightOriginal",originalColors);
+    if(!present(originalColors)){std::cout<<"REFERENCE_HIGHLIGHT evidence=UNAVAILABLE_ORIGINAL_PUBLIC_COLORS targetSetCalls=0 parityClaim=0\n";return;}
+    const auto target=UI_HSB(146,187,130);
+    ComPtr<IPropertyStore> store;const auto query=framework->QueryInterface(IID_PPV_ARGS(&store));current();
+    std::cout<<"REFERENCE_HIGHLIGHT_REQUEST referenceRgbR=29 referenceRgbG=117 referenceRgbB=188"
+        <<" hue=146 saturation=187 brightness=130 packedHSB="<<target;
+    printHr("QIPropertyStore",query);std::cout<<" candidateNotDirectFileRgbMapping=1 productionColorsUntouched=1\n";
+    if(query!=S_OK||!store){store.Reset();current();return;}
+    PROPVARIANT value{};const auto create=InitPropVariantFromUInt32(target,&value);current();
+    const auto set=create==S_OK?store->SetValue(UI_PKEY_GlobalHighlightColor,value):create;
+    PropVariantClear(&value);current();
+    const auto commit=set==S_OK?store->Commit():E_PENDING;current();
+    const auto after=readColors(framework,owner);current();printColors("referenceHighlightAfterCommit",after);
+    const bool independentAccepted=set==S_OK&&commit==S_OK&&present(after)&&
+        after.hsb[1]==target&&after.hsb[0]==originalColors.hsb[0]&&after.hsb[2]==originalColors.hsb[2];
+    std::cout<<"REFERENCE_HIGHLIGHT_RESULT targetSetCalls="<<(create==S_OK?1:0);
+    printHr("actualSetValue",set);printHr("actualCommit",commit);
+    std::cout<<" acceptedIndependently="<<independentAccepted<<" backgroundChanged="
+        <<(present(after)&&after.hsb[0]!=originalColors.hsb[0])<<" textChanged="
+        <<(present(after)&&after.hsb[2]!=originalColors.hsb[2])<<" parityClaim=0\n";
+    // First reverse the same single public property. If the implementation
+    // coupled other properties, attempt exact restoration of all three original
+    // values, then report the real final readback. Never claim a factory restore
+    // merely because SetValue/Commit returned success.
+    PROPVARIANT restore{};const auto restoreCreate=InitPropVariantFromUInt32(originalColors.hsb[1],&restore);current();
+    const auto reverse=restoreCreate==S_OK?store->SetValue(UI_PKEY_GlobalHighlightColor,restore):restoreCreate;
+    PropVariantClear(&restore);current();
+    const auto reverseCommit=reverse==S_OK?store->Commit():E_PENDING;current();
+    auto restored=readColors(framework,owner);current();
+    std::array<HRESULT,3> allRestores{E_PENDING,E_PENDING,E_PENDING};HRESULT allCommit=E_PENDING;
+    const bool allAttempted=!same(originalColors,restored);
+    if(allAttempted){const std::array keys{&UI_PKEY_GlobalBackgroundColor,&UI_PKEY_GlobalTextColor,&UI_PKEY_GlobalHighlightColor};
+        constexpr std::array<std::size_t,3> indexes{0,2,1};
+        for(std::size_t i=0;i<keys.size();++i){PROPVARIANT exactOriginal{};
+            const auto made=InitPropVariantFromUInt32(originalColors.hsb[indexes[i]],&exactOriginal);current();
+            allRestores[i]=made==S_OK?store->SetValue(*keys[i],exactOriginal):made;
+            PropVariantClear(&exactOriginal);current();}
+        allCommit=store->Commit();current();restored=readColors(framework,owner);current();}
+    printColors("referenceHighlightFinalPublicRestore",restored);
+    std::cout<<"REFERENCE_HIGHLIGHT_RESTORE";printHr("samePropertySet",reverse);printHr("samePropertyCommit",reverseCommit);
+    std::cout<<" allPropertiesAttempted="<<allAttempted;printHr("backgroundSet",allRestores[0]);
+    printHr("textSet",allRestores[1]);printHr("highlightSet",allRestores[2]);printHr("allCommit",allCommit);
+    std::cout<<" exactFinalOriginalColors="<<same(originalColors,restored)
+        <<" independentFrameworkStillOwned=1 mandatoryNativeRetirementFollows=1 parityClaim=0\n";
+    store.Reset();current();
+}
+
 void nativeThemeFacts(HWND owner){
     guard(owner);std::array<wchar_t,32768> path{};std::array<wchar_t,1024> scheme{},size{};
     const auto style=GetCurrentThemeName(path.data(),static_cast<int>(path.size()),scheme.data(),static_cast<int>(scheme.size()),size.data(),static_cast<int>(size.size()));
@@ -479,10 +564,169 @@ std::wstring protocolAssociation(ASSOCSTR field,const char* name){
     const auto length=wcsnlen_s(text.data(),characters);if(length>=characters){std::cout<<" evidence=UNAVAILABLE_MALFORMED_OUTPUT\n";return {};}
     printText("actualNativeResource",text.data());std::cout<<'\n';return std::wstring(text.data(),length);
 }
+// Only strings and copied numeric/pixel receipts cross this worker boundary.
+// GetImage extraction is expressly a background operation, never a UI-STA
+// callback. The exact creator desktop connection remains alive through join
+// and lease drain; every native reference retires before its matching Co call.
+struct AppIconRow{UINT pixels=0;SIIGBF flags=SIIGBF_ICONONLY;HRESULT extraction=E_PENDING;bool bitmapPresent=false,rgbReadbackUnavailable=false;
+    int objectBytes=0;LONG bitmapWidth=0,bitmapHeight=0,headerHeight=0,stride=0;WORD bitDepth=0;Pixels copied;};
+struct AppIconReceipt{
+    HRESULT desktopAttach=E_PENDING,initialization=E_PENDING,folderRead=E_PENDING,itemRead=E_PENDING,propertyRead=E_PENDING,identityAdmission=E_PENDING,imageQuery=E_PENDING,leaseFinish=E_PENDING;
+    bool appIdExact=false,parentPidlExact=false,exception=false;DWORD worker=0;
+    explorer::NativeApartmentReadback finished{};std::array<AppIconRow,4> rows{};
+    std::array<HRESULT,32> codeObservations{};UINT codeObservationCount=0;
+};
+struct AppBitmap{
+    HBITMAP bitmap=nullptr;
+    void retire()noexcept{if(bitmap){SetLastError(ERROR_SUCCESS);const auto destroyed=DeleteObject(bitmap);
+        const auto error=GetLastError();if(!destroyed)failClosedRetirement("owned App image DeleteObject",HRESULT_FROM_WIN32(error?error:ERROR_GEN_FAILURE));
+        bitmap=nullptr;}}
+    ~AppBitmap(){retire();}
+};
+struct AppNativeObjects{
+    explorer::NativeApartmentClient client;
+    ComPtr<IShellItem> folder;ComPtr<IShellItem2> item;ComPtr<IShellItemImageFactory> factory;
+    ~AppNativeObjects(){client.beforeNativeRelease();factory.Reset();client.beforeNativeRelease();item.Reset();client.beforeNativeRelease();folder.Reset();}
+};
+template<class SourceFence>
+AppIconReceipt associatedAppIcons(const std::wstring& actualAppId,HWND owner,SourceFence&& sourceFence){
+    guard(owner);sourceFence();AppIconReceipt receipt;
+    if(actualAppId.empty()){receipt.itemRead=HRESULT_FROM_WIN32(ERROR_NOT_FOUND);return receipt;}
+    require(actualAppId.size()<=32767,"Actual association AppID exceeds bounded native child parsing");
+    const auto creatorDesktop=GetThreadDesktop(GetCurrentThreadId());require(creatorDesktop!=nullptr,"Original creator desktop connection is absent");
+    std::unique_ptr<explorer::StaWorkerLease> lease;exact(explorer::StaWorkerLease::prepare(&lease),"Reserve exact creator desktop for App icon worker");
+    struct JoinedWorker{
+        std::thread value;
+        ~JoinedWorker(){if(value.joinable())std::terminate();}
+    } joined;
+    joined.value=std::thread([&,ownedLease=std::move(lease)]() mutable noexcept{
+        receipt.worker=GetCurrentThreadId();receipt.desktopAttach=ownedLease->attach();
+        if(receipt.desktopAttach==S_OK){
+            explorer::NativeApartmentOwner apartment;
+            try{
+                require(GetThreadDesktop(GetCurrentThreadId())==creatorDesktop,"App icon worker attached a different desktop connection");
+                receipt.initialization=apartment.initializeSta();exact(receipt.initialization,"Initialize owned background App icon STA");
+                const auto workerFence=[&]{require(GetTickCount64()<deadline,"App icon worker exceeded original diagnostic deadline");
+                    require(GetThreadDesktop(GetCurrentThreadId())==creatorDesktop,"App icon worker displaced original desktop connection");
+                    exact(explorer::NativeApartmentOwner::currentAdmissionStatus(),"Keep genuine background native apartment admission");};
+                {
+                    AppNativeObjects native;exact(native.client.acquire(),"Reserve App icon worker native objects");
+                    const auto observeCode=[&]{
+                        require(receipt.codeObservationCount<receipt.codeObservations.size(),"Bound actual background code observation rows");
+                        const auto raw=native.client.observeLoadedCode();receipt.codeObservations[receipt.codeObservationCount++]=raw;
+                        // S_FALSE means legitimately absent already-loaded CODE.
+                        // Do not load a module or invent a normal code reference.
+                        if(FAILED(raw))exact(raw,"Observe actual background native code lifetime");workerFence();
+                    };
+                    const auto work=[&]{
+                        workerFence();receipt.folderRead=SHGetKnownFolderItem(FOLDERID_AppsFolder,KF_FLAG_DEFAULT,nullptr,IID_PPV_ARGS(&native.folder));
+                        observeCode();
+                        if(receipt.folderRead!=S_OK||!native.folder){if(receipt.folderRead==S_OK)receipt.folderRead=E_UNEXPECTED;return;}
+                        const auto originalFolder=objectPidl(native.folder.Get());const auto originalFolderBytes=pidlBytes(originalFolder.get());
+                        receipt.itemRead=SHCreateItemInKnownFolder(FOLDERID_AppsFolder,KF_FLAG_DEFAULT,actualAppId.c_str(),IID_PPV_ARGS(&native.item));
+                        observeCode();
+                        if(receipt.itemRead!=S_OK||!native.item){if(receipt.itemRead==S_OK)receipt.itemRead=E_UNEXPECTED;return;}
+                        const auto originalItem=objectPidl(native.item.Get());const auto originalItemBytes=pidlBytes(originalItem.get());
+                        Pidl parent(ILCloneFull(originalItem.get()));require(parent!=nullptr,"Clone actual full App child PIDL");
+                        require(ILRemoveLastID(parent.get())!=FALSE,"Remove actual App child component from owned PIDL clone");
+                        receipt.parentPidlExact=pidlBytes(parent.get())==originalFolderBytes;
+                        if(!receipt.parentPidlExact){receipt.identityAdmission=E_ABORT;return;}
+                        const auto identityRead=[&]{
+                            workerFence();auto folder=objectPidl(native.folder.Get());auto item=objectPidl(native.item.Get());
+                            require(pidlBytes(folder.get())==originalFolderBytes&&pidlBytes(item.get())==originalItemBytes,"Actual associated App identity changed");
+                            PWSTR raw=nullptr;receipt.propertyRead=native.item->GetString(PKEY_AppUserModel_ID,&raw);
+                            struct TextOwner{PWSTR value;~TextOwner(){CoTaskMemFree(value);}} text{raw};
+                            receipt.appIdExact=receipt.propertyRead==S_OK&&raw&&wcsnlen_s(raw,32768)==actualAppId.size()&&actualAppId==raw;
+                            // Never infer child identity from its caption, parser
+                            // success, or the app's protocol resource reference.
+                            observeCode();
+                            return receipt.appIdExact;
+                        };
+                        if(!identityRead()){receipt.identityAdmission=receipt.propertyRead==S_OK?E_UNEXPECTED:receipt.propertyRead;return;}
+                        receipt.identityAdmission=S_OK;receipt.imageQuery=native.item.As(&native.factory);
+                        observeCode();
+                        if(receipt.imageQuery!=S_OK||!native.factory){if(receipt.imageQuery==S_OK)receipt.imageQuery=E_UNEXPECTED;return;}
+                        UINT ordinal=0;
+                        for(const UINT pixels:std::array<UINT,2>{16U,32U})
+                            for(const SIIGBF flags:std::array<SIIGBF,2>{static_cast<SIIGBF>(SIIGBF_ICONONLY),static_cast<SIIGBF>(SIIGBF_ICONONLY|SIIGBF_ICONBACKGROUND)}){
+                            auto& row=receipt.rows[ordinal++];row.pixels=pixels;row.flags=flags;
+                            require(identityRead(),"Previously admitted associated AppID property changed");
+                            AppBitmap ownedBitmap;
+                            row.extraction=native.factory->GetImage({static_cast<LONG>(pixels),static_cast<LONG>(pixels)},flags,&ownedBitmap.bitmap);
+                            row.bitmapPresent=ownedBitmap.bitmap!=nullptr;row.copied.status=row.extraction;
+                            observeCode();
+                            require(identityRead(),"Associated App identity changed during native extraction");
+                            if(row.extraction==S_OK&&ownedBitmap.bitmap){
+                                // Actual GetImage may return a DDB or another
+                                // size. Report unavailable raw-four-byte proof,
+                                // never reconstruct alpha or substitute an icon.
+                                DIBSECTION dib{};
+                                row.objectBytes=GetObjectW(ownedBitmap.bitmap,sizeof(dib),&dib);
+                                row.bitmapWidth=dib.dsBm.bmWidth;row.bitmapHeight=dib.dsBm.bmHeight;row.headerHeight=dib.dsBmih.biHeight;
+                                row.stride=dib.dsBm.bmWidthBytes;row.bitDepth=dib.dsBm.bmBitsPixel;
+                                if(row.objectBytes!=sizeof(dib)||!dib.dsBm.bmBits||
+                                    dib.dsBm.bmWidth!=static_cast<LONG>(pixels)||dib.dsBm.bmHeight!=static_cast<LONG>(pixels)||
+                                    dib.dsBm.bmWidthBytes!=static_cast<LONG>(pixels*4)||dib.dsBm.bmBitsPixel!=32||
+                                    dib.dsBm.bmPlanes!=1||dib.dsBmih.biBitCount!=32||dib.dsBmih.biPlanes!=1||dib.dsBmih.biCompression!=BI_RGB){
+                                    row.copied.status=HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+                                }else{
+                                    try{row.copied.bgra=native_icon_reference::bitmapPixels(ownedBitmap.bitmap,pixels);
+                                        row.copied.width=static_cast<LONG>(pixels);row.copied.height=static_cast<LONG>(pixels);row.copied.status=S_OK;
+                                    }catch(const std::runtime_error&){row.rgbReadbackUnavailable=true;row.copied.status=HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);}
+                                }
+                            }else if(row.extraction==S_OK)row.copied.status=E_UNEXPECTED;
+                            ownedBitmap.retire();
+                            require(identityRead(),"Associated App identity changed during native bitmap retirement");
+                        }
+                    };
+                    work();
+                }
+            }catch(...){receipt.exception=true;}
+            apartment.finishOrTerminate();receipt.finished=apartment.readback();
+        }
+        receipt.leaseFinish=ownedLease->finish();
+    });
+    // Wait for this actual kernel thread while pumping the original creator.
+    // Any failure terminates the owned process without releasing live owners.
+    try{
+        for(;;){const auto waited=WaitForSingleObject(joined.value.native_handle(),0);
+            if(waited==WAIT_OBJECT_0)break;require(waited==WAIT_TIMEOUT,"Read actual App icon worker termination");
+            pump(owner,std::min(deadline,GetTickCount64()+10));}
+    }catch(...){failClosedRetirement("App icon worker join/source/deadline",E_ABORT);}
+    joined.value.join();
+    if(receipt.leaseFinish!=S_OK)failClosedRetirement("App icon worker desktop lease retirement",receipt.leaseFinish);
+    guard(owner);sourceFence();
+    printText("actualAssociatedAppId",actualAppId.c_str());std::cout<<" backgroundWorker="<<receipt.worker<<" kernelJoined=1 appIdExact="<<receipt.appIdExact<<" parentPidlExact="<<receipt.parentPidlExact;
+    printHr("desktopAttach",receipt.desktopAttach);printHr("nativeInitialization",receipt.initialization);printHr("AppsFolder",receipt.folderRead);
+    printHr("actualChild",receipt.itemRead);printHr("actualAppIDProperty",receipt.propertyRead);printHr("identityAdmission",receipt.identityAdmission);
+    printHr("actualImageFactory",receipt.imageQuery);printHr("leaseFinish",receipt.leaseFinish);
+    std::cout<<" nativeOwnerActive="<<receipt.finished.active<<" nativeOwnerClients="<<receipt.finished.clients
+        <<" nativeCodeAcquisitions="<<receipt.finished.codeAcquisitions<<" nativeCodeReleases="<<receipt.finished.codeReleases
+        <<" actualAppIconNotExplorerPrivateCommandAuthority=1\n";
+    require(!receipt.exception,"Background App icon measurement failed exact native identity/readback proof");
+    exact(receipt.desktopAttach,"Attach exact private desktop App icon worker");
+    require(!receipt.finished.active&&!receipt.finished.depth&&!receipt.finished.clients&&!receipt.finished.heldCode&&
+        receipt.finished.codeAcquisitions==receipt.finished.codeReleases&&SUCCEEDED(receipt.finished.failure),"App icon worker native owner did not retire");
+    for(UINT i=0;i<receipt.codeObservationCount;++i){std::cout<<"APP_ICON_CODE_OBSERVATION ordinal="<<i;
+        printHr("actualLoadedCodeObservation",receipt.codeObservations[i]);std::cout<<" S_FALSEMeansNoActualMapping=1 noCodeLoadOrSynthesis=1 kernelJoined=1\n";}
+    const auto currentAppId=protocolAssociation(ASSOCSTR_APPID,"AppUserModelIDPostJoin");guard(owner);sourceFence();
+    std::cout<<"APP_ICON_ASSOCIATION_FENCE originalSnapshotExact="<<(currentAppId==actualAppId)<<" afterNativeRetirementAndKernelJoin=1\n";
+    require(!currentAppId.empty()&&currentAppId==actualAppId,"Actual protocol AppID changed before associated icon admission");
+    for(const auto& row:receipt.rows){std::cout<<"APP_ICON actualSize="<<row.pixels<<" actualFlags="<<static_cast<UINT>(row.flags)<<" bitmapPresent="<<row.bitmapPresent;
+        printHr("actualGetImage",row.extraction);std::cout<<" actualObjectBytes="<<row.objectBytes<<" actualWidth="<<row.bitmapWidth<<" actualBitmapHeight="<<row.bitmapHeight
+            <<" actualHeaderHeight="<<row.headerHeight<<" actualStride="<<row.stride<<" actualBitDepth="<<row.bitDepth<<" topDownRgbReadbackUnavailable="<<row.rgbReadbackUnavailable
+            <<" stockExplorerIconAuthority=UNAVAILABLE\n";
+        if(row.copied.status==S_OK){require(row.copied.bgra.size()<=4096,"App icon plaintext raster exceeded bounded native sizes");
+            std::cout<<"APP_ICON_BYTES actualSize="<<row.pixels<<" actualFlags="<<static_cast<UINT>(row.flags)<<" rawBgraHex=";
+            for(const auto byte:row.copied.bgra)std::cout<<std::hex<<std::setw(2)<<std::setfill('0')<<static_cast<unsigned>(byte);
+            std::cout<<std::dec<<" allFourNativeStoredBytes=1 kernelJoined=1\n";}}
+    sourceFence();return receipt;
+}
+
 enum class Scene{Computer,Network,Recycle};
 const char* sceneName(Scene value){return value==Scene::Computer?"Computer":value==Scene::Network?"Network":"Recycle";}
 REFKNOWNFOLDERID sceneFolder(Scene value){return value==Scene::Computer?FOLDERID_ComputerFolder:value==Scene::Network?FOLDERID_NetworkFolder:FOLDERID_RecycleBinFolder;}
-void run(Scene scene){
+void run(Scene scene,bool referenceHighlight=false){
     std::cout<<"SCENE name="<<sceneName(scene)<<" diagnosticOnly=1\n";SceneOwners owners;
     auto& productionWindow=owners.productionWindow;auto& collector=owners.collector;auto& production=owners.production;
     auto& independent=owners.independent;auto& browser=owners.browser;guard(productionWindow.value);
@@ -588,7 +832,7 @@ void run(Scene scene){
         const auto key=explorer::ribbonCommandStoreName(command.application);
         explorer::NamespaceCommandMetadata baseline,scoped;explorer::NamespaceCommandMetadataDiagnostics baselineReceipt,scopedReceipt;
         HRESULT baselineStatus=HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED),scopedStatus=HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
-        std::wstring protocolDefaultIcon,protocolAppIcon;
+        std::wstring protocolDefaultIcon,protocolAppIcon;AppIconReceipt associatedIcons;
         if(!key.empty()){
             baselineStatus=explorer::namespaceCommandMetadataWithDiagnostics(key,&baseline,nullptr,nullptr,&baselineReceipt);coherent();printMetadata("noSelectionNoSite",baseline,baselineReceipt);
             explorer::NamespaceCommandMetadata emptySelection;explorer::NamespaceCommandMetadataDiagnostics emptyReceipt;
@@ -602,7 +846,9 @@ void run(Scene scene){
             // Windows.OpenSettings or claim a provider GetIcon occurred.
             std::cout<<"METADATA native="<<command.native<<" evidence=UNAVAILABLE_PRODUCTION_COMMANDSTORE_NAME noGuessedProvider=1\n";
             if(command.application==explorer::RibbonOpenSettings){protocolDefaultIcon=protocolAssociation(ASSOCSTR_DEFAULTICON,"DefaultIcon");coherent();
-                protocolAppIcon=protocolAssociation(ASSOCSTR_APPICONREFERENCE,"AppIconReference");coherent();}
+                protocolAppIcon=protocolAssociation(ASSOCSTR_APPICONREFERENCE,"AppIconReference");coherent();
+                const auto actualAppId=protocolAssociation(ASSOCSTR_APPID,"AppUserModelID");coherent();
+                associatedIcons=associatedAppIcons(actualAppId,productionWindow.value,coherent);coherent();}
         }
         std::cout<<"ROUTE_AUTHORITY onlyDocumentedNativeScope=1 actualStockExplorerInvocationRoute=UNAVAILABLE noStateOrEligibilityOverride=1\n";
         std::wstring label;const auto labelStatus=production.commandLabel(command.application,label);coherent();std::cout<<"PRODUCTION_LABEL native="<<command.native;
@@ -619,7 +865,13 @@ void run(Scene scene){
             if(fallbackStatus==S_OK&&fallback)explicitFallback=actualPixels(fallback.Get(),productionWindow.value);else explicitFallback.status=fallbackStatus;coherent();
             const auto fromBaseline=baselineStatus==S_OK?providerPixels(baseline.icon,pixels,productionWindow.value):Pixels{baselineStatus,0,0,{}};coherent();
             const auto fromScoped=scopedStatus==S_OK?providerPixels(scoped.icon,pixels,productionWindow.value):Pixels{scopedStatus,0,0,{}};coherent();
+            const auto pairedBaseline=baselineStatus==S_OK?providerPixels(baseline.icon,pixels,productionWindow.value,true):Pixels{baselineStatus,0,0,{}};coherent();
+            printPixels("baselineProviderPairedResource",pairedBaseline);compare("baselineProviderOriginalSingle",fromBaseline,"baselineProviderPairedResource",pairedBaseline);
+            compare("actualUpdatePropertyReturned",actual,"baselineProviderPairedResource",pairedBaseline);
             if(command.application==explorer::RibbonOpenSettings){
+                for(const auto& row:associatedIcons.rows)if(row.pixels==pixels){
+                    const auto source=row.flags==SIIGBF_ICONONLY?"actualAssociatedAppIcon":"actualAssociatedAppIconRegisteredBackground";
+                    printPixels(source,row.copied);compare("actualUpdatePropertyReturned",actual,source,row.copied);coherent();}
                 const auto fromProtocolDefault=providerPixels(protocolDefaultIcon,pixels,productionWindow.value);coherent();
                 const auto fromProtocolApp=providerPixels(protocolAppIcon,pixels,productionWindow.value);coherent();
                 printPixels("actual-ms-settings-DefaultIconAssociation",fromProtocolDefault);printPixels("actual-ms-settings-AppIconReference",fromProtocolApp);
@@ -631,6 +883,7 @@ void run(Scene scene){
             fallback.Reset();coherent(); // Fence actual native Release before next result is admitted.
         }}
     coherent();std::cout<<"SCENE_DIAGNOSTIC_COMPLETE name="<<sceneName(scene)<<" productionTargetCallbacks="<<productionCount<<" independentFirstRows="<<independentCount<<" allSourceFences=1 parityClaim=0\n";
+    if(referenceHighlight)measureReferenceHighlight(independent);
     // Retire owned native frameworks while all original native sources and
     // retained callback image interfaces remain alive on their creator STA.
     owners.retire();require(!teardownFailed,"Native source/frame/image retirement failed its final source guard");
@@ -641,7 +894,11 @@ void run(Scene scene){
 int wmain(int count,wchar_t** arguments){
     // Unknown/missing arguments are rejected before private desktop, COM,
     // process theme policy, HWND, registry provider or module initialization.
-    if(count!=2||!arguments||!arguments[1]||wcscmp(arguments[1],L"--owned-read-only")!=0){std::cerr<<"Usage: native_resource_oracle --owned-read-only\n";return 2;}
+    if((count!=2&&count!=3&&count!=4)||!arguments||!arguments[1]||wcscmp(arguments[1],L"--owned-read-only")!=0||
+        (count>=3&&(!arguments[2]||wcscmp(arguments[2],L"--light")!=0))||
+        (count==4&&(!arguments[3]||wcscmp(arguments[3],L"--reference-highlight")!=0))){std::cerr<<"Usage: native_resource_oracle --owned-read-only [--light [--reference-highlight]]\n";return 2;}
+    const bool referenceHighlight=count==4;
+    const auto requestedTheme=count>=3?explorer::ThemeMode::Light:explorer::ThemeMode::Auto;
     SetErrorMode(SEM_FAILCRITICALERRORS|SEM_NOOPENFILEERRORBOX);SetLastError(ERROR_SUCCESS);
     const auto dpiSet=SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);const auto dpiError=GetLastError();
     const auto dpiContext=GetThreadDpiAwarenessContext();const auto dpiAwareness=GetAwarenessFromDpiAwarenessContext(dpiContext);
@@ -655,10 +912,11 @@ int wmain(int count,wchar_t** arguments){
     try{APTTYPE apartment{};APTTYPEQUALIFIER qualifier{};exact(CoGetApartmentType(&apartment,&qualifier),"Read actual creator COM apartment");
         require(apartment==APTTYPE_STA||apartment==APTTYPE_MAINSTA,"Native resource oracle creator is not STA");
         INITCOMMONCONTROLSEX controls{sizeof(controls),ICC_STANDARD_CLASSES|ICC_WIN95_CLASSES};require(InitCommonControlsEx(&controls)!=FALSE,"Initialize native owned controls");
-        exact(explorer::initializeProcessTheme(explorer::ThemeMode::Auto),"Initialize actual App process-local theme policy");
+        exact(explorer::initializeProcessTheme(requestedTheme),"Initialize actual App process-local theme policy");
+        std::cout<<"DIAGNOSTIC_THEME explicitLight="<<(requestedTheme==explorer::ThemeMode::Light)<<" processLocalOnly=1 noSystemThemeMutation=1\n";
         WNDCLASSW type{};type.hInstance=GetModuleHandleW(nullptr);type.lpfnWndProc=Window::procedure;type.lpszClassName=hostClass;type.hbrBackground=reinterpret_cast<HBRUSH>(COLOR_WINDOW+1);
         require(RegisterClassW(&type)!=0,"Register only native resource oracle owned HWND class");languageFacts();
-        for(const auto scene:{Scene::Computer,Scene::Network,Scene::Recycle})run(scene);guard();completed=true;
+        for(const auto scene:{Scene::Computer,Scene::Network,Scene::Recycle})run(scene,referenceHighlight&&scene==Scene::Computer);guard();completed=true;
     }catch(const Unavailable& missing){std::cout<<"UNAVAILABLE: "<<missing.message<<" parityClaim=0\n";result=77;}
     catch(const std::exception& failure){std::cerr<<"FAIL: "<<failure.what()<<'\n';result=1;}
     catch(...){std::cerr<<"FAIL: unexpected exception retired through owned RAII\n";result=1;}
@@ -666,7 +924,7 @@ int wmain(int count,wchar_t** arguments){
     // original creator-STA retirement, including exception paths.
     const auto now=GetTickCount64();const DWORD budget=now<deadline?static_cast<DWORD>(std::min<ULONGLONG>(2000,deadline-now)):0;
     const auto drained=explorer::drainStaWorkers(budget);if(drained!=S_OK||explorer::pendingStaWorkers()){
-        std::cerr<<"FAIL: original creator native worker drain HRESULT="<<static_cast<ULONG>(drained)<<'\n';result=1;}
+        failClosedRetirement("original creator native worker drain",drained!=S_OK?drained:E_PENDING);}
     const auto beforeFinish=nativeApartment.readback();
     if(beforeFinish.clients){std::cerr<<"FAIL: native apartment clients survived owned retirement\n";result=1;}
     nativeApartment.finishOrTerminate();const auto finished=nativeApartment.readback();

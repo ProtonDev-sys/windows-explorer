@@ -891,10 +891,37 @@ struct NativeRibbon::Impl : std::enable_shared_from_this<NativeRibbon::Impl> {
             receipt->callbackReturnTicks[index]=GetTickCount64();++receipt->callbackCount;}}
         HRESULT finish(HRESULT result) noexcept {if(receipt)receipt->result=result;return result;}
     };
+    static void appendShutdownPhase(RibbonRecentItemsDiagnostics& storage,Impl* owner,
+        std::uint64_t epoch,RibbonShutdownPhase phase,const RibbonShutdownPhaseContext& app={},
+        std::uintptr_t object=0) noexcept {
+        if(GetCurrentThreadId()!=storage.creatorThread)return;
+        if(storage.count>=storage.receipts.size()){storage.overflow=true;return;}
+        auto& receipt=storage.receipts[storage.count++];
+        receipt.kind=RibbonRecentItemsReceiptKind::ShutdownPhase;receipt.phase=phase;
+        receipt.app=app;receipt.phaseObject=object;receipt.entryEpoch=receipt.exitEpoch=epoch;
+        receipt.entryTick=receipt.exitTick=GetTickCount64();
+        if(owner) {
+            receipt.nativeOwner=reinterpret_cast<std::uintptr_t>(owner);
+            receipt.nativeWindow=reinterpret_cast<std::uintptr_t>(owner->window);
+            receipt.nativeFramework=reinterpret_cast<std::uintptr_t>(owner->framework.Get());
+            receipt.nativeView=reinterpret_cast<std::uintptr_t>(owner->ribbon.Get());
+            receipt.entryRevision=receipt.exitRevision=owner->revision->value;
+            receipt.retired=receipt.exitRetired=owner->revision->retired;
+            receipt.windowDestroyed=receipt.exitWindowDestroyed=owner->revision->windowDestroyed;
+            receipt.messageActive=owner->shutdownMessageActive;receipt.batchDispatching=owner->shutdownRecentItemsDispatching;
+            receipt.destroyStarted=owner->nativeDestroyStarted;receipt.retirementDeferred=owner->nativeRetirementDeferred;
+            receipt.viewLifetimeRejected=owner->shutdownViewLifetimeRejected;
+        }
+    }
+    void observeShutdownPhase(RibbonShutdownPhase phase,std::uintptr_t object=0) noexcept {
+        if(!recentItemsDiagnostics)return;
+        appendShutdownPhase(*recentItemsDiagnostics,this,callbackEpoch?callbackEpoch->load():0,phase,{},object);
+    }
     std::uint64_t shutdownRecentItemsEpoch=0;
     IUIFramework* shutdownRecentItemsFramework=nullptr; // Borrowed inside the original retained close/reset stack.
     bool shutdownRecentItems=false,shutdownRecentItemsStarted=false;
     bool shutdownMessageActive=false,shutdownRecentItemsDispatching=false;
+    bool shutdownViewLifetimeRejected=false;
     bool nativeDestroyStarted=false,nativeDestroyCompleted=false,nativeDestroyFailed=false,nativeRetirementDeferred=false;
     std::function<bool()> ownerWindowRetirementHook;
     std::vector<bool> shutdownRecentPins;
@@ -1203,7 +1230,12 @@ struct NativeRibbon::Impl : std::enable_shared_from_this<NativeRibbon::Impl> {
                     owner_.ribbon=nativeView;owner_.height=nativeHeight;
                     if(owner_.callbacks.heightChanged)owner_.callbacks.heightChanged(nativeHeight);
                     if(owner_.revision->retired)return changedBinding;
-                }else if(verb==UI_VIEWVERB_DESTROY){owner_.height=0;owner_.ribbon.Reset();}
+                }else if(verb==UI_VIEWVERB_DESTROY){
+                    const auto original=reinterpret_cast<std::uintptr_t>(owner_.ribbon.Get());
+                    owner_.observeShutdownPhase(RibbonShutdownPhase::NativeViewDestroyResetBegin,original);
+                    owner_.height=0;owner_.ribbon.Reset();
+                    owner_.observeShutdownPhase(RibbonShutdownPhase::NativeViewDestroyResetReturned,original);
+                }
                 return S_OK;
             } catch(...) {return E_FAIL;}
         }
@@ -1930,17 +1962,49 @@ LRESULT NativeRibbon::dispatchCloseWithFinalPinCallback(const std::function<HRES
     if(!lifetime||GetCurrentThreadId()!=lifetime->thread||lifetime->revision->retired||lifetime->shutdownMessageActive)
         return continuation();
     struct Scope {
-        NativeRibbon& ribbon;Impl& owner;
+        NativeRibbon& ribbon;Impl& owner;ComPtr<IUIRibbon> originalView;
         ~Scope(){owner.shutdownMessageActive=false;owner.shutdownRecentItems=false;
             owner.shutdownRecentItemsFramework=nullptr;owner.shutdownPinItem={};owner.shutdownRecentPins.clear();
-            if(ribbon.closingImpl_.get()==&owner)ribbon.closingImpl_.reset();}
+            if(ribbon.closingImpl_.get()==&owner)ribbon.closingImpl_.reset();
+            // The continuation has fully returned. The outer strong Impl keeps
+            // its native apartment/module alive through this view's Release.
+            const auto view=reinterpret_cast<std::uintptr_t>(originalView.Get());
+            if(view)owner.observeShutdownPhase(RibbonShutdownPhase::ViewLeaseReleaseBegin,view);
+            originalView.Reset();
+            if(view)owner.observeShutdownPhase(RibbonShutdownPhase::ViewLeaseReleaseReturned,view);}
     } scope{*this,*lifetime};
     closingImpl_=lifetime;
     lifetime->shutdownRecentItemsEpoch=callbackEpoch_->load();
     lifetime->shutdownRecentItemsFramework=lifetime->framework.Get();
+    lifetime->shutdownViewLifetimeRejected=false; // this new original scope only; no token/epoch is renewed here
     lifetime->shutdownRecentItemsStarted=false;lifetime->shutdownMessageActive=true;lifetime->shutdownRecentItems=true;
     lifetime->shutdownRecentPins=lifetime->recentPins;lifetime->shutdownPinItem=callback;
-    if(!lifetime->shutdownRecentItemsCurrent())lifetime->shutdownRecentItems=false;
+    // Capture only this already-owned actual view. Arm the original scope
+    // before its AddRef can pump; never GetView/QI or adopt a later native view.
+    const auto originalWindow=lifetime->window;const auto originalFramework=lifetime->framework.Get();
+    auto* const originalView=lifetime->ribbon.Get();
+    const auto originalRevision=lifetime->revision->value,originalBinding=bindingGeneration_;
+    const auto originalEpoch=callbackEpoch_->load();
+    const auto current=[&] {
+        return GetCurrentThreadId()==lifetime->thread&&impl_.get()==lifetime.get()&&
+            closingImpl_.get()==lifetime.get()&&bindingGeneration_==originalBinding&&
+            callbackEpoch_->load()==originalEpoch&&!lifetime->revision->retired&&
+            !lifetime->revision->windowDestroyed&&lifetime->revision->value==originalRevision&&
+            lifetime->window==originalWindow&&lifetime->framework.Get()==originalFramework&&
+            lifetime->ribbon.Get()==originalView&&originalView&&lifetime->shutdownRecentItemsCurrent();
+    };
+    if(current()) {
+        lifetime->observeShutdownPhase(RibbonShutdownPhase::ViewRetainBegin,reinterpret_cast<std::uintptr_t>(originalView));
+        scope.originalView=originalView;
+        lifetime->observeShutdownPhase(RibbonShutdownPhase::ViewRetainReturned,reinterpret_cast<std::uintptr_t>(scope.originalView.Get()));
+        if(!current()) {
+            lifetime->shutdownViewLifetimeRejected=true;lifetime->shutdownRecentItems=false;
+            lifetime->observeShutdownPhase(RibbonShutdownPhase::ViewRetainDenied,reinterpret_cast<std::uintptr_t>(scope.originalView.Get()));
+        }
+    } else {
+        lifetime->shutdownViewLifetimeRejected=true;lifetime->shutdownRecentItems=false;
+        lifetime->observeShutdownPhase(RibbonShutdownPhase::ViewRetainDenied);
+    }
     return continuation();
 }
 HRESULT NativeRibbon::setOwnerWindowRetirementHook(HWND window,const std::function<bool()>& callback) {
@@ -1967,14 +2031,21 @@ void NativeRibbon::finishOwnerWindowRetirement() noexcept {
     retireImpl(original,nullptr,callbackEpoch_->load(),false);
 }
 bool NativeRibbon::closeDispatchActive()const noexcept{return closingImpl_&&closingImpl_->shutdownMessageActive;}
+bool NativeRibbon::closeViewLifetimeRejected()const noexcept{return closingImpl_&&closingImpl_->shutdownViewLifetimeRejected;}
 std::uint64_t NativeRibbon::callbackEntryEpoch()const noexcept{return callbackEpoch_->load();}
 HRESULT NativeRibbon::enableRecentItemsDiagnostics(){
     if(!impl_)return E_UNEXPECTED;if(GetCurrentThreadId()!=impl_->thread)return RPC_E_WRONG_THREAD;
     try{recentItemsDiagnostics_=std::make_shared<RibbonRecentItemsDiagnostics>();
+        recentItemsDiagnostics_->creatorThread=GetCurrentThreadId();
         impl_->recentItemsDiagnostics=recentItemsDiagnostics_;return S_OK;}catch(...){return E_OUTOFMEMORY;}
 }
 void NativeRibbon::recentItemsDiagnostics(RibbonRecentItemsDiagnostics& output)const noexcept{
     output=recentItemsDiagnostics_?*recentItemsDiagnostics_:RibbonRecentItemsDiagnostics{};
+}
+void NativeRibbon::observeShutdownPhase(RibbonShutdownPhase phase,const RibbonShutdownPhaseContext& app)const noexcept {
+    if(!recentItemsDiagnostics_)return;
+    auto* const original=closingImpl_?closingImpl_.get():(delayedWindowImpl_?delayedWindowImpl_.get():impl_.get());
+    Impl::appendShutdownPhase(*recentItemsDiagnostics_,original,callbackEpoch_->load(),phase,app);
 }
 void NativeRibbon::resetImpl(const std::function<HRESULT(UINT,bool)>* finalPinCallback)noexcept{
     // Only an explicitly supplied original final callback, outside a batch,
@@ -2062,7 +2133,10 @@ void NativeRibbon::retireImpl(std::shared_ptr<Impl> retired,const std::function<
             retired->shutdownRecentItems=retired->callbackEpoch&&retired->callbackEpoch->load()==epoch;
             }
         }catch(...) {retired->shutdownRecentItems=false;}
-        if(framework){const auto hr=framework->Destroy();diagnostic.finish(hr);
+        if(framework){
+            retired->observeShutdownPhase(RibbonShutdownPhase::FrameworkDestroyBegin,reinterpret_cast<std::uintptr_t>(framework.Get()));
+            const auto hr=framework->Destroy();diagnostic.finish(hr);
+            retired->observeShutdownPhase(RibbonShutdownPhase::FrameworkDestroyReturned,reinterpret_cast<std::uintptr_t>(framework.Get()));
             retired->nativeDestroyFailed=FAILED(hr);
             // A failed Destroy leaves actual retained COM handler/hook lifetime
             // unproven even after HWND destruction. Do not retry or release an

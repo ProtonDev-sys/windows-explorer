@@ -1,5 +1,6 @@
 #include "explorer/native_apartment.hpp"
 #include "explorer/app.hpp"
+#include "explorer/modern_window.hpp"
 #include "explorer/shell_operations.hpp"
 #include "explorer/theme.hpp"
 #include "explorer/headless_crash.hpp"
@@ -35,6 +36,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     bool visual = false;
     bool benchmark = false;
     bool installedRibbon = false;
+    bool classicChrome = false;
     bool sourceDocumentsLibrary = false;
     explorer::ThemeMode theme = explorer::ThemeMode::Auto;
     explorer::StartupDesktopChild startupContext;
@@ -59,7 +61,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
             arg == L"--details" || arg == L"--collapsed" || arg == L"--open-search-date-menu" ||
             arg == L"--width" || arg == L"--height" || arg == L"--dpi" || arg == L"--view" || arg == L"--path")
             libraryIncompatibleOptions = true;
-        if (arg == L"--headless-smoke") { headless = true; explicitHeadlessSmoke = true; }
+        if (arg == L"--classic") { classicChrome = true; }
+        else if (arg == L"--headless-smoke") { headless = true; explicitHeadlessSmoke = true; }
         else if (arg == L"--headless-library-smoke") {
             if (headlessLibrarySmoke) { LocalFree(arguments); return 2; }
             headless = true; headlessLibrarySmoke = true;
@@ -289,6 +292,25 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
         nativeApartment.finishOrTerminate();
         return SUCCEEDED(isolated) && SUCCEEDED(observed) && !restricted.visibleInputDesktopWindows &&
             SUCCEEDED(reported) && (SUCCEEDED(verified) || restricted.documentsLibrarySource.unavailable) ? 9 : 7;
+    }
+    if(!headless&&!classicChrome) {
+        int result=0;
+        {
+            explorer::ModernExplorerWindow modern(instance);
+            explorer::SearchWindowContext context;
+            auto ready=searchContextHandle?explorer::consumeSearchWindowContext(searchContextHandle,&context):S_OK;
+            if(SUCCEEDED(ready))ready=modern.create(location,searchContextHandle?&context:nullptr);
+            if(FAILED(ready)) {
+                MessageBoxW(nullptr,explorer::hresultMessage(ready).c_str(),L"File Explorer could not start",MB_OK|MB_ICONERROR);result=4;
+            }else result=modern.run(showCommand);
+            if(FAILED(modern.shutdown())&&!result)result=8;
+        }
+        explorer::ShellOperations::flushClipboardIfOwned();
+        DWORD ownerProcess=0;
+        if(const auto owner=GetClipboardOwner())GetWindowThreadProcessId(owner,&ownerProcess);
+        if(ownerProcess==GetCurrentProcessId())OleFlushClipboard();
+        nativeApartment.finishOrTerminate();
+        return result;
     }
     auto app = new explorer::ExplorerApp(instance, headless,
         (installedRibbon || !headless) ? explorer::RibbonLayout::InstalledWindows10 : explorer::RibbonLayout::Authored);

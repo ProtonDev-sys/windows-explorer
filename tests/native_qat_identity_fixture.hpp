@@ -54,18 +54,59 @@ HRESULT gesturePathDescendant(const std::vector<GestureElement>& rows,size_t lea
     return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
 }
 HRESULT gestureCapturePath(const std::vector<GestureElement>& rows,size_t leaf,
-                          HWND owner,DWORD creator,ULONGLONG deadline,GestureActionPath& output) {
+                          HWND owner,DWORD creator,ULONGLONG deadline,GestureActionPath& output,
+                          const GesturePopupAuthority* popup=nullptr) {
     if(rows.empty()||rows.size()>512||leaf>=rows.size()||!owner||!creator)return E_UNEXPECTED;
     GestureActionPath path;path.root=rows[leaf].walkRoot;
-    if(!path.root||!gestureOwnedPopup(path.root,owner,creator)||rows[0].nativeWindow!=path.root)
-        return gestureTraceResult(E_ACCESSDENIED);
-    std::array<size_t,33> indices{};size_t count=0;
+    gestureReadTrace.stage=100;gestureReadTrace.pathRootRole=popup?1u:0u;
+    gestureReadTrace.pathOwnershipGate=1;gestureReadTrace.pathNativeRoot=path.root;
+    gestureReadTrace.pathReportedRoot=rows[0].nativeWindow;gestureReadTrace.pathReportedNode=nullptr;
+    if(popup) {
+        if(popup->owner!=owner||popup->creator!=creator||popup->deadline!=deadline||
+           path.root!=popup->root.window||rows[leaf].type!=UIA_MenuItemControlTypeId)
+            return gestureTraceResult(E_ACCESSDENIED);
+        qat_gesture_protocol::WindowIdentity root;
+        gestureReadTrace.pathOwnershipGate=6;
+        auto hr=gesturePopupWindowRead(*popup,path.root,root);if(hr!=S_OK)return gestureTraceResult(hr);
+        // ElementFromHandle was issued for this independently qualified HWND.
+        // A reported root HWND, when present, must be this root or its genuine
+        // child. Null is unavailable metadata, never a fabricated identity;
+        // the selected leaf still needs the later actual native receiver and
+        // both full-root Legacy/native proofs before Invoke.
+        if(rows[0].nativeWindow) {
+            gestureReadTrace.pathOwnershipGate=7;
+            hr=gesturePopupWindowRead(*popup,rows[0].nativeWindow,root);if(hr!=S_OK)return gestureTraceResult(hr);
+        }
+    } else {
+        gestureReadTrace.pathOwnershipGate=2;
+        if(!path.root)return gestureTraceResult(E_ACCESSDENIED);
+        gestureReadTrace.pathOwnershipGate=3;
+        if(path.root!=owner)return gestureTraceResult(E_ACCESSDENIED);
+        gestureReadTrace.pathOwnershipGate=4;
+        if(rows[0].nativeWindow!=path.root)return gestureTraceResult(E_ACCESSDENIED);
+        qat_gesture_protocol::WindowIdentity root;
+        gestureReadTrace.pathOwnershipGate=5;
+        const auto hr=qat_gesture_protocol::readOwnedWindow(path.root,owner,creator,root);
+        if(hr!=S_OK)return gestureTraceResult(hr);
+    }
+    std::array<size_t,33> indices{};size_t count=0;bool nativeMenuAncestor=false;
     for(;;) {
         if(GetTickCount64()>=deadline)return gestureTraceResult(HRESULT_FROM_WIN32(ERROR_TIMEOUT),4);
         if(count==indices.size())return gestureTraceResult(HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER),8);
         const auto& row=rows[leaf];
         if(row.walkRoot!=path.root)return gestureTraceResult(E_UNEXPECTED);
-        if(row.nativeWindow&&!gestureOwnedPopup(row.nativeWindow,owner,creator))return gestureTraceResult(E_ACCESSDENIED);
+        if(row.type==UIA_MenuControlTypeId&&!row.offscreen)nativeMenuAncestor=true;
+        gestureReadTrace.stage=101;gestureReadTrace.pathOwnershipGate=8;
+        gestureReadTrace.pathReportedNode=row.nativeWindow;
+        if(row.nativeWindow) {
+            qat_gesture_protocol::WindowIdentity native;
+            if(!popup&&!IsWindowVisible(row.nativeWindow)) {
+                gestureReadTrace.pathOwnershipGate=9;return gestureTraceResult(E_ACCESSDENIED);
+            }
+            const auto hr=popup?gesturePopupWindowRead(*popup,row.nativeWindow,native):
+                qat_gesture_protocol::readOwnedWindow(row.nativeWindow,owner,creator,native);
+            if(hr!=S_OK)return gestureTraceResult(hr);
+        }
         // Each actual parent relation must uniquely address this child among
         // all siblings, including hidden/disabled peers, in this complete walk.
         size_t matches=0;
@@ -81,7 +122,10 @@ HRESULT gestureCapturePath(const std::vector<GestureElement>& rows,size_t leaf,
     }
     path.nodes.reserve(count);
     while(count)path.nodes.push_back(gestureDescriptor(rows[indices[--count]]));
-    output=std::move(path);return S_OK;
+    if(popup&&!nativeMenuAncestor) {
+        gestureReadTrace.pathOwnershipGate=10;return gestureTraceResult(E_ACCESSDENIED);
+    }
+    gestureReadTrace.pathOwnershipGate=0;output=std::move(path);return S_OK;
 }
 struct GestureLegacyIdentity {
     HRESULT patternRead=E_PENDING,accessibleRead=E_PENDING,childRead=E_PENDING,unknownRead=E_PENDING;
@@ -137,9 +181,19 @@ struct GestureBridgeValue {
     std::vector<BYTE> identity;
 };
 HRESULT gestureBridgeWindowCurrent(const qat_gesture_protocol::WindowIdentity& expected,
-                                  HWND owner,DWORD creator,ULONGLONG deadline) {
+                                  HWND owner,DWORD creator,ULONGLONG deadline,
+                                  const GesturePopupAuthority* popup) {
     if(GetTickCount64()>=deadline)return HRESULT_FROM_WIN32(ERROR_TIMEOUT);
-    if(!gestureOwnedPopup(expected.window,owner,creator))return E_ACCESSDENIED;
+    if(popup) {
+        if(popup->owner!=owner||popup->creator!=creator||popup->deadline!=deadline)return E_ACCESSDENIED;
+        qat_gesture_protocol::WindowIdentity current;
+        const auto hr=gesturePopupWindowRead(*popup,expected.window,current);if(hr!=S_OK)return hr;
+        return gestureEqualReceiver(current,expected)?S_OK:E_ABORT;
+    }
+    qat_gesture_protocol::WindowIdentity child;
+    if(!IsWindowVisible(expected.window))return E_ACCESSDENIED;
+    const auto childRead=qat_gesture_protocol::readOwnedWindow(expected.window,owner,creator,child);
+    if(childRead!=S_OK)return childRead;
     qat_gesture_protocol::WindowIdentity current;
     current.window=expected.window;current.root=GetAncestor(expected.window,GA_ROOT);
     current.parent=GetAncestor(expected.window,GA_PARENT);
@@ -156,7 +210,8 @@ HRESULT gestureBridgeWindowCurrent(const qat_gesture_protocol::WindowIdentity& e
 }
 HRESULT gestureBridgeRead(const GestureLegacyIdentity& legacy,const GestureElement& expected,
                          const qat_gesture_protocol::WindowIdentity& receiver,
-                         HWND owner,DWORD creator,ULONGLONG deadline,UINT slot,GestureBridgeValue& output) {
+                         HWND owner,DWORD creator,ULONGLONG deadline,UINT slot,GestureBridgeValue& output,
+                         const GesturePopupAuthority* popup) {
     if(slot>=gestureReadTrace.legacyBridge.size()||!legacy.accessible||!legacy.canonical||legacy.child<0)
         return gestureTraceResult(E_UNEXPECTED);
     GestureBridgeValue value;
@@ -168,7 +223,7 @@ HRESULT gestureBridgeRead(const GestureLegacyIdentity& legacy,const GestureEleme
     gestureReadTrace.nativeResult=receipt.windowRead;
     if(receipt.windowRead!=S_OK||!receipt.window)return gestureTraceResult(receipt.windowRead==S_OK?E_UNEXPECTED:receipt.windowRead);
     if(receipt.window!=receiver.window)return gestureTraceResult(E_ABORT);
-    receipt.receiverRead=gestureBridgeWindowCurrent(receiver,owner,creator,deadline);
+    receipt.receiverRead=gestureBridgeWindowCurrent(receiver,owner,creator,deadline,popup);
     gestureReadTrace.nativeResult=receipt.receiverRead;if(receipt.receiverRead!=S_OK)return gestureTraceResult(receipt.receiverRead);
     VARIANT child{};child.vt=VT_I4;child.lVal=legacy.child;
     struct NativeVariant {VARIANT value{};~NativeVariant(){VariantClear(&value);}} role,state;
@@ -225,14 +280,15 @@ HRESULT gestureBridgeRead(const GestureLegacyIdentity& legacy,const GestureEleme
         value.identity.assign(bytes.value,bytes.value+receipt.identityLength);
     }
     hr=before(97);if(hr!=S_OK)return hr;
-    receipt.receiverAfter=gestureBridgeWindowCurrent(receiver,owner,creator,deadline);
+    receipt.receiverAfter=gestureBridgeWindowCurrent(receiver,owner,creator,deadline,popup);
     gestureReadTrace.nativeResult=receipt.receiverAfter;if(receipt.receiverAfter!=S_OK)return gestureTraceResult(receipt.receiverAfter);
     value.evidence=receipt;output=std::move(value);return S_OK;
 }
 HRESULT gestureLegacyPair(IUIAutomation* automation,const GestureElement& retained,const GestureElement& reacquired,
                           const qat_gesture_protocol::WindowIdentity& retainedReceiver,
                           const qat_gesture_protocol::WindowIdentity& currentReceiver,
-                          HWND owner,DWORD creator,ULONGLONG deadline) {
+                          HWND owner,DWORD creator,ULONGLONG deadline,
+                          const GesturePopupAuthority* popup) {
     if(!automation)return gestureTraceResult(E_NOINTERFACE);
     GestureLegacyIdentity left,right;
     auto hr=gestureLegacyRead(retained.element.Get(),deadline,left);if(hr!=S_OK)return hr;
@@ -254,8 +310,8 @@ HRESULT gestureLegacyPair(IUIAutomation* automation,const GestureElement& retain
            !gestureEqualDescriptor(retained,reacquired)||!gestureEqualReceiver(retainedReceiver,currentReceiver))
             return gestureTraceResult(E_ABORT);
         GestureBridgeValue a,b;
-        hr=gestureBridgeRead(left,retained,retainedReceiver,owner,creator,deadline,0,a);if(hr!=S_OK)return hr;
-        hr=gestureBridgeRead(right,reacquired,currentReceiver,owner,creator,deadline,1,b);if(hr!=S_OK)return hr;
+        hr=gestureBridgeRead(left,retained,retainedReceiver,owner,creator,deadline,0,a,popup);if(hr!=S_OK)return hr;
+        hr=gestureBridgeRead(right,reacquired,currentReceiver,owner,creator,deadline,1,b,popup);if(hr!=S_OK)return hr;
         if(a.evidence.window!=b.evidence.window||a.evidence.child!=b.evidence.child||
            a.evidence.role!=b.evidence.role||a.name!=b.name||a.evidence.state!=b.evidence.state||
            !qat_gesture_protocol::equalRect(a.evidence.bounds,b.evidence.bounds)||
@@ -277,10 +333,10 @@ HRESULT gestureLegacyPair(IUIAutomation* automation,const GestureElement& retain
         if(GetTickCount64()>=deadline)return gestureTraceResult(HRESULT_FROM_WIN32(ERROR_TIMEOUT),4);
         qat_gesture_protocol::WindowIdentity retainedAfterReceiver,currentAfterReceiver;
         HWND retainedAfterWindow=nullptr,currentAfterWindow=nullptr;
-        hr=gestureMenuReceiver(automation,retained.element.Get(),owner,creator,retained.bounds,retainedAfterWindow,&retainedAfterReceiver);
+        hr=gestureMenuReceiver(automation,retained.element.Get(),owner,creator,retained.bounds,retainedAfterWindow,&retainedAfterReceiver,popup);
         if(hr!=S_OK)return hr;
         if(GetTickCount64()>=deadline)return gestureTraceResult(HRESULT_FROM_WIN32(ERROR_TIMEOUT),4);
-        hr=gestureMenuReceiver(automation,reacquired.element.Get(),owner,creator,reacquired.bounds,currentAfterWindow,&currentAfterReceiver);
+        hr=gestureMenuReceiver(automation,reacquired.element.Get(),owner,creator,reacquired.bounds,currentAfterWindow,&currentAfterReceiver,popup);
         if(hr!=S_OK)return hr;
         if(!gestureEqualReceiver(retainedAfterReceiver,retainedReceiver)||
            !gestureEqualReceiver(currentAfterReceiver,currentReceiver))return gestureTraceResult(E_ABORT);
@@ -290,13 +346,15 @@ HRESULT gestureLegacyPair(IUIAutomation* automation,const GestureElement& retain
 }
 HRESULT gestureReacquire(IUIAutomation* automation,const std::vector<GestureElement>& expectedRows,size_t expectedIndex,
                         HWND owner,DWORD creator,ULONGLONG deadline,
-                        std::vector<GestureElement>& output,size_t& outputIndex) {
+                        std::vector<GestureElement>& output,size_t& outputIndex,
+                        const GesturePopupAuthority* popup=nullptr) {
     if(!automation||expectedIndex>=expectedRows.size())return E_INVALIDARG;
     const auto& expected=expectedRows[expectedIndex];
-    if(expected.offscreen||expected.bounds.left>=expected.bounds.right||expected.bounds.top>=expected.bounds.bottom)
-        return gestureTraceResult(E_ACCESSDENIED);
+    if(expected.offscreen||expected.bounds.left>=expected.bounds.right||expected.bounds.top>=expected.bounds.bottom) {
+        gestureReadTrace.pathOwnershipGate=11;return gestureTraceResult(E_ACCESSDENIED);
+    }
     GestureActionPath expectedPath;
-    auto hr=gestureCapturePath(expectedRows,expectedIndex,owner,creator,deadline,expectedPath);if(hr!=S_OK)return hr;
+    auto hr=gestureCapturePath(expectedRows,expectedIndex,owner,creator,deadline,expectedPath,popup);if(hr!=S_OK)return hr;
     ComPtr<IUIAutomationElement> root;
     if(GetTickCount64()>=deadline)return gestureTraceResult(HRESULT_FROM_WIN32(ERROR_TIMEOUT),4);
     gestureReadTrace.stage=84;
@@ -309,7 +367,7 @@ HRESULT gestureReacquire(IUIAutomation* automation,const std::vector<GestureElem
     for(size_t index=0;index<rows.size();++index) {
         if(GetTickCount64()>=deadline)return gestureTraceResult(HRESULT_FROM_WIN32(ERROR_TIMEOUT),4);
         if(!gestureEqualDescriptor(rows[index],expectedDescriptor))continue;
-        GestureActionPath path;hr=gestureCapturePath(rows,index,owner,creator,deadline,path);if(hr!=S_OK)return hr;
+        GestureActionPath path;hr=gestureCapturePath(rows,index,owner,creator,deadline,path,popup);if(hr!=S_OK)return hr;
         if(gestureEqualPath(expectedPath,path)){++matches;selected=index;}
     }
     if(matches!=1){++gestureReadTrace.pathCollisions;return gestureTraceResult(E_ABORT,256);}
@@ -324,21 +382,21 @@ HRESULT gestureReacquire(IUIAutomation* automation,const std::vector<GestureElem
     }
     qat_gesture_protocol::WindowIdentity retainedReceiver,currentReceiver;
     HWND retainedWindow=nullptr,currentWindow=nullptr;
-    hr=gestureMenuReceiver(automation,expected.element.Get(),owner,creator,expected.bounds,retainedWindow,&retainedReceiver);
+    hr=gestureMenuReceiver(automation,expected.element.Get(),owner,creator,expected.bounds,retainedWindow,&retainedReceiver,popup);
     if(hr!=S_OK)return hr;
-    hr=gestureMenuReceiver(automation,rows[selected].element.Get(),owner,creator,rows[selected].bounds,currentWindow,&currentReceiver);
+    hr=gestureMenuReceiver(automation,rows[selected].element.Get(),owner,creator,rows[selected].bounds,currentWindow,&currentReceiver,popup);
     if(hr!=S_OK)return hr;
     if(retainedWindow!=currentWindow||!gestureEqualReceiver(retainedReceiver,currentReceiver))return gestureTraceResult(E_ABORT);
-    hr=gestureLegacyPair(automation,expected,rows[selected],retainedReceiver,currentReceiver,owner,creator,deadline);if(hr!=S_OK)return hr;
+    hr=gestureLegacyPair(automation,expected,rows[selected],retainedReceiver,currentReceiver,owner,creator,deadline,popup);if(hr!=S_OK)return hr;
     // All successful branches release their native Legacy owners on return.
     // Preserve the original post-Legacy-release native receiver fence too.
     if(GetTickCount64()>=deadline)return gestureTraceResult(HRESULT_FROM_WIN32(ERROR_TIMEOUT),4);
     qat_gesture_protocol::WindowIdentity retainedFinalReceiver,currentFinalReceiver;
     HWND retainedFinalWindow=nullptr,currentFinalWindow=nullptr;
-    hr=gestureMenuReceiver(automation,expected.element.Get(),owner,creator,expected.bounds,retainedFinalWindow,&retainedFinalReceiver);
+    hr=gestureMenuReceiver(automation,expected.element.Get(),owner,creator,expected.bounds,retainedFinalWindow,&retainedFinalReceiver,popup);
     if(hr!=S_OK)return hr;
     if(GetTickCount64()>=deadline)return gestureTraceResult(HRESULT_FROM_WIN32(ERROR_TIMEOUT),4);
-    hr=gestureMenuReceiver(automation,rows[selected].element.Get(),owner,creator,rows[selected].bounds,currentFinalWindow,&currentFinalReceiver);
+    hr=gestureMenuReceiver(automation,rows[selected].element.Get(),owner,creator,rows[selected].bounds,currentFinalWindow,&currentFinalReceiver,popup);
     if(hr!=S_OK)return hr;
     if(retainedFinalWindow!=retainedWindow||currentFinalWindow!=currentWindow||
        !gestureEqualReceiver(retainedFinalReceiver,retainedReceiver)||!gestureEqualReceiver(currentFinalReceiver,currentReceiver))

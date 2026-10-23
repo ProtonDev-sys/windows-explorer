@@ -211,6 +211,24 @@ struct ShutdownPinsNativeFixture {
         std::cout<<"DIAGNOSTIC native receipts="<<native.count<<" overflow="<<native.overflow<<"\n";
         for(UINT index=0;index<std::min<UINT>(native.count,static_cast<UINT>(native.receipts.size()));++index) {
             const auto& receipt=native.receipts[index];
+            if(receipt.kind==RibbonRecentItemsReceiptKind::ShutdownPhase) {
+                std::cout<<"DIAGNOSTIC native shutdownPhase #"<<index<<" phase="<<static_cast<UINT>(receipt.phase)
+                    <<" tick="<<receipt.entryTick<<" epoch="<<receipt.entryEpoch<<" revision="<<receipt.entryRevision
+                    <<" nativeOwner="<<receipt.nativeOwner<<" nativeWindow="<<receipt.nativeWindow
+                    <<" framework="<<receipt.nativeFramework<<" nativeView="<<receipt.nativeView<<" object="<<receipt.phaseObject
+                    <<" active="<<receipt.messageActive<<" batch="<<receipt.batchDispatching<<" retired="<<receipt.retired
+                    <<" destroyed="<<receipt.windowDestroyed<<" destroyStarted="<<receipt.destroyStarted<<" deferred="<<receipt.retirementDeferred
+                    <<" viewLifetimeRejected="<<receipt.viewLifetimeRejected
+                    <<" app="<<receipt.app.app<<" window="<<receipt.app.window<<" originalWindow="<<receipt.app.originalWindow
+                    <<" ownedWindow="<<receipt.app.ownedWindow<<" hookGeneration="<<receipt.app.hookGeneration
+                    <<" closeEntry="<<receipt.app.closeEntry<<" originalFrame="<<receipt.app.originalFrame
+                    <<" nativeCallActive="<<receipt.app.nativeCallActive<<" forwarded="<<receipt.app.forwarded
+                    <<" destroyForwarded="<<receipt.app.destroyForwarded<<" browser="<<receipt.app.browser
+                    <<" view="<<receipt.app.view<<" folder="<<receipt.app.folder<<" cleanupStarted="<<receipt.app.cleanupStarted
+                    <<" transaction="<<receipt.app.transaction<<" capturing="<<receipt.app.capturing
+                    <<" pinDispatching="<<receipt.app.pinDispatching<<" sourceRevoked="<<receipt.app.sourceRevoked<<"\n";
+                continue;
+            }
             const auto kind=receipt.kind==RibbonRecentItemsReceiptKind::Source?"source":
                 receipt.kind==RibbonRecentItemsReceiptKind::NormalCommit?"normalCommit":
                 receipt.kind==RibbonRecentItemsReceiptKind::NormalPinned?"normalPinned":
@@ -250,6 +268,7 @@ struct ShutdownPinsNativeFixture {
         if(layout==RibbonLayout::InstalledWindows10)
             require(app->ribbon_.installedLayoutStatus()==S_OK,"Requested installed native Ribbon failed");
         succeeded(app->ribbon_.enableRecentItemsDiagnostics(),"Enable fixed actual native RecentItems receipts");
+        app->headlessShutdownPhaseDiagnostics_=true;
         app->cancelFrequentPlaces();
         app->frequentPlaces_={{folders.items[0],L"Owned Recent One",folders.paths[0].native(),false},
                               {folders.items[1],L"Owned Recent Two",folders.paths[1].native(),false}};
@@ -313,8 +332,10 @@ struct ShutdownPinsNativeFixture {
                 }
                 case Reentry::Close: SendMessageW(originalWindow,WM_CLOSE,0,0);break;
                 case Reentry::DestroyOwner:
+                    app->observeShutdownPhase(RibbonShutdownPhase::FixtureOwnerDestroyBegin);
                     require(DestroyWindow(originalWindow)!=FALSE,"Actual nested owner DestroyWindow was refused");
-                    require(!IsWindow(originalWindow)&&!app->window_,"Actual nested owner destruction did not reach native NCDESTROY");break;
+                    require(!IsWindow(originalWindow)&&!app->window_,"Actual nested owner destruction did not reach native NCDESTROY");
+                    app->observeShutdownPhase(RibbonShutdownPhase::FixtureOwnerDestroyReturned);break;
                 case Reentry::ReplaceDisplayedIdentity:
                     // Deliberately replace only the old native index with a real
                     // third Shell item. The actual old pin array must not follow.
@@ -359,6 +380,8 @@ struct ShutdownPinsNativeFixture {
         // Real window destruction causes the framework's actual final batch.
         const auto preClose=app->headlessShutdownPinFacts();
         stages[3]=snapshot("before-real-WM_CLOSE",*app.Get());app->headlessNormalPinPhase_=5;
+        std::cerr<<"BEGIN actual App pin close enum="<<static_cast<UINT>(reentry)<<" case="<<label<<"\n"<<std::flush;
+        app->observeShutdownPhase(RibbonShutdownPhase::FixtureCloseBegin);
         SendMessageW(originalWindow,WM_CLOSE,0,0);
         checkOwnedPinDeadline();
         printTiming(stages,*app.Get());
@@ -414,6 +437,7 @@ struct ShutdownPinsNativeFixture {
         if(layout==RibbonLayout::InstalledWindows10)
             require(app->ribbon_.installedLayoutStatus()==S_OK,"Requested installed native Ribbon failed");
         succeeded(app->ribbon_.enableRecentItemsDiagnostics(),"Enable fixed actual native RecentItems receipts");
+        app->headlessShutdownPhaseDiagnostics_=true;
         app->cancelFrequentPlaces();
         app->frequentPlaces_={{folders.items[0],L"Owned Recent One",folders.paths[0].native(),false},
                               {folders.items[1],L"Owned Recent Two",folders.paths[1].native(),false}};

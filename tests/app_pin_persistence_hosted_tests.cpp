@@ -482,6 +482,64 @@ struct HostedPinPersistenceFixture {
         std::cout<<"FinalAppPinReceipt normalApp=1 actualWM_CLOSE=1 requested="<<requested<<" actualCallbackHRESULT=0 actualProviderInvokeHRESULT=0 originalIndex="
             <<source.index<<" creatorTID="<<source.thread<<" generation="<<source.generation<<" revision="<<source.revision<<" staleSuccess=0\n";
     }
+    static void seedOwnedNativePin(Session& session,const HostedAdmission& admission,const PrivateDesktop& desktop,
+        const OwnedTarget& target) {
+        // This one native provider invocation is environmental setup, never an
+        // App callback or final-Destroy persistence acceptance. A fresh App below
+        // must independently admit the actual native Home pinned row.
+        require(session.app&&session.app->hostedPinInvokeCount_==0&&session.app->hostedPinReturnCount_==0&&
+            session.app->hostedNormalPinReturnCount_==0,"Owned setup requires a fresh callback-free normal App");
+        auto source=snapshot(*session.app.Get());
+        const auto fence=[&] {
+            checkOwnedPinDeadline();admission.normalAppAllowed(desktop);target.verify(target.item.Get());
+            DWORD process=0;const auto thread=GetWindowThreadProcessId(source.window,&process);
+            require(thread==source.thread&&thread==GetCurrentThreadId()&&process==GetCurrentProcessId()&&
+                GetWindowLongPtrW(source.window,GWLP_USERDATA)==reinterpret_cast<LONG_PTR>(session.app.Get())&&
+                current(*session.app.Get(),source),"Owned setup original App window/view/source authority changed");
+            checkOwnedPinDeadline();
+        };
+        fence();ComPtr<IShellItemArray> array;ComPtr<IShellItem> bound;
+        auto status=SHCreateShellItemArrayFromShellItem(target.item.Get(),IID_PPV_ARGS(&array));fence();
+        require(status==S_OK&&array,"Owned setup original native single-item array is absent");
+        DWORD count=0;status=array->GetCount(&count);fence();
+        require(status==S_OK&&count==1,"Owned setup array contains an unowned or ambiguous additional target");
+        status=array->GetItemAt(0,&bound);fence();
+        require(status==S_OK&&bound,"Owned setup actual native array target is absent");
+        int order=1;status=bound->Compare(target.item.Get(),SICHINT_CANONICAL,&order);fence();
+        require(status==S_OK&&order==0,"Owned setup provider array canonical identity is not the original GUID target");
+        target.verify(bound.Get());bound.Reset();fence();
+        NativeContextMenu menu;std::vector<ContextMenuEntry> leaves;
+        status=menu.createSelection(source.window,array.Get(),source.site.Get());fence();
+        require(status==S_OK,"Owned setup genuine native pin provider binding failed");
+        status=menu.enumerate(leaves,false);fence();
+        require(status==S_OK,"Owned setup genuine native pin provider leaves are unavailable");
+        UINT command=0;unsigned matches=0;
+        for(const auto& leaf:leaves)if(leaf.canonicalVerb==L"pintohome"&&leaf.enabled()&&!leaf.submenu&&!leaf.separator()) {
+            ++matches;command=leaf.id;
+        }
+        require(matches==1&&command!=0,"Owned setup needs exactly one actual enabled canonical native pin leaf");
+        // All temporary identity/handle reads above retire before the final
+        // current-source fence. The original array/menu/site remain the actual
+        // provider's invocation authority; no alternate target or retry exists.
+        fence();
+        HRESULT invoked=E_PENDING;
+        {
+            struct ActiveMenu {
+                ExplorerApp& app;NativeContextMenu* previous;
+                ~ActiveMenu(){app.activeContextMenu_=previous;}
+            } active{*session.app.Get(),session.app->activeContextMenu_};
+            session.app->activeContextMenu_=&menu;
+            invoked=menu.invoke(command);
+        }
+        std::cout<<"OwnedSetupPinReceipt canonical=pintohome actualProviderInvokeAttempts=1 actualProviderInvokeHRESULT="
+            <<static_cast<unsigned long>(invoked)<<" arrayCount="<<count<<" menuId="<<command
+            <<" AppCallbackAcceptance=0 finalDestroyAcceptance=0 ownedVolumeSerial="<<target.original.VolumeSerialNumber
+            <<" ownedFileID128="<<hex(target.original.FileId.Identifier,16)<<'\n'<<std::flush;
+        menu.reset();array.Reset();fence();
+        require(invoked==S_OK,"Owned setup actual native pin invocation failed");
+        require(session.app->hostedPinInvokeCount_==0&&session.app->hostedPinReturnCount_==0&&
+            session.app->hostedNormalPinReturnCount_==0,"Owned setup invocation was incorrectly delivered or counted as an App callback");
+    }
     static Result run(const HostedAdmission& admission,const PrivateDesktop& desktop,RibbonLayout layout,bool finalOnly) {
         OwnedTarget target(admission);Inventory original;
         bool baselineRead=false,restored=false,persistenceProved=false;
@@ -493,20 +551,26 @@ struct HostedPinPersistenceFixture {
             original=inventory();baselineRead=true;require(!targetPinned(original,target),"Fresh owned GUID target already pinned");
             recordInventory("original",original,target);
             std::cout<<"OriginalCompletePinnedInventoryReceipt exhausted=1 nativeRows="<<original.size()<<" ownedTargetPinned=0\n";
-            // Environmental recent-membership setup only; never a pin Invoke.
-            // Windows may still omit it. Actual Home/App admission is mandatory.
-            admission.normalAppAllowed(desktop);SHAddToRecentDocs(SHARD_SHELLITEM,target.item.Get());
-            auto seeded=inventory();originalUnchanged(original,seeded,target);require(!targetPinned(seeded,target),"Recent registration unexpectedly changed owned pin state");
-            std::cout<<"OwnedRecentAdmissionReceipt SHAddToRecentDocsAttempted=1 nativeMembershipStillRequired=1 pinnedInventoryUnchanged=1\n";
-            create(session,admission,desktop,target,layout);mutate(session,admission,desktop,target,true,finalOnly);session.app.Reset();
-            auto pinned=inventory();originalUnchanged(original,pinned,target);require(targetPinned(pinned,target),"Actual normal App pin callback did not persist native pinned state");
-            recordInventory("after-actual-final-pin",pinned,target);
+            // SHAddToRecentDocs did not admit this new folder in the actual
+            // 566ce07 Hosted runs. Pin exactly the protected owned GUID through
+            // its real native provider as distinct, receipted setup. Never
+            // fabricate a Home row or claim this setup is an App pin callback.
+            create(session,admission,desktop,target,layout);seedOwnedNativePin(session,admission,desktop,target);
+            auto seeded=inventory();originalUnchanged(original,seeded,target);
+            require(targetPinned(seeded,target),"Owned setup native pin did not produce actual complete Home membership");
+            recordInventory("after-owned-native-setup-pin",seeded,target);
+            close(session);require(session.app->hostedPinInvokeCount_==0&&session.app->hostedPinReturnCount_==0&&
+                session.app->hostedNormalPinReturnCount_==0,"Owned setup App teardown cannot grant or replace measurement callback coverage");
+            session.app.Reset();
+            // The measurement begins in a new normal App from native persisted
+            // pinned membership. Preserve the original normal/final timing
+            // matrix and every callback/array/source assertion in mutate().
             create(session,admission,desktop,target,layout);auto pinnedSource=capture(*session.app.Get(),target,true);
             resolvedNativeLeaf(*session.app.Get(),pinnedSource,target,false);nativeArray(*session.app.Get(),pinnedSource);
             mutate(session,admission,desktop,target,false,finalOnly);session.app.Reset();
             auto unpinned=inventory();originalUnchanged(original,unpinned,target);require(!targetPinned(unpinned,target),"Actual normal App unpin callback did not persist native unpinned state");
-            recordInventory("after-actual-final-unpin",unpinned,target);
-            // A third fresh normal App reads the real source. Missing unpinned
+            recordInventory("after-actual-app-unpin",unpinned,target);
+            // A further fresh normal App reads the real source. Missing unpinned
             // owned row is allowed only if the complete native Home source also
             // omits it; no retained earlier App cache grants this observation.
             create(session,admission,desktop,target,layout);
@@ -523,7 +587,7 @@ struct HostedPinPersistenceFixture {
             unsigned nativeMatches=0;for(const auto& row:finalNative)if(ownedPlace(row,target))++nativeMatches;
             require(admitted==1||nativeMatches==0,"Fresh App omitted an existing native unpinned target; fresh-source persistence coverage is incomplete");
             close(session);session.app.Reset();persistenceProved=true;
-            std::cout<<"FreshAppPersistenceReceipt pinAndUnpinObserved=1 finalOwnedSourceRows="<<admitted<<" actualNativeOwnedPinned=0\n";
+            std::cout<<"FreshAppPersistenceReceipt ownedNativeSetupPinObserved=1 actualAppUnpinObserved=1 AppPinPersistenceCoverage=0 finalOwnedSourceRows="<<admitted<<" actualNativeOwnedPinned=0\n";
         }catch(const std::exception& error){outcome=1;failure=error.what();std::cerr<<"FAIL: genuine Hosted App pin persistence: "<<failure<<'\n';
             if(session.app)recordCallbacks(*session.app.Get(),"main-failure");}
         // Separate bounded recovery never changes the assertion outcome. Only
@@ -661,7 +725,7 @@ int wmain(int argc,wchar_t** argv) {
                     require(observation.persistenceProved&&observation.ownedFoldersRemoved&&GetTickCount64()<observation.primaryDeadline,
                         "Actual validation teardown crossed the original acceptance deadline or isolation fence");
                     std::cout<<"PASS: genuine Hosted normal App "<<(finalOnly?"actual final-Destroy":"actual normal-flow")
-                        <<" pin/unpin Invoke and fresh-source persistence; complete original pinned inventory restored after both App/OLE and validation teardown\n";
+                        <<" unpin Invoke and fresh-source persistence after distinct owned native pin setup (App pin persistence unmeasured); complete original pinned inventory restored after both App/OLE and validation teardown\n";
                 }catch(const std::exception& failure){std::cerr<<"FinalRetirementAdmissionFailure "<<failure.what()<<'\n';result=1;}
             }
         }else {std::cerr<<"FinalProfileAdmission originalAuthorityOrAppTeardownUnproved=1\n";if(result==0)result=86;}

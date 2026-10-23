@@ -325,10 +325,11 @@ HRESULT shellExecute(HWND owner, const wchar_t* target, const wchar_t* arguments
 }
 }
 
-ExplorerApp::ExplorerApp(HINSTANCE instance, bool headless, RibbonLayout ribbonLayout)
+ExplorerApp::ExplorerApp(HINSTANCE instance, bool headless, RibbonLayout ribbonLayout, ExplorerChrome chrome)
     : instance_(instance), headless_(headless), preferences_(headless ? Preferences{} : loadPreferences(preferencesPath())),
       quickAccessModel_(headless ? QuickAccessToolbar{} : loadQuickAccessToolbar(quickAccessSettingsPath())) {
     requestedRibbonLayout_=ribbonLayout;
+    compactChrome_=chrome==ExplorerChrome::Compact;
     expandCurrent_ = preferences_.expandToCurrent;
     showAllFolders_ = preferences_.showAllFolders;
     showLibraries_ = preferences_.showLibraries;
@@ -482,6 +483,7 @@ void ExplorerApp::updateFrameTitle() {
         if(!path.empty())title=path;
     }
     SetWindowTextW(window_,title.c_str());
+    if(embeddedParent_)PostMessageW(embeddedParent_,EmbeddedTitleChanged,reinterpret_cast<WPARAM>(window_),reinterpret_cast<LPARAM>(this));
 }
 
 HRESULT ExplorerApp::openNewWindow(const std::wstring& location) {
@@ -597,6 +599,45 @@ HRESULT ExplorerApp::prepareHeadlessVisual(const VisualScene& scene) {
     return S_OK;
 }
 
+HRESULT ExplorerApp::createEmbedded(HWND parent, const std::wstring& location) {
+    DWORD process=0;
+    if(window_||!compactChrome_||!parent||!IsWindow(parent)||
+       GetWindowThreadProcessId(parent,&process)!=GetCurrentThreadId()||process!=GetCurrentProcessId())return E_INVALIDARG;
+    embeddedParent_=parent;
+    const auto hr=create(location);
+    if(FAILED(hr)&&!window_)embeddedParent_=nullptr;
+    return hr;
+}
+
+HRESULT ExplorerApp::headlessSelectionCount(DWORD* count) const {
+    if(!count)return E_POINTER;
+    const auto desktop=PrivateDesktop::current();
+    if(!headless_||!desktop||FAILED(desktop->verifyIsolation()))return E_ACCESSDENIED;
+    if(!folderView_||navigating_||closing_)return E_PENDING;
+    int selected=0;const auto hr=folderView_->ItemCount(SVGIO_SELECTION,&selected);
+    if(FAILED(hr))return hr;if(selected<0)return E_UNEXPECTED;
+    *count=static_cast<DWORD>(selected);return S_OK;
+}
+
+void ExplorerApp::setEmbeddedActive(bool active) {
+    ComPtr<ExplorerApp> retained(this);
+    SearchNativeCallScope nativeCall(*this);
+    if(!embeddedParent_||!window_||closing_)return;
+    const auto target=window_;
+    if(!active) {
+        const auto focus=GetFocus();
+        if(focus==window_||IsChild(window_,focus))embeddedFocus_=focus;
+        embeddedActive_=false;KillTimer(window_,1);ShowWindow(window_,SW_HIDE);
+    } else {
+        embeddedActive_=true;ShowWindow(window_,SW_SHOWNA);SetTimer(window_,1,700,nullptr);
+        if(closing_||window_!=target||!embeddedActive_)return;
+        if(embeddedFocus_&&IsWindow(embeddedFocus_)&&IsChild(window_,embeddedFocus_))SetFocus(embeddedFocus_);
+        else {const auto view=view_;if(view)view->UIActivate(SVUIA_ACTIVATE_FOCUS);}
+        if(closing_||window_!=target||!embeddedActive_)return;
+        updateCommands();
+    }
+}
+
 HRESULT ExplorerApp::create(const std::wstring& location) {
     SearchNativeCallScope searchDispatch(*this);
     auto directionStatus = loadThreadUiDirection(&uiDirection_);
@@ -615,15 +656,16 @@ HRESULT ExplorerApp::create(const std::wstring& location) {
     // Mirroring already implies RTL reading. RTLREADING reverses that
     // direction again when combined with LAYOUTRTL.
     const DWORD extended = WS_EX_CONTROLPARENT | (rightToLeft ? WS_EX_LAYOUTRTL : 0);
-    window_ = CreateWindowExW(extended, WindowClass, L"Windows Explorer", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+    window_ = CreateWindowExW(extended, WindowClass, L"Windows Explorer",
+                             (embeddedParent_?WS_CHILD:WS_OVERLAPPEDWINDOW) | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
                              CW_USEDEFAULT, CW_USEDEFAULT, preferences_.windowWidth, preferences_.windowHeight,
-                             nullptr, nullptr, instance_, this);
+                             embeddedParent_, nullptr, instance_, this);
     if (!window_) return HRESULT_FROM_WIN32(GetLastError());
     applyWindowTheme(window_);
     dpi_ = GetDpiForWindow(window_);
     updateCaptionIcon();
     RECT initialBounds{}; GetWindowRect(window_, &initialBounds);
-    SetWindowPos(window_, nullptr, 0, 0, std::max(px(600), static_cast<int>(initialBounds.right - initialBounds.left)),
+    if(!embeddedParent_)SetWindowPos(window_, nullptr, 0, 0, std::max(px(600), static_cast<int>(initialBounds.right - initialBounds.left)),
                  std::max(px(480), static_cast<int>(initialBounds.bottom - initialBounds.top)),
                  SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
     NONCLIENTMETRICSW metrics{sizeof(metrics)};
@@ -638,7 +680,7 @@ HRESULT ExplorerApp::create(const std::wstring& location) {
     hr = preparedSearchWindowTarget_?browser_->BrowseToIDList(preparedSearchWindowTarget_.get(),SBSP_ABSOLUTE):
         navigate(location.empty() ? (preferences_.useWindowsStartup ? windowsDefaultStartupLocation() : preferences_.startupLocation) : location);
     preparedSearchWindowTarget_.reset();
-    if(SUCCEEDED(hr))hr=installOwnedCloseHook();
+    if(SUCCEEDED(hr)&&!compactChrome_)hr=installOwnedCloseHook();
     if (FAILED(hr)) DestroyWindow(window_);
     return hr;
 }
@@ -671,11 +713,14 @@ void ExplorerApp::finishWindowDestruction() {
     // Reserve once before providers/workers can pump nested cleanup.
     if(windowDestructionCleanupStarted_)return;
     windowDestructionCleanupStarted_=true;
+    observeShutdownPhase(RibbonShutdownPhase::CleanupBegin);
     cancelLiveSearch();
     if(window_)RemoveClipboardFormatListener(window_);cancelCommandStates();
     closing_=true;if(window_)KillTimer(window_,1);cancelFrequentPlaces();
     if(breadcrumbTask_) {breadcrumbTask_->cancel();breadcrumbTask_.reset();}
+    observeShutdownPhase(RibbonShutdownPhase::PreviewBegin);
     shutdownStatus_=shutdownPreview();
+    observeShutdownPhase(RibbonShutdownPhase::PreviewReturned);
     if(SUCCEEDED(shutdownStatus_)) {
         DWORD remaining=5000;
         if(searchBackings_) {
@@ -687,11 +732,15 @@ void ExplorerApp::finishWindowDestruction() {
     if(SUCCEEDED(shutdownStatus_)) {
         // The native frequent-place pin callback can arrive on Destroy.
         // Keep its original Shell view site alive until that callback ends.
-        forgetRibbonTheme(ribbon_.framework());resetRibbonForClose();destroyBrowser();
+        forgetRibbonTheme(ribbon_.framework());
+        observeShutdownPhase(RibbonShutdownPhase::RibbonResetBegin);resetRibbonForClose();
+        observeShutdownPhase(RibbonShutdownPhase::RibbonResetReturned);
+        observeShutdownPhase(RibbonShutdownPhase::BrowserCleanupBegin);destroyBrowser();
+        observeShutdownPhase(RibbonShutdownPhase::BrowserCleanupReturned);
         if(searchBackings_&&SUCCEEDED(shutdownStatus_))shutdownStatus_=closeSearchBackings();
     }
 #if defined(EXPLORER_HOSTED_PIN_PERSISTENCE_FIXTURE)
-    if (!headless_) {
+    if (!headless_&&!embeddedParent_) {
         PostQuitMessage(0);
         if(hostedPinReceiptsEnabled_) {
             ++hostedNormalPostQuitCount_;
@@ -702,8 +751,9 @@ void ExplorerApp::finishWindowDestruction() {
         }
     }
 #else
-    if (!headless_) PostQuitMessage(0);
+    if (!headless_&&!embeddedParent_) PostQuitMessage(0);
 #endif
+    observeShutdownPhase(RibbonShutdownPhase::CleanupReturned);
 }
 
 void ExplorerApp::reconcileMissingWindowDestruction() {
@@ -750,17 +800,26 @@ void ExplorerApp::destroyBrowser() {
     newItemTypes_.reset();ribbonCommandChildren_.clear();ribbonCommandPaths_.clear();cancelFrequentPlaces();
     if(window_)KillTimer(window_,3);navigationExpansion_.clear();navigationTree_.Reset();
     if (breadcrumbDrop_) { breadcrumbDrop_->revokeWindow(); breadcrumbDrop_.Reset(); }
+    observeShutdownPhase(RibbonShutdownPhase::ViewSiteClearBegin);
     if(view_) {ComPtr<IObjectWithSite> site;if(SUCCEEDED(view_.As(&site)))site->SetSite(nullptr);}
+    observeShutdownPhase(RibbonShutdownPhase::ViewSiteClearReturned);
     sortPropertyValid_ = groupPropertyValid_ = false; orderStateView_ = nullptr;
+    observeShutdownPhase(RibbonShutdownPhase::ShellViewReleaseBegin);
     folderView_.Reset(); view_.Reset();
+    observeShutdownPhase(RibbonShutdownPhase::ShellViewReleaseReturned);
     if (browser_) {
         ComPtr<IFolderFilterSite> filterSite;
         if (SUCCEEDED(browser_.As(&filterSite))) filterSite->SetFilter(nullptr);
         if (adviseCookie_) { browser_->Unadvise(adviseCookie_); adviseCookie_ = 0; }
         ComPtr<IObjectWithSite> site;
         if (SUCCEEDED(browser_.As(&site))) site->SetSite(nullptr);
-        if (browserInitialized_) { browser_->Destroy(); browserInitialized_ = false; }
-        browser_.Reset();
+        if (browserInitialized_) {
+            observeShutdownPhase(RibbonShutdownPhase::BrowserDestroyBegin);
+            browser_->Destroy(); browserInitialized_ = false;
+            observeShutdownPhase(RibbonShutdownPhase::BrowserDestroyReturned);
+        }
+        observeShutdownPhase(RibbonShutdownPhase::BrowserReleaseBegin);browser_.Reset();
+        observeShutdownPhase(RibbonShutdownPhase::BrowserReleaseReturned);
     }
 }
 HRESULT ExplorerApp::recreateBrowser(UINT toggleCommand) {
@@ -1397,6 +1456,14 @@ HRESULT ExplorerApp::createControls() {
     }
     const auto chromeStatus = applyChrome(nav_, breadcrumbs_, address_, search_, addressActions_);
     if (FAILED(chromeStatus)) return chromeStatus;
+    if(compactChrome_) {
+        const auto compactStatus=compactCommands_.create(window_,instance_);
+        if(FAILED(compactStatus))return compactStatus;
+        compactCommands_.setFont(font_);
+        AddClipboardFormatListener(window_);
+        SetTimer(window_,1,700,nullptr);
+        return S_OK;
+    }
     RibbonCallbacks callbacks;
     callbacks.execute = [this](UINT command) { auto hr = executeRibbon(command); showError(hr, L"Command"); return hr; };
     callbacks.query = [this](UINT command) { return ribbonState(command); };
@@ -1466,6 +1533,13 @@ void ExplorerApp::rebuildRibbon() {
     ribbon_.flush();
     layout();
 }
+void ExplorerApp::updateCompactCommands() {
+    if(!compactChrome_||!compactCommands_.window())return;
+    for(const UINT command:{NewFolder,Cut,Copy,Paste,Rename,Delete,SortMenu,ViewMenu,FileMenu}) {
+        const auto state=ribbonState(command);
+        compactCommands_.setCommandState(command,state.enabled&&!navigating_,state.checked);
+    }
+}
 void ExplorerApp::rebuildQuickAccess() {
     if (!ribbon_.valid()) return;
     std::vector<UINT> commands(quickAccessModel_.commands().begin(), quickAccessModel_.commands().end());
@@ -1488,7 +1562,13 @@ void ExplorerApp::layout() {
     } layoutEnd{*this};
     RECT client{}; GetClientRect(window_, &client);
     const int width = client.right, height = client.bottom;
-    const int y = static_cast<int>(ribbon_.height());
+    const int y = compactChrome_?0:static_cast<int>(ribbon_.height());
+    int contentTop=y+px(41);
+    if(compactChrome_) {
+        RECT commands{px(8),contentTop,std::max(px(8),width-px(8)),contentTop+compactCommands_.height(dpi_)};
+        compactCommands_.layout(commands,dpi_);
+        contentTop+=compactCommands_.height(dpi_)+px(4);
+    }
     updateRibbonCollapseButton();
     const int searchWidth = std::clamp(px(preferences_.searchWidth),px(90),std::max(px(90),width-px(220)));
     const int navWidth = px(106);
@@ -1500,7 +1580,7 @@ void ExplorerApp::layout() {
     fitBreadcrumbs(std::max(px(60),addressWidth-px(25)));
     MoveWindow(search_, navWidth + addressWidth + px(12), y + px(5), searchWidth, px(30), TRUE);
     if (browser_) {
-        RECT viewRect{0, y + px(41), width, std::max(y + px(42), height)};
+        RECT viewRect{0, contentTop, width, std::max(contentTop+1, height)};
         const auto nativeBrowser=browser_;
         const auto laidOut=nativeBrowser->SetRect(nullptr, viewRect);
         if(!closing_&&nativeBrowser.Get()==browser_.Get())
@@ -1580,6 +1660,18 @@ void ExplorerApp::updateNamespaceImpl() {
     if (SUCCEEDED(initialized)||SUCCEEDED(backgroundInitialized)) {
         const auto context = commandContext();
         for (const auto& binding : appCommandCatalog()) {
+            // Compact chrome has no contextual Ribbon pages. Do not activate
+            // unrelated sharing/device/media handlers on every selection.
+            // The Shell view retains its own native context menu, and command
+            // invocation still revalidates the provider when requested.
+            if(compactChrome_) {
+                switch(binding.command) {
+                case NewFolder:case Cut:case Copy:case Paste:case Rename:case Delete:
+                case SortMenu:case ViewMenu:case FileMenu:case Undo:case Redo:
+                case CopyPath:case Properties:case Terminal:break;
+                default:continue;
+                }
+            }
             AppCommandCapability capability;
             const bool useBackground=binding.scope==NamespaceMenuScope::Background;
             if(useBackground?FAILED(backgroundInitialized):FAILED(initialized))continue;
@@ -1645,6 +1737,7 @@ void ExplorerApp::updateContextTabs() {
 }
 void ExplorerApp::updateContextTabsImpl() {
     SearchNativeCallScope searchDispatch(*this);
+    if(compactChrome_) {updateNamespaceImpl();updateCompactCommands();return;}
     if (!ribbon_.valid()) return;
     updateNamespaceImpl();
     const auto contextStarted=commandTimingNow();
@@ -1703,6 +1796,7 @@ HRESULT ExplorerApp::cycleFocus(bool backwards) {
     else appendToolbarFocus(window_,breadcrumbs_,&toolbar);
     appendToolbarFocus(window_,addressActions_,&toolbar);
     if(usableOwnedControl(window_,search_))toolbar.push_back({search_,-1});
+    if(compactChrome_)appendToolbarFocus(window_,compactCommands_.window(),&toolbar);
     if(activeView.Get()!=view_.Get()||closing_)return HRESULT_FROM_WIN32(ERROR_RETRY);
     const auto current=currentFocusRegion();
     if(activeView.Get()!=view_.Get()||closing_)return HRESULT_FROM_WIN32(ERROR_RETRY);
@@ -1710,6 +1804,10 @@ HRESULT ExplorerApp::cycleFocus(bool backwards) {
                                       !toolbar.empty(),preferences_.navigationPane&&usableOwnedControl(window_,regions.tree),
                                       previewHost_&&preferences_.previewPane&&previewHost_->status().ready&&previewSourceCurrent(false)};
     const auto next=cycleFocusRegion(current,backwards,available);
+    if(compactChrome_&&embeddedParent_&&current&&next&&
+       ((!backwards&&*next==FocusRegion::FolderView)||(backwards&&*current==FocusRegion::FolderView))) {
+        SendMessageW(embeddedParent_,EmbeddedFocusTabs,0,0);return S_OK;
+    }
     if (!next) return S_FALSE;
     HRESULT focused=E_UNEXPECTED;
     switch (*next) {
@@ -1862,7 +1960,8 @@ std::optional<FocusRegion> ExplorerApp::currentFocusRegion() const {
     const auto focus=GetFocus();auto within=[focus](HWND parent){return parent&&(focus==parent||IsChild(parent,focus));};
     if(within(nativeView))return FocusRegion::FolderView;
     if(within(regions.tree))return FocusRegion::Navigation;
-    if(within(nav_)||within(breadcrumbs_)||within(address_)||within(addressActions_)||within(search_))return FocusRegion::Toolbar;
+    if(within(nav_)||within(breadcrumbs_)||within(address_)||within(addressActions_)||within(search_)||
+       (compactChrome_&&within(compactCommands_.window())))return FocusRegion::Toolbar;
     return std::nullopt;
 }
 HRESULT ExplorerApp::cycleToolbarFocus(bool backwards) {
@@ -1872,6 +1971,7 @@ HRESULT ExplorerApp::cycleToolbarFocus(bool backwards) {
     else appendToolbarFocus(window_,breadcrumbs_,&items);
     appendToolbarFocus(window_,addressActions_,&items);
     if(usableOwnedControl(window_,search_))items.push_back({search_,-1});
+    if(compactChrome_)appendToolbarFocus(window_,compactCommands_.window(),&items);
     if(items.empty())return S_FALSE;
     const auto focus=GetFocus();
     const auto current=std::find_if(items.begin(),items.end(),[focus](const ToolbarFocusItem& item){
@@ -2791,6 +2891,7 @@ void ExplorerApp::updateCommands() {
     bool minimized = false;
     if (SUCCEEDED(ribbon_.minimized(minimized))) preferences_.ribbonCollapsed = minimized;
     ribbon_.invalidateState();
+    updateCompactCommands();
     if(headless_) {
         const auto completed=commandTimingNow();
         commandTimings_.ribbonInvalidationMs+=completed-ribbonStarted;
@@ -3119,7 +3220,9 @@ HRESULT ExplorerApp::execute(UINT command) {
     case AddressList: popup(AddressList,breadcrumbs_);return headless_?E_ACCESSDENIED:S_OK;
     case FocusNext: return cycleFocus(false);
     case FocusPrevious: return cycleFocus(true);
-    case Fullscreen: return toggleFullscreen();
+    case Fullscreen:
+        if(embeddedParent_)return PostMessageW(embeddedParent_,EmbeddedToggleFullscreen,0,0)?S_OK:HRESULT_FROM_WIN32(GetLastError());
+        return toggleFullscreen();
     case FocusSearch: SetFocus(search_); SendMessageW(search_, EM_SETSEL, 0, -1); return S_OK;
     case CloseSearch:
         if(searchWindowOrigin_) {
@@ -3307,7 +3410,9 @@ void ExplorerApp::popup(UINT command, HWND anchor) {
         POINT point{};
         if (SUCCEEDED(hr) && anchor) {
             RECT bounds{};
-            if (!GetWindowRect(anchor, &bounds)) hr = HRESULT_FROM_WIN32(GetLastError());
+            if(compactChrome_&&anchor==compactCommands_.window()&&SendMessageW(anchor,TB_GETRECT,command,reinterpret_cast<LPARAM>(&bounds)))
+                hr=mapUiRect(anchor,nullptr,bounds,&bounds);
+            else if (!GetWindowRect(anchor, &bounds)) hr = HRESULT_FROM_WIN32(GetLastError());
             UiPopupPlacement placement;
             if (SUCCEEDED(hr)) hr = popupUiPlacement(window_, bounds, TPM_RETURNCMD | TPM_NONOTIFY, &placement);
             if (SUCCEEDED(hr)) point = placement.anchor;
@@ -3379,12 +3484,30 @@ void ExplorerApp::popup(UINT command, HWND anchor) {
         add(Network, L"Network"); add(RecycleBin, L"Recycle Bin"); separator();
         add(FolderOptions, L"Change folder and search options");
         add(NewLibrary, L"New library…");
-        add(QuickAccessMenu, L"Customize Quick Access Toolbar");
-        add(Collapse, L"Minimize the ribbon\tCtrl+F1", preferences_.ribbonCollapsed); separator();
+        if(!compactChrome_) {
+            add(QuickAccessMenu, L"Customize Quick Access Toolbar");
+            add(Collapse, L"Minimize the ribbon\tCtrl+F1", preferences_.ribbonCollapsed);
+        } else {
+            separator();
+            add(Undo,L"Undo\tCtrl+Z",false,!ribbonState(Undo).enabled);
+            add(Redo,L"Redo\tCtrl+Y",false,!ribbonState(Redo).enabled);
+            add(CopyPath,L"Copy as path\tCtrl+Shift+C",false,!ribbonState(CopyPath).enabled);
+            add(Properties,L"Properties\tAlt+Enter",false,!ribbonState(Properties).enabled);
+        }
+        separator();
         add(Fullscreen, L"Full screen\tF11", fullscreen_); separator();
         add(Close, L"Close\tAlt+F4");
     } else if (command == ViewMenu) {
         for (int i = 0; i < 8; ++i) add(ViewFirst + i, ViewNames[i], static_cast<int>(preferences_.view) == i);
+        if(compactChrome_) {
+            separator();
+            add(NavigationPane,L"Navigation pane",preferences_.navigationPane);
+            add(PreviewPane,L"Preview pane\tAlt+P",preferences_.previewPane);
+            add(DetailsPane,L"Details pane",preferences_.detailsPane);
+            add(Checkboxes,L"Item check boxes",checkboxes_);
+            add(Extensions,L"File name extensions",preferences_.showExtensions);
+            add(HiddenItems,L"Hidden items",preferences_.showHidden);
+        }
     } else if (command == HistoryMenu) {
         historyLocations.reserve(history_.size());
         for (const auto& location : history_) {
@@ -3407,7 +3530,9 @@ void ExplorerApp::popup(UINT command, HWND anchor) {
     auto placementRead = popupUiFlags(window_, TPM_RETURNCMD | TPM_NONOTIFY | TPM_TOPALIGN, &menuFlags);
     if (SUCCEEDED(placementRead) && anchor) {
         RECT bounds{};
-        if (!GetWindowRect(anchor, &bounds)) placementRead = HRESULT_FROM_WIN32(GetLastError());
+        if(compactChrome_&&anchor==compactCommands_.window()&&SendMessageW(anchor,TB_GETRECT,command,reinterpret_cast<LPARAM>(&bounds)))
+            placementRead=mapUiRect(anchor,nullptr,bounds,&bounds);
+        else if (!GetWindowRect(anchor, &bounds)) placementRead = HRESULT_FROM_WIN32(GetLastError());
         UiPopupPlacement placement;
         if (SUCCEEDED(placementRead)) placementRead = popupUiPlacement(window_, bounds, menuFlags, &placement);
         if (SUCCEEDED(placementRead)) { menuPoint = placement.anchor; menuFlags = placement.flags; }
@@ -3503,14 +3628,14 @@ HRESULT ExplorerApp::persist() {
         });
         addressHistoryStatus_=persistenceStatus_.addressHistory;
     }
-    if (fullscreen_) {
+    if (fullscreen_&&!embeddedParent_) {
         preferences_.windowWidth = windowRect_.right - windowRect_.left;
         preferences_.windowHeight = windowRect_.bottom - windowRect_.top;
     } else if (!IsIconic(window_)) {
         RECT rect{};
         record(persistenceStatus_.windowPlacement,[&] {
             SetLastError(ERROR_SUCCESS);
-            if(GetWindowRect(window_,&rect))return S_OK;
+            if(GetWindowRect(embeddedParent_?embeddedParent_:window_,&rect))return S_OK;
             const auto error=GetLastError();
             return HRESULT_FROM_WIN32(error?error:ERROR_GEN_FAILURE);
         });
@@ -3520,13 +3645,15 @@ HRESULT ExplorerApp::persist() {
         }
     }
     bool minimized = false;
-    record(persistenceStatus_.ribbonState,[&] { return ribbon_.minimized(minimized); });
-    if (SUCCEEDED(persistenceStatus_.ribbonState)) preferences_.ribbonCollapsed = minimized;
+    if(!compactChrome_) {
+        record(persistenceStatus_.ribbonState,[&] { return ribbon_.minimized(minimized); });
+        if (SUCCEEDED(persistenceStatus_.ribbonState)) preferences_.ribbonCollapsed = minimized;
+    }
     preferences_.expandToCurrent=expandCurrent_; preferences_.showAllFolders=showAllFolders_; preferences_.showLibraries=showLibraries_;
     record(persistenceStatus_.preferences,[&] {
         return FAILED(pathStatus)?pathStatus:savePreferencesStatus(settings,preferences_);
     });
-    record(persistenceStatus_.ribbonSettings,[&] {
+    if(!compactChrome_)record(persistenceStatus_.ribbonSettings,[&] {
         return FAILED(pathStatus)?pathStatus:ribbon_.saveSettings(settings.parent_path()/L"ribbon.bin");
     });
     persistenceStatus_.result=result;
@@ -3566,7 +3693,7 @@ bool ExplorerApp::preprocess(MSG& message) {
             showError(execute(*command), L"Command"); return true;
         }
         if(message.message==WM_KEYDOWN&&key==VK_RETURN&&!control&&!shift&&!alt&&
-           (focus==nav_||focus==breadcrumbs_||focus==addressActions_)) {
+           (focus==nav_||focus==breadcrumbs_||focus==addressActions_||(compactChrome_&&focus==compactCommands_.window()))) {
             const auto index=SendMessageW(focus,TB_GETHOTITEM,0,0);TBBUTTON button{};
             if(index>=0&&SendMessageW(focus,TB_GETBUTTON,index,reinterpret_cast<LPARAM>(&button))&&
                (button.fsState&TBSTATE_ENABLED)&&!(button.fsState&TBSTATE_HIDDEN)&&!(button.fsStyle&BTNS_SEP)) {
@@ -3583,7 +3710,8 @@ bool ExplorerApp::preprocess(MSG& message) {
     if (message.message == WM_KEYDOWN && message.wParam == VK_TAB &&
         !(GetKeyState(VK_CONTROL) & 0x8000) && !(GetKeyState(VK_MENU) & 0x8000)) {
         const auto focus=GetFocus();
-        if(focus==nav_||focus==breadcrumbs_||focus==address_||focus==addressActions_||focus==search_)
+        if(focus==nav_||focus==breadcrumbs_||focus==address_||focus==addressActions_||focus==search_||
+           (compactChrome_&&focus==compactCommands_.window()))
             return cycleToolbarFocus((GetKeyState(VK_SHIFT)&0x8000)!=0)==S_OK;
         auto next = GetNextDlgTabItem(window_, GetFocus(), (GetKeyState(VK_SHIFT) & 0x8000) != 0);
         if (next) { SetFocus(next); return true; }
@@ -3637,6 +3765,8 @@ LRESULT CALLBACK ExplorerApp::editProc(HWND window, UINT message, WPARAM wparam,
     return DefSubclassProc(window, message, wparam, lparam);
 }
 LRESULT ExplorerApp::onMessage(UINT message, WPARAM wparam, LPARAM lparam) {
+    if(message==WM_DESTROY)observeShutdownPhase(RibbonShutdownPhase::AppDestroyMessage);
+    if(message==WM_NCDESTROY)observeShutdownPhase(RibbonShutdownPhase::AppNcDestroyMessage);
     const bool originalCloseMessage=message==WM_CLOSE&&consumeOwnedCloseContinuation();
     observeShutdownWindowMessage(message,originalCloseMessage);
     // Message handlers may retain a native search view across provider calls.
@@ -3712,11 +3842,12 @@ LRESULT ExplorerApp::onMessage(UINT message, WPARAM wparam, LPARAM lparam) {
         dpi_ = HIWORD(wparam);
         updateCaptionIcon();
         auto rect = reinterpret_cast<RECT*>(lparam);
-        SetWindowPos(window_, nullptr, rect->left, rect->top, rect->right - rect->left, rect->bottom - rect->top, SWP_NOZORDER | SWP_NOACTIVATE);
+        if(!embeddedParent_)SetWindowPos(window_, nullptr, rect->left, rect->top, rect->right - rect->left, rect->bottom - rect->top, SWP_NOZORDER | SWP_NOACTIVATE);
         NONCLIENTMETRICSW metrics{sizeof(metrics)};
         SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0, dpi_);
         auto old = font_; font_ = CreateFontIndirectW(&metrics.lfMessageFont);
         for (auto hwnd : {nav_, address_, breadcrumbs_, search_, addressActions_, previewText_}) if(hwnd)SendMessageW(hwnd, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
+        if(compactChrome_)compactCommands_.setFont(font_);
         applyChrome(nav_, breadcrumbs_, address_, search_, addressActions_);
         applyWindowTheme(window_); applyRibbonTheme(ribbon_.framework());
         ribbon_.invalidate(); rebuildRibbon(); updateBreadcrumbs(); layout(); if (old) DeleteObject(old);
@@ -3724,6 +3855,7 @@ LRESULT ExplorerApp::onMessage(UINT message, WPARAM wparam, LPARAM lparam) {
     }
     case WM_THEMECHANGED: case WM_SETTINGCHANGE: case WM_SYSCOLORCHANGE:
         refreshProcessTheme(); applyWindowTheme(window_); applyRibbonTheme(ribbon_.framework());
+        if(compactChrome_)compactCommands_.refreshTheme();
         applyChrome(nav_, breadcrumbs_, address_, search_, addressActions_);
         updatePreviewVisuals();
         if(!headless_) {
@@ -3790,6 +3922,14 @@ LRESULT ExplorerApp::onMessage(UINT message, WPARAM wparam, LPARAM lparam) {
     case WM_NOTIFY: {
         auto notification = reinterpret_cast<NMHDR*>(lparam);
         if (!notification) return 0;
+        if(compactChrome_) {
+            LRESULT result=0;
+            if(compactCommands_.notification(notification,result))return result;
+        }
+        if(compactChrome_&&notification->hwndFrom==compactCommands_.window()&&notification->code==TBN_DROPDOWN) {
+            const auto dropdown=reinterpret_cast<NMTOOLBARW*>(lparam);
+            popup(static_cast<UINT>(dropdown->iItem),compactCommands_.window());return TBDDRET_NODEFAULT;
+        }
         if (notification->code == TBN_GETINFOTIPW &&
             (notification->hwndFrom == nav_ || notification->hwndFrom == addressActions_)) {
             const auto info = reinterpret_cast<NMTBGETINFOTIPW*>(lparam);
@@ -3919,6 +4059,7 @@ LRESULT ExplorerApp::onMessage(UINT message, WPARAM wparam, LPARAM lparam) {
         finishWindowDestruction();return 0;
     case WM_NCDESTROY: {
         const auto old=window_;detachOwnedCloseHook();SetWindowLongPtrW(old,GWLP_USERDATA,0);window_=nullptr;
+        if(embeddedParent_)PostMessageW(embeddedParent_,EmbeddedDestroyed,reinterpret_cast<WPARAM>(old),reinterpret_cast<LPARAM>(this));
         return DefWindowProcW(old,message,wparam,lparam);
     }
     }

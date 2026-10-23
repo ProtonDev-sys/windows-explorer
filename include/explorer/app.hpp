@@ -19,6 +19,7 @@
 #include "explorer/live_search.hpp"
 #include "explorer/ui_direction.hpp"
 #include "explorer/preview_host.hpp"
+#include "explorer/modern_command_bar.hpp"
 #include <shlobj.h>
 #include <commctrl.h>
 #include <shobjidl.h>
@@ -135,10 +136,24 @@ struct HeadlessStartupTimings {
     double createReturnedMs = 0;
 };
 
+enum class ExplorerChrome { Ribbon, Compact };
+
 class ExplorerApp final : public IExplorerBrowserEvents, public IServiceProvider,
                           public IExplorerPaneVisibility, public ICommDlgBrowser3, public IFolderFilter {
 public:
-    ExplorerApp(HINSTANCE instance, bool headless, RibbonLayout ribbonLayout = RibbonLayout::Authored);
+    ExplorerApp(HINSTANCE instance, bool headless, RibbonLayout ribbonLayout = RibbonLayout::Authored,
+                ExplorerChrome chrome = ExplorerChrome::Ribbon);
+    static constexpr UINT EmbeddedTitleChanged = WM_APP + 80;
+    static constexpr UINT EmbeddedDestroyed = WM_APP + 81;
+    static constexpr UINT EmbeddedToggleFullscreen = WM_APP + 82;
+    static constexpr UINT EmbeddedFocusTabs = WM_APP + 83;
+    HRESULT createEmbedded(HWND parent, const std::wstring& location);
+    void setEmbeddedActive(bool active);
+    const std::wstring& currentLocation() const noexcept { return currentLocation_; }
+    const std::wstring& currentTitle() const noexcept { return currentName_; }
+    bool navigationPending() const noexcept { return navigating_; }
+    bool compactChrome() const noexcept { return compactChrome_; }
+    HRESULT headlessSelectionCount(DWORD* count) const;
     HRESULT prepareHeadlessVisual(const VisualScene& scene);
     HRESULT create(const std::wstring& location);
     HRESULT prepareSearchWindowContext(const SearchWindowContext& context);
@@ -194,6 +209,12 @@ private:
     static LRESULT CALLBACK editProc(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
     LRESULT onMessage(UINT, WPARAM, LPARAM);
     HRESULT createControls();
+    void updateCompactCommands();
+    bool compactChrome_ = false;
+    HWND embeddedParent_ = nullptr;
+    HWND embeddedFocus_ = nullptr;
+    bool embeddedActive_ = true;
+    ModernCommandBar compactCommands_;
     void layout();
     HRESULT createPreviewPane();
     struct PreviewCallScope {
@@ -527,6 +548,8 @@ private:
         bool window=false,browser=false,view=false,folder=false,location=false,transaction=false;
     };
     HeadlessShutdownPinFacts headlessShutdownPinFacts() const noexcept;
+    bool headlessShutdownPhaseDiagnostics_=false;
+    void observeShutdownPhase(RibbonShutdownPhase) const noexcept;
     ULONGLONG headlessOwnedCloseEntryTick_=0;
     // Fixture-only controlled reentry after plain source capture, before its
     // first provider AddRef. Empty in ordinary App operation. No fake provider.

@@ -5,6 +5,7 @@
 #include "explorer/headless_visual.hpp"
 #include "explorer/worker_sta.hpp"
 #include "native_menu_state_tests.hpp"
+#include "actual_native_view_enumeration.hpp"
 
 #include <shlobj.h>
 #include <propkey.h>
@@ -86,10 +87,14 @@ struct Fixture {
 class NavigationEvents final : public Microsoft::WRL::RuntimeClass<
     Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::ClassicCom>,IExplorerBrowserEvents> {
 public:
-    bool finished = false;
+    bool finished = false,observeEnumeration=false;
     HRESULT status = E_PENDING;
+    native_view_fixture::ActualEnumeration enumeration;
     HRESULT STDMETHODCALLTYPE OnNavigationPending(PCIDLIST_ABSOLUTE) override { return S_OK; }
-    HRESULT STDMETHODCALLTYPE OnViewCreated(IShellView*) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE OnViewCreated(IShellView* originalView) override {
+        if(observeEnumeration)enumeration.attach(originalView);
+        return S_OK; // Preserve navigation; actual attachment failure rejects readiness.
+    }
     HRESULT STDMETHODCALLTYPE OnNavigationComplete(PCIDLIST_ABSOLUTE) override { finished = true; status = S_OK; return S_OK; }
     HRESULT STDMETHODCALLTYPE OnNavigationFailed(PCIDLIST_ABSOLUTE) override { finished = true; status = E_FAIL; return S_OK; }
 };
@@ -127,6 +132,8 @@ struct HiddenView {
     void waitForOwnedMembers(IShellItem* originalFolder,PCIDLIST_ABSOLUTE originalFolderId,const std::vector<ReadyMember>& expected) {
         require(originalFolder&&originalFolderId&&expected.size()==3&&browser&&view&&initializationDeadline,
             "Equivalence readiness requires exactly three original sources and its actual initialized view");
+        events->enumeration.emit("NativeMenu","navigation-complete");
+        require(events->enumeration.attachmentStatus()==S_OK,"Original native menu EnumDone attachment failed");
         ComPtr<IFolderView2> folderView;succeeded(view.As(&folderView),"Read original equivalence readiness folder view");
         const auto current=[&](const char* phase=nullptr) {
             const auto desktop=PrivateDesktop::current();
@@ -170,6 +177,8 @@ struct HiddenView {
         unsigned observations=0;int previousCount=-2;HRESULT previousRead=E_PENDING;
         std::array<bool,3> identityLogged{};
         const auto ready=[&] {
+            if(!events->enumeration.completed(view.Get()))return false;
+            const auto enumeration=events->enumeration.completedCount();
             if(GetTickCount64()>=initializationDeadline)return false;
             require(current(),"Equivalence readiness lost the original private folder/view");
             int count=-1;const auto countRead=folderView->ItemCount(SVGIO_ALLVIEW,&count);++observations;
@@ -214,7 +223,9 @@ struct HiddenView {
                 }
                 matched[memberIndex]=true;
             }
-            return std::all_of(matched.begin(),matched.end(),[](bool value){return value;})&&current()&&GetTickCount64()<initializationDeadline;
+            return std::all_of(matched.begin(),matched.end(),[](bool value){return value;})&&current()&&
+                events->enumeration.completed(view.Get())&&enumeration==events->enumeration.completedCount()&&
+                GetTickCount64()<initializationDeadline;
         };
         bool completed=ready();
         while(!completed&&GetTickCount64()<initializationDeadline) {
@@ -224,6 +235,7 @@ struct HiddenView {
             if(!completed&&GetTickCount64()<initializationDeadline)Sleep(1);
         }
         counts(completed?"ready-before-first-provider":"failed-before-first-provider");
+        events->enumeration.emit("NativeMenu","before-first-provider");
         require(completed&&current()&&GetTickCount64()<initializationDeadline,
             "Original complete owned menu view membership did not become ready within initialization budget");
         std::cout<<"NativeMenu readiness completeOwnedFileIDs=3 beforeFirstProvider=1 observations="<<observations<<'\n'<<std::flush;
@@ -522,6 +534,7 @@ struct HiddenView {
         succeeded(browser->Initialize(owner,&bounds,&settings),"Initialize actual hidden provider view");
         events = Microsoft::WRL::Make<NavigationEvents>();
         require(events != nullptr,"Create native navigation observer");
+        events->observeEnumeration=!ownedPaths.empty();
         succeeded(browser->Advise(events.Get(),&cookie),"Observe hidden native view navigation");
         succeeded(browser->BrowseToObject(folder,SBSP_ABSOLUTE),"Browse owned fixture without displaying a window");
         initializationDeadline=GetTickCount64()+5000;
@@ -540,6 +553,7 @@ struct HiddenView {
         }
     }
     ~HiddenView() {
+        if(events){events->observeEnumeration=false;events->enumeration.detachOrTerminate();}
         diagnosticOriginalFolderView.Reset();
         view.Reset();
         if (browser) { if (cookie) browser->Unadvise(cookie); browser->Destroy(); browser.Reset(); }
@@ -1692,7 +1706,10 @@ void nativeLeafStateMenuEquivalence(std::span<const DWORD> counts, unsigned mixt
             for(const bool registered:{false,true}) {
                 if(!(registrationMask&(registered?2u:1u)))continue;
                 const auto diagnosticBoundary=[&](const char* stage,const char* operation,const char* edge,HRESULT hr=E_PENDING) {
-                    if(registered)host.recordRegisteredMenuBoundary(stage,operation,edge,selected.Get(),count,mixed,hr);
+                    if(registered) {
+                        host.events->enumeration.emit("NativeMenu",operation);
+                        host.recordRegisteredMenuBoundary(stage,operation,edge,selected.Get(),count,mixed,hr);
+                    }
                 };
                 const auto diagnosticCall=[&](const char* stage,const char* operation,const auto& call) {
                     diagnosticBoundary(stage,operation,"before");

@@ -1,8 +1,8 @@
 # windows-explorer
 
-A native C++20 file manager targeting Windows 10 22H2. It runs in its own process, hosts actual Windows folder views through `IExplorerBrowser`, and uses the native Windows Ribbon Framework. The executable has no web runtime or Python dependency.
+A native C++20 file manager with a tabbed window and compact command bar. It runs in its own process and hosts actual Windows folder views through `IExplorerBrowser`. Each tab owns an independent browser, navigation history, search and selection. The executable has no web runtime or Python dependency.
 
-Normal launches use the installed Windows 10 ribbon layout on build 19045 after checking its resource signature. An incompatible system uses the authored native fallback. Windows resources are loaded from the operating system at runtime and are not included in this repository.
+Normal launches use the compact native interface. `--classic` opens the earlier Ribbon interface, which uses the installed Windows 10 layout on build 19045 after checking its resource signature and otherwise uses an authored fallback. Existing headless smoke/visual modes retain that classic baseline. Windows resources are loaded from the operating system at runtime and are not included in this repository.
 
 The [feature matrix](docs/feature-matrix.md) records each Windows 10 feature, its implementation, and its verification requirements. [Headless visual comparisons](docs/headless-visual.md) compare real private-desktop captures with pinned online Windows 10 references. Source wiring, passing behavioral tests, and matching pixels are separate evidence.
 
@@ -13,12 +13,15 @@ Build the current source using the instructions below. [Releases](https://github
 ```powershell
 ./WindowsExplorer.exe
 ./WindowsExplorer.exe --path 'C:\Users'
+./WindowsExplorer.exe --classic
 ```
 
 The executable is unsigned and includes the C++ runtime. It starts at Windows' configured Quick access or This PC location unless an explicit application startup location or command-line path is supplied. It runs alongside the Windows desktop shell. Application preferences and recent searches are stored under `%LOCALAPPDATA%\WindowsExplorer`; normal extension/hidden-item commands use Windows' shared settings.
 
 ## Features
 
+- Compact native commands with labels, icons, keyboard access and wrapping at narrow widths; native Sort, View and More menus.
+- Independent tabs: Ctrl+T opens a tab, Ctrl+W closes it, Ctrl+Tab/Ctrl+Shift+Tab cycles tabs, and Ctrl+1 through Ctrl+9 selects a tab. Closing an inactive tab preserves the active browser. Session restoration and tab tear-off are not yet implemented.
 - Native folder views, thumbnails, preview/details panes, overlays, association-based opening, inline rename, context menus, and drag-and-drop.
 - Home, Share, View, Computer, and Network ribbon pages; Picture, Drive, Disc Image, Compressed, Search, Library, Recycle Bin, Application, Shortcut, Music, and Video contextual pages.
 - Actual caption Quick Access Toolbar, customization, native keytips, ribbon collapse, and framework settings persistence.
