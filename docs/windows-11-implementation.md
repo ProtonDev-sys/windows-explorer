@@ -52,7 +52,7 @@ AE351A33C12BD6C066AA1ADA173A5DBBA254569A8BD702915AE56864AE7CACFD
 
 The downloaded binary archive matched GitHub's SHA256 `43214af1151cc534046f46e3af0bfd90faabf7762c399818634fc1bdc77a5818`. Locally, `artifacts/modern-native-ci-ec2600a/` preserves `source.zip`, `provenance.json`, `verification.json`, exact binaries, CI JUnit/log evidence and each local process's exit code, executable hash and stdout/stderr. The source ZIP SHA256 is `48F4BD29FC60F04D58F93E3FD12E3DF59297F4140D27638818AC6648906277E2`.
 
-The [broad workflow for this commit](https://github.com/ProtonDev-sys/windows-explorer/actions/runs/39984101911) is separate: the isolated native transfer and destination-drop job has passed; the broad behavioral suite is still running at this checkpoint. The preceding commit's broad behavioral suite passed. Classic-interface captures do not certify the compact interface's visual parity.
+The [broad workflow for this commit](https://github.com/ProtonDev-sys/windows-explorer/actions/runs/39984101911) also passed its broad behavioral test step and its isolated native transfer/destination-drop job. Later classic-interface captures and navigation benchmarks were still running at this checkpoint. Those captures do not certify the compact interface's visual parity.
 
 Earlier passing reports do not certify later code changes. Subsequent documentation-only commits retain the code and binaries identified above.
 
