@@ -9,6 +9,7 @@ namespace explorer {
 namespace {
 constexpr wchar_t FrameClass[]=L"WindowsExplorer.ModernFrame";
 constexpr size_t MaxTabs=32;
+constexpr UINT ReconcileTabs=WM_APP+84;
 void frameTheme(HWND window) {
     applyWindowTheme(window);
     const auto theme=themeState();
@@ -59,7 +60,18 @@ HRESULT ModernExplorerWindow::addTab(const std::wstring& location,TabId* result,
     if(busy_)return HRESULT_FROM_WIN32(ERROR_BUSY);
     if(entries_.size()>=MaxTabs)return HRESULT_FROM_WIN32(ERROR_TOO_MANY_OPEN_FILES);
     busy_=true;
-    struct End {ModernExplorerWindow& host;~End(){host.busy_=false;host.collectRetired();if(host.closeRequested_&&host.window_)PostMessageW(host.window_,WM_CLOSE,0,0);}} end{*this};
+    struct End {
+        ModernExplorerWindow& host;
+        ~End() noexcept {
+            host.busy_=false;
+            // Reconciliation can allocate or enter native callbacks. Dispatch
+            // it through the protected window procedure, never a destructor.
+            if(host.window_) {
+                PostMessageW(host.window_,ReconcileTabs,0,0);
+                if(host.closeRequested_)PostMessageW(host.window_,WM_CLOSE,0,0);
+            }
+        }
+    } end{*this};
     ComPtr<ExplorerApp> app;TabId id=BrowserTabs::NoTab;
     struct Rollback {
         ModernExplorerWindow& host;TabId& id;ComPtr<ExplorerApp>& app;bool committed=false;
@@ -73,6 +85,11 @@ HRESULT ModernExplorerWindow::addTab(const std::wstring& location,TabId* result,
         hr=tabs_.add(L"New tab",&id);if(FAILED(hr))return hr;
         entries_.push_back({id,app,nullptr,false});
         hr=app->createEmbedded(window_,location);
+        if(SUCCEEDED(hr)&&headless_&&headlessConstructionProbe_) {
+            const auto desktop=PrivateDesktop::current();
+            if(!desktop||FAILED(desktop->verifyIsolation()))return E_ACCESSDENIED;
+            headlessConstructionProbe_();
+        }
         auto found=std::find_if(entries_.begin(),entries_.end(),[&](const Entry& row){return row.id==id;});
         if(FAILED(hr))return hr;
         if(found==entries_.end())return E_ABORT;
@@ -87,6 +104,7 @@ HRESULT ModernExplorerWindow::addTab(const std::wstring& location,TabId* result,
 
 void ModernExplorerWindow::retireFailedTab(TabId id,ExplorerApp* app) noexcept {
     if(id==BrowserTabs::NoTab)return;
+    if(active_==id) {active_=BrowserTabs::NoTab;++activationRevision_;}
     const auto found=std::find_if(entries_.begin(),entries_.end(),[&](const Entry& row){return row.id==id&&row.app.Get()==app;});
     if(found==entries_.end()) {tabs_.remove(id);return;}
     // createEmbedded may throw after creating its HWND. Retain its real owner
@@ -142,28 +160,37 @@ void ModernExplorerWindow::collectDestroyed(HWND child,ExplorerApp* app) {
     if(found==entries_.end()||found->app->window())return;
     const auto retained=found->app;const auto id=found->id;
     const bool wasActive=id==active_;
-    if(wasActive)++activationRevision_;
+    if(wasActive) {active_=BrowserTabs::NoTab;++activationRevision_;}
     const auto status=retained->shutdownStatus();if(FAILED(status))shutdownStatus_=status;
     entries_.erase(found);tabs_.remove(id);
     if(entries_.empty()) {
         active_=BrowserTabs::NoTab;
         if(window_)DestroyWindow(window_);
     }else if(!closing_&&wasActive) {
-        auto selected=tabs_.selected();
-        if(selected==BrowserTabs::NoTab)selected=entries_.front().id;
-        selectTab(selected);
+        activateSurvivor();
     }else if(!closing_) {
         layout();updateTitle();
     }
 }
 
 void ModernExplorerWindow::collectRetired() {
-    while(!busy_) {
+    if(busy_)return;
+    for(;;) {
         const auto found=std::find_if(entries_.begin(),entries_.end(),[](const Entry& row){return row.child&&!row.app->window();});
-        if(found==entries_.end())return;
+        if(found==entries_.end())break;
         const auto retained=found->app;const auto child=found->child;
         collectDestroyed(child,retained.Get());
     }
+    if(!closing_&&!activeBrowser()&&!entries_.empty())activateSurvivor();
+}
+
+void ModernExplorerWindow::activateSurvivor() {
+    const auto eligible=[](const Entry& row){return !row.closing&&row.child&&row.app->window()==row.child;};
+    const auto selected=tabs_.selected();
+    auto next=std::find_if(entries_.begin(),entries_.end(),[&](const Entry& row){return row.id==selected&&eligible(row);});
+    if(next==entries_.end())next=std::find_if(entries_.begin(),entries_.end(),eligible);
+    if(next!=entries_.end())selectTab(next->id);
+    else {active_=BrowserTabs::NoTab;updateTitle();}
 }
 
 void ModernExplorerWindow::refreshFont() {
@@ -292,6 +319,7 @@ LRESULT ModernExplorerWindow::onMessage(UINT message,WPARAM wparam,LPARAM lparam
         updateTitle();return 0;
     case ExplorerApp::EmbeddedDestroyed:
         collectDestroyed(reinterpret_cast<HWND>(wparam),reinterpret_cast<ExplorerApp*>(lparam));return 0;
+    case ReconcileTabs:collectRetired();return 0;
     case ExplorerApp::EmbeddedFocusTabs:SetFocus(tabs_.window());return 0;
     case WM_GETMINMAXINFO:reinterpret_cast<MINMAXINFO*>(lparam)->ptMinTrackSize={MulDiv(640,dpi_,96),MulDiv(400,dpi_,96)};return 0;
     case WM_DPICHANGED: {

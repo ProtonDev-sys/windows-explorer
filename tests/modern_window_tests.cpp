@@ -6,7 +6,16 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <new>
 #include <stdexcept>
+
+namespace explorer {
+struct ModernWindowTests {
+    static void constructionProbe(ModernExplorerWindow& frame,std::function<void()> probe) {
+        frame.headlessConstructionProbe_=std::move(probe);
+    }
+};
+}
 
 namespace {
 void require(bool value,const char* message) {if(!value)throw std::runtime_error(message);}
@@ -150,13 +159,38 @@ int main() {
         succeeded(frame.selectTab(remaining.front()),"Activate tab that closes during native show");
         require(pumpUntil([&]{return frame.tabCount()==1;}),"Reentrant close retires only its browser");
         require(showCloseCalls==1&&frame.activeTab()==secondId,"Activation close preserves remaining tab");
+        const auto queuedActive=frame.activeTab();
+        explorer::ModernExplorerWindow::TabId queuedClosing=0,survivorId=0;
+        succeeded(frame.addTab((fixture.root/L"second").native(),&queuedClosing),"Add adjacent closing tab");
+        succeeded(frame.addTab((fixture.root/L"third").native(),&survivorId),"Add queued-close survivor");
+        require(pumpUntil([&]{return at(frame.activeBrowser(),fixture.root/L"third");}),"Queued-close survivor ready");
+        succeeded(frame.selectTab(queuedActive),"Activate first tab before adjacent closes");
+        succeeded(frame.closeTab(queuedActive),"Queue active tab close");
+        succeeded(frame.closeTab(queuedClosing),"Queue adjacent tab close before dispatch");
+        require(pumpUntil([&]{return frame.tabCount()==1;}),"Both queued closes retire");
+        require(frame.activeTab()==survivorId&&frame.activeBrowser()&&IsWindowVisible(frame.activeBrowser()->window()),"Replacement skips already-closing tabs and stays visible");
+        for(const bool destroyBeforeThrow:{false,true}) {
+            HWND partial=nullptr;
+            explorer::ModernWindowTests::constructionProbe(frame,[&] {
+                succeeded(frame.selectTab(frame.tabIds().back()),"Reentrantly select tab during construction");
+                partial=frame.activeBrowser()->window();
+                if(destroyBeforeThrow)SendMessageW(partial,WM_CLOSE,0,0);
+                throw std::bad_alloc{};
+            });
+            explorer::ModernExplorerWindow::TabId failed=123;
+            const auto added=frame.addTab((fixture.root/L"first").native(),&failed);
+            explorer::ModernWindowTests::constructionProbe(frame,{});
+            require(added==E_OUTOFMEMORY&&failed==explorer::BrowserTabs::NoTab&&partial,"Allocation failure publishes no tab ID");
+            require(pumpUntil([&]{return frame.tabCount()==1&&frame.activeTab()==survivorId;}),"Failed construction restores the surviving active browser");
+            require(!IsWindow(partial)&&IsWindowVisible(frame.activeBrowser()->window()),"Partial native HWND retires while survivor is visible");
+        }
         succeeded(frame.shutdown(),"Close all actual browser sessions");
         require(!frame.window()&&frame.tabCount()==0,"Frame and child windows retired");
         retainedFirst.Reset();
         succeeded(desktop.verifyIsolation(),"Input desktop unchanged");
         bool visible=false;succeeded(desktop.visibleWindowsOnInputDesktop(visible),"Read input-desktop ownership");
         require(!visible,"No owned windows appeared on input desktop");
-        std::cout<<"PASS: compact frame, independent native tab locations/history/selection, reentrant activation, inactive close and full teardown\n";
+        std::cout<<"PASS: compact frame, independent native tab locations/history/selection, reentrant activation, queued closes, allocation rollback and full teardown\n";
     }catch(const std::exception& error) {std::cerr<<"FAIL: "<<error.what()<<'\n';result=1;}
     apartment.finishOrTerminate();
     if(FAILED(desktop.verifyIsolation()))result=1;

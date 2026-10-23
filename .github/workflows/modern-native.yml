@@ -35,7 +35,7 @@ jobs:
         with:
           name: modern-native-evidence
           path: |
-            modern-native-junit.xml
+            build/modern-native-junit.xml
             build/Testing/Temporary/*
             build/Release/modern-window-crash*.dmp
           if-no-files-found: ignore

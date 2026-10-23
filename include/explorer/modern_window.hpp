@@ -1,6 +1,7 @@
 #pragma once
 #include "explorer/app.hpp"
 #include "explorer/browser_tabs.hpp"
+#include <functional>
 #include <vector>
 
 namespace explorer {
@@ -27,6 +28,7 @@ public:
     ExplorerApp* activeBrowser() const noexcept;
     static constexpr UINT ToggleFullscreen=ExplorerApp::EmbeddedToggleFullscreen;
 private:
+    friend struct ModernWindowTests;
     struct Entry {TabId id=0;ComPtr<ExplorerApp> app;HWND child=nullptr;bool closing=false;};
     static LRESULT CALLBACK windowProc(HWND,UINT,WPARAM,LPARAM);
     LRESULT onMessage(UINT,WPARAM,LPARAM);
@@ -35,6 +37,7 @@ private:
     void updateTitle();
     void collectDestroyed(HWND child,ExplorerApp* app);
     void collectRetired();
+    void activateSurvivor();
     void retireFailedTab(TabId id,ExplorerApp* app) noexcept;
     void showFailure(HRESULT status);
     HINSTANCE instance_;
@@ -46,6 +49,8 @@ private:
     std::vector<Entry> entries_;
     TabId active_=BrowserTabs::NoTab;
     std::uint64_t activationRevision_=0;
+    // Owned private-desktop fault injection; absent from interactive sessions.
+    std::function<void()> headlessConstructionProbe_;
     HRESULT shutdownStatus_=S_OK;
     WINDOWPLACEMENT placement_{sizeof(WINDOWPLACEMENT)};
     LONG_PTR windowStyle_=0;
