@@ -4,6 +4,8 @@ A native C++20 file manager with a tabbed window and compact command bar. It run
 
 Normal launches use the compact native interface. `--classic` opens the earlier Ribbon interface, which uses the installed Windows 10 layout on build 19045 after checking its resource signature and otherwise uses an authored fallback. Existing headless smoke/visual modes retain that classic baseline. Windows resources are loaded from the operating system at runtime and are not included in this repository.
 
+The [Windows 11 implementation checkpoint](docs/windows-11-implementation.md) records the new interface, targeted headless coverage and remaining scope.
+
 The [feature matrix](docs/feature-matrix.md) records each Windows 10 feature, its implementation, and its verification requirements. [Headless visual comparisons](docs/headless-visual.md) compare real private-desktop captures with pinned online Windows 10 references. Source wiring, passing behavioral tests, and matching pixels are separate evidence.
 
 ## Run
@@ -23,8 +25,8 @@ The executable is unsigned and includes the C++ runtime. It starts at Windows' c
 - Compact native commands with labels, icons, keyboard access and wrapping at narrow widths; native Sort, View and More menus.
 - Independent tabs: Ctrl+T opens a tab, Ctrl+W closes it, Ctrl+Tab/Ctrl+Shift+Tab cycles tabs, and Ctrl+1 through Ctrl+9 selects a tab. Closing an inactive tab preserves the active browser. Session restoration and tab tear-off are not yet implemented.
 - Native folder views, thumbnails, preview/details panes, overlays, association-based opening, inline rename, context menus, and drag-and-drop.
-- Home, Share, View, Computer, and Network ribbon pages; Picture, Drive, Disc Image, Compressed, Search, Library, Recycle Bin, Application, Shortcut, Music, and Video contextual pages.
-- Actual caption Quick Access Toolbar, customization, native keytips, ribbon collapse, and framework settings persistence.
+- In `--classic`: Home, Share, View, Computer, and Network ribbon pages; Picture, Drive, Disc Image, Compressed, Search, Library, Recycle Bin, Application, Shortcut, Music, and Video contextual pages.
+- In `--classic`: caption Quick Access Toolbar, customization, native keytips, ribbon collapse, and framework settings persistence.
 - PIDL navigation history, ancestor breadcrumbs, asynchronous sibling menus, destination drop targets, editable Shell paths, and native address completion.
 - Quick access, known folders, This PC, Libraries, Network, and Recycle Bin; configurable navigation tree expansion and roots.
 - Eight native layouts, per-folder view persistence, native sorting/grouping and complete property-column menus, checkboxes, visibility settings, and the native status footer.
